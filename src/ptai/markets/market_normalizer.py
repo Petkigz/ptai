@@ -275,14 +275,23 @@ class MarketNormalizer:
 
     def get_report(self) -> Dict[str, Any]:
         return {
-            "normalizer": "Market Normalizer - robust for 19 venues",
-            "supported_venues": [
+            "normalizer": "Market Normalizer - generic normalization layer prepared for many venue types, while actual trading support is currently much narrower",
+            "important_clarification": "Normalization support does NOT mean trading support. It's saying: If another adapter gives me data in these forms, I know how to turn that data into a common Market object. That's useful, but doesn't mean PTAI can currently discover, evaluate, execute and reconcile trades on those venues. PTAI has generic normalization layer prepared for many venue types, while actual trading support is currently much narrower - Polymarket partially operational, Kalshi scaffolding, others mostly normalization/extension scaffolding.",
+            "supported_venues_normalization": [
                 "polymarket", "kalshi", "manifold", "predictit", "simmer", "cymetica",
                 "crypto_binance", "whitebit", "afx_dex", "grvt", "pionex", "stock_mock",
                 "betfair", "betdaq", "betconnect", "ccxt_unified", "veynor", "openpx", "apify"
             ],
-            "fields_normalized": ["id", "question", "outcomes", "outcome_prices", "tokens", "volume", "volume_24h", "liquidity", "end_date", "active", "closed", "slug", "event_slug", "category", "venue"],
-            "category_detection": "politics, sports, crypto, economics, weather, ai, general via keywords",
-            "robustness": "Handles various price formats, volume formats, date formats, fallback to generic normalization",
-            "validation": "Checks id, question, price 0-1, liquidity, volume non-negative"
+            "actual_trading_support": {
+                "polymarket": "⚠️ Partially operational - real orderbook via CLOB but still has estimation fallback, portfolio via storage real but on-chain not yet, execution via CLOB if keys provided",
+                "kalshi": "❌ Not operational - adapter exists with real API + mock fallback but not end-to-end tested, qualification not proven",
+                "manifold": "❌ Mostly normalization scaffolding - discovery mock, no real trading",
+                "other_exchanges": "❌ Mostly normalization/extension scaffolding - normalization prepared, trading not operational",
+                "honest_assessment": "Architecture 8.5/10 genuinely multi-market/multi-venue, actual multi-venue implementation 3-4/10, autonomous trading readiness 4/10"
+            },
+            "fields_normalized": ["id", "question", "outcomes", "outcome_prices", "tokens", "volume", "volume_24h", "liquidity", "end_date", "active", "closed", "slug", "event_slug", "category", "venue", "venue_id immutable"],
+            "category_detection": "politics, sports, crypto, economics, weather, ai, general via keywords - useful preprocessing but not actual AI market-selection model, fast LLM Qwen 7B now added for actual AI screening",
+            "robustness": "Handles various price formats, volume formats, date formats, fallback to generic normalization, venue_id immutable through pipeline",
+            "validation": "Checks id, question, price 0-1, liquidity, volume non-negative, venue_id explicit",
+            "venue_identity": "FIXED V7: Market.venue_id explicit immutable through pipeline, never enum, never first eligible, exact routing opportunity.venue_id -> Registry -> exact adapter -> exact market -> exact orderbook"
         }

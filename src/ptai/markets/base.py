@@ -37,6 +37,32 @@ class Market:
     condition_id: str = ""
     market_type: str = "binary"  # binary, categorical
     raw: Dict[str, Any] = field(default_factory=dict)
+    # FIXED: explicit venue identity immutable through pipeline
+    # Previously only source enum, now venue_id str is explicit and immutable
+    # venue_id must be adapter's real venue ID, never enum, never first eligible
+    venue_id: str = ""  # explicit venue identity: polymarket, kalshi, manifold, etc - immutable
+    venue_type: str = "prediction"  # prediction, financial, other
+
+    def __post_init__(self):
+        # Ensure venue_id is always explicit and immutable
+        # If not provided, derive from source but keep as string not enum
+        if not self.venue_id:
+            if isinstance(self.source, str):
+                self.venue_id = self.source
+            elif hasattr(self.source, 'value'):
+                self.venue_id = self.source.value
+            else:
+                self.venue_id = str(self.source)
+        # Always store as string, never enum
+        if hasattr(self.venue_id, 'value'):
+            self.venue_id = self.venue_id.value
+        self.venue_id = str(self.venue_id).lower()
+        
+        # Store venue_id also in raw for audit trail
+        if "venue_id" not in self.raw:
+            self.raw["venue_id"] = self.venue_id
+        if "source" not in self.raw:
+            self.raw["source"] = self.source.value if hasattr(self.source, 'value') else str(self.source)
 
     @property
     def best_price(self) -> float:

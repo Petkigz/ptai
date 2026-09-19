@@ -258,12 +258,14 @@ class TradingAgentV2:
             context["x_credibility"] = x_signal.credibility
             context["x_should_use"] = x_signal.should_use
             
-            # Orderbook
-            # Get from venue adapter
-            eligible = self.venue_registry.get_eligible_adapters()
-            if eligible:
-                try:
-                    orderbook_raw = await eligible[0].get_orderbook(market)
+            # Orderbook - FIXED V7: Exact routing, never eligible[0]
+            # Previously: eligible[0].get_orderbook(market) - dangerous if Kalshi market asked to Polymarket adapter
+            # Now: opportunity.venue_id -> VenueRegistry -> exact adapter -> exact market -> exact orderbook
+            # Never first eligible adapter
+            try:
+                exact_adapter = self.venue_registry.get_adapter_for_market(market)
+                if exact_adapter:
+                    orderbook_raw = await exact_adapter.get_orderbook(market)
                     orderbook_snapshot = self.orderbook_analyzer.analyze(market, raw_orderbook=orderbook_raw)
                     context["orderbook"] = {
                         "spread": orderbook_snapshot.spread,
@@ -271,14 +273,21 @@ class TradingAgentV2:
                         "ask": orderbook_snapshot.ask,
                         "imbalance": orderbook_snapshot.imbalance,
                         "large_orders": orderbook_snapshot.large_orders,
-                        "price_velocity": orderbook_snapshot.price_velocity
+                        "price_velocity": orderbook_snapshot.price_velocity,
+                        "source": orderbook_raw.get("source", "unknown"),
+                        "venue_id": exact_adapter.venue_id,
+                        "is_real": orderbook_raw.get("is_real", False)
                     }
-                    # Check manipulation
                     manip_risks = self.orderbook_analyzer.detect_manipulation(orderbook_snapshot)
                     if manip_risks:
                         context["manipulation_risks"] = manip_risks
-                except Exception as e:
-                    logger.warning(f"Orderbook fetch failed for {market.id}: {e}")
+                    logger.debug(f"Orderbook for {market.id} via exact adapter {exact_adapter.venue_id} spread {orderbook_snapshot.spread*100:.2f}%")
+                else:
+                    # If no exact adapter, DO NOT fallback to eligible[0] - that's bug
+                    logger.error(f"No exact adapter for market {market.id} venue_id {getattr(market, 'venue_id', 'unknown')} - ABORT orderbook, never fallback")
+                    context["orderbook"] = {"spread": 0.02, "error": "no_exact_adapter_ABORT"}
+            except Exception as e:
+                logger.warning(f"Orderbook fetch failed for {market.id}: {e}")
             
             # Web research - bull/bear
             research_result = await self.web_researcher.research(market, max_time_seconds=20)
@@ -451,11 +460,18 @@ class TradingAgentV2:
                     logger.info(f"Order manager blocks {opp.market.id}: {order_reason}")
                     continue
 
-                # Place order via venue adapter
-                adapter = self.venue_registry.adapters.get(opp.venue_id)
+                # Place order via venue adapter - FIXED V7: Exact routing, ABORT if not found, never fallback
+                # Previously: if requested adapter doesn't exist use first eligible - DANGEROUS for real money
+                # Now: if venue=kalshi and Kalshi adapter isn't available, ABORT TRADE not try first venue - hard safety
+                adapter = self.venue_registry.get_adapter_for_venue_id(opp.venue_id)
                 if not adapter:
-                    # Try first eligible
-                    adapter = eligible_adapters[0] if eligible_adapters else None
+                    logger.error(f"ABORT TRADE: venue {opp.venue_id} adapter not found for market {opp.market.id} - requested {opp.venue_id} not in {list(self.venue_registry.adapters.keys())} - ABORT, never fallback to first eligible")
+                    continue
+                # Validate venue identity matches opportunity
+                if adapter.venue_id != opp.venue_id.split("+")[0]:
+                    logger.error(f"ABORT TRADE: venue mismatch opportunity {opp.venue_id} vs adapter {adapter.venue_id} for market {opp.market.id} - ABORT")
+                    continue
+                logger.info(f"Exact routing: opportunity venue_id {opp.venue_id} -> adapter {adapter.venue_id} -> market {opp.market.id} -> orderbook/execution")
                 
                 if adapter:
                     # Get portfolio before

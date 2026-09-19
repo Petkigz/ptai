@@ -1,5 +1,6 @@
 """
 Venue Registry - manages all adapters, learns which venues work
+FIXED V7: Exact routing, no fallback to first eligible - hard safety
 """
 from typing import Dict, List, Optional
 from loguru import logger
@@ -13,12 +14,13 @@ class VenueRegistry:
     Registry of all venue adapters.
     Learns performance per venue/strategy/category.
     Concentrates research where demonstrated edge is strongest.
+    FIXED V7: Exact routing - opportunity.venue_id -> Registry -> exact adapter -> exact market -> exact orderbook
+    Never first eligible adapter
     """
     def __init__(self, country_code: str = "UG"):
         self.adapters: Dict[str, MarketAdapter] = {}
         self.country_code = country_code
         self.eligibility_cache: Dict[str, EligibilityStatus] = {}
-        # Performance tracking per venue/category
         self.venue_performance: Dict[str, Dict] = {}
 
     def register(self, adapter: MarketAdapter):
@@ -26,7 +28,6 @@ class VenueRegistry:
         logger.info(f"Registered venue {adapter.venue_id} type {adapter.venue_type.value}")
 
     def check_all_eligibility(self) -> Dict[str, EligibilityStatus]:
-        """Check eligibility for all venues - critical for geographic compliance"""
         results = {}
         for venue_id, adapter in self.adapters.items():
             status = adapter.check_eligibility(self.country_code)
@@ -37,7 +38,6 @@ class VenueRegistry:
         return results
 
     def get_eligible_adapters(self) -> List[MarketAdapter]:
-        """Only return adapters that are eligible and not restricted"""
         eligible = []
         for venue_id, adapter in self.adapters.items():
             status = self.eligibility_cache.get(venue_id)
@@ -51,49 +51,116 @@ class VenueRegistry:
         return eligible
 
     async def discover_all(self, target_per_venue: int = 500) -> List[Market]:
-        """Discover markets from all eligible venues"""
+        """Discover markets from all eligible venues - exact venue_id immutable"""
         all_markets = []
         for adapter in self.get_eligible_adapters():
             try:
                 markets = await adapter.discover_markets(target_count=target_per_venue)
+                for m in markets:
+                    m.venue_id = adapter.venue_id
+                    m.raw["venue_id"] = adapter.venue_id
+                    m.raw["discovery_source"] = f"VenueRegistry.discover_all->{adapter.venue_id}"
                 all_markets.extend(markets)
-                logger.info(f"{adapter.venue_id}: discovered {len(markets)} markets")
+                logger.info(f"{adapter.venue_id}: discovered {len(markets)} markets - venue_id immutable")
             except Exception as e:
                 logger.error(f"{adapter.venue_id} discovery failed: {e}")
         return all_markets
 
+    async def discover_all_including_verification(self, target_per_venue: int = 500) -> List[Market]:
+        """Discover from eligible + requires_verification for paper trading learning"""
+        all_markets = []
+        for venue_id, adapter in self.adapters.items():
+            status = self.eligibility_cache.get(venue_id)
+            if status is None:
+                status = adapter.check_eligibility(self.country_code)
+                self.eligibility_cache[venue_id] = status
+            if status in [EligibilityStatus.ELIGIBLE, EligibilityStatus.REQUIRES_VERIFICATION]:
+                try:
+                    markets = await adapter.discover_markets(target_count=target_per_venue)
+                    for m in markets:
+                        m.venue_id = adapter.venue_id
+                        m.raw["venue_id"] = adapter.venue_id
+                        m.raw["discovery_source"] = f"VenueRegistry.discover_all_including_verification->{adapter.venue_id}"
+                        m.raw["eligibility"] = status.value
+                    all_markets.extend(markets)
+                    logger.info(f"{adapter.venue_id} ({status.value}): discovered {len(markets)} markets for paper trading")
+                except Exception as e:
+                    logger.error(f"{adapter.venue_id} discovery failed: {e}")
+            else:
+                logger.info(f"Skipping {venue_id} status {status.value} - restricted")
+        return all_markets
+
+    def get_adapter_for_market(self, market: Market) -> Optional[MarketAdapter]:
+        """
+        FIXED V7: Exact routing, never first eligible
+        Previously: eligible[0].get_orderbook(market) - dangerous if Kalshi market asked to Polymarket adapter
+        Now: opportunity.venue_id -> VenueRegistry -> exact adapter -> exact market -> exact orderbook
+        Never first eligible adapter
+        """
+        venue_id = getattr(market, 'venue_id', None)
+        if not venue_id:
+            venue_id = market.raw.get("venue_id") if hasattr(market, 'raw') else None
+        if not venue_id:
+            source = getattr(market, 'source', None)
+            if source:
+                venue_id = source.value if hasattr(source, 'value') else str(source)
+            else:
+                venue_id = "unknown"
+        
+        if hasattr(venue_id, 'value'):
+            venue_id = venue_id.value
+        venue_id = str(venue_id).lower()
+        
+        adapter = self.adapters.get(venue_id)
+        if adapter:
+            logger.debug(f"Routing market {market.id} venue_id {venue_id} -> exact adapter {adapter.venue_id}")
+            return adapter
+        
+        logger.error(f"Routing FAILED: market {market.id} venue_id {venue_id} not found in adapters {list(self.adapters.keys())} - ABORT, never fallback to first eligible")
+        return None
+
+    def get_adapter_for_venue_id(self, venue_id: str) -> Optional[MarketAdapter]:
+        """
+        FIXED V7: Hard safety - if requested adapter doesn't exist, ABORT TRADE not try first available
+        Previously dangerous fallback: if requested adapter doesn't exist use first eligible
+        Now: if venue=kalshi and Kalshi adapter isn't available, correct result ABORT TRADE not try first venue
+        """
+        if hasattr(venue_id, 'value'):
+            venue_id = venue_id.value
+        venue_id = str(venue_id).lower()
+        
+        adapter = self.adapters.get(venue_id)
+        if adapter:
+            return adapter
+        logger.error(f"Adapter for venue_id {venue_id} not found in {list(self.adapters.keys())} - ABORT TRADE, never fallback")
+        return None
+
     def rank_opportunities(self, opportunities: List[VenueOpportunity]) -> List[VenueOpportunity]:
         """
         Rank opportunities by common score across all venues.
-        PTAI learns which venues it is good at and concentrates there.
         FIXED BUG: Previously looked up venue_id only, but update_performance stores venue_id:category
         Now correctly looks up venue_id:category first, then venue_id fallback, then category, then default.
-        This makes learning/concentration system actually effective.
         """
-        # Calculate common score for each
         for opp in opportunities:
             opp.calculate_common_score()
-            # FIXED: Look up performance by venue_id:category first (as stored), then fallbacks
             category = opp.category or "unknown"
-            venue_id = opp.venue_id.split("+")[0] if "+" in opp.venue_id else opp.venue_id  # handle composite arb ids
+            venue_id = opp.venue_id.split("+")[0] if "+" in opp.venue_id else opp.venue_id
+            if hasattr(venue_id, 'value'):
+                venue_id = venue_id.value
+            venue_id = str(venue_id).lower()
             
-            # Try exact key venue:category
             key_exact = f"{venue_id}:{category}"
-            # Try venue_id only (legacy)
-            # Try category only
-            # Try any key containing venue_id
+            
             venue_perf = None
             if key_exact in self.venue_performance:
                 venue_perf = self.venue_performance[key_exact]
             elif venue_id in self.venue_performance:
                 venue_perf = self.venue_performance[venue_id]
             else:
-                # Find any performance for this venue (any category)
                 for k, v in self.venue_performance.items():
                     if k.startswith(f"{venue_id}:"):
                         if venue_perf is None or v.get("total", 0) > venue_perf.get("total", 0):
                             venue_perf = v
-                # If still none, try category match across venues
                 if venue_perf is None:
                     for k, v in self.venue_performance.items():
                         if f":{category}" in k:
@@ -107,36 +174,28 @@ class VenueRegistry:
             brier = venue_perf.get("brier_score", 0.5)
             win_rate = venue_perf.get("win_rate", 0.5)
             
-            # Boost opportunities from venues where we have demonstrated skill
-            # Skill 0.5 -> 1.0x multiplier, 0.8 -> 1.3x, 0.9 -> 1.4x
-            # Also penalize poorly calibrated venues
             calibration_multiplier = 1.0
-            if brier > 0.3:  # poorly calibrated
+            if brier > 0.3:
                 calibration_multiplier = 0.7
-            elif brier < 0.2:  # well calibrated
+            elif brier < 0.2:
                 calibration_multiplier = 1.2
             
-            # Win rate multiplier
-            win_rate_multiplier = 0.5 + win_rate  # 0.5 win rate -> 1.0x, 0.7 -> 1.2x
+            win_rate_multiplier = 0.5 + win_rate
             
             opp.score *= (0.5 + skill) * calibration_multiplier * win_rate_multiplier
             
-            # Log for debugging learning effectiveness
             if venue_perf:
-                logger.debug(f"Learning adjustment for {venue_id}:{category} skill={skill:.2f} brier={brier:.3f} win_rate={win_rate:.2f} -> score multiplier {(0.5+skill)*calibration_multiplier*win_rate_multiplier:.2f}")
+                logger.debug(f"Learning adjustment for {venue_id}:{category} skill={skill:.2f} brier={brier:.3f} win_rate={win_rate:.2f} -> multiplier {(0.5+skill)*calibration_multiplier*win_rate_multiplier:.2f}")
 
-        # Sort by score descending
         ranked = sorted(opportunities, key=lambda x: x.score, reverse=True)
         return ranked
 
     def get_performance_for_venue_category(self, venue_id: str, category: str) -> Dict:
-        """Helper to get performance with correct key handling"""
         key_exact = f"{venue_id}:{category}"
         if key_exact in self.venue_performance:
             return self.venue_performance[key_exact]
         if venue_id in self.venue_performance:
             return self.venue_performance[venue_id]
-        # Find best match for venue
         best = None
         for k, v in self.venue_performance.items():
             if k.startswith(f"{venue_id}:"):
@@ -145,7 +204,6 @@ class VenueRegistry:
         return best or {"forecast_skill": 0.5, "brier_score": 0.5, "win_rate": 0.5, "total": 0}
 
     def update_performance(self, venue_id: str, category: str, outcome: Dict):
-        """Update performance tracking after trade resolution"""
         key = f"{venue_id}:{category}"
         if key not in self.venue_performance:
             self.venue_performance[key] = {
@@ -163,16 +221,13 @@ class VenueRegistry:
         if outcome.get("win"):
             perf["wins"] += 1
         perf["win_rate"] = perf["wins"] / perf["total"]
-        # Update Brier
         forecast = outcome.get("forecast", 0.5)
         actual = 1.0 if outcome.get("win") else 0.0
         perf["brier_sum"] += (forecast - actual) ** 2
         perf["brier_score"] = perf["brier_sum"] / perf["total"]
-        # Forecast skill = 1 - Brier (higher better), calibrated
         perf["forecast_skill"] = max(0, 1 - perf["brier_score"] * 2)
 
     def get_venue_leaderboard(self) -> List[Dict]:
-        """Get leaderboard of venues by demonstrated skill - for learning"""
         leaderboard = []
         for key, perf in self.venue_performance.items():
             venue_id, category = key.split(":", 1) if ":" in key else (key, "unknown")
@@ -188,7 +243,6 @@ class VenueRegistry:
         return sorted(leaderboard, key=lambda x: x["skill"], reverse=True)
 
     def should_concentrate_on(self) -> Dict[str, str]:
-        """Suggest where to concentrate research based on demonstrated edge"""
         leaderboard = self.get_venue_leaderboard()
         if not leaderboard:
             return {"message": "Not enough data - need paper trading"}

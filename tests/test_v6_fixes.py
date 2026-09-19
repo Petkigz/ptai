@@ -278,23 +278,34 @@ def test_market_normalizer_robust_19_venues():
         assert normalizer.validate_market(markets[0])
     
     report = normalizer.get_report()
-    assert len(report["supported_venues"]) >= 15
-    assert "polymarket" in report["supported_venues"]
+    # V7 honest: normalization != trading support
+    venues_key = report.get("supported_venues") or report.get("supported_venues_normalization") or []
+    assert len(venues_key) >= 15
+    assert "polymarket" in venues_key
+    # Check honest assessment exists
+    assert "actual_trading_support" in report or "important_clarification" in report
 
 def test_venue_qualification_robust():
     engine = VenueQualificationEngine(data_dir="/tmp/test_qual")
     
     # Not qualified - not enough trades
-    perf_not_enough = {"total_paper_trades": 50, "win_rate": 0.7, "brier_score": 0.18, "forecast_skill": 0.64, "profit_paper": 20, "avg_edge": 0.08}
+    perf_not_enough = {"total_paper_trades": 50, "win_rate": 0.7, "brier_score": 0.18, "forecast_skill": 0.64, "profit_paper": 20, "avg_edge": 0.08, "net_pnl": 20, "expected_value": 0.08, "profit_factor": 1.5, "log_loss": 0.5, "calibration_ece": 0.1, "execution_quality_avg": 0.6}
     result = engine.evaluate_qualification("polymarket", perf_not_enough)
     assert not result.is_qualified
     assert "50" in result.reasoning  # should mention total
     
-    # Qualified
-    perf_qualified = {"total_paper_trades": 120, "win_rate": 0.60, "brier_score": 0.20, "forecast_skill": 0.65, "profit_paper": 15, "avg_edge": 0.05}
+    # Qualified - V7 includes P&L, EV, profit_factor, etc not just win rate
+    perf_qualified = {
+        "total_paper_trades": 120, "win_rate": 0.60, "brier_score": 0.20, "forecast_skill": 0.65, 
+        "profit_paper": 15, "avg_edge": 0.05, "net_pnl": 15, "expected_value": 0.05, 
+        "profit_factor": 1.5, "log_loss": 0.5, "calibration_ece": 0.1, "execution_quality_avg": 0.6,
+        "fees_total": 2, "slippage_total": 1, "drawdown_max": 0.1
+    }
     result2 = engine.evaluate_qualification("kalshi", perf_qualified)
     assert result2.is_qualified
     assert result2.qualification_date is not None
+    # Check V7 reasoning mentions win rate alone not profitability
+    assert "win rate alone NOT profitability" in result2.reasoning or "net P&L" in result2.reasoning
 
 def test_paper_trading_engine():
     engine = PaperTradingEngine(data_dir="/tmp/test_paper")

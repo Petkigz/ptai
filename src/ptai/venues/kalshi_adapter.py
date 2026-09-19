@@ -98,7 +98,9 @@ class KalshiAdapter(MarketAdapter):
                 event_slug=raw.get("event_ticker", ""),
                 condition_id=ticker,
                 market_type="binary",
-                raw=raw
+                raw={**raw, "venue_id": "kalshi", "adapter_venue_id": "kalshi", "discovery_source": "KalshiAdapter._parse_kalshi_market"},
+                venue_id="kalshi",
+                venue_type="prediction"
             )
             return market
         except Exception as e:
@@ -179,7 +181,9 @@ class KalshiAdapter(MarketAdapter):
                 slug=f"kalshi-mock-{i}",
                 event_slug=f"kalshi-event-{i//5}",
                 market_type="binary",
-                raw={"mock": True, "venue": "kalshi"}
+                raw={"mock": True, "venue": "kalshi", "venue_id": "kalshi", "adapter_venue_id": "kalshi", "discovery_source": "KalshiAdapter.mock"},
+                venue_id="kalshi",
+                venue_type="prediction"
             )
             markets.append(m)
         

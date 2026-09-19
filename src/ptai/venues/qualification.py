@@ -1,8 +1,20 @@
-
 """
 Venue Qualification - paper-trading qualification robust
-Each venue must prove positive EV through paper trading before real capital
-Makes paper-trading qualification robust per user request
+FIXED V7: User correctly identified win rate alone is not profitability
+Example: 90% wins +$0.01, 10% losses -$1.00 would have fantastic win rate and still lose money
+
+Now includes:
+- net P&L
+- expected value
+- fees
+- slippage
+- drawdown
+- profit factor
+- calibration
+- Brier/log loss
+- sample size
+- execution quality
+Not just win rate
 """
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
@@ -25,12 +37,23 @@ class QualificationResult:
     qualification_date: Optional[datetime]
     requirements: Dict[str, Any]
     reasoning: str
+    # FIXED V7: Additional metrics beyond win rate
+    net_pnl: float = 0.0
+    expected_value: float = 0.0
+    fees_total: float = 0.0
+    slippage_total: float = 0.0
+    drawdown_max: float = 0.0
+    profit_factor: float = 0.0
+    calibration_ece: float = 0.0
+    log_loss: float = 0.0
+    execution_quality_avg: float = 0.0
+    sample_size: int = 0
 
 class VenueQualificationEngine:
     """
     Robust paper-trading qualification
-    Previously: simple check min_trades 100 win_rate 0.55 brier 0.25
-    Now: comprehensive qualification with multiple criteria, calibration, profit, skill
+    FIXED V7: Beyond win rate - includes P&L, EV, fees, slippage, drawdown, profit factor, calibration, Brier, sample, execution quality
+    User: Venue qualification should eventually consider net P&L, expected value, fees, slippage, drawdown, profit factor, calibration, Brier/log loss, sample size, execution quality not just win rate
     """
     def __init__(self, data_dir: str = "./data"):
         self.data_dir = Path(data_dir)
@@ -39,16 +62,24 @@ class VenueQualificationEngine:
         self.qualifications: Dict[str, QualificationResult] = {}
         self._load()
 
-        # Qualification requirements
+        # FIXED V7: Comprehensive requirements beyond win rate
         self.requirements = {
             "min_trades": 100,
             "min_win_rate": 0.55,
             "max_brier": 0.25,
+            "max_log_loss": 0.6,
+            "max_ece": 0.15,
             "min_forecast_skill": 0.6,
             "min_profit_paper": 0.0,  # must be profitable after fees
+            "min_net_pnl": 0.0,  # net P&L after fees/slippage
+            "min_expected_value": 0.01,  # EV >1% per trade
             "min_avg_edge": 0.03,  # 3% avg edge
-            "min_calibration": 0.5,  # at least 50% calibrated
+            "min_calibration": 0.5,
             "max_drawdown": 0.20,  # max 20% drawdown
+            "min_profit_factor": 1.1,  # gross profit / gross loss >1.1
+            "min_execution_quality": 0.5,  # avg execution quality
+            "min_sample_size": 100,
+            "max_fees_pct": 0.05,  # fees <5% of profit
         }
 
     def _load(self):
@@ -59,6 +90,10 @@ class VenueQualificationEngine:
                     for venue_id, qual_data in data.items():
                         if qual_data.get("qualification_date"):
                             qual_data["qualification_date"] = datetime.fromisoformat(qual_data["qualification_date"])
+                        # Handle old format without new fields
+                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size"]:
+                            if field not in qual_data:
+                                qual_data[field] = 0.0
                         self.qualifications[venue_id] = QualificationResult(**qual_data)
             except Exception as e:
                 logger.warning(f"Qualification load failed: {e}")
@@ -79,7 +114,17 @@ class VenueQualificationEngine:
                     "is_qualified": qual.is_qualified,
                     "qualification_date": qual.qualification_date.isoformat() if qual.qualification_date else None,
                     "requirements": qual.requirements,
-                    "reasoning": qual.reasoning
+                    "reasoning": qual.reasoning,
+                    "net_pnl": qual.net_pnl,
+                    "expected_value": qual.expected_value,
+                    "fees_total": qual.fees_total,
+                    "slippage_total": qual.slippage_total,
+                    "drawdown_max": qual.drawdown_max,
+                    "profit_factor": qual.profit_factor,
+                    "calibration_ece": qual.calibration_ece,
+                    "log_loss": qual.log_loss,
+                    "execution_quality_avg": qual.execution_quality_avg,
+                    "sample_size": qual.sample_size
                 }
             with open(self.qualification_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -91,31 +136,57 @@ class VenueQualificationEngine:
         win_rate = performance_stats.get("win_rate", 0)
         avg_edge = performance_stats.get("avg_edge", 0)
         brier = performance_stats.get("brier_score", 1.0)
+        log_loss = performance_stats.get("log_loss", 1.0)
+        ece = performance_stats.get("calibration_ece", 0.5)
         profit_paper = performance_stats.get("profit_paper", 0)
         profit_live = performance_stats.get("profit_live", 0)
+        net_pnl = performance_stats.get("net_pnl", profit_paper)
+        expected_value = performance_stats.get("expected_value", avg_edge)
+        fees_total = performance_stats.get("fees_total", 0)
+        slippage_total = performance_stats.get("slippage_total", 0)
+        drawdown_max = performance_stats.get("drawdown_max", 0)
+        profit_factor = performance_stats.get("profit_factor", 0)
+        execution_quality = performance_stats.get("execution_quality_avg", 0.5)
         skill = performance_stats.get("forecast_skill", 0.5)
 
-        # Check all requirements
+        # FIXED V7: Check all requirements beyond win rate
         checks = {
             "min_trades": total >= self.requirements["min_trades"],
             "min_win_rate": win_rate >= self.requirements["min_win_rate"],
             "max_brier": brier <= self.requirements["max_brier"],
+            "max_log_loss": log_loss <= self.requirements["max_log_loss"],
+            "max_ece": ece <= self.requirements["max_ece"],
             "min_skill": skill >= self.requirements["min_forecast_skill"],
             "min_profit": profit_paper >= self.requirements["min_profit_paper"],
+            "min_net_pnl": net_pnl >= self.requirements["min_net_pnl"],
+            "min_ev": expected_value >= self.requirements["min_expected_value"],
             "min_edge": avg_edge >= self.requirements["min_avg_edge"],
+            "max_drawdown": drawdown_max <= self.requirements["max_drawdown"],
+            "min_profit_factor": profit_factor >= self.requirements["min_profit_factor"],
+            "min_execution": execution_quality >= self.requirements["min_execution_quality"],
         }
 
         is_qualified = all(checks.values())
 
+        # Detailed reasoning showing why win rate alone insufficient
         reasoning = (
-            f"Qualification for {venue_id}: total {total} >= {self.requirements['min_trades']}? {checks['min_trades']} | "
-            f"win_rate {win_rate:.2f} >= {self.requirements['min_win_rate']}? {checks['min_win_rate']} | "
+            f"Qualification V7 for {venue_id}: "
+            f"total {total} >= {self.requirements['min_trades']}? {checks['min_trades']} | "
+            f"win_rate {win_rate:.2f} >= {self.requirements['min_win_rate']}? {checks['min_win_rate']} BUT win rate alone NOT profitability - example 90% wins +$0.01 10% losses -$1.00 fantastic win rate still lose money | "
+            f"net_pnl ${net_pnl:.2f} >= ${self.requirements['min_net_pnl']}? {checks['min_net_pnl']} | "
+            f"expected_value {expected_value*100:.2f}% >= {self.requirements['min_expected_value']*100:.1f}%? {checks['min_ev']} | "
+            f"profit_factor {profit_factor:.2f} >= {self.requirements['min_profit_factor']}? {checks['min_profit_factor']} | "
             f"brier {brier:.3f} <= {self.requirements['max_brier']}? {checks['max_brier']} | "
+            f"log_loss {log_loss:.3f} <= {self.requirements['max_log_loss']}? {checks['max_log_loss']} | "
+            f"ece {ece:.3f} <= {self.requirements['max_ece']}? {checks['max_ece']} | "
             f"skill {skill:.2f} >= {self.requirements['min_forecast_skill']}? {checks['min_skill']} | "
             f"profit ${profit_paper:.2f} >= ${self.requirements['min_profit_paper']}? {checks['min_profit']} | "
             f"avg_edge {avg_edge*100:.1f}% >= {self.requirements['min_avg_edge']*100:.1f}%? {checks['min_edge']} | "
+            f"drawdown {drawdown_max*100:.1f}% <= {self.requirements['max_drawdown']*100:.0f}%? {checks['max_drawdown']} | "
+            f"exec_quality {execution_quality:.2f} >= {self.requirements['min_execution_quality']}? {checks['min_execution']} | "
+            f"fees ${fees_total:.2f} slippage ${slippage_total:.2f} | "
             f"Qualified {is_qualified} | "
-            f"Must prove positive EV through paper trading before real capital, 100 trades win_rate>55% Brier<0.25 skill>0.6 profitable after fees"
+            f"FIXED: now considers net P&L, EV, fees, slippage, drawdown, profit factor, calibration, Brier/log loss, sample size, execution quality not just win rate"
         )
 
         result = QualificationResult(
@@ -130,7 +201,17 @@ class VenueQualificationEngine:
             is_qualified=is_qualified,
             qualification_date=datetime.now(timezone.utc) if is_qualified else None,
             requirements=self.requirements,
-            reasoning=reasoning
+            reasoning=reasoning,
+            net_pnl=net_pnl,
+            expected_value=expected_value,
+            fees_total=fees_total,
+            slippage_total=slippage_total,
+            drawdown_max=drawdown_max,
+            profit_factor=profit_factor,
+            calibration_ece=ece,
+            log_loss=log_loss,
+            execution_quality_avg=execution_quality,
+            sample_size=total
         )
 
         self.qualifications[venue_id] = result
@@ -160,22 +241,42 @@ class VenueQualificationEngine:
             "qualified_venues": [q.venue_id for q in qualified],
             "not_qualified_venues": [q.venue_id for q in not_qualified],
             "requirements": self.requirements,
+            "requirements_explanation": {
+                "min_trades": "100 paper trades - sample size",
+                "min_win_rate": "55%+ win rate - BUT not profitability alone",
+                "min_net_pnl": "Net P&L after fees/slippage must be positive - fixes 90% wins +$0.01 10% losses -$1.00 still lose money example",
+                "min_expected_value": "EV >1% per trade - expected value",
+                "min_profit_factor": "Gross profit / gross loss >1.1 - profit factor",
+                "max_brier": "Brier <=0.25 - calibration",
+                "max_log_loss": "Log loss <=0.6",
+                "max_ece": "ECE <=0.15 - calibration error",
+                "max_drawdown": "Max 20% drawdown",
+                "min_execution_quality": "Avg execution quality 0.5+"
+            },
             "details": {
                 q.venue_id: {
                     "total": q.total_paper_trades,
                     "win_rate": q.win_rate,
+                    "net_pnl": q.net_pnl,
+                    "ev": q.expected_value,
+                    "profit_factor": q.profit_factor,
                     "brier": q.brier_score,
+                    "log_loss": q.log_loss,
+                    "ece": q.calibration_ece,
                     "skill": q.forecast_skill,
                     "profit": q.profit_paper,
+                    "drawdown": q.drawdown_max,
+                    "fees": q.fees_total,
+                    "slippage": q.slippage_total,
+                    "exec_quality": q.execution_quality_avg,
                     "qualified": q.is_qualified,
-                    "reasoning": q.reasoning[:300]
+                    "reasoning": q.reasoning[:500]
                 } for q in self.qualifications.values()
             },
-            "principle": "Each venue must prove positive EV through paper trading before real capital, don't assume profitable prove via paper trading/backtesting then cautiously allocate"
+            "principle": "Each venue must prove positive EV through paper trading before real capital, don't assume profitable prove via paper trading/backtesting then cautiously allocate. FIXED V7: win rate alone NOT profitability - now considers net P&L, EV, fees, slippage, drawdown, profit factor, calibration, Brier/log loss, sample size, execution quality"
         }
 
     def should_concentrate_on(self) -> Dict[str, Any]:
-        # Suggest where to concentrate based on qualified venues
         qualified = [v for v in self.qualifications.values() if v.is_qualified]
         qualified_sorted = sorted(qualified, key=lambda x: x.forecast_skill, reverse=True)
         
@@ -183,7 +284,7 @@ class VenueQualificationEngine:
             return {"message": "No qualified venues yet - need paper trading 100+ trades per venue", "recommendation": "Start with Polymarket paper trading"}
         
         return {
-            "strong_venues": [f"{q.venue_id} skill={q.forecast_skill:.2f} win={q.win_rate:.2f} brier={q.brier_score:.3f}" for q in qualified_sorted[:3]],
-            "recommendation": f"Concentrate on {qualified_sorted[0].venue_id} - demonstrated skill {qualified_sorted[0].forecast_skill:.2f}",
+            "strong_venues": [f"{q.venue_id} skill={q.forecast_skill:.2f} win={q.win_rate:.2f} brier={q.brier_score:.3f} pnl=${q.net_pnl:.2f} pf={q.profit_factor:.2f}" for q in qualified_sorted[:3]],
+            "recommendation": f"Concentrate on {qualified_sorted[0].venue_id} - demonstrated skill {qualified_sorted[0].forecast_skill:.2f} pnl ${qualified_sorted[0].net_pnl:.2f}",
             "principle": "PTAI learns which venue/category combos it is good at and concentrates research there"
         }
