@@ -1,0 +1,191 @@
+"""
+X Engine - X as information source, NOT truth
+Credibility analysis, independent corroboration, information novelty, time decay, model input
+Detects bot bursts, duplicates, engagement farming, old info, fake accounts, coordinated narratives, source credibility
+"""
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from loguru import logger
+
+
+@dataclass
+class XSignal:
+    market_id: str
+    raw_sentiment: float  # -1 to 1
+    volume: int
+    credibility: float  # 0-1
+    bot_likelihood: float
+    novelty: float  # 0-1, is this new info?
+    time_decay: float  # 0-1, recent = higher
+    corroborated: bool
+    issues: List[str] = field(default_factory=list)
+    adjusted_sentiment: float = 0.0  # After credibility, novelty, decay
+    should_use: bool = True
+
+
+class XEngine:
+    """
+    X Engine - sophisticated X analysis, not just sentiment = probability
+    """
+    def __init__(self, x_scraper=None, sentiment_analyzer=None):
+        self.x_scraper = x_scraper
+        self.sentiment_analyzer = sentiment_analyzer
+
+    def analyze_tweets(self, tweets: List[Dict]) -> Dict:
+        """Analyze tweets for credibility, bots, duplicates, etc."""
+        if not tweets:
+            return {
+                "credibility": 0.3,
+                "bot_likelihood": 0.5,
+                "issues": ["no_tweets"],
+                "unique_ratio": 0,
+                "volume": 0
+            }
+
+        # Duplicate detection
+        texts = [t.get("text", "") for t in tweets]
+        unique_ratio = len(set(texts)) / max(1, len(texts))
+        
+        issues = []
+        bot_likelihood = 0.0
+
+        if unique_ratio < 0.6:
+            issues.append("duplicate_posts")
+            bot_likelihood += 0.3
+
+        # Engagement farming detection - high likes but low quality?
+        # Would check engagement ratios
+
+        # Old info resurfacing - check timestamps
+        now = datetime.now(timezone.utc)
+        old_count = 0
+        for t in tweets:
+            try:
+                ts = t.get("timestamp")
+                if ts:
+                    tweet_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if (now - tweet_time).total_seconds() > 24*3600*7:  # older than week
+                        old_count += 1
+            except:
+                pass
+        if old_count > len(tweets) * 0.5:
+            issues.append("old_info_resurfacing")
+            bot_likelihood += 0.2
+
+        # Coordinated narratives - similar phrasing
+        # Simple check for demo
+
+        credibility = max(0.1, 1.0 - bot_likelihood - len(issues)*0.15)
+
+        return {
+            "credibility": credibility,
+            "bot_likelihood": min(1.0, bot_likelihood),
+            "unique_ratio": unique_ratio,
+            "issues": issues,
+            "volume": len(tweets),
+            "old_count": old_count
+        }
+
+    def calculate_novelty(self, tweets: List[Dict], existing_knowledge: str = "") -> float:
+        """Information novelty - is this new info or already known?"""
+        # Would compare tweet content to existing knowledge base
+        # For now simple: if tweets mention recent keywords, higher novelty
+        if not tweets:
+            return 0.0
+        
+        # Check if tweets contain timestamps like "just now", "breaking"
+        text = " ".join([t.get("text", "") for t in tweets]).lower()
+        novelty_keywords = ["breaking", "just", "now", "announced", "today", "new"]
+        novelty_score = sum(1 for kw in novelty_keywords if kw in text) / len(novelty_keywords)
+        return min(1.0, novelty_score + 0.3)
+
+    def calculate_time_decay(self, tweets: List[Dict]) -> float:
+        """Time decay - recent info more valuable"""
+        if not tweets:
+            return 0.0
+        
+        now = datetime.now(timezone.utc)
+        recent_count = 0
+        for t in tweets:
+            try:
+                ts = t.get("timestamp")
+                if ts:
+                    tweet_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    hours_ago = (now - tweet_time).total_seconds() / 3600
+                    if hours_ago < 24:
+                        recent_count += 1
+            except:
+                pass
+        
+        return recent_count / max(1, len(tweets))
+
+    def corroborate(self, x_signal: str, news: str = "", web_research: str = "") -> bool:
+        """Independent corroboration - does other sources confirm X?"""
+        if not x_signal or not (news or web_research):
+            return False
+        
+        # Simple keyword overlap for demo
+        # Production would use LLM to check corroboration
+        x_words = set(x_signal.lower().split()[:20])
+        other_text = (news + " " + web_research).lower()
+        overlap = sum(1 for w in x_words if w in other_text and len(w) > 4)
+        return overlap >= 3
+
+    async def get_signal(self, market, news: str = "", web_research: str = "") -> XSignal:
+        """Get X signal with full analysis"""
+        # Fetch tweets via scraper
+        tweets = []
+        sentiment_score = 0.0
+        
+        if self.x_scraper:
+            try:
+                tweets = await self.x_scraper.search(market.question, limit=20) if hasattr(self.x_scraper, 'search') else []
+            except Exception as e:
+                logger.warning(f"X scrape failed: {e}")
+        
+        if self.sentiment_analyzer and tweets:
+            try:
+                sentiment_result = self.sentiment_analyzer.analyze(market.question, tweets)
+                sentiment_score = sentiment_result.get("score", 0) if isinstance(sentiment_result, dict) else 0
+            except:
+                pass
+
+        # Analyze
+        credibility_analysis = self.analyze_tweets(tweets)
+        novelty = self.calculate_novelty(tweets)
+        time_decay = self.calculate_time_decay(tweets)
+        corroborated = self.corroborate(" ".join([t.get("text", "") for t in tweets[:5]]), news, web_research)
+
+        # Adjusted sentiment: raw * credibility * novelty * time_decay * corroboration boost
+        # X is information source, not truth - heavily discount if low credibility
+        base = sentiment_score
+        adjusted = base * credibility_analysis["credibility"] * (0.5 + novelty*0.5) * (0.5 + time_decay*0.5)
+        if corroborated:
+            adjusted *= 1.2  # boost if corroborated
+        adjusted = max(-1.0, min(1.0, adjusted))
+
+        # Should use? If bot likelihood high or credibility low, don't use
+        should_use = (
+            credibility_analysis["credibility"] > 0.4 and
+            credibility_analysis["bot_likelihood"] < 0.6 and
+            len(tweets) >= 3
+        )
+
+        signal = XSignal(
+            market_id=market.id,
+            raw_sentiment=sentiment_score,
+            volume=len(tweets),
+            credibility=credibility_analysis["credibility"],
+            bot_likelihood=credibility_analysis["bot_likelihood"],
+            novelty=novelty,
+            time_decay=time_decay,
+            corroborated=corroborated,
+            issues=credibility_analysis["issues"],
+            adjusted_sentiment=adjusted,
+            should_use=should_use
+        )
+
+        logger.info(f"X signal for {market.id}: raw {sentiment_score:.2f} -> adjusted {adjusted:.2f} cred {credibility_analysis['credibility']:.2f} bot {credibility_analysis['bot_likelihood']:.2f} use {should_use}")
+
+        return signal

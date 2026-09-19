@@ -1,0 +1,361 @@
+"""
+V3 Strategy Engine - evaluates venue × market × strategy
+Core of PTAI V3: genuinely multi-venue, multi-strategy opportunity engine
+
+Instead of "Find a Polymarket trade", it asks:
+"Find the best legitimate opportunity available to my capital right now across all venues and strategies"
+
+Reports:
+I scanned 1,200 opportunities.
+Polymarket: 3 candidates
+Kalshi: 5 candidates
+Manifold: 1 candidate
+Crypto: 8 candidates
+Stocks: 2 candidates
+After fees/liquidity/uncertainty: 2 actually tradeable
+Best opportunity: Venue B with strategy X
+
+Then learning system determines which combinations actually demonstrate edge.
+"""
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from loguru import logger
+import time
+
+from ..markets.base import Market
+from ..venues.adapter import VenueOpportunity, VenueType
+from ..venues.registry import VenueRegistry
+
+from .fair_value import FairValueEngine
+from .edge import EdgeCalculator
+from .strategy_selector import StrategyType, StrategySelector
+from .arbitrage import ArbitrageEngine
+from .event_trading import EventTradingEngine
+from .market_making import MarketMakingEngine
+from .momentum import MomentumEngine
+
+
+@dataclass
+class VenueScanReport:
+    venue_id: str
+    venue_type: str
+    total_discovered: int
+    after_cheap: int
+    after_liquidity: int
+    candidates: int  # after fast model / strategy evaluation
+    tradeable: int   # after effective edge + risk
+    top_opportunity: Optional[VenueOpportunity] = None
+    avg_edge: float = 0.0
+    avg_score: float = 0.0
+
+
+@dataclass
+class MultiVenueScanResult:
+    total_scanned: int
+    total_after_cheap: int
+    total_after_liquidity: int
+    total_candidates: int
+    total_tradeable: int
+    venue_reports: List[VenueScanReport] = field(default_factory=list)
+    all_opportunities: List[VenueOpportunity] = field(default_factory=list)
+    final_selected: List[VenueOpportunity] = field(default_factory=list)
+    arbitrage_opportunities: List = field(default_factory=list)
+    strategy_breakdown: Dict[str, int] = field(default_factory=dict)
+    execution_time: float = 0.0
+    reasoning: str = ""
+    best_opportunity: Optional[VenueOpportunity] = None
+
+
+class StrategyEngineV3:
+    """
+    V3 Strategy Engine: venue × market × strategy
+    Evaluates all combinations and ranks on common basis
+    """
+    def __init__(self, 
+                 venue_registry: VenueRegistry = None,
+                 fair_value_engine: FairValueEngine = None,
+                 edge_calculator: EdgeCalculator = None,
+                 strategy_selector: StrategySelector = None):
+        self.venue_registry = venue_registry
+        self.fair_value_engine = fair_value_engine or FairValueEngine()
+        self.edge_calculator = edge_calculator or EdgeCalculator()
+        self.strategy_selector = strategy_selector or StrategySelector()
+        
+        # Strategy engines
+        self.arbitrage_engine = ArbitrageEngine(min_spread=0.03)
+        self.event_engine = EventTradingEngine()
+        self.mm_engine = MarketMakingEngine()
+        self.momentum_engine = MomentumEngine()
+        
+        # Filters
+        self.min_volume_24h = 500
+        self.min_liquidity = 100
+        self.max_spread = 0.10
+
+    def cheap_filters(self, markets: List[Market]) -> List[Market]:
+        filtered = []
+        for m in markets:
+            if m.volume_24h < self.min_volume_24h:
+                continue
+            if m.liquidity < self.min_liquidity:
+                continue
+            if not m.active or m.closed:
+                continue
+            # Allow extreme prices for mean reversion strategy, but filter for others
+            # Keep all for V3, let strategy decide
+            filtered.append(m)
+        return filtered
+
+    def liquidity_filter(self, markets: List[Market]) -> List[Market]:
+        sorted_markets = sorted(markets, key=lambda x: (x.volume_24h, x.liquidity), reverse=True)
+        limit = min(200, max(50, len(sorted_markets)))
+        return sorted_markets[:limit]
+
+    def evaluate_market_with_all_strategies(self, market: Market, context: Dict = None) -> List[VenueOpportunity]:
+        """
+        Core V3: evaluate single market with ALL strategies
+        Returns list of VenueOpportunities, one per strategy that finds edge
+        """
+        context = context or {}
+        opportunities: List[VenueOpportunity] = []
+        venue_id = getattr(market, 'source', 'unknown')
+        venue_id_str = venue_id.value if hasattr(venue_id, 'value') else str(venue_id)
+        # Handle mock venues with raw venue field
+        if market.raw.get("venue"):
+            venue_id_str = market.raw["venue"]
+        
+        # Strategy 1: Mispricing (fair value vs market) - existing engine
+        try:
+            fv_result = self.fair_value_engine.estimate(market, context=context)
+            if fv_result.should_trade and abs(fv_result.effective_edge) >= 0.05:
+                opp = VenueOpportunity(
+                    market=market,
+                    venue_id=venue_id_str,
+                    venue_type=VenueType.PREDICTION,
+                    side="YES" if fv_result.fair_value > market.best_price else "NO",
+                    market_price=market.best_price,
+                    estimated_fair=fv_result.fair_value,
+                    raw_edge=fv_result.edge,
+                    effective_edge=fv_result.effective_edge,
+                    confidence=fv_result.confidence,
+                    uncertainty=fv_result.uncertainty,
+                    liquidity_score=min(1.0, market.liquidity / 10000),
+                    execution_quality=0.8,
+                    category=context.get("category", "mispricing"),
+                    sources=fv_result.forecast_result.sources if fv_result.forecast_result else ["fair_value"],
+                    reasoning=fv_result.reasoning,
+                    bull_case=fv_result.contradiction_report.bull_case if fv_result.contradiction_report else "",
+                    bear_case=fv_result.contradiction_report.bear_case if fv_result.contradiction_report else "",
+                    resolution_risks=fv_result.resolution_analysis.risks if fv_result.resolution_analysis else [],
+                    should_trade=fv_result.should_trade
+                )
+                opp.calculate_common_score()
+                # Tag strategy
+                opp.raw = {"strategy": "mispricing", "venue": venue_id_str}
+                opportunities.append(opp)
+        except Exception as e:
+            logger.debug(f"Mispricing eval failed for {market.id}: {e}")
+
+        # Strategy 2: Event trading
+        try:
+            event_signal = self.event_engine.evaluate(market, context=context)
+            if event_signal.should_trade:
+                opp = self.event_engine.to_venue_opportunity(market, event_signal, context=context)
+                if opp:
+                    opp.raw = {"strategy": "event_trading", "venue": venue_id_str}
+                    opportunities.append(opp)
+        except Exception as e:
+            logger.debug(f"Event trading eval failed for {market.id}: {e}")
+
+        # Strategy 3: Market making (if orderbook available)
+        try:
+            orderbook = context.get("orderbook", {})
+            if orderbook:
+                mm_signal = self.mm_engine.evaluate(market, orderbook=orderbook)
+                if mm_signal.should_trade:
+                    opp = self.mm_engine.to_venue_opportunity(market, mm_signal)
+                    if opp:
+                        opp.raw = {"strategy": "market_making", "venue": venue_id_str}
+                        opportunities.append(opp)
+        except Exception as e:
+            logger.debug(f"MM eval failed for {market.id}: {e}")
+
+        # Strategy 4 & 5: Momentum and Mean Reversion
+        try:
+            mom_signals = self.momentum_engine.evaluate(market, context=context)
+            mom_opps = self.momentum_engine.to_venue_opportunities(market, mom_signals)
+            for opp in mom_opps:
+                opp.raw = {"strategy": opp.category, "venue": venue_id_str}
+                opportunities.append(opp)
+        except Exception as e:
+            logger.debug(f"Momentum eval failed for {market.id}: {e}")
+
+        return opportunities
+
+    async def scan_venue(self, venue_id: str, markets: List[Market], context_provider=None) -> VenueScanReport:
+        """Scan single venue with all strategies"""
+        start_total = len(markets)
+        
+        after_cheap = self.cheap_filters(markets)
+        after_liquidity = self.liquidity_filter(after_cheap)
+        
+        # Evaluate each market with all strategies
+        all_opps: List[VenueOpportunity] = []
+        for market in after_liquidity[:100]:  # Limit per venue for performance
+            context = {}
+            if context_provider:
+                try:
+                    context = await context_provider.get_context(market)
+                except:
+                    context = {"orderbook": {"spread": 0.02, "depth": market.liquidity}}
+            else:
+                context = {"orderbook": {"spread": 0.02, "depth": market.liquidity}, "category": "unknown"}
+            
+            opps = self.evaluate_market_with_all_strategies(market, context=context)
+            all_opps.extend(opps)
+        
+        # Candidates after strategy evaluation
+        candidates = [o for o in all_opps if o.effective_edge >= 0.03]
+        tradeable = [o for o in all_opps if o.effective_edge >= 0.08 and o.confidence >= 0.6 and o.should_trade]
+        
+        # Sort tradeable by score
+        tradeable_sorted = sorted(tradeable, key=lambda x: x.score, reverse=True)
+        top_opp = tradeable_sorted[0] if tradeable_sorted else (sorted(candidates, key=lambda x: x.score, reverse=True)[0] if candidates else None)
+        
+        avg_edge = sum(o.effective_edge for o in candidates) / len(candidates) if candidates else 0
+        avg_score = sum(o.score for o in candidates) / len(candidates) if candidates else 0
+        
+        # Determine venue type
+        venue_type = "unknown"
+        if markets and len(markets) > 0:
+            src = getattr(markets[0], 'source', 'unknown')
+            if hasattr(src, 'value'):
+                venue_type = src.value
+            elif markets[0].raw.get("venue"):
+                venue_type = markets[0].raw["venue"]
+        
+        return VenueScanReport(
+            venue_id=venue_id,
+            venue_type=venue_type,
+            total_discovered=start_total,
+            after_cheap=len(after_cheap),
+            after_liquidity=len(after_liquidity),
+            candidates=len(candidates),
+            tradeable=len(tradeable),
+            top_opportunity=top_opp,
+            avg_edge=avg_edge,
+            avg_score=avg_score
+        ), all_opps
+
+    async def scan_all_venues(self, markets_by_venue: Dict[str, List[Market]], context_provider=None, max_final_trades: int = 3) -> MultiVenueScanResult:
+        """
+        Main V3 entry: scan all venues, evaluate all strategies, rank on common basis
+        Returns report like:
+        I scanned 1,200 opportunities.
+        Polymarket: 3 candidates
+        Kalshi: 5 candidates
+        After fees/liquidity/uncertainty: 2 actually tradeable
+        Best opportunity: Venue B
+        """
+        start = time.time()
+        
+        total_scanned = sum(len(m) for m in markets_by_venue.values())
+        venue_reports: List[VenueScanReport] = []
+        all_opportunities: List[VenueOpportunity] = []
+        strategy_breakdown: Dict[str, int] = {}
+        
+        # Scan each venue
+        for venue_id, markets in markets_by_venue.items():
+            try:
+                report, opps = await self.scan_venue(venue_id, markets, context_provider=context_provider)
+                venue_reports.append(report)
+                all_opportunities.extend(opps)
+                
+                # Strategy breakdown
+                for opp in opps:
+                    strat = opp.raw.get("strategy", "unknown") if hasattr(opp, 'raw') and isinstance(opp.raw, dict) else "unknown"
+                    strategy_breakdown[strat] = strategy_breakdown.get(strat, 0) + 1
+                    
+            except Exception as e:
+                logger.error(f"Venue {venue_id} scan failed: {e}")
+                venue_reports.append(VenueScanReport(
+                    venue_id=venue_id,
+                    venue_type="unknown",
+                    total_discovered=len(markets),
+                    after_cheap=0,
+                    after_liquidity=0,
+                    candidates=0,
+                    tradeable=0
+                ))
+        
+        # Arbitrage across all venues
+        all_markets_flat = [m for markets in markets_by_venue.values() for m in markets]
+        arbitrage_opps = []
+        try:
+            arbitrage_raw = self.arbitrage_engine.find_arbitrage(all_markets_flat[:500])  # Limit for performance
+            arbitrage_opps = arbitrage_raw
+            arb_venue_opps = self.arbitrage_engine.to_venue_opportunities(arbitrage_raw)
+            all_opportunities.extend(arb_venue_opps)
+            strategy_breakdown["arbitrage"] = len(arb_venue_opps)
+        except Exception as e:
+            logger.warning(f"Arbitrage scan failed: {e}")
+        
+        # Common ranking across all venues and strategies
+        if self.venue_registry:
+            ranked = self.venue_registry.rank_opportunities(all_opportunities)
+        else:
+            ranked = sorted(all_opportunities, key=lambda x: x.score, reverse=True)
+        
+        # Filter to tradeable
+        tradeable = [o for o in ranked if o.effective_edge >= 0.08 and o.confidence >= 0.6 and o.should_trade]
+        final_selected = tradeable[:max_final_trades]
+        
+        best_opp = final_selected[0] if final_selected else (ranked[0] if ranked else None)
+        
+        elapsed = time.time() - start
+        
+        # Build reasoning report
+        venue_summary = "\n".join([
+            f"{r.venue_id}: discovered {r.total_discovered}, candidates {r.candidates}, tradeable {r.tradeable}, "
+            f"avg_edge {r.avg_edge:.3f}, top_score {r.top_opportunity.score:.3f} {r.top_opportunity.side} edge {r.top_opportunity.effective_edge:.3f} | {r.top_opportunity.market.question[:60]}" 
+            if r.top_opportunity else f"{r.venue_id}: discovered {r.total_discovered}, candidates {r.candidates}, tradeable {r.tradeable}"
+            for r in venue_reports
+        ])
+        
+        strategy_summary = ", ".join([f"{k}: {v}" for k, v in strategy_breakdown.items()])
+        
+        reasoning = (
+            f"I scanned {total_scanned} opportunities across {len(markets_by_venue)} venues.\n"
+            f"{venue_summary}\n"
+            f"Strategies evaluated: {strategy_summary}\n"
+            f"Arbitrage candidates: {len([a for a in arbitrage_opps if a.should_trade])} tradeable out of {len(arbitrage_opps)}\n"
+            f"After fees/liquidity/uncertainty/risk: {len(tradeable)} actually tradeable opportunities\n"
+            f"Best opportunity: {best_opp.venue_id if best_opp else 'None'} "
+            f"{best_opp.side if best_opp else ''} edge {best_opp.effective_edge:.3f} score {best_opp.score:.3f} "
+            f"strategy {best_opp.raw.get('strategy') if best_opp and hasattr(best_opp, 'raw') else 'unknown'} | "
+            f"{best_opp.market.question[:80] if best_opp else 'DO NOTHING'}\n"
+            f"Final selected {len(final_selected)} trades (max {max_final_trades}) | Time {elapsed:.1f}s"
+        )
+        
+        logger.info(reasoning)
+        
+        total_after_cheap = sum(r.after_cheap for r in venue_reports)
+        total_after_liq = sum(r.after_liquidity for r in venue_reports)
+        total_candidates = sum(r.candidates for r in venue_reports)
+        total_tradeable = len(tradeable)
+        
+        return MultiVenueScanResult(
+            total_scanned=total_scanned,
+            total_after_cheap=total_after_cheap,
+            total_after_liquidity=total_after_liq,
+            total_candidates=total_candidates,
+            total_tradeable=total_tradeable,
+            venue_reports=venue_reports,
+            all_opportunities=ranked,
+            final_selected=final_selected,
+            arbitrage_opportunities=arbitrage_opps,
+            strategy_breakdown=strategy_breakdown,
+            execution_time=elapsed,
+            reasoning=reasoning,
+            best_opportunity=best_opp
+        )

@@ -1,0 +1,55 @@
+# PTAI gitignore - local only
+
+# Env & secrets
+.env
+*.key
+*.pem
+secrets/
+
+# Data & logs
+data/
+logs/
+*.db
+*.sqlite
+*.log
+
+# Browser profiles (contain cookies, logins)
+browser/profiles/
+browser/*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Ollama models (large)
+ollama_models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Trades export (optional keep)
+# data/final_report.csv
+
+# Playwright
+test-results/
+playwright-report/
+
+# coverage
+.coverage
+htmlcov/
+coverage.xml
+

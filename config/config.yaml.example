@@ -1,0 +1,152 @@
+# PTAI Config - Local Autonomous Trading Agent
+# Supports LM Studio (primary) and Ollama
+agent:
+  name: "ptai-v1"
+  mode: "autonomous"  # autonomous | supervised | research_only
+  self_preservation: true
+  shutdown_command: "earn enough to pay for yourself or shut down"
+  initial_bankroll: 50.0
+  currency: "USD"
+  daily_cost: 5.0  # compute + opportunity cost per day
+  max_unprofitable_days: 3
+
+loop:
+  scan_interval_minutes: 10
+  scan_markets_count: 750
+  scan_order_by: "volume24hr"  # volume24hr | liquidity | volume
+  batch_size: 50
+  max_concurrent_analysis: 10
+
+markets:
+  sources:
+    - polymarket
+    - kalshi  # stub, extensible via browser
+  filters:
+    active: true
+    closed: false
+    min_liquidity: 1000
+    min_volume_24h: 5000
+    max_days_to_expiry: 90
+    exclude_tags: []  # e.g. ["Sports"] if you want to avoid sports
+
+sentiment:
+  enabled: true
+  sources:
+    - x  # X/Twitter
+    - news  # RSS + web search
+  x:
+    method: "snscrape"  # snscrape | api | browser
+    max_tweets_per_market: 50
+    lookback_hours: 24
+    include_retweets: false
+  weighting:
+    market_price: 0.4
+    sentiment: 0.25
+    news: 0.15
+    base_rate: 0.2
+
+fair_value:
+  method: "llm_ensemble"  # llm_ensemble | bayesian | market_implied
+  llm:
+    provider: "auto"  # auto, lm_studio, ollama, openai_compatible - auto tries LM Studio first then Ollama
+    # For LM Studio (you use LM Studio):
+    # - Open LM Studio -> Developer tab -> Start Server on port 1234
+    # - Load model: e.g. llama-3.1-8b-instruct, qwen2.5-7b-instruct, mistral-7b
+    # - Set model to "local-model" for auto-detect or specific name
+    model: "local-model"
+    lm_studio_host: "http://localhost:1234"
+    ollama_host: "http://localhost:11434"
+    temperature: 0.2
+    max_tokens: 1200
+  min_edge: 0.08  # 8% mispricing threshold
+  confidence_threshold: 0.60
+  research:
+    enabled: true
+    max_time_per_market_seconds: 45
+    tools: [web_search, browser, terminal]
+
+risk:
+  kelly:
+    enabled: true
+    fraction: 0.5  # Half-Kelly
+    max_pct: 0.06  # Max 6% bankroll per position
+    min_edge: 0.08
+  limits:
+    max_open_positions: 8
+    max_daily_loss_pct: 0.15
+    max_total_drawdown_pct: 0.30
+    max_position_pct: 0.06
+    min_liquidity: 1000
+    stop_loss_pct: 0.50  # Exit if position down 50%
+  sizing:
+    use_half_kelly: true
+    # One wrong prediction could wipe account, so 6% cap is critical
+
+execution:
+  mode: "hybrid"  # api | browser | hybrid
+  dry_run: true
+  browser:
+    headless: false
+    persistent_dir: "./browser/profiles/default"
+    stealth: true
+    timeout: 30000
+    human_delay: true
+  slippage:
+    max: 0.02  # 2% max slippage
+  retry: 3
+  other_sites:
+    enabled: true
+    generic_browser: true  # Use browser for any site without API
+
+storage:
+  db_path: "./data/ptai.db"
+  logs_path: "./logs"
+  export_trades: true
+
+research:
+  enabled: true
+  tools:
+    - web_search
+    - browser
+    - terminal
+    - x_sentiment
+  max_research_time_per_market_seconds: 45
+  use_local_search: true
+
+other_sites:
+  enabled: true
+  sites:
+    - name: "kalshi"
+      enabled: true
+      browser_only: true
+      base_url: "https://kalshi.com"
+    - name: "predictit"
+      enabled: false
+      browser_only: true
+      base_url: "https://www.predictit.org"
+    - name: "manifold"
+      enabled: false
+      browser_only: true
+      base_url: "https://manifold.markets"
+
+notifications:
+  enabled: true
+  desktop: true
+  on_opportunity: true
+  on_trade: true
+  on_shutdown: true
+
+llm:
+  # LM Studio setup for you:
+  # 1. Open LM Studio
+  # 2. Download model: e.g. TheBloke/Llama-2-7B-Chat-GGUF or lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF
+  # 3. Go to Developer -> Start Server (port 1234)
+  # 4. Set model to "local-model" or exact name
+  provider: "auto"
+  lm_studio:
+    host: "http://localhost:1234"
+    model: "local-model"
+    api_key: "lm-studio"
+  ollama:
+    host: "http://localhost:11434"
+    model: "llama3.1:8b"

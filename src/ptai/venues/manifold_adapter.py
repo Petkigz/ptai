@@ -1,0 +1,205 @@
+"""
+Manifold Markets Adapter
+API: https://docs.manifold.markets/api
+Public: GET https://api.manifold.markets/v0/markets
+"""
+from typing import List, Dict, Any, Optional
+from loguru import logger
+import requests
+from datetime import datetime
+
+from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
+from ..markets.base import Market, Token, MarketSource
+
+
+MANIFOLD_API = "https://api.manifold.markets/v0"
+
+
+class ManifoldAdapter(MarketAdapter):
+    def __init__(self, api_key: str = None):
+        super().__init__(venue_id="manifold", venue_type=VenueType.PREDICTION)
+        self.api_key = api_key
+        self.base_url = MANIFOLD_API
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "PTAI/1.0 Local Trading Agent",
+            "Accept": "application/json"
+        })
+        self.capabilities = AdapterCapability(
+            supports_market_discovery=True,
+            supports_orderbook=False,  # Manifold uses AMM, not orderbook
+            supports_trading=bool(api_key),
+            supports_portfolio=True,
+            supports_history=True,
+            supports_browser_fallback=True,
+            fee_taker_pct=0.0,  # No fees, but 5% liquidity pool
+            fee_maker_pct=0.0,
+            min_order_usd=1.0
+        )
+
+    def check_eligibility(self, country_code: str = "UG") -> EligibilityStatus:
+        # Manifold is play money (Mana), generally available worldwide
+        # Real money via sweepstakes may be restricted
+        country_code = country_code.upper()
+        if country_code in {"US", "UG", "GB", "CA", "AU", "DE", "FR", "KE", "NG", "ZA"}:
+            return EligibilityStatus.ELIGIBLE
+        return EligibilityStatus.ELIGIBLE
+
+    def _parse_manifold_market(self, raw: Dict) -> Optional[Market]:
+        try:
+            if raw.get("outcomeType") != "BINARY":
+                return None  # Only binary for now
+            
+            question = raw.get("question", "")
+            prob = raw.get("probability", 0.5)
+            volume = float(raw.get("volume", 0))
+            volume_24h = float(raw.get("volume24Hours", volume * 0.2))
+            liquidity = float(raw.get("pool", {}).get("NO", 0) + raw.get("pool", {}).get("YES", 0)) if isinstance(raw.get("pool"), dict) else float(raw.get("totalLiquidity", 1000))
+            
+            close_time = raw.get("closeTime")
+            end_date = None
+            if close_time:
+                try:
+                    end_date = datetime.fromtimestamp(close_time / 1000)
+                except:
+                    pass
+
+            tokens = [
+                Token(token_id=f"{raw.get('id')}_YES", outcome="YES", price=prob),
+                Token(token_id=f"{raw.get('id')}_NO", outcome="NO", price=1-prob)
+            ]
+
+            market = Market(
+                id=str(raw.get("id")),
+                source=MarketSource.PREDICTIT,  # Reuse for non-polymarket generic, will add MANIFOLD
+                question=question,
+                description=raw.get("description", "")[:500] if raw.get("description") else "",
+                outcomes=["YES", "NO"],
+                outcome_prices=[prob, 1-prob],
+                tokens=tokens,
+                volume=volume,
+                volume_24h=volume_24h,
+                liquidity=liquidity,
+                end_date=end_date,
+                active=not raw.get("isResolved", False) and not raw.get("closeTime", 0) < (datetime.now().timestamp()*1000),
+                closed=raw.get("isResolved", False),
+                slug=raw.get("slug", ""),
+                event_slug="",
+                condition_id=str(raw.get("id")),
+                market_type="binary",
+                raw=raw
+            )
+            # Override source string
+            market.raw["venue"] = "manifold"
+            return market
+        except Exception as e:
+            logger.debug(f"Failed to parse Manifold market: {e}")
+            return None
+
+    async def discover_markets(self, target_count: int = 500, filters: Dict = None) -> List[Market]:
+        filters = filters or {}
+        markets: List[Market] = []
+        
+        try:
+            params = {"limit": min(100, target_count), "sort": "24-hour-vol", "filter": "open"}
+            resp = self.session.get(f"{self.base_url}/markets", params=params, timeout=10)
+            if resp.status_code == 200:
+                raw_markets = resp.json()
+                if isinstance(raw_markets, list):
+                    for rm in raw_markets[:target_count]:
+                        m = self._parse_manifold_market(rm)
+                        if m:
+                            markets.append(m)
+                if markets:
+                    logger.info(f"Manifold discovered {len(markets)} real markets")
+                    return markets[:target_count]
+        except Exception as e:
+            logger.warning(f"Manifold API failed (expected offline): {e}")
+
+        # Mock fallback for V3 multi-venue testing
+        import random
+        mock_questions = [
+            "Will {company} release {product} in 2026?",
+            "Will AI achieve {milestone} by {date}?",
+            "Will {country} have {event} in {year}?",
+            "Will {person} do {action} in {month}?",
+            "Will {tech} be adopted by {percent}% by {year}?",
+        ]
+        for i in range(min(target_count, 150)):
+            q_template = random.choice(mock_questions)
+            question = q_template.format(
+                company=random.choice(["OpenAI", "Google", "Meta", "Apple"]),
+                product=random.choice(["AGI", "new model", "AR glasses"]),
+                milestone=random.choice(["human-level coding", "100% on MMLU", "self-improvement"]),
+                date=f"2026-{random.randint(1,12):02d}",
+                country=random.choice(["USA", "China", "UK"]),
+                event=random.choice(["recession", "election", "new law"]),
+                year=random.randint(2026, 2028),
+                person=random.choice(["Elon", "Sam Altman", "Satoshi"]),
+                action=random.choice(["tweet about crypto", "launch rocket", "release paper"]),
+                month=random.choice(["Jan", "Feb", "Mar", "Apr"]),
+                tech=random.choice(["AI agents", "quantum", "VR"]),
+                percent=random.randint(10, 90)
+            )
+            price = random.uniform(0.1, 0.9)
+            vol = random.uniform(1000, 50000)
+            liq = random.uniform(500, 20000)
+            m = Market(
+                id=f"MANIFOLD-MOCK-{i:04d}",
+                source=MarketSource.PREDICTIT,
+                question=question,
+                description=f"Manifold mock market {i}",
+                outcomes=["YES", "NO"],
+                outcome_prices=[price, 1-price],
+                tokens=[
+                    Token(token_id=f"MANIFOLD-MOCK-{i}_YES", outcome="YES", price=price),
+                    Token(token_id=f"MANIFOLD-MOCK-{i}_NO", outcome="NO", price=1-price)
+                ],
+                volume=vol,
+                volume_24h=vol*0.3,
+                liquidity=liq,
+                active=True,
+                closed=False,
+                slug=f"manifold-mock-{i}",
+                event_slug=f"manifold-event-{i//5}",
+                market_type="binary",
+                raw={"mock": True, "venue": "manifold"}
+            )
+            markets.append(m)
+        
+        min_vol = filters.get("min_volume", 500)
+        min_liq = filters.get("min_liquidity", 100)
+        filtered = [m for m in markets if m.volume_24h >= min_vol and m.liquidity >= min_liq]
+        logger.info(f"Manifold mock discovery: {len(markets)} -> {len(filtered)}")
+        return filtered[:target_count]
+
+    async def get_orderbook(self, market: Market) -> Dict[str, Any]:
+        # Manifold uses AMM, not orderbook - simulate spread based on liquidity
+        spread = 0.03 if market.liquidity > 2000 else 0.06
+        return {
+            "market_id": market.id,
+            "token_id": market.yes_token_id,
+            "bid": max(0.01, market.yes_price - spread/2),
+            "ask": min(0.99, market.yes_price + spread/2),
+            "spread": spread,
+            "depth": market.liquidity,
+            "amm": True
+        }
+
+    async def get_portfolio(self) -> Dict[str, Any]:
+        return {"balance": 0, "positions": [], "orders": [], "venue": "manifold", "paper": True}
+
+    async def place_order(self, opportunity: VenueOpportunity, max_spend_usd: float, max_price: float) -> Dict[str, Any]:
+        if max_spend_usd <= 0 or max_price <= 0 or max_price >= 1:
+            return {"status": "rejected", "reason": "Invalid guard params", "venue": "manifold"}
+        if max_spend_usd > 1000:
+            return {"status": "rejected", "reason": "Exceeds absolute max $1000", "venue": "manifold"}
+        
+        logger.info(f"Manifold guard: market={opportunity.market.id} side={opportunity.side} max_price={max_price} max_spend=${max_spend_usd}")
+        
+        return {
+            "status": "dry_run",
+            "venue": "manifold",
+            "message": f"Would place {opportunity.side} ${max_spend_usd} @ {max_price} for {opportunity.market.id}",
+            "market_id": opportunity.market.id
+        }
