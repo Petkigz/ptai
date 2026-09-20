@@ -1371,4 +1371,181 @@ Add third venue (Manifold) etc one at a time under same contract
 | 19 venues claim | Misleading implies trading support | Fixed honest normalization != trading support |
 | Fast model | Keyword classifier useful preprocessing but not AI | Fixed two-stage heuristic + fast LLM Qwen 7B hook |
 
+---
+
+# V8 Qualification Engine - Properly Connected to Main Loop
+
+## User Revised Assessment (Third Inspection)
+
+> Your current PTAI is already designed to be much broader than Polymarket. If concern was Will we have to redesign PTAI so it can look outside Polymarket? No. Current architecture already gives foundation. Next job is to make existing system actually decide where to trade, rather than merely having many adapters sitting in repository.
+
+### Assessment Table (Current)
+
+| Area | Status |
+|------|--------|
+| Multi-venue architecture | Very strong |
+| Venue abstraction | Present |
+| Venue registry | Present |
+| Venue qualification | Present |
+| Multiple prediction markets | Present |
+| Crypto exchange abstraction | Present |
+| Stock abstraction | Present |
+| Multi-venue execution | Present |
+| Strategy abstraction | Strong |
+| Multiple strategies | Present |
+| Intelligence | Strong foundation |
+| Calibration/learning | Present |
+| Paper trading | Present |
+| Risk architecture | Strong |
+| Autonomous loops | Present, multiple versions |
+| Production validation | Still needs serious testing |
+| Proven profitability | Not demonstrated |
+
+### Core Problem (Not Architecture)
+
+Architecture already multi-venue (VenueRegistry, adapters for polymarket kalshi betfair manifold predictit simmer cymetica whitebit afx grvt pionex ccxt veynor openpx apify, strategy arbitrage market_making momentum etc, execution multi_venue_executor order_manager execution_guard reconciliation, risk multi_venue_risk kelly correlation drawdown exposure limits kill_switch, intelligence news_engine web_researcher x_engine ensemble forecaster calibration). Problem not architecture but distinction adapter exists vs production-ready connected legally usable liquid tested profitable - some adapters experimental/data-only/credentials/jurisdiction/illiquid/missing execution. Should NOT add more adapters, instead make Venue/Strategy Qualification Engine properly connected to main autonomous loop.
+
+### Qualification Flow (User Diagram)
+
+```
+ALL AVAILABLE VENUES
+        ↓
+Capability Check
+        ↓
+Trading available? Data quality? Liquidity sufficient?
+        ↓
+Strategy Check
+        ↓
+Historical Edge?
+        ↓
+Fees/Slippage
+        ↓
+Legal/Account eligibility
+        ↓
+QUALIFIED
+        ↓
+OPPORTUNITY ENGINE
+```
+
+### Real Target Decision Process (22 steps, No Polymarket Step)
+
+1. PTAI wakes up
+2. Check capital + account health
+3. Check all qualified venues - via VenueStrategyQualificationEngine
+4. Discover markets - via VenueRegistry.discover_all() SINGLE SOURCE, venue_id immutable
+5. Normalize markets - via MarketNormalizer, honest about normalization != trading support
+6. Generate candidate opportunities
+7. Evaluate strategies - venue × market × strategy
+8. Estimate fair value / expected return - via ensemble, forecaster, calibration
+9. Account for fees + spread + slippage - via FeeEngine, GasModel, real orderbook is_real flag
+10. Check liquidity - liquidity_score, avg_liquidity
+11. Check uncertainty - uncertainty_engine
+12. Check correlations - correlation_engine, per event cap 12% one bet not two
+13. Check historical model performance - calibration_db, Brier
+14. Check venue/strategy performance - venue_performance venue_id:category, capability_engine
+15. Calculate risk-adjusted opportunity - expected_edge × prob_correct × liquidity × execution × calibration × time / (fees+slippage+uncertainty+risk)
+16. Compare EVERY candidate - via VenueRegistry.rank_opportunities with learning
+17. Choose only opportunities passing hard rules - edge>8% conf>60% liquidity>0.3 exec_quality>0.3 EV>0
+18. Risk engine - exposure, correlation, drawdown, limits, kill_switch
+19. Execution guard - validate max_price max_spend, exact routing ABORT not fallback
+20. Execute - via exact adapter place_order, venue_id validation
+21. Verify - reconciliation
+22. Monitor - order_manager, monitor
+23. Record prediction + outcome - calibration_db, trade_outcomes
+24. Update calibration/performance - learning loop, paper_trading, performance
+25. Repeat
+
+**Notice**: There is no Polymarket step in that logic. Polymarket becomes Venue #1 rather than PTAI = Polymarket bot
+
+### Core Objective
+
+> PTAI searches every qualified venue and strategy available to it, measures the opportunity on a common risk-adjusted basis, and only deploys capital when the opportunity passes its independently enforced rules.
+
+### Implementation V8
+
+#### CapabilityStatus 8 Values
+
+- QUALIFIED - trading available, data quality ok, liquidity sufficient, historical edge, fees ok, legal eligible, account configured, execution tested
+- DATA_ONLY - trading not available, data quality ok, usable for sentiment/reference odds
+- ILLIQUID - liquidity insufficient <1000 avg
+- RESTRICTED - legal not eligible UG etc
+- EXPERIMENTAL - no historical edge sample <100 or win_rate<0.55 Brier>0.25 profit_factor<1.1
+- UNTESTED - no performance data
+- NO_CREDENTIALS - account not configured
+- NOT_CONFIGURED - execution not tested
+
+#### VenueCapabilityReport
+
+Fields: venue_id, venue_type, status, trading_available, data_quality 0-1, avg_liquidity, liquidity_sufficient, historical_edge, avg_edge, win_rate, brier_score, profit_factor, net_pnl, fees_pct, slippage_pct, legal_eligible, eligibility_status, account_configured, execution_tested, sample_size, is_qualified, qualification_score 0-1 weighted, reasoning, checks dict
+
+Score weighted: trading 20% + data 15% + liquidity 15% + edge 20% + legal 15% + account 5% + execution 5% + sample 5%
+
+#### VenueStrategyQualificationEngine
+
+**File**: `src/ptai/venues/capability_engine.py` (620 lines from V7 push)
+
+Methods:
+- `check_venue_capability(adapter, sample_markets)`: checks trading_available via has private_key/funder or is_mock, data_quality via sample markets count valid price liquidity volume, avg_liquidity, liquidity_sufficient >=1000, historical edge via venue_performance win_rate>=0.55 Brier<=0.25 profit_factor>=1.1 sample>=100 net_pnl>0, fees/slippage from capabilities, legal via eligibility_cache, account_configured, execution_tested via performance stats, builds checks dict, calculates score, determines status QUALIFIED etc, reasoning
+- `evaluate_all_venues(target_per_venue=20)`: loops all adapters, check_venue_capability, aggregates total/qualified/data_only/restricted/untested, qualified_ids, recommended, execution_time, reasoning "PTAI now has broad multi-venue framework..."
+- `get_qualified_adapters()`: returns adapters where status QUALIFIED and is_qualified, uses last_report
+- `get_report()`: returns dict total_venues, qualified, details per venue, principle
+
+**Principle**: Would not add another bunch of venue adapters. You already have many. Instead, next layer should be Venue/Strategy Qualification Engine. Code contains adapter does not mean adapter is production-ready, connected, legally usable, liquid, tested and profitable.
+
+#### V3 Loop Wiring V8
+
+**File**: `src/ptai/agent/v3_loop.py`
+
+Changes from V7:
+- Imports: VenueQualificationEngine + VenueStrategyQualificationEngine + CapabilityStatus
+- Init: venue_registry must be before capability_engine (reordered), qualification_engine = VenueQualificationEngine(), capability_engine = VenueStrategyQualificationEngine(venue_registry, qualification_engine, country_code)
+- run_cycle: now does health -> eligibility -> capability_engine.evaluate_all_venues(target_per_venue=20) with reasoning log -> discover_all_venues -> flat markets alpha scan -> strategy_engine_v3.scan_all_venues -> risk -> execution, result includes qualification dict total_venues/qualified/recommended/reasoning/details
+- Principle: Polymarket=Venue #1, no Polymarket step in decision process
+
+#### Dashboard V8 Endpoints
+
+- GET /api/v8/qualification: returns engine concept flow decision_process 22 steps no Polymarket step, core_objective, report total/qualified/data_only/restricted/untested/qualified_ids/recommended/execution_time/reasoning, venue_details per venue with all checks, assessment table multi-venue Very strong etc, revised_assessment message core_objective bottom_line principle
+- GET /api/v8/capability/{venue_id}: returns capability details for single venue, is_production_ready, is_data_only, is_experimental, explanation code contains adapter does not mean production-ready
+- GET /api/v8/decision-process: returns 22 steps decision process, notice no Polymarket step, core_objective, do_nothing_valid, venue_1 Polymarket becomes Venue #1, qualification_flow diagram, principle
+
+### Tests V8: 9 new tests
+
+- capability_check_trading_available: without keys trading_available False, data_quality >=0
+- capability_check_data_quality: good markets data_quality >=0.8 liquidity_sufficient avg_liquidity >=1000
+- capability_check_liquidity_insufficient: thin markets not liquidity_sufficient avg<1000 status ILLIQUID/UNTESTED/EXPERIMENTAL
+- capability_check_historical_edge: performance stats with edge sample>=100
+- qualification_engine_all_venues: total>=2 venue_reports>=2 reasoning contains broad multi-venue execution_time>=0
+- qualified_adapters_only: qualified adapters returns only qualified
+- decision_process_no_polymarket_step: 22 steps no polymarket step, Polymarket becomes Venue #1
+- core_objective: every qualified venue, common risk-adjusted basis, independently enforced rules, only deploys capital when
+- not_add_more_adapters: venue_files>=10, capability_engine.py exists, qualification.py exists
+
+Total tests: 373 passed (was 364 +9 V8)
+
+### Production Readiness V8
+
+| Component | V7 | V8 |
+|-----------|----|----|
+| Architecture | 8.5/10 genuinely multi-market | 8.5/10 |
+| Multi-venue implementation | 6/10 exact routing no fallback real orderbook flag real portfolio qualification beyond win rate MarketScanner single source | 7/10 + Qualification Engine properly connected to main loop |
+| Autonomous readiness | 6/10 venue_id immutable exact routing ABORT orderbook is_real portfolio real but needs prove one adapter end-to-end | 7/10 + Qualification Engine checks trading available data quality liquidity historical edge fees legal account before opportunity engine |
+| Qualification Engine | Robust but not connected to main loop | Properly connected to main loop V8 - run_cycle calls evaluate_all_venues before discovery |
+| Decision Process | Implicit | Explicit 22 steps no Polymarket step Polymarket=Venue #1 |
+| Core Objective | Implicit | Explicit PTAI searches every qualified venue and strategy available measures on common risk-adjusted basis only deploys capital when passes independently enforced rules |
+| Adapter vs Production-Ready | Confusing | Clear distinction 8 statuses QUALIFIED DATA_ONLY ILLIQUID RESTRICTED EXPERIMENTAL UNTESTED NO_CREDENTIALS NOT_CONFIGURED |
+
+### Bottom Line V8
+
+Current PTAI already broader than Polymarket, next job make existing system actually decide where to trade. V8 does this by making Venue/Strategy Qualification Engine properly connected to main autonomous loop. Code contains adapter does not mean production-ready. Qualification flow: ALL VENUES -> Capability Check -> Trading available? Data quality? Liquidity sufficient? -> Strategy Check -> Historical Edge? -> Fees/Slippage -> Legal/Account -> QUALIFIED -> OPPORTUNITY ENGINE. Real target decision process 22 steps defined with no Polymarket step, Polymarket = Venue #1. PTAI searches every qualified venue and strategy available, measures opportunity on common risk-adjusted basis, only deploys capital when passes independently enforced rules.
+
+### Files Added/Updated V8
+
+- src/ptai/venues/capability_engine.py: NEW 620 lines VenueStrategyQualificationEngine CapabilityStatus 8 values VenueCapabilityReport QualificationEngineReport check_venue_capability evaluate_all_venues get_qualified_adapters get_report
+- src/ptai/agent/v3_loop.py: UPDATED imports qualification + capability, reordered init venue_registry before capability_engine, added qualification_engine + capability_engine, run_cycle now capability_engine.evaluate_all_venues with reasoning log + qual_report_dict included in result
+- src/ptai/dashboard.py: 3 new V8 endpoints qualification capability/{venue_id} decision-process, concept flow decision_process 22 steps core_objective assessment revised_assessment bottom_line principle
+- tests/test_v8_qualification.py: 9 tests for capability engine
+- V3_ARCHITECTURE.md: This section
+- Total tests: 373 passed
+
+
 

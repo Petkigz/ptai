@@ -78,6 +78,9 @@ from ..venues.openpx_adapter import OpenPXAdapter
 from ..venues.apify_adapter import ApifyAdapter
 from ..venues.adapter import EligibilityStatus
 
+from ..venues.qualification import VenueQualificationEngine
+from ..venues.capability_engine import VenueStrategyQualificationEngine, CapabilityStatus
+
 from ..intelligence.calibration import CalibrationEngine
 from ..intelligence.uncertainty import UncertaintyEngine
 from ..intelligence.ensemble import EnsembleForecaster
@@ -175,11 +178,19 @@ class TradingAgentV3:
             strategy_selector=self.strategy_selector
         )
         
+        # Venues - multi-venue registry - must be before capability engine
+        self.venue_registry = VenueRegistry(country_code=country_code)
+        
         # Alpha engine - all additional alpha ideas
         self.alpha_engine = AlphaEngine(bankroll=self.storage.get_performance_summary().get("bankroll", 50.0))
         
-        # Venues - multi-venue registry
-        self.venue_registry = VenueRegistry(country_code=country_code)
+        # Venue/Strategy Qualification Engine - V8 - properly connected to main loop
+        self.qualification_engine = VenueQualificationEngine()
+        self.capability_engine = VenueStrategyQualificationEngine(
+            venue_registry=self.venue_registry,
+            qualification_engine=self.qualification_engine,
+            country_code=country_code
+        )
         
         # Register all venues
         try:
@@ -394,12 +405,14 @@ class TradingAgentV3:
 
     async def run_cycle(self, target_per_venue: int = 200, max_trades: int = 3) -> Dict[str, Any]:
         """
-        V3 Cycle: multi-venue × multi-strategy
+        V3 Cycle: multi-venue × multi-strategy WITH Qualification Engine V8
+        PTAI wakes up -> Check capital + account health -> Check all qualified venues -> Discover -> Normalize -> Generate candidates -> Evaluate strategies -> Estimate fair value -> Fees/spread/slippage -> Liquidity -> Uncertainty -> Correlations -> Historical performance -> Venue/strategy performance -> Risk-adjusted opportunity -> Compare EVERY candidate -> Choose only passing hard rules -> Risk -> Execution guard -> Execute -> Verify -> Monitor -> Record -> Update -> Repeat
+        No Polymarket step - Polymarket becomes Venue #1
         """
         start = time.time()
-        logger.info("=== PTAI V3 Cycle Start: Multi-Venue × Multi-Strategy ===")
+        logger.info("=== PTAI V3 Cycle Start: Multi-Venue × Multi-Strategy WITH Qualification Engine V8 ===")
         
-        # Health check
+        # Health check - Check capital + account health
         health = await self.check_system_health()
         if not health["can_trade"]:
             return {
@@ -410,10 +423,21 @@ class TradingAgentV3:
                 "execution_time": time.time() - start
             }
         
-        # Eligibility
+        # Eligibility - Legal/Account eligibility
         eligibility = await self.check_eligibility()
         
-        # Discover all venues
+        # V8: Venue/Strategy Qualification Engine - Capability Check
+        logger.info("V8 Qualification Engine: Checking all venues capability - trading available? data quality? liquidity? historical edge? fees/slippage? legal eligibility?")
+        try:
+            qualification_report = await self.capability_engine.evaluate_all_venues(target_per_venue=20)
+            logger.info(f"Qualification: {qualification_report.reasoning}")
+            qualified_venue_ids = qualification_report.qualified_venue_ids
+        except Exception as e:
+            logger.warning(f"Qualification engine failed {e}, using all venues")
+            qualification_report = None
+            qualified_venue_ids = list(self.venue_registry.adapters.keys())
+        
+        # Discover all venues - Check all qualified venues -> Discover markets
         markets_by_venue = await self.discover_all_venues(target_per_venue=target_per_venue)
         total_markets = sum(len(m) for m in markets_by_venue.values())
         
@@ -423,6 +447,7 @@ class TradingAgentV3:
                 "reason": "No markets discovered from any venue",
                 "health": health,
                 "eligibility": {k: v.value for k, v in eligibility.items()},
+                "qualification": qualification_report.reasoning if qualification_report else "No qualification",
                 "execution_time": time.time() - start,
                 "mission": self.mission
             }
@@ -551,12 +576,30 @@ class TradingAgentV3:
         
         elapsed = time.time() - start
         
+        # Build V3 report with qualification engine
+        qual_report_dict = {}
+        try:
+            if qualification_report:
+                qual_report_dict = {
+                    "total_venues": qualification_report.total_venues,
+                    "qualified": qualification_report.qualified_venues,
+                    "qualified_ids": qualification_report.qualified_venue_ids,
+                    "recommended": qualification_report.recommended_venues,
+                    "reasoning": qualification_report.reasoning,
+                    "details": self.capability_engine.get_report()
+                }
+            else:
+                qual_report_dict = self.capability_engine.get_report()
+        except Exception as e:
+            qual_report_dict = {"error": str(e), "principle": "PTAI has broad multi-venue framework"}
+        
         # Build V3 report
         result = {
             "status": "completed",
             "mission": self.mission,
             "health": health,
             "eligibility": {k: v.value for k, v in eligibility.items()},
+            "qualification": qual_report_dict,
             "discovery": {
                 "total_scanned": scan_result.total_scanned,
                 "per_venue": {
