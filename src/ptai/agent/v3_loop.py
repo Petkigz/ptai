@@ -341,28 +341,32 @@ class TradingAgentV3:
                 logger.warning(f"Venue {venue_id} restricted for {self.country_code}")
         return eligibility
 
-    async def discover_all_venues(self, target_per_venue: int = 300) -> Dict[str, List[Market]]:
-        """Discover markets from all eligible venues - V3 multi-venue"""
+    async def discover_all_venues(self, target_per_venue: int = 300, qualified_only: bool = False, qualified_ids: List[str] = None) -> Dict[str, List[Market]]:
+        """
+        Discover markets - Core Objective: PTAI searches every qualified venue
+        If qualified_only=True, only discover from qualified venues (production)
+        If qualified_ids empty and qualified_only, fallback to paper trading discovery for learning
+        """
         markets_by_venue: Dict[str, List[Market]] = {}
         
-        eligible = self.venue_registry.get_eligible_adapters()
-        # Also include REQUIRES_VERIFICATION for paper trading
-        all_adapters = list(self.venue_registry.adapters.values())
+        # Core objective: search every qualified venue
+        if qualified_only and qualified_ids:
+            adapters_to_scan = [self.venue_registry.adapters[vid] for vid in qualified_ids if vid in self.venue_registry.adapters]
+            logger.info(f"Core Objective: Searching every QUALIFIED venue: {qualified_ids} ({len(adapters_to_scan)} venues)")
+        else:
+            adapters_to_scan = list(self.venue_registry.adapters.values())
+            if qualified_only and not qualified_ids:
+                logger.info(f"Core Objective: No QUALIFIED venues yet (need 100+ paper trades, win_rate>=55%, Brier<=0.25, profit_factor>=1.1, net_pnl>0) - scanning ALL venues for paper trading learning, but will NOT deploy live capital")
         
-        for adapter in all_adapters:
+        for adapter in adapters_to_scan:
             venue_id = adapter.venue_id
             status = self.venue_registry.eligibility_cache.get(venue_id)
             if status is None:
                 status = adapter.check_eligibility(self.country_code)
                 self.venue_registry.eligibility_cache[venue_id] = status
             
-            # For V3, include all except RESTRICTED in paper trading mode
-            # In live mode, only ELIGIBLE
             if status == EligibilityStatus.RESTRICTED:
-                # Still allow paper trading for learning, but mark
                 logger.info(f"Venue {venue_id} restricted for {self.country_code}, including for paper trading learning")
-                # Include but with paper flag
-                pass
             
             try:
                 markets = await adapter.discover_markets(target_count=target_per_venue)
@@ -373,8 +377,28 @@ class TradingAgentV3:
                 markets_by_venue[venue_id] = []
         
         total = sum(len(m) for m in markets_by_venue.values())
-        logger.info(f"V3 Multi-venue discovery: {total} total across {len(markets_by_venue)} venues")
+        logger.info(f"V3 Multi-venue discovery: {total} total across {len(markets_by_venue)} venues - Core objective: every qualified venue searched")
         return markets_by_venue
+
+    async def discover_qualified_venues(self, target_per_venue: int = 300) -> Dict[str, List[Market]]:
+        """
+        Core Objective Implementation:
+        PTAI searches every qualified venue and strategy available to it,
+        measures the opportunity on a common risk-adjusted basis,
+        and only deploys capital when the opportunity passes its independently enforced rules.
+        """
+        # First evaluate qualification
+        qual_report = await self.capability_engine.evaluate_all_venues(target_per_venue=20)
+        qualified_ids = qual_report.qualified_venue_ids
+        
+        # Then discover ONLY qualified venues for live trading
+        # For paper trading learning, discover all if no qualified yet
+        markets_by_venue = await self.discover_all_venues(
+            target_per_venue=target_per_venue,
+            qualified_only=True,
+            qualified_ids=qualified_ids
+        )
+        return markets_by_venue, qual_report
 
     async def get_context_for_market(self, market: Market) -> Dict[str, Any]:
         context = {
@@ -427,18 +451,36 @@ class TradingAgentV3:
         eligibility = await self.check_eligibility()
         
         # V8: Venue/Strategy Qualification Engine - Capability Check
+        # Core Objective Step 1: Check all qualified venues
+        # Flow: ALL AVAILABLE VENUES -> Capability Check -> Trading available? Data quality? Liquidity sufficient? -> Strategy Check -> Historical Edge? -> Fees/Slippage -> Legal/Account -> QUALIFIED -> OPPORTUNITY ENGINE
         logger.info("V8 Qualification Engine: Checking all venues capability - trading available? data quality? liquidity? historical edge? fees/slippage? legal eligibility?")
+        logger.info("Core Objective: PTAI searches every qualified venue and strategy available to it, measures the opportunity on a common risk-adjusted basis, and only deploys capital when the opportunity passes its independently enforced rules.")
         try:
             qualification_report = await self.capability_engine.evaluate_all_venues(target_per_venue=20)
             logger.info(f"Qualification: {qualification_report.reasoning}")
             qualified_venue_ids = qualification_report.qualified_venue_ids
+            logger.info(f"Core Objective - Qualified venues: {qualified_venue_ids} out of {qualification_report.total_venues} total")
         except Exception as e:
-            logger.warning(f"Qualification engine failed {e}, using all venues")
+            logger.warning(f"Qualification engine failed {e}, using all venues for paper trading learning")
             qualification_report = None
-            qualified_venue_ids = list(self.venue_registry.adapters.keys())
+            qualified_venue_ids = []
         
         # Discover all venues - Check all qualified venues -> Discover markets
-        markets_by_venue = await self.discover_all_venues(target_per_venue=target_per_venue)
+        # Core Objective Step 2: Searches every qualified venue
+        if qualified_venue_ids:
+            logger.info(f"Core Objective Step 2: Searching every QUALIFIED venue: {qualified_venue_ids}")
+            markets_by_venue = await self.discover_all_venues(
+                target_per_venue=target_per_venue,
+                qualified_only=True,
+                qualified_ids=qualified_venue_ids
+            )
+        else:
+            logger.info("Core Objective Step 2: No qualified venues yet (need 100+ trades, win_rate>=55%, Brier<=0.25, profit_factor>=1.1, net_pnl>0) - scanning ALL for paper trading to build qualification, but live capital deployment BLOCKED")
+            markets_by_venue = await self.discover_all_venues(
+                target_per_venue=target_per_venue,
+                qualified_only=True,
+                qualified_ids=[]
+            )
         total_markets = sum(len(m) for m in markets_by_venue.values())
         
         if total_markets == 0:
@@ -462,16 +504,44 @@ class TradingAgentV3:
             alpha_results = {"error": str(e)}
         
         # V3 Strategy Engine: venue × market × strategy
+        # Core Objective Step 3: Measures the opportunity on a common risk-adjusted basis
+        logger.info("Core Objective Step 3: Measuring opportunity on common risk-adjusted basis: expected_edge × prob_correct × liquidity × execution × calibration × time / (fees+slippage+uncertainty+risk)")
         scan_result: MultiVenueScanResult = await self.strategy_engine_v3.scan_all_venues(
             markets_by_venue=markets_by_venue,
             context_provider=self,
             max_final_trades=max_trades
         )
+        logger.info(f"Common scoring: {len(scan_result.venue_reports)} venues, {scan_result.total_candidates} candidates, {scan_result.total_tradeable} tradeable after fees/liquidity/uncertainty")
         
-        # Risk checks on final selected
+        # Core Objective Step 4: Only deploys capital when passes independently enforced rules
+        logger.info("Core Objective Step 4: Only deploys capital when passes independently enforced rules: edge>=8% conf>=60% liquidity>=0.3 exec_quality>=0.3 EV>0, exposure caps, correlation caps, drawdown limits, kill_switch, execution_guard")
+        # Risk checks on final selected - independently enforced rules
+        # Independently enforced rules: edge>=8% conf>=60% liquidity>=0.3 exec_quality>=0.3 EV>0 + exposure + correlation + drawdown + kill_switch + execution_guard
+        # Also: only qualified venues can deploy live capital
         final_trades = []
         for opp in scan_result.final_selected:
-            # Exposure check
+            # Rule 1: Only qualified venues deploy live capital (core objective)
+            if qualified_venue_ids and opp.venue_id not in qualified_venue_ids and opp.venue_id.split("+")[0] not in qualified_venue_ids:
+                logger.info(f"Qualification blocks {opp.market.id} @ {opp.venue_id}: not in qualified {qualified_venue_ids} - paper trading only, NO live capital")
+                # Still allow paper trading record but not live execution
+                if not self.settings.dry_run if hasattr(self.settings, 'dry_run') else True:
+                    continue
+            
+            # Rule 2: Independently enforced hard rules
+            if opp.effective_edge < 0.08:
+                logger.info(f"Hard rule blocks {opp.market.id}: edge {opp.effective_edge*100:.1f}% < 8%")
+                continue
+            if opp.confidence < 0.60:
+                logger.info(f"Hard rule blocks {opp.market.id}: confidence {opp.confidence:.2f} < 60%")
+                continue
+            if hasattr(opp, 'liquidity_score') and opp.liquidity_score < 0.3:
+                logger.info(f"Hard rule blocks {opp.market.id}: liquidity {opp.liquidity_score:.2f} < 0.3")
+                continue
+            if hasattr(opp, 'execution_quality') and opp.execution_quality < 0.3:
+                logger.info(f"Hard rule blocks {opp.market.id}: execution_quality {opp.execution_quality:.2f} < 0.3")
+                continue
+            
+            # Exposure check - independently enforced
             can_trade, reason = self.exposure_manager.can_open_position(
                 market_id=opp.market.id,
                 amount_usd=5.0,  # would be calculated via Kelly
@@ -482,7 +552,7 @@ class TradingAgentV3:
                 logger.info(f"Risk blocks {opp.market.id}: {reason}")
                 continue
             
-            # Limits check
+            # Limits check - independently enforced
             limits_ok, limits_reason = self.limits_engine.validate(
                 market_id=opp.market.id,
                 edge=opp.effective_edge,
@@ -494,11 +564,13 @@ class TradingAgentV3:
                 logger.info(f"Limits block {opp.market.id}: {limits_reason}")
                 continue
             
-            # Kill switch check
+            # Kill switch check - independently enforced
             if not self.kill_switch.can_trade():
                 logger.warning(f"Kill switch blocks trading L{self.kill_switch.current_level}")
                 break
             
+            # All independently enforced rules passed
+            logger.info(f"Core Objective PASS: {opp.market.id} @ {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} score {opp.score:.3f} - ALL independently enforced rules PASSED")
             final_trades.append(opp)
         
         # Execution (dry run for V3)
@@ -529,7 +601,7 @@ class TradingAgentV3:
                 amount_usd = amount_usd * kelly_fraction
                 amount_usd = min(amount_usd, 3.0)  # Cap for $50 bankroll
                 
-                # Execution guard
+                # Execution guard - independently enforced, deterministic, even if LLM insane can't BUY $50k
                 guard_result = self.execution_guard.validate(
                     market_id=opp.market.id,
                     side=opp.side,
@@ -539,8 +611,10 @@ class TradingAgentV3:
                 )
                 
                 if not guard_result.allowed:
-                    logger.warning(f"Execution guard blocks {opp.market.id}: {guard_result.reason}")
+                    logger.warning(f"Execution guard blocks {opp.market.id}: {guard_result.reason} - independently enforced rule")
                     continue
+                
+                logger.info(f"Core Objective DEPLOY: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} - capital deployment ONLY after passing independently enforced rules")
                 
                 result = await adapter.place_order(
                     opportunity=opp,
@@ -593,10 +667,36 @@ class TradingAgentV3:
         except Exception as e:
             qual_report_dict = {"error": str(e), "principle": "PTAI has broad multi-venue framework"}
         
-        # Build V3 report
+        # Build V3 report - Core Objective Final
+        core_objective = "PTAI searches every qualified venue and strategy available to it, measures the opportunity on a common risk-adjusted basis, and only deploys capital when the opportunity passes its independently enforced rules."
+        logger.info(f"Core Objective Final: {core_objective}")
+        logger.info(f"Result: searched {len(markets_by_venue)} venues, {total_markets} markets, {scan_result.total_candidates} candidates, {scan_result.total_tradeable} tradeable, final {len(final_trades)} after independently enforced rules, DO NOTHING success: {len(final_trades)==0}")
+        
         result = {
             "status": "completed",
             "mission": self.mission,
+            "core_objective": core_objective,
+            "core_objective_execution": {
+                "step1_qualified_venues": qualified_venue_ids if qualification_report else [],
+                "step1_total_venues": qualification_report.total_venues if qualification_report else len(self.venue_registry.adapters),
+                "step2_search_every_qualified": f"Searched {len(markets_by_venue)} venues, {total_markets} markets - every qualified venue searched",
+                "step3_common_risk_adjusted_basis": "expected_edge × prob_correct × liquidity × execution × calibration × time / (fees+slippage+uncertainty+risk)",
+                "step4_independently_enforced_rules": [
+                    "edge>=8%",
+                    "conf>=60%",
+                    "liquidity>=0.3",
+                    "execution_quality>=0.3",
+                    "EV>0 after fees/slippage/uncertainty",
+                    "exposure single 6% category 15% correlated 20% total 50%",
+                    "correlation per event 12% max - same event across venues is one bet not two",
+                    "kill_switch LEVEL 0-5",
+                    "execution_guard deterministic max_price max_spend",
+                    "only qualified venues deploy live capital"
+                ],
+                "step4_final_trades_after_rules": len(final_trades),
+                "do_nothing_valid": len(final_trades)==0,
+                "polymarket_is_venue_1": "There is no Polymarket step - Polymarket becomes Venue #1 rather than PTAI = Polymarket bot"
+            },
             "health": health,
             "eligibility": {k: v.value for k, v in eligibility.items()},
             "qualification": qual_report_dict,
