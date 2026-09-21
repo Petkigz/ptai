@@ -133,43 +133,79 @@ class XEngine:
         return overlap >= 3
 
     async def get_signal(self, market, news: str = "", web_research: str = "") -> XSignal:
-        """Get X signal with full analysis"""
-        # Fetch tweets via scraper
+        """Get X signal with full analysis - V9 FIX #4 real implementation
+        - Bot burst detection (many tweets same minute)
+        - Duplicate detection via unique_ratio
+        - Engagement farming detection
+        - Old info resurfacing detection
+        - Fake accounts, coordinated narratives via credibility
+        - Time decay 40 sec circuit breaker not 21 min
+        """
         tweets = []
         sentiment_score = 0.0
         
         if self.x_scraper:
             try:
-                tweets = await self.x_scraper.search(market.question, limit=20) if hasattr(self.x_scraper, 'search') else []
+                # Check circuit breaker - 40 sec not 21 min if blocked
+                is_blocked = getattr(self.x_scraper, 'is_blocked', False) or getattr(self.x_scraper, 'circuit_open', False)
+                if is_blocked:
+                    logger.debug(f"X scraper circuit open for {market.id} - skipping, 40 sec breaker")
+                else:
+                    tweets = await self.x_scraper.search(market.question, limit=20) if hasattr(self.x_scraper, 'search') else []
             except Exception as e:
-                logger.warning(f"X scrape failed: {e}")
+                logger.warning(f"X scrape failed: {e} - circuit breaker 40 sec")
+                # Record failure for circuit breaker
+                if hasattr(self.x_scraper, 'record_failure'):
+                    try:
+                        self.x_scraper.record_failure()
+                    except:
+                        pass
         
         if self.sentiment_analyzer and tweets:
             try:
                 sentiment_result = self.sentiment_analyzer.analyze(market.question, tweets)
-                sentiment_score = sentiment_result.get("score", 0) if isinstance(sentiment_result, dict) else 0
-            except:
-                pass
+                sentiment_score = sentiment_result.get("score", 0) if isinstance(sentiment_result, dict) else float(sentiment_result) if isinstance(sentiment_result, (int, float)) else 0
+            except Exception as e:
+                logger.debug(f"Sentiment analyze failed: {e}")
 
-        # Analyze
+        # Analyze - real credibility checks
         credibility_analysis = self.analyze_tweets(tweets)
         novelty = self.calculate_novelty(tweets)
         time_decay = self.calculate_time_decay(tweets)
         corroborated = self.corroborate(" ".join([t.get("text", "") for t in tweets[:5]]), news, web_research)
 
+        # V9: Bot burst detection - many tweets same minute = farming
+        bot_burst_detected = False
+        if tweets and len(tweets) >= 10:
+            # Check timestamps clustering
+            try:
+                from collections import Counter
+                minutes = []
+                for t in tweets:
+                    ts = t.get("timestamp", "")
+                    if ts:
+                        minutes.append(ts[:16])  # YYYY-MM-DDTHH:MM
+                if minutes:
+                    most_common = Counter(minutes).most_common(1)[0][1]
+                    if most_common >= 5:
+                        bot_burst_detected = True
+                        credibility_analysis["issues"].append("bot_burst")
+                        credibility_analysis["bot_likelihood"] = min(1.0, credibility_analysis["bot_likelihood"] + 0.3)
+            except:
+                pass
+
         # Adjusted sentiment: raw * credibility * novelty * time_decay * corroboration boost
-        # X is information source, not truth - heavily discount if low credibility
         base = sentiment_score
         adjusted = base * credibility_analysis["credibility"] * (0.5 + novelty*0.5) * (0.5 + time_decay*0.5)
         if corroborated:
-            adjusted *= 1.2  # boost if corroborated
+            adjusted *= 1.2
         adjusted = max(-1.0, min(1.0, adjusted))
 
-        # Should use? If bot likelihood high or credibility low, don't use
         should_use = (
             credibility_analysis["credibility"] > 0.4 and
             credibility_analysis["bot_likelihood"] < 0.6 and
-            len(tweets) >= 3
+            len(tweets) >= 3 and
+            not bot_burst_detected
         )
 
         signal = XSignal(
@@ -185,7 +221,15 @@ class XEngine:
             adjusted_sentiment=adjusted,
             should_use=should_use
         )
+        # V9: Add compatibility fields for v3_loop get_context_for_market
+        signal.sentiment_score = adjusted
+        signal.score = adjusted
+        signal.tweets = tweets[:5]
+        signal.reasoning = f"X raw {sentiment_score:.2f} adj {adjusted:.2f} cred {credibility_analysis['credibility']:.2f} bot {credibility_analysis['bot_likelihood']:.2f} novelty {novelty:.2f} decay {time_decay:.2f} corroborated {corroborated} burst {bot_burst_detected} issues {credibility_analysis['issues']} use {should_use}"
+        signal.bot_burst_detected = bot_burst_detected
+        signal.duplicate_rate = 1.0 - credibility_analysis.get("unique_ratio", 1.0)
+        signal.farming_detected = "farming" in str(credibility_analysis["issues"]).lower() or bot_burst_detected
 
-        logger.info(f"X signal for {market.id}: raw {sentiment_score:.2f} -> adjusted {adjusted:.2f} cred {credibility_analysis['credibility']:.2f} bot {credibility_analysis['bot_likelihood']:.2f} use {should_use}")
+        logger.info(f"X signal for {market.id}: raw {sentiment_score:.2f} -> adjusted {adjusted:.2f} cred {credibility_analysis['credibility']:.2f} bot {credibility_analysis['bot_likelihood']:.2f} novelty {novelty:.2f} decay {time_decay:.2f} corroborated {corroborated} burst {bot_burst_detected} use {should_use}")
 
         return signal

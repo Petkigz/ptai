@@ -784,14 +784,20 @@ class TradingAgentV3:
                     "result": result
                 })
                 
-                # Record for calibration
-                self.calibration_engine.record_prediction(
-                    market_id=opp.market.id,
-                    forecast_prob=opp.estimated_fair,
-                    confidence=opp.confidence,
-                    category=opp.category,
-                    venue=opp.venue_id
-                )
+                # Record for calibration - V9 FIX #5 persistent
+                try:
+                    self.calibration_engine.record_forecast(
+                        market_id=opp.market.id,
+                        question=opp.market.question[:200],
+                        forecast_prob=opp.estimated_fair,
+                        confidence=opp.confidence,
+                        market_price=opp.market_price,
+                        category=opp.category
+                    )
+                    # V9 FIX #5: Save immediately for persistence
+                    self.calibration_engine.save()
+                except Exception as e:
+                    logger.warning(f"Calibration record/save failed for {opp.market.id}: {e}")
                 
             except Exception as e:
                 logger.error(f"Execution failed for {opp.market.id}: {e}")

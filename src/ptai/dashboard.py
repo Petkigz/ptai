@@ -683,6 +683,8 @@ async def api_backtest_run(request: Request):
         days = int(data.get("days", 30))
         min_edge = float(data.get("min_edge", 0.08))
         bankroll = float(data.get("bankroll", 50.0))
+        allow_synthetic = bool(data.get("allow_synthetic", False))
+        historical_markets = data.get("historical_markets")  # real historical data if provided
         
         from .backtest import BacktestEngine
         engine = BacktestEngine()
@@ -693,7 +695,8 @@ async def api_backtest_run(request: Request):
             "max_pos_pct": float(data.get("max_pos_pct", 0.06)),
             "kelly_fraction": float(data.get("kelly_fraction", 0.5))
         }
-        result = engine.run(strategy_config=config, days=days)
+        # V9 FIX #6: Real historical data gate
+        result = engine.run(strategy_config=config, historical_markets=historical_markets, days=days, allow_synthetic=allow_synthetic)
         
         return {
             "strategy": result.strategy_name,
@@ -709,7 +712,12 @@ async def api_backtest_run(request: Request):
             "max_drawdown": round(result.max_drawdown*100, 1),
             "sharpe": round(result.sharpe, 2),
             "equity_curve": result.equity_curve[-20:],
-            "recent_trades": result.trades[-10:]
+            "recent_trades": result.trades[-10:],
+            "is_synthetic": result.is_synthetic,
+            "data_mode": result.data_mode,
+            "warnings": result.warnings,
+            "is_production_grade": result.is_production_grade,
+            "production_block": "BLOCKED - synthetic data cannot be used for live deployment decisions" if result.is_synthetic else "OK - real data" if result.is_production_grade else "NEEDS_MORE_DATA - need 100+ real markets"
         }
     except Exception as e:
         return {"error": str(e)}

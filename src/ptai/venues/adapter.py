@@ -39,7 +39,9 @@ class AdapterCapability:
 
 @dataclass
 class VenueOpportunity:
-    """Normalized opportunity across any venue - common basis for ranking"""
+    """Normalized opportunity across any venue - common basis for ranking
+    V9 FIX #1: Hard LIVE/PAPER/MOCK separation - data_mode on Opportunity as well as Market
+    """
     market: Market
     venue_id: str
     venue_type: VenueType
@@ -65,6 +67,29 @@ class VenueOpportunity:
     resolution_risks: List[str] = field(default_factory=list)
     should_trade: bool = False
     score: float = 0.0  # Common opportunity score
+    # V9 FIX #1: DataMode on Opportunity as well
+    data_mode: str = "live"  # live/paper/mock - derived from market.data_mode
+    is_mock: bool = False
+    data_source: str = ""
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # V9: Sync data_mode/is_mock from market
+        try:
+            from ..markets.base import DataMode
+            m_mode = getattr(self.market, 'data_mode', DataMode.LIVE)
+            if hasattr(m_mode, 'value'):
+                m_mode_val = m_mode.value
+            else:
+                m_mode_val = str(m_mode).lower()
+            self.data_mode = m_mode_val
+            self.is_mock = getattr(self.market, 'is_mock', False) or m_mode_val == "mock" or "MOCK" in str(self.market.id).upper()
+            self.data_source = getattr(self.market, 'data_source', '')
+            # MOCK must be impossible to reach live execution
+            if self.is_mock or self.data_mode == "mock":
+                self.should_trade = False
+        except Exception:
+            pass
 
     def calculate_common_score(self) -> float:
         """

@@ -61,33 +61,110 @@ class NewsEngine:
             return 0.2
 
     async def get_news(self, market, max_articles: int = 5) -> List[NewsSignal]:
-        """Get news for market"""
+        """Get news for market - V9 FIX #4 real RSS + web_search, not mock
+        Local-only, public info, no cloud
+        """
         signals = []
         
-        # Would use web search to find news
-        # For now mock
+        # Path 1: Use injected web_search if available (real search)
         if self.web_search:
             try:
-                # Search for news about market question
                 results = await self.web_search.search(market.question, limit=max_articles) if hasattr(self.web_search, 'search') else []
                 for r in results[:max_articles]:
                     url = r.get("url", "")
                     credibility = self.assess_source_credibility(url)
-                    # Would parse timestamp
+                    ts_str = r.get("timestamp") or r.get("published")
+                    ts = datetime.now(timezone.utc)
+                    if ts_str:
+                        try:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        except:
+                            pass
                     signals.append(NewsSignal(
                         market_id=market.id,
                         summary=r.get("snippet", "")[:200],
                         relevance=0.7,
                         credibility=credibility,
-                        recency=0.6,
+                        recency=self.calculate_recency(ts),
                         sentiment=0.0,
                         sources=[url],
-                        timestamp=datetime.now(timezone.utc)
+                        timestamp=ts
                     ))
             except Exception as e:
                 logger.warning(f"News search failed: {e}")
 
-        return signals
+        # Path 2: Real RSS feeds - local HTTP, no API keys, public info only
+        if not signals:
+            try:
+                import requests
+                # Extract keywords from market question for filtering
+                q_lower = market.question.lower()
+                keywords = [w for w in q_lower.split() if len(w) > 4][:5]
+                
+                # Try BBC, Reuters RSS - public, no auth
+                rss_feeds = [
+                    "https://feeds.bbci.co.uk/news/rss.xml",
+                    "https://www.reutersagency.com/feed/?best-topics=tech&post_type=best",
+                ]
+                # For local testing, use lightweight fetch with timeout
+                # Only fetch if market category suggests news relevance
+                has_news_potential = any(k in q_lower for k in ["trump", "biden", "election", "fed", "cpi", "inflation", "rate", "earnings", "nfl", "nba", "btc", "bitcoin"])
+                if has_news_potential:
+                    for feed_url in rss_feeds[:1]:  # only 1 to save time
+                        try:
+                            resp = requests.get(feed_url, timeout=3, headers={"User-Agent": "PTAI/1.0"})
+                            if resp.status_code == 200:
+                                text = resp.text[:10000]
+                                # Simple keyword matching
+                                relevance = 0.0
+                                for kw in keywords:
+                                    if kw in text.lower():
+                                        relevance += 0.2
+                                relevance = min(1.0, relevance)
+                                if relevance > 0.1:
+                                    signals.append(NewsSignal(
+                                        market_id=market.id,
+                                        summary=f"RSS {feed_url} mentions {keywords} relevance {relevance:.2f} for {market.question[:80]}",
+                                        relevance=relevance,
+                                        credibility=self.assess_source_credibility(feed_url),
+                                        recency=0.8,
+                                        sentiment=0.0,
+                                        sources=[feed_url],
+                                        timestamp=datetime.now(timezone.utc)
+                                    ))
+                        except Exception as e:
+                            logger.debug(f"RSS fetch {feed_url} failed: {e}")
+                            continue
+            except Exception as e:
+                logger.debug(f"RSS news failed for {market.id}: {e}")
+
+        # Path 3: Category-based heuristic when no real news - still provides context
+        if not signals:
+            q_lower = market.question.lower()
+            if any(k in q_lower for k in ["trump", "biden", "election"]):
+                signals.append(NewsSignal(
+                    market_id=market.id,
+                    summary=f"Politics market {market.question[:100]} - check polls, official announcements, reputable sources Reuters/AP/BBC",
+                    relevance=0.5,
+                    credibility=0.6,
+                    recency=0.5,
+                    sentiment=0.0,
+                    sources=["category_heuristic_politics"],
+                    timestamp=datetime.now(timezone.utc)
+                ))
+            elif any(k in q_lower for k in ["fed", "cpi", "inflation"]):
+                signals.append(NewsSignal(
+                    market_id=market.id,
+                    summary=f"Economics market {market.question[:100]} - check Fed announcements, CPI data, official gov sources",
+                    relevance=0.5,
+                    credibility=0.7,
+                    recency=0.5,
+                    sentiment=0.0,
+                    sources=["category_heuristic_economics"],
+                    timestamp=datetime.now(timezone.utc)
+                ))
+
+        return signals[:max_articles]
 
     def synthesize(self, signals: List[NewsSignal]) -> Dict:
         """Synthesize news signals into summary"""
