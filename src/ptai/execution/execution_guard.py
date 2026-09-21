@@ -32,17 +32,55 @@ class ExecutionGuard:
     def update_bankroll(self, bankroll: float):
         self.bankroll = bankroll
 
-    def validate(self, proposal: Dict, risk_approved: Dict) -> GuardResult:
+    def validate(self, proposal: Dict = None, risk_approved: Dict = None, **kwargs) -> GuardResult:
         """
         Validate execution request.
+        V9 FIX #1 & #2: Hard LIVE/PAPER/MOCK separation + exact routing ABORT
         proposal: from LLM
         risk_approved: from risk engine with max_spend and max_price
+        Also supports legacy kwargs: market_id, side, max_price, max_spend
         """
         checks_passed = []
         checks_failed = []
 
+        # Backward compat: if called with kwargs market_id/side/max_price/max_spend
+        if proposal is None and kwargs:
+            proposal = {
+                "market_id": kwargs.get("market_id", "unknown"),
+                "side": kwargs.get("side", "YES"),
+                "venue_id": kwargs.get("venue_id", "unknown"),
+                "data_mode": kwargs.get("data_mode", "live"),
+                "is_mock": kwargs.get("is_mock", False)
+            }
+            risk_approved = {
+                "market_id": kwargs.get("market_id", "unknown"),
+                "max_price": kwargs.get("max_price", 0),
+                "max_spend_usd": kwargs.get("max_spend", kwargs.get("max_spend_usd", kwargs.get("risk_approved_amount", 0))),
+                "venue_id": kwargs.get("venue_id", "unknown"),
+                "data_mode": kwargs.get("data_mode", "live")
+            }
+        
+        proposal = proposal or {}
+        risk_approved = risk_approved or {}
+
+        # V9 FIX #1: MOCK_DATA must be impossible to reach live execution
+        data_mode = proposal.get("data_mode") or risk_approved.get("data_mode") or "live"
+        if hasattr(data_mode, 'value'):
+            data_mode = data_mode.value
+        data_mode = str(data_mode).lower()
+        is_mock = proposal.get("is_mock", False) or risk_approved.get("is_mock", False) or data_mode == "mock"
+        
+        market_id_check = proposal.get("market_id") or risk_approved.get("market_id") or ""
+        if "MOCK" in str(market_id_check).upper():
+            is_mock = True
+            data_mode = "mock"
+        
+        if is_mock or data_mode == "mock":
+            checks_failed.append(f"MOCK_DATA detected market {market_id_check} data_mode={data_mode} is_mock={is_mock} - MUST NEVER reach live execution")
+            return GuardResult(False, f"MOCK_DATA {market_id_check} blocked - cannot reach execution", 0, 0, checks_passed, checks_failed)
+        checks_passed.append(f"data_mode {data_mode} not mock - LIVE/PAPER OK")
+
         # Extract risk-approved values - these are the ONLY values that matter
-        # LLM proposal is ignored for amounts
         max_spend = risk_approved.get("max_spend_usd", 0)
         max_price = risk_approved.get("max_price", 0)
         market_id = risk_approved.get("market_id", proposal.get("market_id", "unknown"))

@@ -10,7 +10,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class VeynorAdapter(MarketAdapter):
     def __init__(self, api_key: str = None):
@@ -44,20 +44,26 @@ class VeynorAdapter(MarketAdapter):
             markets = []
             for i, m in enumerate(mock_markets[:target_count]):
                 markets.append(Market(
-                    id=f"veynor-{i}",
+                    id=f"veynor-MOCK-{i}",
                     source=MarketSource.POLYMARKET,
                     question=m["question"],
                     outcomes=["YES", "NO"],
                     outcome_prices=[m["price"], 1-m["price"]],
-                    tokens=[Token(token_id=f"veynor-{i}", outcome="YES", price=m["price"])],
+                    tokens=[Token(token_id=f"veynor-MOCK-{i}", outcome="YES", price=m["price"])],
                     volume=50000,
                     volume_24h=20000,
                     liquidity=30000,
                     active=True,
                     closed=False,
                     event_slug=f"veynor-{i}",
-                    raw={"venue": "veynor", "whale_signal": m["whale"], "arb_spread": m["arb"], "category": "intelligence", "credits": self.credits_free}
-                ))
+                    raw={"venue": "veynor", "whale_signal": m["whale"], "arb_spread": m["arb"], "category": "intelligence", "credits": self.credits_free, "data_mode": "mock", "data_source": "veynor_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"}
+                ,
+                venue_id="veynor",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="veynor_mock_fallback",
+                is_mock=True
+            ))
             logger.info(f"Veynor discovered {len(markets)} intelligence markets (whale trades, smart money, arb) free tier {self.credits_free} credits/month")
             return markets
         except Exception as e:

@@ -8,7 +8,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class PionexAdapter(MarketAdapter):
     def __init__(self, api_key: str = None, api_secret: str = None):
@@ -42,7 +42,7 @@ class PionexAdapter(MarketAdapter):
         for i, sym in enumerate(symbols[:target_count]):
             prob = 0.5 + (i*0.02 - 0.06)
             markets.append(Market(
-                id=f"pionex-{sym}",
+                id=f"pionex-MOCK-{sym}",
                 source=MarketSource.POLYMARKET,
                 question=f"Will {sym} grid bot profitable? Pionex built-in bots",
                 outcomes=["YES", "NO"],
@@ -54,7 +54,13 @@ class PionexAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=sym,
-                raw={"venue": "pionex", "symbol": sym, "type": "spot", "category": "crypto", "bots": ["grid", "DCA", "infinity_grid"], "rate_limit": "10 req/sec"}
+                raw={"venue": "pionex", "symbol": sym, "type": "spot", "category": "crypto", "bots": ["grid", "DCA", "infinity_grid"], "rate_limit": "10 req/sec", "data_mode": "mock", "data_source": "pionex_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"}
+            ,
+                venue_id="pionex",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="pionex_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"Pionex discovered {len(markets)} markets (rate limit {self.rate_limit}, built-in bots grid/DCA)")
         return markets

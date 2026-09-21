@@ -1436,7 +1436,11 @@ async def api_v3_opportunities(target_per_venue: int = 100, max_trades: int = 3)
                     "edge": opp.effective_edge,
                     "score": opp.score,
                     "side": opp.side,
-                    "confidence": opp.confidence
+                    "confidence": opp.confidence,
+                    "data_mode": getattr(opp.market, 'data_mode', 'live').value if hasattr(getattr(opp.market, 'data_mode', 'live'), 'value') else str(getattr(opp.market, 'data_mode', 'live')),
+                    "is_mock": getattr(opp.market, 'is_mock', False),
+                    "data_source": getattr(opp.market, 'data_source', ''),
+                    "market_id": opp.market.id
                 } for opp in scan_result.final_selected
             ],
             "reasoning": scan_result.reasoning,
@@ -5367,18 +5371,24 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                     document.getElementById('v3-best-venue').textContent = (data.best.venue||'DO NOTHING') + ' ' + (data.best.strategy||'');
                     document.getElementById('v3-best-edge').textContent = 'Edge ' + (data.best.edge*100).toFixed(1) + '% | Score ' + (data.best.score||0).toFixed(3) + ' | ' + (data.best.question||'').slice(0,60);
                 }
-                let html = '<tr><th>Venue</th><th>Strategy</th><th>Question</th><th>Edge</th><th>Score</th><th>Side</th><th>Conf</th></tr>';
+                let html = '<tr><th>Venue</th><th>Strategy</th><th>Question</th><th>Edge</th><th>Score</th><th>Side</th><th>Conf</th><th>Data Mode</th><th>Market ID</th></tr>';
                 if (data.final_selected && data.final_selected.length > 0) {
                     data.final_selected.forEach(opp => {
-                        html += '<tr><td><strong>' + escapeHTML(opp.venue) + '</strong></td><td>' + escapeHTML(opp.strategy||'') + '</td><td style="font-size: 11px;">' + escapeHTML(opp.question.slice(0,60)) + '</td><td class="mono positive">' + (opp.edge*100).toFixed(1) + '%</td><td class="mono">' + (opp.score||0).toFixed(3) + '</td><td>' + escapeHTML(opp.side||'') + '</td><td>' + (opp.confidence||0).toFixed(2) + '</td></tr>';
+                        const dm = (opp.data_mode||'live').toUpperCase();
+                        let badgeColor = 'green';
+                        if (dm === 'MOCK') badgeColor = 'red';
+                        else if (dm === 'PAPER') badgeColor = 'yellow';
+                        const dmBadge = '<span class="status-pill ' + (badgeColor==='green'?'ok':badgeColor==='red'?'error':'warn') + '">' + escapeHTML(dm) + (opp.is_mock?' MOCK':'' ) + '</span>';
+                        const src = escapeHTML(opp.data_source||'');
+                        html += '<tr><td><strong>' + escapeHTML(opp.venue) + '</strong></td><td>' + escapeHTML(opp.strategy||'') + '</td><td style="font-size: 11px;">' + escapeHTML(opp.question.slice(0,60)) + '</td><td class="mono positive">' + (opp.edge*100).toFixed(1) + '%</td><td class="mono">' + (opp.score||0).toFixed(3) + '</td><td>' + escapeHTML(opp.side||'') + '</td><td>' + (opp.confidence||0).toFixed(2) + '</td><td>' + dmBadge + '<br><span style="font-size:10px;">' + src + '</span></td><td style="font-size:10px;" class="mono">' + escapeHTML(opp.market_id||'') + '</td></tr>';
                     });
                 } else {
-                    html += '<tr><td colspan=7 style="color: var(--text3);">No tradeable opportunities - DO NOTHING is successful. Scanned ' + (data.total_scanned||0) + ' across ' + (data.venue_reports?.length||0) + ' venues, ' + (data.total_candidates||0) + ' candidates, ' + (data.total_tradeable||0) + ' tradeable after fees/liquidity/uncertainty/risk</td></tr>';
+                    html += '<tr><td colspan=9 style="color: var(--text3);">No tradeable opportunities - DO NOTHING is successful. Scanned ' + (data.total_scanned||0) + ' across ' + (data.venue_reports?.length||0) + ' venues, ' + (data.total_candidates||0) + ' candidates, ' + (data.total_tradeable||0) + ' tradeable after fees/liquidity/uncertainty/risk</td></tr>';
                 }
                 // Add venue breakdown
                 if (data.venue_reports) {
                     data.venue_reports.forEach(r => {
-                        html += '<tr style="background: var(--bg3);"><td colspan=7 style="font-size: 11px;">' + escapeHTML(r.venue_id) + ': discovered ' + r.discovered + ', candidates ' + r.candidates + ', tradeable ' + r.tradeable + ', avg_edge ' + (r.avg_edge*100).toFixed(1) + '% | Top: ' + escapeHTML((r.top?.question||'none').slice(0,60)) + ' edge ' + (r.top?.edge*100||0).toFixed(1) + '% score ' + (r.top?.score||0).toFixed(3) + ' strategy ' + escapeHTML(r.top?.strategy||'') + '</td></tr>';
+                        html += '<tr style="background: var(--bg3);"><td colspan=9 style="font-size: 11px;">' + escapeHTML(r.venue_id) + ': discovered ' + r.discovered + ', candidates ' + r.candidates + ', tradeable ' + r.tradeable + ', avg_edge ' + (r.avg_edge*100).toFixed(1) + '% | Top: ' + escapeHTML((r.top?.question||'none').slice(0,60)) + ' edge ' + (r.top?.edge*100||0).toFixed(1) + '% score ' + (r.top?.score||0).toFixed(3) + ' strategy ' + escapeHTML(r.top?.strategy||'') + '</td></tr>';
                     });
                 }
                 document.getElementById('v3-opportunities-table').innerHTML = html;

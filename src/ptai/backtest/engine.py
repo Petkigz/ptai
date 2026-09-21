@@ -27,6 +27,11 @@ class BacktestResult:
     sharpe: float
     trades: List[Dict] = field(default_factory=list)
     equity_curve: List[Dict] = field(default_factory=list)
+    # V9 FIX #6: Mark synthetic vs real
+    is_synthetic: bool = False
+    data_mode: str = "live"  # live or mock
+    warnings: List[str] = field(default_factory=list)
+    is_production_grade: bool = False
 
 class BacktestEngine:
     """
@@ -37,13 +42,16 @@ class BacktestEngine:
         self.storage = storage
         logger.info("BacktestEngine initialized")
     
-    def run(self, strategy_config: Dict[str, Any], historical_markets: List[Dict] = None, days: int = 30) -> BacktestResult:
+    def run(self, strategy_config: Dict[str, Any], historical_markets: List[Dict] = None, days: int = 30, allow_synthetic: bool = False) -> BacktestResult:
         """
-        Run backtest for N days
+        V9 FIX #6: Replace synthetic backtester with real historical data requirement
+        Previously generated random synthetic markets if no data - misleading
+        Now: requires real historical data, or if allow_synthetic=True clearly marks as synthetic and warns not production-grade
+        
         strategy_config: {min_edge: 0.08, max_pos_pct: 0.06, kelly_fraction: 0.5, model: "qwen/qwen3-32b"}
-        historical_markets: list of markets with resolved outcomes (if None, mock)
+        historical_markets: list of markets with resolved outcomes (if None, must set allow_synthetic=True to generate mock, but result marked synthetic)
         """
-        logger.info(f"Backtest starting: {strategy_config} for {days} days")
+        logger.info(f"Backtest starting: {strategy_config} for {days} days - V9 requires real historical data")
         
         initial = strategy_config.get("bankroll", 50.0)
         bankroll = initial
@@ -57,29 +65,40 @@ class BacktestEngine:
         losing = 0
         max_dd = 0
         peak = bankroll
+        is_synthetic = False
         
-        # Mock historical data if not provided
+        # V9 FIX #6: Require real historical data, synthetic only if explicitly allowed and marked
         if not historical_markets:
-            # Generate mock 30 days * 10 markets per day
+            if not allow_synthetic:
+                logger.error("Backtest requires real historical markets with resolved outcomes - no synthetic data allowed by default V9 FIX")
+                raise ValueError(
+                    "Backtest requires real historical data: historical_markets must be provided with resolved outcomes. "
+                    "Synthetic random markets are misleading and not production-grade. "
+                    "If you want synthetic for development, set allow_synthetic=True but result will be marked synthetic and should NOT be used for live trading decisions. "
+                    "Real historical data needs: fees, spreads, slippage, partial fills, latency, liquidity, position limits, resolution timing, bankroll constraints"
+                )
+            # Synthetic path - only if explicitly allowed
+            is_synthetic = True
+            logger.warning("Backtest using SYNTHETIC random markets - NOT production-grade, misleading results, DO NOT use for live trading V9")
             historical_markets = []
             for day in range(days):
                 for i in range(10):
-                    # Mock market with random edge and outcome
                     market_price = random.uniform(0.2, 0.8)
                     fair_value = market_price + random.uniform(-0.15, 0.15)
                     edge = fair_value - market_price
-                    # Simulate actual outcome: if fair > market, more likely YES wins
                     actual_prob = fair_value
                     actual_outcome = 1 if random.random() < actual_prob else 0
                     
                     historical_markets.append({
                         "day": day,
-                        "question": f"Mock market day {day} #{i}",
+                        "question": f"SYNTHETIC Mock market day {day} #{i} - NOT REAL DATA - V9 WARNING",
                         "market_price": market_price,
                         "fair_value": fair_value,
                         "edge": edge,
                         "actual_outcome": actual_outcome,
-                        "confidence": random.uniform(0.5, 0.9)
+                        "confidence": random.uniform(0.5, 0.9),
+                        "data_mode": "mock",
+                        "is_synthetic": True
                     })
         
         for market in historical_markets:
@@ -144,8 +163,14 @@ class BacktestEngine:
         # Sharpe mock
         sharpe = (total_pnl_pct / max(0.01, max_dd)) if max_dd > 0 else total_pnl_pct * 10
         
+        warnings = []
+        if is_synthetic:
+            warnings.append("SYNTHETIC DATA - NOT production-grade, random markets, no real fees/spreads/slippage/latency/liquidity")
+            warnings.append("DO NOT use synthetic backtest for live trading decisions - misleading results")
+            warnings.append("Real backtest needs: historical market/orderbook data, fees, spreads, slippage, partial fills, latency, liquidity, position limits, resolution timing, bankroll constraints")
+        
         result = BacktestResult(
-            strategy_name=strategy_config.get("name", "Default Strategy"),
+            strategy_name=strategy_config.get("name", "Default Strategy") + (" [SYNTHETIC - NOT PRODUCTION-GRADE]" if is_synthetic else " [REAL DATA]"),
             start_date=(datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
             end_date=datetime.now(timezone.utc).isoformat(),
             initial_bankroll=initial,
@@ -159,10 +184,17 @@ class BacktestEngine:
             avg_edge=avg_edge,
             max_drawdown=max_dd,
             sharpe=sharpe,
-            trades=trades[-50:],  # last 50
-            equity_curve=equity_curve
+            trades=trades[-50:],
+            equity_curve=equity_curve,
+            is_synthetic=is_synthetic,
+            data_mode="mock" if is_synthetic else "live",
+            warnings=warnings,
+            is_production_grade=not is_synthetic and len(historical_markets) >= 100
         )
         
-        logger.success(f"Backtest done: {initial} -> {bankroll:.2f} PnL {total_pnl:.2f} {total_pnl_pct:.1%} win rate {win_rate:.1f}% trades {len(trades)}")
+        if is_synthetic:
+            logger.warning(f"Backtest done SYNTHETIC: {initial} -> {bankroll:.2f} PnL {total_pnl:.2f} {total_pnl_pct:.1%} win rate {win_rate:.1f}% trades {len(trades)} - NOT PRODUCTION-GRADE")
+        else:
+            logger.success(f"Backtest done REAL DATA: {initial} -> {bankroll:.2f} PnL {total_pnl:.2f} {total_pnl_pct:.1%} win rate {win_rate:.1f}% trades {len(trades)} - production-grade: {result.is_production_grade}")
         
         return result

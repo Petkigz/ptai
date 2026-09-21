@@ -8,7 +8,7 @@ import requests
 from datetime import datetime
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, Token, MarketSource
+from ..markets.base import Market, Token, MarketSource, DataMode
 
 
 class CryptoAdapter(MarketAdapter):
@@ -81,13 +81,18 @@ class CryptoAdapter(MarketAdapter):
                         ],
                         volume=volume_24h,
                         volume_24h=volume_24h,
-                        liquidity=volume_24h * 0.1,  # estimate
+                        liquidity=volume_24h * 0.1,
                         active=True,
                         closed=False,
                         slug=symbol.lower(),
                         event_slug=f"crypto-{self.exchange}",
                         market_type="binary",
-                        raw={"venue": f"crypto_{self.exchange}", "symbol": symbol, "last_price": last_price, "change_pct": price_change_pct, "real": True}
+                        raw={"venue": f"crypto_{self.exchange}", "symbol": symbol, "last_price": last_price, "change_pct": price_change_pct, "real": True, "data_mode": "live", "data_source": "binance_api"},
+                        venue_id=f"crypto_{self.exchange}",
+                        venue_type="financial",
+                        data_mode=DataMode.LIVE,
+                        data_source="binance_api",
+                        is_mock=False
                     )
                     markets.append(m)
                 if markets:
@@ -109,8 +114,8 @@ class CryptoAdapter(MarketAdapter):
             m = Market(
                 id=f"CRYPTO-MOCK-{symbol}",
                 source=MarketSource.PREDICTIT,
-                question=f"Will {symbol} close higher in 24h? (Crypto {self.exchange})",
-                description=f"Mock crypto {symbol} last ${price:.2f} change {change:.1f}%",
+                question=f"Will {symbol} close higher in 24h? (Crypto {self.exchange}) - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
+                description=f"Mock crypto {symbol} last ${price:.2f} change {change:.1f}% - MOCK",
                 outcomes=["YES", "NO"],
                 outcome_prices=[prob_up, 1-prob_up],
                 tokens=[
@@ -125,7 +130,12 @@ class CryptoAdapter(MarketAdapter):
                 slug=symbol.lower(),
                 event_slug=f"crypto-{self.exchange}",
                 market_type="binary",
-                raw={"mock": True, "venue": f"crypto_{self.exchange}", "symbol": symbol}
+                raw={"mock": True, "venue": f"crypto_{self.exchange}", "symbol": symbol, "data_mode": "mock", "data_source": "crypto_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
+                venue_id=f"crypto_{self.exchange}",
+                venue_type="financial",
+                data_mode=DataMode.MOCK,
+                data_source="crypto_mock_fallback",
+                is_mock=True
             )
             markets.append(m)
         

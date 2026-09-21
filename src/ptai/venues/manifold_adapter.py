@@ -9,7 +9,7 @@ import requests
 from datetime import datetime
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, Token, MarketSource
+from ..markets.base import Market, Token, MarketSource, DataMode
 
 
 MANIFOLD_API = "https://api.manifold.markets/v0"
@@ -71,7 +71,7 @@ class ManifoldAdapter(MarketAdapter):
 
             market = Market(
                 id=str(raw.get("id")),
-                source=MarketSource.PREDICTIT,  # Reuse for non-polymarket generic, will add MANIFOLD
+                source=MarketSource.PREDICTIT,
                 question=question,
                 description=raw.get("description", "")[:500] if raw.get("description") else "",
                 outcomes=["YES", "NO"],
@@ -87,7 +87,12 @@ class ManifoldAdapter(MarketAdapter):
                 event_slug="",
                 condition_id=str(raw.get("id")),
                 market_type="binary",
-                raw=raw
+                raw={**raw, "venue": "manifold", "data_mode": "live", "data_source": "manifold_api"},
+                venue_id="manifold",
+                venue_type="prediction",
+                data_mode=DataMode.LIVE,
+                data_source="manifold_api",
+                is_mock=False
             )
             # Override source string
             market.raw["venue"] = "manifold"
@@ -148,7 +153,7 @@ class ManifoldAdapter(MarketAdapter):
                 id=f"MANIFOLD-MOCK-{i:04d}",
                 source=MarketSource.PREDICTIT,
                 question=question,
-                description=f"Manifold mock market {i}",
+                description=f"Manifold mock market {i} - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
                 outcomes=["YES", "NO"],
                 outcome_prices=[price, 1-price],
                 tokens=[
@@ -163,7 +168,12 @@ class ManifoldAdapter(MarketAdapter):
                 slug=f"manifold-mock-{i}",
                 event_slug=f"manifold-event-{i//5}",
                 market_type="binary",
-                raw={"mock": True, "venue": "manifold"}
+                raw={"mock": True, "venue": "manifold", "data_mode": "mock", "data_source": "manifold_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
+                venue_id="manifold",
+                venue_type="prediction",
+                data_mode=DataMode.MOCK,
+                data_source="manifold_mock_fallback",
+                is_mock=True
             )
             markets.append(m)
         

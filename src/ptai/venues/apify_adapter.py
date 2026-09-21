@@ -8,7 +8,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class ApifyAdapter(MarketAdapter):
     def __init__(self, api_token: str = None):
@@ -38,19 +38,25 @@ class ApifyAdapter(MarketAdapter):
             # Create synthetic arb opportunity as market
             price = arb["polymarket"]
             markets.append(Market(
-                id=f"apify-arb-{i}",
+                id=f"apify-MOCK-arb-{i}",
                 source=MarketSource.POLYMARKET,
                 question=f"Arb: {arb['event']} Poly {arb['polymarket']} Kalshi {arb['kalshi']} PredictIt {arb['predictit']} edge {arb['fee_adjusted_edge']*100:.1f}% - Apify scanner",
                 outcomes=["YES", "NO"],
                 outcome_prices=[price, 1-price],
-                tokens=[Token(token_id=f"apify-{i}", outcome="YES", price=price)],
+                tokens=[Token(token_id=f"apify-MOCK-{i}", outcome="YES", price=price)],
                 volume=10000,
                 volume_24h=5000,
                 liquidity=15000,
                 active=True,
                 closed=False,
                 event_slug=arb["event"],
-                raw={"venue": "apify", "arb": arb, "type": "cross_venue_arb", "fee_adjusted_edge": arb["fee_adjusted_edge"], "pricing": "$2 per 1000 matched pairs"}
+                raw={"venue": "apify", "arb": arb, "type": "cross_venue_arb", "fee_adjusted_edge": arb["fee_adjusted_edge"], "pricing": "$2 per 1000 matched pairs", "data_mode": "mock", "data_source": "apify_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible"}
+            ,
+                venue_id="apify",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="apify_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"Apify discovered {len(markets)} fee-adjusted arb opportunities ($2 per 1000 pairs, expensive for $50 but useful if scale)")
         return markets

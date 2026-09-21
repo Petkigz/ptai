@@ -8,7 +8,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class AFXAdapter(MarketAdapter):
     def __init__(self, wallet_address: str = None, private_key: str = None):
@@ -40,7 +40,7 @@ class AFXAdapter(MarketAdapter):
         for i, sym in enumerate(symbols[:target_count]):
             prob = 0.5 + (i*0.02 - 0.04)
             markets.append(Market(
-                id=f"afx-{sym}",
+                id=f"afx-MOCK-{sym}",
                 source=MarketSource.POLYMARKET,
                 question=f"Will {sym} funding positive? AFX DEX perpetual",
                 outcomes=["YES", "NO"],
@@ -52,7 +52,13 @@ class AFXAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=sym,
-                raw={"venue": "afx_dex", "symbol": sym, "type": "perpetual", "category": "crypto", "auth": "EIP-712 wallet-signed", "min_deposit": 10, "min_withdrawal": 2}
+                raw={"venue": "afx_dex", "symbol": sym, "type": "perpetual", "category": "crypto", "auth": "EIP-712 wallet-signed", "min_deposit": 10, "min_withdrawal": 2, "data_mode": "mock", "data_source": "afx_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"}
+            ,
+                venue_id="afx",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="afx_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"AFX DEX discovered {len(markets)} perpetual markets (min deposit {self.min_deposit} USDC)")
         return markets

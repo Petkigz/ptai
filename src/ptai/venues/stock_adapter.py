@@ -8,7 +8,7 @@ import requests
 from datetime import datetime
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, Token, MarketSource
+from ..markets.base import Market, Token, MarketSource, DataMode
 
 
 class StockAdapter(MarketAdapter):
@@ -70,8 +70,8 @@ class StockAdapter(MarketAdapter):
             m = Market(
                 id=f"STOCK-MOCK-{symbol}",
                 source=MarketSource.PREDICTIT,
-                question=f"Will {symbol} ({name}) close higher tomorrow? (Stock momentum/event)",
-                description=f"Mock stock {symbol} {name} last ${price:.2f} change {change:.1f}% vol ${vol:,.0f}",
+                question=f"Will {symbol} ({name}) close higher tomorrow? (Stock momentum/event) - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
+                description=f"Mock stock {symbol} {name} last ${price:.2f} change {change:.1f}% vol ${vol:,.0f} - MOCK broker={self.broker}",
                 outcomes=["YES", "NO"],
                 outcome_prices=[prob_up, 1-prob_up],
                 tokens=[
@@ -86,7 +86,12 @@ class StockAdapter(MarketAdapter):
                 slug=symbol.lower(),
                 event_slug=f"stock-{self.broker}",
                 market_type="binary",
-                raw={"mock": True, "venue": f"stock_{self.broker}", "symbol": symbol, "name": name, "last_price": price, "change_pct": change}
+                raw={"mock": True, "venue": f"stock_{self.broker}", "symbol": symbol, "name": name, "last_price": price, "change_pct": change, "data_mode": "mock", "data_source": f"stock_{self.broker}_mock", "is_mock": True, "safety": "MOCK_DATA - broker mock, must be impossible to reach live execution"},
+                venue_id=f"stock_{self.broker}",
+                venue_type="financial",
+                data_mode=DataMode.MOCK,
+                data_source=f"stock_{self.broker}_mock",
+                is_mock=True
             )
             markets.append(m)
         

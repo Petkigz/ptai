@@ -13,7 +13,7 @@ import hashlib
 import time
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class WhiteBITAdapter(MarketAdapter):
     def __init__(self, api_key: str = None, api_secret: str = None):
@@ -74,7 +74,12 @@ class WhiteBITAdapter(MarketAdapter):
                             active=True,
                             closed=False,
                             event_slug=symbol,
-                            raw={"venue": "whitebit", "symbol": symbol, "last_price": last, "type": "spot", "category": "crypto"}
+                            raw={"venue": "whitebit", "symbol": symbol, "last_price": last, "type": "spot", "category": "crypto", "data_mode": "live", "data_source": "whitebit_api", "is_mock": False},
+                            venue_id="whitebit",
+                            venue_type="financial",
+                            data_mode=DataMode.LIVE,
+                            data_source="whitebit_api",
+                            is_mock=False
                         ))
                     except:
                         continue
@@ -90,9 +95,9 @@ class WhiteBITAdapter(MarketAdapter):
         for i, sym in enumerate(symbols[:target_count]):
             prob = 0.5 + (i*0.02 - 0.06)
             markets.append(Market(
-                id=f"whitebit-{sym}",
+                id=f"whitebit-MOCK-{sym}",
                 source=MarketSource.POLYMARKET,
-                question=f"Will {sym} close higher? (WhiteBIT margin/futures)",
+                question=f"Will {sym} close higher? (WhiteBIT margin/futures) - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
                 outcomes=["YES", "NO"],
                 outcome_prices=[prob, 1-prob],
                 tokens=[Token(token_id=sym, outcome="YES", price=prob)],
@@ -102,25 +107,74 @@ class WhiteBITAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=sym,
-                raw={"venue": "whitebit", "symbol": sym, "type": "futures" if "PERP" in sym else "spot", "category": "crypto", "leverage": "10x margin 100x futures"}
+                raw={"venue": "whitebit", "symbol": sym, "type": "futures" if "PERP" in sym else "spot", "category": "crypto", "leverage": "10x margin 100x futures", "data_mode": "mock", "data_source": "whitebit_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
+                venue_id="whitebit",
+                venue_type="financial",
+                data_mode=DataMode.MOCK,
+                data_source="whitebit_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"WhiteBIT mock discovered {len(markets)} markets")
         return markets
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
+        # V9 FIX #1 & #3: Real vs mock orderbook with is_real flag
         symbol = market.raw.get("symbol", market.event_slug)
+        # Try real API for LIVE markets
+        is_mock_market = getattr(market, 'is_mock', False) or "MOCK" in market.id
+        if not is_mock_market:
+            try:
+                import requests
+                resp = requests.get(f"{self.base_url}/public/orderbook/{symbol}", timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    best_bid = float(bids[0][0]) if bids else market.best_price - 0.001
+                    best_ask = float(asks[0][0]) if asks else market.best_price + 0.001
+                    return {
+                        "market_id": market.id,
+                        "venue_id": "whitebit",
+                        "symbol": symbol,
+                        "bid": best_bid,
+                        "ask": best_ask,
+                        "spread": best_ask - best_bid,
+                        "spread_pct": (best_ask - best_bid) / best_bid if best_bid else 0.002,
+                        "bid_size": 5000,
+                        "ask_size": 5000,
+                        "depth": market.liquidity,
+                        "venue": "whitebit",
+                        "auth": "HMAC-SHA512",
+                        "source": "whitebit_api_real",
+                        "is_real": True,
+                        "is_mock": False,
+                        "executable": True,
+                        "data_mode": "live"
+                    }
+            except Exception as e:
+                logger.debug(f"WhiteBIT orderbook real fetch failed {market.id}: {e}")
+
+        # Mock fallback - marked not executable
         return {
             "market_id": market.id,
+            "venue_id": "whitebit",
             "symbol": symbol,
             "bid": market.best_price - 0.001,
             "ask": market.best_price + 0.001,
             "spread": 0.002,
+            "spread_pct": 0.002,
             "bid_size": 5000,
             "ask_size": 5000,
             "depth": market.liquidity,
             "venue": "whitebit",
             "auth": "HMAC-SHA512",
-            "note": "No testnet - test with min orders low leverage"
+            "note": "No testnet - test with min orders low leverage - MOCK estimation" if is_mock_market else "Estimation - real API failed",
+            "source": "whitebit_mock_fallback" if is_mock_market else "whitebit_estimation",
+            "is_real": False,
+            "is_mock": True if is_mock_market else False,
+            "executable": False if is_mock_market else False,
+            "data_mode": "mock" if is_mock_market else "live",
+            "warning": "MOCK_DATA - cannot execute" if is_mock_market else "Estimation - verify executable price"
         }
 
     async def get_portfolio(self) -> Dict[str, Any]:

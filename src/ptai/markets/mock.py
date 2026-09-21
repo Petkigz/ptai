@@ -5,7 +5,7 @@ from typing import List
 import random
 from datetime import datetime, timedelta
 
-from .base import Market, Token, MarketSource
+from .base import Market, Token, MarketSource, DataMode
 
 MOCK_QUESTIONS = [
     "Will Bitcoin hit $100k by end of month?",
@@ -42,10 +42,10 @@ def generate_mock_markets(count: int = 100) -> List[Market]:
         no_token = Token(token_id=f"mock_no_{i}_{random.randint(100000,999999)}", outcome="NO", price=no_price)
 
         market = Market(
-            id=f"mock_{i}",
+            id=f"MOCK-mock_{i}",
             source=MarketSource.POLYMARKET,
-            question=question,
-            description=f"Mock market for testing: {question}",
+            question=question + " - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
+            description=f"Mock market for testing: {question} - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
             outcomes=["YES", "NO"],
             outcome_prices=[yes_price, no_price],
             tokens=[yes_token, no_token],
@@ -59,7 +59,12 @@ def generate_mock_markets(count: int = 100) -> List[Market]:
             event_slug=f"mock-event-{i}",
             condition_id=f"0xmock{i}",
             market_type="binary",
-            raw={"mock": True}
+            raw={"mock": True, "venue": "mock", "data_mode": "mock", "data_source": "mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
+            venue_id="mock",
+            venue_type="prediction",
+            data_mode=DataMode.MOCK,
+            data_source="mock_fallback",
+            is_mock=True
         )
         markets.append(market)
     return markets

@@ -7,7 +7,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class SimmerAdapter(MarketAdapter):
     def __init__(self, api_key: str = None, use_virtual: bool = True):
@@ -47,19 +47,25 @@ class SimmerAdapter(MarketAdapter):
         for i, q in enumerate(mock_questions[:target_count]):
             price = 0.45 + i*0.05
             markets.append(Market(
-                id=f"simmer-{i}",
+                id=f"simmer-MOCK-{i}",
                 source=MarketSource.POLYMARKET,
                 question=q,
                 outcomes=["YES", "NO"],
                 outcome_prices=[price, 1-price],
-                tokens=[Token(token_id=f"simmer-{i}-yes", outcome="YES", price=price)],
+                tokens=[Token(token_id=f"simmer-MOCK-{i}-yes", outcome="YES", price=price)],
                 volume=2000,
                 volume_24h=500,
                 liquidity=3000,
                 active=True,
                 closed=False,
                 event_slug=f"simmer-event-{i}",
-                raw={"venue": "simmer", "virtual": self.use_virtual, "category": "ai"}
+                raw={"venue": "simmer", "virtual": self.use_virtual, "category": "ai", "data_mode": "mock", "data_source": "simmer_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"}
+            ,
+                venue_id="simmer",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="simmer_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"Simmer discovered {len(markets)} markets (virtual={self.use_virtual})")
         return markets

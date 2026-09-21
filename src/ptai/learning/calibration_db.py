@@ -19,13 +19,53 @@ class CalibrationDB(CalibrationEngine):
         self.load()
 
     def load(self):
+        """
+        V9 FIX #5: Make calibration genuinely persistent - actually restore points
+        Previously only logged count, didn't restore into memory - learning lost after restart
+        """
         if self.db_path.exists():
             try:
                 data = json.loads(self.db_path.read_text())
-                # Would load points from file
-                logger.info(f"Calibration DB loaded from {self.db_path}: {len(data.get('points', []))} points")
+                points_data = data.get('points', [])
+                # Actually restore points into memory
+                from ..intelligence.calibration import CalibrationPoint
+                restored = 0
+                for pd in points_data:
+                    try:
+                        # Parse timestamp
+                        ts_str = pd.get('timestamp')
+                        if ts_str:
+                            ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        else:
+                            ts = datetime.now(timezone.utc)
+                        resolved_at = None
+                        if pd.get('resolved_at'):
+                            resolved_at = datetime.fromisoformat(pd['resolved_at'].replace('Z', '+00:00'))
+                        point = CalibrationPoint(
+                            forecast_id=pd.get('forecast_id', pd.get('id', 'unknown')),
+                            market_id=pd.get('market_id', 'unknown'),
+                            question=pd.get('question', ''),
+                            forecast_prob=float(pd.get('forecast_prob', 0.5)),
+                            confidence=float(pd.get('confidence', 0.5)),
+                            market_price=float(pd.get('market_price', pd.get('forecast_prob', 0.5))),
+                            category=pd.get('category', 'default'),
+                            timestamp=ts,
+                            actual_outcome=pd.get('actual_outcome'),
+                            resolved_at=resolved_at
+                        )
+                        self.points.append(point)
+                        restored += 1
+                    except Exception as e:
+                        logger.debug(f"Failed to restore calibration point {pd.get('forecast_id')}: {e}")
+                        continue
+                # Restore category adjustments
+                if 'category_adjustments' in data:
+                    self.category_adjustments.update(data['category_adjustments'])
+                logger.info(f"Calibration DB loaded from {self.db_path}: {len(points_data)} points in file, {restored} restored to memory - V9 FIX persistent")
             except Exception as e:
                 logger.warning(f"Calibration DB load failed: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
 
     def save(self):
         try:

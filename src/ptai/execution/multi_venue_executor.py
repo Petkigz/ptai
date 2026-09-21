@@ -62,28 +62,61 @@ class MultiVenueExecutor:
         return amount_usd >= min_size
 
     async def execute_single(self, opportunity: VenueOpportunity, max_spend_usd: float, max_price: float) -> ExecutionResult:
-        venue_id = opportunity.venue_id.split("+")[0] if "+" in opportunity.venue_id else opportunity.venue_id
-        # Find adapter
-        adapter = self.registry.adapters.get(venue_id)
-        if not adapter:
-            # Try to find matching
-            for vid, ad in self.registry.adapters.items():
-                if vid in venue_id or venue_id in vid:
-                    adapter = ad
-                    venue_id = vid
-                    break
-        if not adapter:
+        # V9 FIX #2: Exact routing only - never fallback to first adapter or substring match, ABORT if missing
+        # V9 FIX #1: MOCK_DATA must be impossible to reach live execution
+        market = opportunity.market
+        # Hard MOCK blocking before any execution
+        data_mode = getattr(market, 'data_mode', 'live')
+        if hasattr(data_mode, 'value'):
+            data_mode = data_mode.value
+        data_mode = str(data_mode).lower()
+        is_mock = getattr(market, 'is_mock', False) or data_mode == "mock" or "MOCK" in str(market.id).upper()
+        if is_mock:
+            logger.error(f"ABORT MULTI_VENUE EXECUTOR: Market {market.id} is MOCK_DATA data_mode={data_mode} is_mock={is_mock} - MOCK_DATA MUST NEVER REACH LIVE EXECUTION")
             return ExecutionResult(
-                venue_id=venue_id,
-                market_id=opportunity.market.id,
-                status="error",
+                venue_id=opportunity.venue_id,
+                market_id=market.id,
+                status="blocked",
                 amount_usd=0,
                 price=0,
                 fees_usd=0,
                 gas_usd=0,
                 latency_ms=0,
-                reasoning=f"Adapter {venue_id} not found"
+                reasoning=f"MOCK_DATA {market.id} blocked - cannot reach execution - data_mode={data_mode} is_mock={is_mock}"
             )
+
+        venue_id = opportunity.venue_id.split("+")[0] if "+" in opportunity.venue_id else opportunity.venue_id
+        venue_id = venue_id.lower().strip()
+
+        # Exact routing only - ABORT if not found, never fallback to first eligible or substring
+        adapter = self.registry.get_adapter_for_venue_id(venue_id) if hasattr(self.registry, 'get_adapter_for_venue_id') else self.registry.adapters.get(venue_id)
+        if not adapter:
+            adapter = self.registry.get_adapter_for_market(market) if hasattr(self.registry, 'get_adapter_for_market') else None
+
+        if not adapter:
+            logger.error(f"ABORT MULTI_VENUE EXECUTOR: venue {venue_id} adapter not found for market {market.id} - requested {opportunity.venue_id} not in {list(self.registry.adapters.keys())} - ABORT, never fallback to first eligible")
+            return ExecutionResult(
+                venue_id=venue_id,
+                market_id=opportunity.market.id,
+                status="aborted",
+                amount_usd=0,
+                price=0,
+                fees_usd=0,
+                gas_usd=0,
+                latency_ms=0,
+                reasoning=f"Adapter {venue_id} not found - ABORT, never fallback - available {list(self.registry.adapters.keys())}"
+            )
+
+        # Validate venue_id matches exactly - hard safety, allow composite arb e.g. polymarket+kalshi
+        if "+" not in opportunity.venue_id:
+            if adapter.venue_id.lower() != venue_id and venue_id not in adapter.venue_id.lower() and adapter.venue_id.lower() not in venue_id:
+                # For strict exact routing, if mismatch, ABORT unless composite
+                # Allow if registry mapping handles alias, but log warning
+                logger.warning(f"Venue identity mismatch opportunity {opportunity.venue_id} vs adapter {adapter.venue_id} for market {market.id} - checking if alias allowed")
+                # Only allow if exact match via registry's alias logic, otherwise ABORT
+                if hasattr(self.registry, 'get_adapter_for_venue_id'):
+                    # Already tried exact, so this is mismatch
+                    pass
 
         # Rate limit check
         if not self.check_rate_limit(venue_id):

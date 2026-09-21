@@ -9,7 +9,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class CCXTUnifiedAdapter(MarketAdapter):
     def __init__(self, venues: List[str] = None):
@@ -47,20 +47,26 @@ class CCXTUnifiedAdapter(MarketAdapter):
             for i in range(target_count // len(self.venues)):
                 price = 0.5 + (i*0.01 - 0.05)
                 markets.append(Market(
-                    id=f"ccxt-{venue}-{i}",
+                    id=f"ccxt-MOCK-{venue}-{i}",
                     source=MarketSource.POLYMARKET,
                     question=f"CCXT unified {venue} market {i} - one strategy reads odds across multiple venues",
                     outcomes=["YES", "NO"],
                     outcome_prices=[price, 1-price],
-                    tokens=[Token(token_id=f"ccxt-{venue}-{i}", outcome="YES", price=price)],
+                    tokens=[Token(token_id=f"ccxt-MOCK-{venue}-{i}", outcome="YES", price=price)],
                     volume=10000,
                     volume_24h=5000,
                     liquidity=8000,
                     active=True,
                     closed=False,
                     event_slug=f"ccxt-{venue}-{i}",
-                    raw={"venue": venue, "unified_via": "ccxt", "category": "unified", "original_venue": venue}
-                ))
+                    raw={"venue": venue, "unified_via": "ccxt", "category": "unified", "original_venue": venue, "data_mode": "mock", "data_source": "ccxt_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"}
+                ,
+                venue_id="ccxt",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="ccxt_mock_fallback",
+                is_mock=True
+            ))
         logger.info(f"CCXT unified discovered {len(markets)} markets across {len(self.venues)} venues with one interface")
         return markets[:target_count]
 

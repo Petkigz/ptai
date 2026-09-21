@@ -10,7 +10,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class BetfairAdapter(MarketAdapter):
     def __init__(self, username: str = None, api_key: str = None, use_flumine: bool = True):
@@ -54,9 +54,9 @@ class BetfairAdapter(MarketAdapter):
         for i, q in enumerate(mock_sports[:target_count]):
             price = 0.45 + i*0.05
             markets.append(Market(
-                id=f"betfair-{i}",
+                id=f"betfair-MOCK-{i}",
                 source=MarketSource.POLYMARKET,
-                question=q,
+                question=q + " - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
                 outcomes=["BACK", "LAY"],
                 outcome_prices=[price, 1-price],
                 tokens=[Token(token_id=f"bf-{i}", outcome="BACK", price=price)],
@@ -66,7 +66,12 @@ class BetfairAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=f"betfair-sport-{i}",
-                raw={"venue": "betfair", "type": "exchange", "category": "sports", "lay_available": True, "flumine": self.use_flumine, "framework": "flumine event-based"}
+                raw={"venue": "betfair", "type": "exchange", "category": "sports", "lay_available": True, "flumine": self.use_flumine, "framework": "flumine event-based", "data_mode": "mock", "data_source": "betfair_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
+                venue_id="betfair",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="betfair_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"Betfair discovered {len(markets)} sports exchange markets (flumine={self.use_flumine}, lay betting available)")
         return markets
@@ -128,9 +133,9 @@ class BetdaqAdapter(MarketAdapter):
         for i, q in enumerate(mock_qs[:target_count]):
             price = 0.5
             markets.append(Market(
-                id=f"betdaq-{i}",
+                id=f"betdaq-MOCK-{i}",
                 source=MarketSource.POLYMARKET,
-                question=q,
+                question=q + " - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
                 outcomes=["BACK", "LAY"],
                 outcome_prices=[price, 1-price],
                 tokens=[Token(token_id=f"bd-{i}", outcome="BACK", price=price)],
@@ -140,7 +145,12 @@ class BetdaqAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=f"betdaq-{i}",
-                raw={"venue": "betdaq", "type": "exchange", "category": "sports", "flumine_support": True}
+                raw={"venue": "betdaq", "type": "exchange", "category": "sports", "flumine_support": True, "data_mode": "mock", "data_source": "betdaq_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
+                venue_id="betdaq",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="betdaq_mock_fallback",
+                is_mock=True
             ))
         return markets
 
@@ -177,9 +187,9 @@ class BetConnectAdapter(MarketAdapter):
         for i, q in enumerate(mock_qs[:target_count]):
             price = 0.5
             markets.append(Market(
-                id=f"betconnect-{i}",
+                id=f"betconnect-MOCK-{i}",
                 source=MarketSource.POLYMARKET,
-                question=q,
+                question=q + " - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
                 outcomes=["BACK", "LAY"],
                 outcome_prices=[price, 1-price],
                 tokens=[Token(token_id=f"bc-{i}", outcome="BACK", price=price)],
@@ -189,7 +199,12 @@ class BetConnectAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=f"betconnect-{i}",
-                raw={"venue": "betconnect", "type": "exchange", "category": "sports"}
+                raw={"venue": "betconnect", "type": "exchange", "category": "sports", "data_mode": "mock", "data_source": "betconnect_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
+                venue_id="betconnect",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="betconnect_mock_fallback",
+                is_mock=True
             ))
         return markets
 

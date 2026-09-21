@@ -8,7 +8,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class GRVTAdapter(MarketAdapter):
     def __init__(self, api_key: str = None, private_key: str = None):
@@ -42,7 +42,7 @@ class GRVTAdapter(MarketAdapter):
         for i, sym in enumerate(symbols[:target_count]):
             prob = 0.5 + (i*0.02 - 0.02)
             markets.append(Market(
-                id=f"grvt-{sym}",
+                id=f"grvt-MOCK-{sym}",
                 source=MarketSource.POLYMARKET,
                 question=f"Will {sym} funding rate positive? GRVT hybrid CLOB",
                 outcomes=["YES", "NO"],
@@ -54,7 +54,13 @@ class GRVTAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=sym,
-                raw={"venue": "grvt", "symbol": sym, "type": "hybrid_perp", "category": "crypto", "min_testing": 50, "min_live": 200, "clob": True}
+                raw={"venue": "grvt", "symbol": sym, "type": "hybrid_perp", "category": "crypto", "min_testing": 50, "min_live": 200, "clob": True, "data_mode": "mock", "data_source": "grvt_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"}
+            ,
+                venue_id="grvt",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="grvt_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"GRVT discovered {len(markets)} hybrid perpetual markets (min testing $50 live $200+)")
         return markets

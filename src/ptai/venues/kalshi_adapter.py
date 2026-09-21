@@ -9,7 +9,7 @@ import requests
 from datetime import datetime
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, Token, MarketSource
+from ..markets.base import Market, Token, MarketSource, DataMode
 
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
@@ -98,9 +98,12 @@ class KalshiAdapter(MarketAdapter):
                 event_slug=raw.get("event_ticker", ""),
                 condition_id=ticker,
                 market_type="binary",
-                raw={**raw, "venue_id": "kalshi", "adapter_venue_id": "kalshi", "discovery_source": "KalshiAdapter._parse_kalshi_market"},
+                raw={**raw, "venue_id": "kalshi", "adapter_venue_id": "kalshi", "discovery_source": "KalshiAdapter._parse_kalshi_market", "data_mode": "live", "data_source": "kalshi_api"},
                 venue_id="kalshi",
-                venue_type="prediction"
+                venue_type="prediction",
+                data_mode=DataMode.LIVE,
+                data_source="kalshi_api",
+                is_mock=False
             )
             return market
         except Exception as e:
@@ -166,7 +169,7 @@ class KalshiAdapter(MarketAdapter):
                 id=f"KALSHI-MOCK-{i:04d}",
                 source=MarketSource.KALSHI,
                 question=title,
-                description=f"Kalshi mock market {i} for V3 multi-venue testing",
+                description=f"Kalshi mock market {i} for V3 multi-venue testing - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
                 outcomes=["YES", "NO"],
                 outcome_prices=[price, 1-price],
                 tokens=[
@@ -181,9 +184,12 @@ class KalshiAdapter(MarketAdapter):
                 slug=f"kalshi-mock-{i}",
                 event_slug=f"kalshi-event-{i//5}",
                 market_type="binary",
-                raw={"mock": True, "venue": "kalshi", "venue_id": "kalshi", "adapter_venue_id": "kalshi", "discovery_source": "KalshiAdapter.mock"},
+                raw={"mock": True, "venue": "kalshi", "venue_id": "kalshi", "adapter_venue_id": "kalshi", "discovery_source": "KalshiAdapter.mock", "data_mode": "mock", "data_source": "kalshi_mock_fallback", "is_mock": True, "safety": "MOCK_DATA - must be impossible to reach live execution"},
                 venue_id="kalshi",
-                venue_type="prediction"
+                venue_type="prediction",
+                data_mode=DataMode.MOCK,
+                data_source="kalshi_mock_fallback",
+                is_mock=True
             )
             markets.append(m)
         
@@ -195,31 +201,53 @@ class KalshiAdapter(MarketAdapter):
         return filtered[:target_count]
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
+        # V9 FIX #1 & #3: Real orderbook with is_real flag
         try:
             resp = self.session.get(f"{self.base_url}/markets/{market.id}/orderbook", timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
+                ob = data.get("orderbook", {})
+                yes_ob = ob.get("yes", {})
+                bid = yes_ob.get("bid", market.yes_price - 0.01) if isinstance(yes_ob, dict) else market.yes_price - 0.01
+                ask = yes_ob.get("ask", market.yes_price + 0.01) if isinstance(yes_ob, dict) else market.yes_price + 0.01
                 return {
                     "market_id": market.id,
-                    "bid": data.get("orderbook", {}).get("yes", {}).get("bid", market.yes_price - 0.01),
-                    "ask": data.get("orderbook", {}).get("yes", {}).get("ask", market.yes_price + 0.01),
-                    "spread": data.get("orderbook", {}).get("spread", 0.02),
-                    "depth": market.liquidity
+                    "venue_id": "kalshi",
+                    "bid": bid,
+                    "ask": ask,
+                    "spread": ob.get("spread", 0.02) if isinstance(ob, dict) else 0.02,
+                    "spread_pct": ob.get("spread", 0.02) if isinstance(ob, dict) else 0.02,
+                    "depth": market.liquidity,
+                    "liquidity": market.liquidity,
+                    "source": "kalshi_api_real",
+                    "is_real": True,
+                    "is_mock": False,
+                    "executable": True,
+                    "data_mode": "live"
                 }
         except Exception as e:
             logger.debug(f"Kalshi orderbook fetch failed for {market.id}: {e}")
         
-        # Mock orderbook
+        # Mock orderbook - marked not real, not executable for safety
         spread = 0.02 if market.liquidity > 5000 else 0.05
         return {
             "market_id": market.id,
+            "venue_id": "kalshi",
             "token_id": market.yes_token_id,
             "bid": max(0.01, market.yes_price - spread/2),
             "ask": min(0.99, market.yes_price + spread/2),
             "spread": spread,
+            "spread_pct": spread,
             "bid_size": market.liquidity * 0.1,
             "ask_size": market.liquidity * 0.1,
-            "depth": market.liquidity
+            "depth": market.liquidity,
+            "liquidity": market.liquidity,
+            "source": "kalshi_mock_estimation",
+            "is_real": False,
+            "is_mock": True,
+            "executable": False,
+            "data_mode": "mock",
+            "warning": "ESTIMATION not real Kalshi orderbook"
         }
 
     async def get_portfolio(self) -> Dict[str, Any]:

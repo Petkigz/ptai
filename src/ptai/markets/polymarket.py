@@ -11,7 +11,7 @@ import requests
 import aiohttp
 from loguru import logger
 
-from .base import Market, Token, MarketSource
+from .base import Market, Token, MarketSource, DataMode
 from ..config import get_settings
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -111,7 +111,12 @@ class PolymarketClient:
                     event_slug=event_slug,
                     condition_id=m.get("conditionId") or m.get("condition_id") or "",
                     market_type="binary" if len(outcomes) == 2 else "categorical",
-                    raw={"event": event, "market": m}
+                    raw={"event": event, "market": m, "venue": "polymarket", "data_mode": "live", "data_source": "gamma_api", "is_mock": False},
+                    venue_id="polymarket",
+                    venue_type="prediction",
+                    data_mode=DataMode.LIVE,
+                    data_source="gamma_api",
+                    is_mock=False
                 )
                 markets.append(market)
             except Exception as e:

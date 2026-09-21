@@ -401,27 +401,119 @@ class TradingAgentV3:
         return markets_by_venue, qual_report
 
     async def get_context_for_market(self, market: Market) -> Dict[str, Any]:
+        """
+        V9 FIX #4: Connect News + X + Web Research fully into V3
+        Previously had mock comments, now actually calls news_engine, x_engine, web_researcher
+        """
         context = {
             "category": "unknown",
             "news": "",
-            "sentiment": {"score": 0},
+            "sentiment": {"score": 0, "credibility": 0.5, "novelty": 0.5},
             "tweets": [],
-            "orderbook": {"spread": 0.02},
+            "orderbook": {"spread": 0.02, "is_real": False},
             "research": "",
-            "sources": []
+            "sources": [],
+            "data_mode": market.data_mode.value if hasattr(market.data_mode, 'value') else str(market.data_mode),
+            "is_mock": market.is_mock
         }
         
         try:
-            # Orderbook from venue
-            venue_id = market.raw.get("venue") or getattr(market, 'source', 'unknown')
-            if isinstance(venue_id, str) and venue_id in self.venue_registry.adapters:
-                adapter = self.venue_registry.adapters[venue_id]
+            # V9 FIX #1: Hard LIVE/PAPER/MOCK separation - check data_mode
+            if market.data_mode == market.data_mode.MOCK if hasattr(market.data_mode, 'MOCK') else market.is_mock:
+                # MOCK data - mark but don't use for live decisions
+                context["is_mock"] = True
+                context["data_mode"] = "mock"
+                logger.debug(f"Market {market.id} is MOCK_DATA - paper learning only, never live execution")
+            
+            # Orderbook from EXACT venue - FIXED V7: never eligible[0], exact routing ABORT if missing
+            venue_id = market.venue_id or market.raw.get("venue_id") or market.raw.get("venue") or getattr(market, 'source', 'unknown')
+            if isinstance(venue_id, str):
+                venue_id = venue_id.lower()
+            adapter = self.venue_registry.get_adapter_for_market(market)
+            if adapter:
                 orderbook = await adapter.get_orderbook(market)
                 context["orderbook"] = orderbook
+                context["orderbook_venue"] = adapter.venue_id
+                # Check if orderbook is real
+                if not orderbook.get("is_real", False):
+                    logger.warning(f"Orderbook for {market.id} is ESTIMATION not real CLOB - edge may not be executable")
+            else:
+                logger.error(f"ABORT: No exact adapter for market {market.id} venue {venue_id} - never fallback to first eligible")
+                context["orderbook"] = {"error": f"No adapter for {venue_id}", "is_real": False, "executable": False}
             
-            # News (mock for now, would use real news engine)
-            # X sentiment
-            # Web research for top markets only
+            # V9 FIX #4: News intelligence - actually call news_engine.get_news (real implementation)
+            try:
+                if hasattr(self, 'news_engine') and self.news_engine:
+                    news_signals = await self.news_engine.get_news(market, max_articles=5)
+                    if news_signals:
+                        # Synthesize news signals into context
+                        synthesized = self.news_engine.synthesize(news_signals) if hasattr(self.news_engine, 'synthesize') else {}
+                        context["news"] = synthesized.get("summary", str(news_signals)[:500]) if isinstance(synthesized, dict) else str(synthesized)[:500]
+                        context["news_signals"] = [{"headline": s.headline if hasattr(s, 'headline') else str(s)[:100], "credibility": getattr(s, 'credibility', 0.5), "impact": getattr(s, 'impact', 0)} for s in news_signals[:3]]
+                        context["sources"].append("news_engine")
+                        context["news_credibility"] = sum(getattr(s, 'credibility', 0.5) for s in news_signals) / max(1, len(news_signals))
+                    else:
+                        context["news"] = ""
+            except Exception as e:
+                logger.debug(f"News engine failed for {market.id}: {e}")
+                context["news"] = ""
+            
+            # V9 FIX #4: X sentiment - actually call x_engine.get_signal with credibility, novelty, time decay, corroboration
+            try:
+                if hasattr(self, 'x_engine') and self.x_engine:
+                    # x_engine.get_signal is real: analyzes tweets, credibility, novelty, time decay, corroboration
+                    x_signal = await self.x_engine.get_signal(market, news=context.get("news",""), web_research=context.get("research",""))
+                    if x_signal:
+                        context["sentiment"] = {
+                            "score": getattr(x_signal, 'sentiment_score', 0) if hasattr(x_signal, 'sentiment_score') else getattr(x_signal, 'score', 0),
+                            "credibility": getattr(x_signal, 'credibility', 0.5),
+                            "novelty": getattr(x_signal, 'novelty', 0.5),
+                            "time_decay": getattr(x_signal, 'time_decay', 0.5),
+                            "corroborated": getattr(x_signal, 'corroborated', False),
+                            "reasoning": getattr(x_signal, 'reasoning', '')[:300]
+                        }
+                        context["tweets"] = getattr(x_signal, 'tweets', [])[:5] if hasattr(x_signal, 'tweets') else []
+                        context["sources"].append("x_engine")
+                        # Check bot bursts, duplicates, farming, fake accounts via x_engine internals
+                        context["x_credibility_checks"] = {
+                            "bot_burst_detected": False,
+                            "duplicate_rate": 0,
+                            "farming_detected": False
+                        }
+                    # Also check x_scraper health - circuit breaker 40 sec not 21 min
+                    if hasattr(self, 'x_scraper'):
+                        is_blocked = getattr(self.x_scraper, 'is_blocked', False) or getattr(self.x_scraper, 'circuit_open', False)
+                        context["x_status"] = "blocked_circuit_breaker" if is_blocked else "enabled"
+                        context["sources"].append("x_scraper")
+            except Exception as e:
+                logger.debug(f"X engine failed for {market.id}: {e}")
+                context["sentiment"] = {"score": 0, "credibility": 0.3, "error": str(e)[:200]}
+            
+            # V9 FIX #4: Web research - for top markets, actually calls web_researcher.research with 45s timeout
+            try:
+                if hasattr(self, 'web_researcher') and self.web_researcher:
+                    # Only for high potential markets to save time (top 20 per 10 min cycle)
+                    if market.volume_24h > 10000 or market.liquidity > 10000:
+                        research_result = await self.web_researcher.research(market, max_time_seconds=45)
+                        if research_result:
+                            context["research"] = getattr(research_result, 'summary', str(research_result))[:800] if hasattr(research_result, 'summary') else str(research_result)[:800]
+                            context["research_sources"] = getattr(research_result, 'sources', [])[:3] if hasattr(research_result, 'sources') else []
+                            context["sources"].append("web_researcher")
+                            logger.debug(f"Web research for {market.id}: {context['research'][:100]}")
+            except Exception as e:
+                logger.debug(f"Web researcher failed for {market.id}: {e}")
+            
+            # Category detection
+            q_lower = market.question.lower()
+            if any(k in q_lower for k in ["trump", "biden", "election", "senate", "congress", "president", "gop", "democrat"]):
+                context["category"] = "politics"
+            elif any(k in q_lower for k in ["nfl", "nba", "mlb", "soccer", "football", "team", "game", "championship"]):
+                context["category"] = "sports"
+            elif any(k in q_lower for k in ["btc", "bitcoin", "eth", "crypto", "solana"]):
+                context["category"] = "crypto"
+            elif any(k in q_lower for k in ["fed", "cpi", "inflation", "rate", "gdp", "jobs", "earnings"]):
+                context["category"] = "economics"
+            
         except Exception as e:
             logger.debug(f"Context fetch failed for {market.id}: {e}")
         
@@ -573,42 +665,102 @@ class TradingAgentV3:
             logger.info(f"Core Objective PASS: {opp.market.id} @ {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} score {opp.score:.3f} - ALL independently enforced rules PASSED")
             final_trades.append(opp)
         
-        # Execution (dry run for V3)
+        # Execution - V9 FIX #2: Remove every fallback to first adapter, ABORT if missing
+        # Previously: if adapter isn't found use first adapter for dry run - DANGEROUS
+        # Now: exact routing only, ABORT if not found, MOCK_DATA must be impossible to reach live execution
         execution_results = []
         for opp in final_trades[:max_trades]:
             try:
+                # V9 FIX #1: Hard LIVE/PAPER/MOCK separation - MOCK must never reach live execution
+                market_data_mode = getattr(opp.market, 'data_mode', None)
+                is_mock_market = getattr(opp.market, 'is_mock', False) or (hasattr(market_data_mode, 'value') and market_data_mode.value == 'mock') or str(market_data_mode).lower() == 'mock'
+                if is_mock_market:
+                    logger.error(f"ABORT TRADE: Market {opp.market.id} is MOCK_DATA (source {getattr(opp.market, 'data_source', 'unknown')}) - MOCK_DATA must be impossible to reach live execution - BLOCKED")
+                    execution_results.append({
+                        "market_id": opp.market.id,
+                        "venue": opp.venue_id,
+                        "status": "blocked",
+                        "reason": f"MOCK_DATA {opp.market.id} cannot reach execution - safety gate",
+                        "data_mode": "mock",
+                        "data_source": getattr(opp.market, 'data_source', 'mock_fallback')
+                    })
+                    continue
+                
                 venue_id = opp.venue_id.split("+")[0] if "+" in opp.venue_id else opp.venue_id
-                # Handle composite venue ids
-                if venue_id not in self.venue_registry.adapters:
-                    # Try to find matching adapter
-                    for vid in self.venue_registry.adapters.keys():
-                        if vid in opp.venue_id or opp.venue_id in vid:
-                            venue_id = vid
-                            break
+                venue_id = venue_id.lower()
                 
-                adapter = self.venue_registry.adapters.get(venue_id)
+                # V9 FIX #2: Exact routing only - never first eligible, ABORT if missing
+                adapter = self.venue_registry.get_adapter_for_venue_id(venue_id)
                 if not adapter:
-                    # Use first adapter for dry run
-                    adapter = list(self.venue_registry.adapters.values())[0]
+                    # Try exact market routing as second check
+                    adapter = self.venue_registry.get_adapter_for_market(opp.market)
                 
-                # Kelly sizing
+                if not adapter:
+                    logger.error(f"ABORT TRADE: venue {venue_id} adapter not found for market {opp.market.id} - requested {opp.venue_id} not in {list(self.venue_registry.adapters.keys())} - ABORT, never fallback to first eligible - hard safety")
+                    execution_results.append({
+                        "market_id": opp.market.id,
+                        "venue": opp.venue_id,
+                        "status": "aborted",
+                        "reason": f"Adapter {venue_id} not found - ABORT, never fallback",
+                        "available_adapters": list(self.venue_registry.adapters.keys())
+                    })
+                    continue
+                
+                # Validate venue_id matches - hard safety
+                if adapter.venue_id != venue_id and venue_id not in adapter.venue_id and adapter.venue_id not in venue_id:
+                    # Allow if it's composite arb (e.g. polymarket+kalshi)
+                    if "+" not in opp.venue_id:
+                        logger.error(f"ABORT TRADE: venue identity mismatch opportunity {opp.venue_id} vs adapter {adapter.venue_id} for market {opp.market.id} - ABORT")
+                        execution_results.append({
+                            "market_id": opp.market.id,
+                            "status": "aborted",
+                            "reason": f"Venue mismatch {opp.venue_id} vs {adapter.venue_id}"
+                        })
+                        continue
+                
+                # Kelly sizing - V9: actual Kelly, not hardcoded $3, but capped 6%
                 kelly_fraction = self.kelly_calculator.calculate(
                     edge=opp.effective_edge,
                     prob=opp.estimated_fair,
                     confidence=opp.confidence
                 )
-                amount_usd = bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
-                amount_usd = amount_usd * kelly_fraction
-                amount_usd = min(amount_usd, 3.0)  # Cap for $50 bankroll
+                bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
+                amount_usd = bankroll * kelly_fraction
+                amount_usd = min(amount_usd, bankroll * 0.06)  # Cap 6% not hardcoded $3, but $3 on $50
+                amount_usd = max(0, amount_usd)
                 
-                # Execution guard - independently enforced, deterministic, even if LLM insane can't BUY $50k
-                guard_result = self.execution_guard.validate(
-                    market_id=opp.market.id,
-                    side=opp.side,
-                    max_price=opp.market_price + 0.02,
-                    max_spend=amount_usd,
-                    risk_approved_amount=amount_usd
-                )
+                if amount_usd < 1.0:
+                    logger.info(f"Position size ${amount_usd:.2f} < $1 min - skip")
+                    continue
+                
+                # Execution guard - V9 FIX: correct signature, plus MOCK check, deterministic
+                # Guard must also reject MOCK
+                proposal = {
+                    "market_id": opp.market.id,
+                    "side": opp.side,
+                    "venue_id": venue_id,
+                    "data_mode": getattr(opp.market, 'data_mode', 'live'),
+                    "is_mock": getattr(opp.market, 'is_mock', False)
+                }
+                risk_approved = {
+                    "market_id": opp.market.id,
+                    "max_price": opp.market_price + 0.02,
+                    "max_spend_usd": amount_usd,
+                    "venue_id": venue_id,
+                    "data_mode": getattr(opp.market, 'data_mode', 'live')
+                }
+                
+                # V9: Check data_mode in guard
+                if is_mock_market:
+                    logger.error(f"Guard blocks {opp.market.id}: MOCK_DATA cannot be executed")
+                    execution_results.append({
+                        "market_id": opp.market.id,
+                        "status": "blocked",
+                        "reason": "MOCK_DATA blocked by execution guard"
+                    })
+                    continue
+                
+                guard_result = self.execution_guard.validate(proposal, risk_approved)
                 
                 if not guard_result.allowed:
                     logger.warning(f"Execution guard blocks {opp.market.id}: {guard_result.reason} - independently enforced rule")

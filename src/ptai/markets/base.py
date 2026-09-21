@@ -11,6 +11,25 @@ class MarketSource(str, Enum):
     KALSHI = "kalshi"
     PREDICTIT = "predictit"
 
+class DataMode(str, Enum):
+    """
+    CRITICAL SAFETY V9: Hard separation of data types
+    LIVE = real API data, executable for real money (if qualified)
+    PAPER = real API data but paper trading mode, learning only, no live capital unless qualified
+    MOCK = synthetic/fake markets for development/testing, MUST NEVER reach live execution
+    """
+    LIVE = "live"
+    PAPER = "paper"
+    MOCK = "mock"
+
+    @property
+    def is_executable(self) -> bool:
+        return self in (DataMode.LIVE, DataMode.PAPER)
+
+    @property
+    def can_deploy_live_capital(self) -> bool:
+        return self == DataMode.LIVE
+
 @dataclass
 class Token:
     token_id: str
@@ -38,14 +57,15 @@ class Market:
     market_type: str = "binary"  # binary, categorical
     raw: Dict[str, Any] = field(default_factory=dict)
     # FIXED: explicit venue identity immutable through pipeline
-    # Previously only source enum, now venue_id str is explicit and immutable
-    # venue_id must be adapter's real venue ID, never enum, never first eligible
     venue_id: str = ""  # explicit venue identity: polymarket, kalshi, manifold, etc - immutable
     venue_type: str = "prediction"  # prediction, financial, other
+    # FIXED V9: Hard LIVE/PAPER/MOCK separation - MOCK must never reach live execution
+    data_mode: DataMode = DataMode.LIVE
+    is_mock: bool = False
+    data_source: str = ""
 
     def __post_init__(self):
         # Ensure venue_id is always explicit and immutable
-        # If not provided, derive from source but keep as string not enum
         if not self.venue_id:
             if isinstance(self.source, str):
                 self.venue_id = self.source
@@ -53,16 +73,33 @@ class Market:
                 self.venue_id = self.source.value
             else:
                 self.venue_id = str(self.source)
-        # Always store as string, never enum
         if hasattr(self.venue_id, 'value'):
             self.venue_id = self.venue_id.value
         self.venue_id = str(self.venue_id).lower()
+
+        # V9: Ensure data_mode is enum and is_mock sync
+        if isinstance(self.data_mode, str):
+            try:
+                self.data_mode = DataMode(self.data_mode.lower())
+            except:
+                self.data_mode = DataMode.LIVE if not self.is_mock else DataMode.MOCK
+        if self.is_mock and self.data_mode == DataMode.LIVE:
+            self.data_mode = DataMode.MOCK
+        if self.data_mode == DataMode.MOCK:
+            self.is_mock = True
+        if not self.data_source:
+            self.data_source = "mock_fallback" if self.data_mode == DataMode.MOCK else f"{self.venue_id}_api"
         
-        # Store venue_id also in raw for audit trail
         if "venue_id" not in self.raw:
             self.raw["venue_id"] = self.venue_id
         if "source" not in self.raw:
             self.raw["source"] = self.source.value if hasattr(self.source, 'value') else str(self.source)
+        if "data_mode" not in self.raw:
+            self.raw["data_mode"] = self.data_mode.value if hasattr(self.data_mode, 'value') else str(self.data_mode)
+        if "data_source" not in self.raw:
+            self.raw["data_source"] = self.data_source
+        if "is_mock" not in self.raw:
+            self.raw["is_mock"] = self.is_mock
 
     @property
     def best_price(self) -> float:

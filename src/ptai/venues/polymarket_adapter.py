@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource
+from ..markets.base import Market, MarketSource, DataMode
 from ..markets.polymarket import PolymarketClient
 from ..markets.scanner import MarketScanner
 
@@ -47,12 +47,21 @@ class PolymarketAdapter(MarketAdapter):
             min_vol = filters.get("min_volume", 1000)
             min_liq = filters.get("min_liquidity", 100)
             filtered = [m for m in markets if m.volume_24h >= min_vol and m.liquidity >= min_liq]
-            # Ensure venue_id immutable
+            # Ensure venue_id immutable + V9 FIX #1 explicit LIVE data_mode
             for m in filtered:
                 m.venue_id = "polymarket"
+                m.venue_type = "prediction"
+                # V9 FIX #1: Explicit LIVE data separation - real Polymarket Gamma API
+                m.data_mode = DataMode.LIVE
+                m.data_source = "gamma_api"
+                m.is_mock = False
                 m.raw["venue_id"] = "polymarket"
                 m.raw["adapter_venue_id"] = self.venue_id
                 m.raw["discovery_source"] = "PolymarketAdapter.discover_markets"
+                m.raw["data_mode"] = "live"
+                m.raw["data_source"] = "gamma_api"
+                m.raw["is_mock"] = False
+                m.raw["safety"] = "LIVE_DATA - executable"
             return filtered[:target_count]
         except Exception as e:
             logger.error(f"Polymarket discovery failed: {e}")
@@ -64,7 +73,14 @@ class PolymarketAdapter(MarketAdapter):
             markets = self.scanner.scan(target_count=target_count, order_by="volume_24hr", use_registry=False)
             for m in markets:
                 m.venue_id = "polymarket"
+                m.venue_type = "prediction"
+                m.data_mode = DataMode.LIVE
+                m.data_source = "gamma_api"
+                m.is_mock = False
                 m.raw["venue_id"] = "polymarket"
+                m.raw["data_mode"] = "live"
+                m.raw["data_source"] = "gamma_api"
+                m.raw["is_mock"] = False
             return markets[:target_count]
         except Exception as e:
             logger.error(f"Sync discovery failed: {e}")

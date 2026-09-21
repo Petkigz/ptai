@@ -8,7 +8,7 @@ from typing import List, Dict, Any
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class OpenPXAdapter(MarketAdapter):
     def __init__(self, polymarket_key: str = None, kalshi_key: str = None):
@@ -45,19 +45,25 @@ class OpenPXAdapter(MarketAdapter):
         for i, q in enumerate(mock_qs[:target_count]):
             price = 0.5 + i*0.05
             markets.append(Market(
-                id=f"openpx-{i}",
+                id=f"openpx-MOCK-{i}",
                 source=MarketSource.POLYMARKET,
                 question=q,
                 outcomes=["YES", "NO"],
                 outcome_prices=[price, 1-price],
-                tokens=[Token(token_id=f"openpx-{i}", outcome="YES", price=price)],
+                tokens=[Token(token_id=f"openpx-MOCK-{i}", outcome="YES", price=price)],
                 volume=50000,
                 volume_24h=20000,
                 liquidity=30000,
                 active=True,
                 closed=False,
                 event_slug=f"openpx-{i}",
-                raw={"venue": "openpx", "latency": "sub-millisecond", "type": "rust_client", "venues": ["polymarket", "kalshi"], "typed_interfaces": True}
+                raw={"venue": "openpx", "latency": "sub-millisecond", "type": "rust_client", "venues": ["polymarket", "kalshi"], "typed_interfaces": True, "data_mode": "mock", "data_source": "openpx_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"}
+            ,
+                venue_id="openpx",
+                venue_type="other",
+                data_mode=DataMode.MOCK,
+                data_source="openpx_mock_fallback",
+                is_mock=True
             ))
         logger.info(f"OpenPX discovered {len(markets)} markets (Rust client sub-ms WebSocket Polymarket+Kalshi)")
         return markets

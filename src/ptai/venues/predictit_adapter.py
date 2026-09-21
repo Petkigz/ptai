@@ -9,7 +9,7 @@ from loguru import logger
 import requests
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
-from ..markets.base import Market, MarketSource, Token
+from ..markets.base import Market, MarketSource, Token, DataMode
 
 class PredictItAdapter(MarketAdapter):
     def __init__(self):
@@ -71,7 +71,12 @@ class PredictItAdapter(MarketAdapter):
                         closed=False,
                         slug=str(m.get("id")),
                         event_slug=m.get("shortName", "")[:50],
-                        raw={"venue": "predictit", "api": "public", "original": m}
+                        raw={"venue": "predictit", "api": "public", "original": m, "data_mode": "live", "data_source": "predictit_api"},
+                        venue_id="predictit",
+                        venue_type="prediction",
+                        data_mode=DataMode.LIVE,
+                        data_source="predictit_api",
+                        is_mock=False
                     )
                     markets.append(market)
                 except Exception as e:
@@ -96,9 +101,9 @@ class PredictItAdapter(MarketAdapter):
         for i, q in enumerate(mock_qs[:count]):
             price = 0.5 + (i * 0.05)
             markets.append(Market(
-                id=f"predictit-mock-{i}",
+                id=f"predictit-MOCK-{i}",
                 source=MarketSource.POLYMARKET,
-                question=q,
+                question=q + " - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
                 outcomes=["YES", "NO"],
                 outcome_prices=[price, 1-price],
                 tokens=[Token(token_id=f"pit-{i}", outcome="YES", price=price)],
@@ -108,7 +113,12 @@ class PredictItAdapter(MarketAdapter):
                 active=True,
                 closed=False,
                 event_slug=f"predictit-mock-{i}",
-                raw={"venue": "predictit", "mock": True, "category": "politics"}
+                raw={"venue": "predictit", "mock": True, "category": "politics", "data_mode": "mock", "data_source": "predictit_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"},
+                venue_id="predictit",
+                venue_type="prediction",
+                data_mode=DataMode.MOCK,
+                data_source="predictit_mock_fallback",
+                is_mock=True
             ))
         return markets
 
