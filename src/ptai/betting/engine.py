@@ -58,6 +58,20 @@ from .derivative_markets import (
     price_match_card,
     price_player_count,
 )
+from .high_scoring import (
+    LEAGUE_TO_SPORT,
+    SPORT_PARAMS,
+    resolve_sport,
+    HighScoringCard,
+    is_high_scoring,
+    params_for,
+    price_high_scoring_card,
+    price_margin_bands,
+    price_period_spread,
+    price_period_total,
+    price_spread_normal,
+    price_total_normal,
+)
 from .market_types import (
     MARKET_CATALOGUE,
     MatchFacts,
@@ -147,6 +161,11 @@ class BettingEngine:
         # non-executable until a feed supplies real odds for it.
         self.feed_market_types: List[str] = ["h2h", "spreads", "totals"]
         self.priced_cards: Dict[str, MatchCardPrices] = {}
+        # High-scoring sports (basketball/gridiron/baseball/hockey) are priced
+        # with a normal margin model, not the soccer Poisson grid. Poisson
+        # ties variance to the mean, which understates an NBA total's spread
+        # by ~30% and makes every line look further away than it is.
+        self.priced_high_scoring: Dict[str, HighScoringCard] = {}
         self.player_props: Dict[str, Dict[str, float]] = {}
 
     # ------------------------------------------------------------------
@@ -468,6 +487,13 @@ class BettingEngine:
         s = strengths.get(ev.key)
         if not s:
             return None
+
+        # Route by sport BEFORE pricing. Feeding an NBA fixture into the
+        # soccer scoreline grid produces numbers that look plausible and are
+        # wrong, which is worse than refusing.
+        if is_high_scoring(ev.sport) or is_high_scoring(ev.league):
+            return self._price_high_scoring_card(ev, s)
+
         home = s.get("home") or {}
         away = s.get("away") or {}
         card = price_match_card(
@@ -483,6 +509,67 @@ class BettingEngine:
         )
         self.priced_cards[ev.key] = card
         return card
+
+    def _price_high_scoring_card(self, ev: SportsEvent, s: Dict) -> Optional[MatchCardPrices]:
+        """
+        Price a basketball/gridiron/baseball/hockey fixture with the normal
+        margin model.
+
+        Expects strengths of the form
+            {'home': {'expected_points': 114.0}, 'away': {'expected_points': 110.0},
+             'total_std': 20.5, 'margin_std': 12.0}
+        and falls back to league priors for the standard deviations rather
+        than for the scores - a score cannot be invented, but a variance can
+        be taken from the long-run league figure.
+        """
+        home = s.get("home") or {}
+        away = s.get("away") or {}
+        exp_home = home.get("expected_points")
+        exp_away = away.get("expected_points")
+        if exp_home is None or exp_away is None:
+            logger.info(f"[betting] {ev.key}: no expected points supplied for a "
+                        f"high-scoring fixture - refusing to invent a score")
+            return None
+
+        # ev.sport is often the league code ("nba"), which params_for now
+        # resolves; prefer whichever of the two is recognised.
+        sport = resolve_sport(ev.sport) if is_high_scoring(ev.sport) else resolve_sport(ev.league)
+        params = params_for(sport)
+        card = price_high_scoring_card(
+            event_key=ev.key, sport=sport,
+            expected_home=float(exp_home), expected_away=float(exp_away),
+            total_std=s.get("total_std"), margin_std=s.get("margin_std"),
+            total_lines=s.get("total_lines") or [
+                round(params.typical_total), params.typical_total + 0.5,
+                params.typical_total - 0.5, params.typical_total + 5.5,
+                params.typical_total - 5.5],
+            spread_lines=s.get("spread_lines") or [0.0, -1.5, 1.5, -3.5, 3.5, -6.5, 6.5, -10.5],
+            team_total_lines=s.get("team_total_lines"),
+            margin_bands=s.get("margin_bands"),
+            periods=s.get("periods") or ({"Q1": 0.25, "H1": 0.5} if sport == "basketball"
+                                         else {"H1": 0.5} if sport == "football" else None),
+        )
+        self.priced_high_scoring[ev.key] = card
+        return None
+
+    def high_scoring_fair_prices(self, ev_key: str) -> Dict[str, Dict[str, float]]:
+        """Fair prices from the normal margin model, keyed like the soccer card."""
+        card = self.priced_high_scoring.get(ev_key)
+        if card is None:
+            return {}
+        out: Dict[str, Dict[str, float]] = {
+            "moneyline": card.moneyline,
+            "margin_bands": card.margin_bands,
+        }
+        for ln, t in card.totals.items():
+            out[f"totals_{ln}"] = {"over": t.over, "under": t.under, "push": t.push}
+        for ln, sp in card.spreads.items():
+            out[f"spreads_{ln}"] = {"home": sp.home, "away": sp.away, "push": sp.push}
+        for name, v in card.team_totals.items():
+            out[f"team_total_{name}"] = {"over": v.over, "under": v.under, "push": v.push}
+        for name, v in card.periods.items():
+            out[f"period_{name}"] = {"over": v["over"], "under": v["under"]}
+        return out
 
     def card_fair_prices(self, ev_key: str) -> Dict[str, Dict[str, float]]:
         """
@@ -549,6 +636,9 @@ class BettingEngine:
         """
         out: List[BetOpportunity] = []
         fair = self.card_fair_prices(ev.key)
+        # High-scoring sports use the normal margin model and keep their own
+        # priced-card dict, so merge their fair prices in.
+        fair.update(self.high_scoring_fair_prices(ev.key))
         books_by_type = {mt: c for mt, c in consensus_by_type.items()}
 
         for market_key, prices in fair.items():
@@ -645,6 +735,11 @@ class BettingEngine:
     def _feed_type_for(cls, card_market_key: str) -> Optional[str]:
         if card_market_key in cls._CARD_TO_FEED:
             return cls._CARD_TO_FEED[card_market_key]
+        # High-scoring keys carry their line: "totals_225.0", "spreads_-3.5".
+        # Strip the line suffix so they map onto the feed's market type.
+        for prefix in ("totals_", "spreads_", "team_total_", "period_"):
+            if card_market_key.startswith(prefix):
+                return prefix.rstrip("_")
         # player props are keyed "player_goals:<name>" - strip the player
         base = card_market_key.split(":", 1)[0]
         return cls._CARD_TO_FEED.get(base, base)

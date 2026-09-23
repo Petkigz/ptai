@@ -119,6 +119,28 @@ from .derivative_markets import (
     price_player_count,
     price_red_card,
 )
+from .high_scoring import (
+    LEAGUE_TO_SPORT,
+    SPORT_PARAMS,
+    resolve_sport,
+    HighScoringCard,
+    SportParams,
+    TotalPrices,
+    SpreadPrices,
+    is_high_scoring,
+    normal_cdf,
+    params_for,
+    price_high_scoring_card,
+    price_margin_band,
+    price_margin_bands,
+    price_moneyline_normal,
+    price_period_spread,
+    price_period_total,
+    price_race_to_points,
+    price_spread_normal,
+    price_team_total_normal,
+    price_total_normal,
+)
 from .engine import BetOpportunity, BettingEngine
 
 __all__ = [
@@ -155,6 +177,13 @@ __all__ = [
     "price_accumulator", "price_anytime_scorer", "price_booking_points",
     "price_count_market", "price_first_scorer", "price_half_time",
     "price_match_card", "price_player_count", "price_red_card",
+    # high-scoring sports (normal margin model, not Poisson)
+    "LEAGUE_TO_SPORT", "resolve_sport",
+    "SPORT_PARAMS", "HighScoringCard", "SportParams", "TotalPrices", "SpreadPrices",
+    "is_high_scoring", "normal_cdf", "params_for", "price_high_scoring_card",
+    "price_margin_band", "price_margin_bands", "price_moneyline_normal",
+    "price_period_spread", "price_period_total", "price_race_to_points",
+    "price_spread_normal", "price_team_total_normal", "price_total_normal",
     # engine
     "BetOpportunity", "BettingEngine",
 ]

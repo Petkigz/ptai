@@ -103,6 +103,18 @@ def test_line_validation_rejects_nonsense():
 # Pricing consistency - all goal markets from one grid
 # ---------------------------------------------------------------------------
 
+def soccer_event():
+    """A soccer fixture - sample_events()[0] is NBA, which routes elsewhere."""
+    from src.ptai.betting.sports_data import SportsEvent
+    from datetime import datetime, timedelta, timezone
+    return SportsEvent(
+        event_id="EPL-1", sport="soccer", league="epl",
+        home_team="Manchester City", away_team="Arsenal",
+        commence_time=datetime.now(timezone.utc) + timedelta(hours=3),
+        provider="test", raw={},
+    )
+
+
 CARD = price_match_card(
     event_key="epl:arsenal-at-man-city",
     home_attack=1.35, home_defence=0.90,
@@ -650,7 +662,7 @@ def test_accumulator_needs_two_legs():
 
 def test_engine_prices_a_card_and_exposes_fair_prices():
     engine = BettingEngine(bankroll=500.0)
-    ev = sample_events(1)[0]
+    ev = soccer_event()
     strengths = {ev.key: {"home": {"attack": 1.4, "defence": 0.9, "corners": 6.2,
                                    "cards": 1.8, "shots": 14.0, "shots_on_target": 4.8},
                           "away": {"attack": 1.0, "defence": 1.1, "corners": 4.2,
@@ -669,7 +681,7 @@ def test_engine_prices_a_card_and_exposes_fair_prices():
 
 def test_engine_refuses_to_price_a_card_without_strengths():
     engine = BettingEngine(bankroll=500.0)
-    ev = sample_events(1)[0]
+    ev = soccer_event()
     assert engine.price_card(ev, {}) is None
 
 
@@ -679,7 +691,7 @@ def test_card_markets_are_not_executable_without_a_book_price():
     engine must record that rather than presenting a model price as a bet.
     """
     engine = BettingEngine(bankroll=500.0)
-    ev = sample_events(1)[0]
+    ev = soccer_event()
     strengths = {ev.key: {"home": {"attack": 1.4, "defence": 0.9},
                           "away": {"attack": 1.0, "defence": 1.1}}}
     card = engine.price_card(ev, strengths)
@@ -726,7 +738,7 @@ PLAYERS = [
 
 def _engine_with_card():
     engine = BettingEngine(bankroll=500.0)
-    ev = sample_events(1)[0]
+    ev = soccer_event()
     strengths = {ev.key: {"home": {"attack": 1.42, "defence": 0.88, "corners": 6.6,
                                    "cards": 1.8, "shots": 15.2, "shots_on_target": 5.4},
                           "away": {"attack": 1.18, "defence": 1.02, "corners": 4.3,
@@ -759,7 +771,7 @@ def test_every_priced_card_key_has_a_feed_mapping():
 
 def test_player_props_require_player_data():
     engine = BettingEngine(bankroll=500.0)
-    ev = sample_events(1)[0]
+    ev = soccer_event()
     engine.price_card(ev, {ev.key: {"home": {"attack": 1.2, "defence": 1.0},
                                     "away": {"attack": 1.0, "defence": 1.1}}})
     assert engine.price_player_props(ev, []) == {}
@@ -817,7 +829,7 @@ def test_player_prop_opportunities_never_execute_without_the_void_check():
 def test_run_cycle_prices_props_when_players_are_supplied():
     from src.ptai.betting.sports_data import BookOdds, SportsDataEngine
 
-    ev = sample_events(1)[0]
+    ev = soccer_event()
     ev.event_id = "evt-props"
     books = [BookOdds(book="softbook", market="h2h",
                       outcomes={ev.home_team: 1.75, ev.away_team: 2.20})]
@@ -858,3 +870,154 @@ def test_run_cycle_prices_props_when_players_are_supplied():
     for o in engine.opportunities:
         if o.opportunity_id.startswith("prop-"):
             assert not o.executable
+
+
+# ---------------------------------------------------------------------------
+# High-scoring sports: normal margin model, NOT the soccer Poisson grid
+# ---------------------------------------------------------------------------
+
+from src.ptai.betting.high_scoring import (
+    SPORT_PARAMS,
+    is_high_scoring,
+    price_high_scoring_card,
+    price_period_total,
+    price_spread_normal,
+    price_total_normal,
+)
+
+
+def test_high_scoring_sports_are_routed_away_from_poisson():
+    for sport in ("basketball", "football", "baseball", "hockey"):
+        assert is_high_scoring(sport), sport
+    assert not is_high_scoring("soccer")
+    assert not is_high_scoring("tennis")
+
+
+def test_poisson_would_understate_the_nba_total_spread():
+    """
+    The whole reason this model exists. Poisson variance == mean, so a 224
+    point total implies std sqrt(2*112) = 15.0 against ~20.5 actual.
+    """
+    import math
+    poisson_total_std = math.sqrt(2 * 112.0)
+    assert poisson_total_std == pytest.approx(15.0, abs=0.1)
+    assert SPORT_PARAMS["basketball"].total_std > poisson_total_std * 1.3
+
+
+def test_total_over_under_push_sum_to_one():
+    for line in (224.0, 225.0, 225.5, 226.0):
+        t = price_total_normal(224.5, 20.5, line)
+        assert t.over + t.under + t.push == pytest.approx(1.0, abs=1e-3), line
+
+
+def test_whole_number_line_can_push_but_half_line_cannot():
+    whole = price_total_normal(224.5, 20.5, 225.0)
+    assert whole.push > 0
+    half = price_total_normal(224.5, 20.5, 225.5)
+    assert half.push == 0.0
+
+
+def test_quarter_line_is_the_mean_of_adjacent_halves():
+    q = price_total_normal(224.5, 20.5, 225.25)
+    lo = price_total_normal(224.5, 20.5, 225.0)
+    hi = price_total_normal(224.5, 20.5, 225.5)
+    assert q.quarter_line is True
+    assert q.components == [225.0, 225.5]
+    assert q.over == pytest.approx((lo.over + hi.over) / 2.0, abs=1e-6)
+
+
+def test_higher_line_means_lower_over_probability():
+    probs = [price_total_normal(224.5, 20.5, l).over for l in (215.5, 220.5, 225.5, 230.5)]
+    assert probs == sorted(probs, reverse=True)
+
+
+def test_wider_std_flattens_the_over_under():
+    """More variance pulls a tail line toward 50%."""
+    tight = price_total_normal(224.5, 12.0, 240.5).over
+    wide = price_total_normal(224.5, 25.0, 240.5).over
+    assert wide > tight
+
+
+def test_spread_sums_to_one_and_pushes_on_whole_lines():
+    for line in (0.0, -1.5, -3.5, -6.0):
+        sp = price_spread_normal(4.0, 12.0, line)
+        # three values each rounded to 4dp can drift by up to ~1.5e-4
+        assert sp.home + sp.away + sp.push == pytest.approx(1.0, abs=1e-3), line
+    assert price_spread_normal(4.0, 12.0, -4.0).push > 0     # whole line
+    assert price_spread_normal(4.0, 12.0, -3.5).push == 0.0  # half line
+
+
+def test_spread_direction_is_monotonic():
+    probs = [price_spread_normal(4.0, 12.0, l).home for l in (3.5, 0.0, -3.5, -10.5)]
+    assert probs == sorted(probs, reverse=True)
+
+
+def test_spread_at_the_expected_margin_is_even():
+    sp = price_spread_normal(4.0, 12.0, -4.5)
+    assert sp.home == pytest.approx(0.5, abs=0.02)
+
+
+def test_moneyline_matches_the_spread_direction():
+    ml = price_high_scoring_card("e", "basketball", 114.0, 110.0).moneyline
+    assert ml["home"] > ml["away"]
+    assert ml["home"] + ml["away"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_period_std_scales_with_sqrt_not_linearly():
+    """Variances add over independent periods, so std scales with sqrt(fraction)."""
+    full = price_total_normal(224.0, 20.0, 224.5)
+    q = price_period_total(224.0, 20.0, 56.5, 0.25)
+    # a quarter's std must be half the full-game std, not a quarter of it
+    assert q.std == pytest.approx(10.0, abs=1e-6)
+    assert full.std == 20.0
+    # and the over probability at the mean should stay near 50% at any scale
+    assert 0.4 < q.over < 0.6
+
+
+def test_margin_bands_are_a_distribution_over_positive_margins():
+    card = price_high_scoring_card("e", "football", 24.0, 20.0,
+                                   margin_bands=[(1, 3), (4, 6), (7, 10), (11, 99)])
+    total = sum(card.margin_bands.values())
+    assert total < 1.0            # only covers home wins, not all outcomes
+    assert all(v >= 0 for v in card.margin_bands.values())
+
+
+def test_nfl_model_does_not_use_the_soccer_total_std():
+    nfl = SPORT_PARAMS["football"]
+    assert nfl.total_std == pytest.approx(13.5, abs=0.5)
+    assert nfl.typical_total == pytest.approx(45.0, abs=1.0)
+
+
+def test_engine_routes_basketball_to_the_normal_model():
+    engine = BettingEngine(bankroll=500.0)
+    ev = sample_events(1)[0]      # sample_events[0] is NBA
+    assert ev.sport == "nba" or ev.league == "nba"
+    strengths = {ev.key: {"home": {"expected_points": 114.0},
+                          "away": {"expected_points": 110.0}}}
+    result = engine.price_card(ev, strengths)
+    # the soccer card is not produced; the high-scoring one is
+    assert result is None
+    assert ev.key in engine.priced_high_scoring
+    fair = engine.high_scoring_fair_prices(ev.key)
+    assert "moneyline" in fair
+    assert any(k.startswith("totals_") for k in fair)
+    assert any(k.startswith("spreads_") for k in fair)
+    assert "margin_bands" in fair
+
+
+def test_engine_refuses_to_invent_a_basketball_score():
+    engine = BettingEngine(bankroll=500.0)
+    ev = sample_events(1)[0]
+    # attack/defence strengths are soccer inputs - not valid for basketball
+    strengths = {ev.key: {"home": {"attack": 1.3, "defence": 0.9},
+                          "away": {"attack": 1.0, "defence": 1.1}}}
+    assert engine.price_card(ev, strengths) is None
+    assert ev.key not in engine.priced_high_scoring
+
+
+def test_feed_type_mapping_handles_dynamic_high_scoring_keys():
+    f = BettingEngine._feed_type_for
+    assert f("totals_225.0") == "totals"
+    assert f("spreads_-3.5") == "spreads"
+    assert f("team_total_home_110.5") == "team_total"
+    assert f("period_Q1") == "period"
