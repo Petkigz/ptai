@@ -1021,3 +1021,205 @@ def test_feed_type_mapping_handles_dynamic_high_scoring_keys():
     assert f("spreads_-3.5") == "spreads"
     assert f("team_total_home_110.5") == "team_total"
     assert f("period_Q1") == "period"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Betfair exchange adapter - the feed that makes the wide card tradeable
+# ═══════════════════════════════════════════════════════════════════════════
+
+from src.ptai.venues.betfair_exchange import (
+    BETFAIR_EVENT_TYPES, BETFAIR_MARKET_MAP, CORE_MARKET_TYPES,
+    PLAYER_MARKET_TYPES, SECONDARY_MARKET_TYPES, BetfairClient,
+    BetfairMarket, BetfairRunner, fetch_full_card,
+)
+
+
+def _book(market_id, runners, total_matched=5000.0):
+    """A Betfair market book in lightweight (dict) form."""
+    return {"id": market_id, "totalMatched": total_matched,
+            "runners": [{"selectionId": sid, "name": nm, "status": "ACTIVE",
+                         "lastPriceTraded": lp, "totalMatched": tm,
+                         "ex": {"availableToBack": [{"price": bp, "size": bs}],
+                                "availableToLay": [{"price": lp2, "size": ls}]}}
+                        for sid, nm, bp, bs, lp2, ls, lp, tm in runners]}
+
+
+def test_betfair_market_map_covers_the_whole_catalogue():
+    """
+    The mapping is the bridge from Betfair's codes to this project's keys.
+    Every code we request must land somewhere, and nothing may map to a
+    catalogue key that does not exist.
+    """
+    from src.ptai.betting.market_types import MARKET_CATALOGUE
+    requested = set(CORE_MARKET_TYPES) | set(SECONDARY_MARKET_TYPES) | set(PLAYER_MARKET_TYPES)
+    unmapped = [t for t in requested if t not in BETFAIR_MARKET_MAP]
+    assert not unmapped, f"requested but unmapped: {unmapped}"
+
+    dangling = sorted({v for v in BETFAIR_MARKET_MAP.values()} - set(MARKET_CATALOGUE))
+    assert not dangling, f"maps to unknown catalogue keys: {dangling}"
+
+
+def test_betfair_sports_have_event_type_ids():
+    for sport in ("soccer", "basketball", "football", "baseball", "hockey", "tennis"):
+        assert sport in BETFAIR_EVENT_TYPES, f"no Betfair event type id for {sport}"
+
+
+def test_betfair_without_credentials_returns_nothing_not_a_placeholder():
+    """
+    The old adapter returned five hardcoded fixtures priced 0.45 + i*0.05.
+    No credentials must mean no markets, with a reason recorded.
+    """
+    client = BetfairClient()
+    assert not client.configured
+    assert client.market_catalogue("1") == []
+    assert client.market_books(["1.234"]) == {}
+    assert "credentials" in client.last_error.lower()
+    assert client.health()["logged_in"] is False
+
+
+def test_betfair_parses_back_and_lay_from_a_book():
+    """
+    An exchange price is two-sided. Keeping only the back price would discard
+    the lay side that makes hedging and book-vs-exchange arbs possible.
+    """
+    book = _book("1.100", [(1, "Manchester City", 2.10, 500.0, 2.14, 400.0, 2.12, 9000.0),
+                           (2, "Arsenal", 3.90, 250.0, 4.10, 180.0, 4.00, 4000.0)])
+    runners, total = BetfairClient.parse_runners(book)
+    assert total == 5000.0
+    assert len(runners) == 2
+    home = runners[0]
+    assert home.back_price == 2.10 and home.lay_price == 2.14
+    assert home.spread == 0.04
+    assert home.has_both_sides
+    assert home.back_size == 500.0 and home.lay_size == 400.0
+
+
+def test_betfair_runner_without_a_lay_side_is_not_bookable():
+    book = _book("1.200", [(1, "Team A", 1.80, 100.0, None, 0.0, None, 0.0)])
+    runners, _ = BetfairClient.parse_runners(book)
+    # one-sided price: back present, no lay available
+    assert runners[0].back_price == 1.80
+    assert runners[0].has_both_sides is False
+    assert runners[0].spread is None
+
+
+def test_betfair_market_is_bookable_only_when_a_runner_has_both_sides():
+    thin = BetfairMarket(market_id="1.1", market_type="MATCH_ODDS", catalogue_key="h2h",
+                         market_name="Match Odds", event_id="3", event_name="A v B",
+                         commence_time=None, in_play=False,
+                         runners=[BetfairRunner(selection_id=1, name="A", back_price=2.0)])
+    assert thin.is_bookable is False
+
+    wide = BetfairMarket(market_id="1.2", market_type="MATCH_ODDS", catalogue_key="h2h",
+                         market_name="Match Odds", event_id="3", event_name="A v B",
+                         commence_time=None, in_play=False,
+                         runners=[BetfairRunner(selection_id=1, name="A",
+                                                back_price=2.0, back_size=100.0,
+                                                lay_price=2.05, lay_size=90.0)])
+    assert wide.is_bookable is True
+
+
+def test_betfair_to_market_carries_the_lay_side_through():
+    mf = BetfairMarket(market_id="1.300", market_type="OVER_UNDER_CORNERS",
+                       catalogue_key="corners_total", market_name="Over/Under 10.5 Corners",
+                       event_id="77", event_name="Man City v Arsenal", commence_time=None,
+                       in_play=False, total_matched=2500.0,
+                       runners=[BetfairRunner(selection_id=1, name="Over 10.5",
+                                              back_price=1.95, back_size=300.0,
+                                              lay_price=2.00, lay_size=250.0),
+                                BetfairRunner(selection_id=2, name="Under 10.5",
+                                              back_price=1.98, back_size=280.0,
+                                              lay_price=2.02, lay_size=260.0)])
+    m = BetfairClient().to_market(mf, data_mode=DataMode.LIVE)
+    assert m is not None
+    assert m.venue_id == "betfair"
+    assert m.is_mock is False
+    assert m.data_source == "betfair_exchange_live"
+    assert m.raw["is_exchange"] is True and m.raw["lay_available"] is True
+    assert m.raw["catalogue_key"] == "corners_total"
+    # the lay ladder is preserved, not just the back prices
+    assert m.raw["lay_prices"] == [2.0, 2.02]
+    assert m.raw["back_prices"] == [1.95, 1.98]
+    assert m.raw["spreads"] == [0.05, 0.04]
+
+
+def test_betfair_refuses_an_unknown_market_type():
+    """
+    An unmapped Betfair code cannot be settled against the right facts, so it
+    is reported and dropped rather than guessed into some market key.
+    """
+    client = BetfairClient()
+    mf = BetfairMarket(market_id="1.400", market_type="NEW_FANCY_MARKET",
+                       catalogue_key="", market_name="Fancy", event_id="9",
+                       event_name="X v Y", commence_time=None, in_play=False,
+                       runners=[BetfairRunner(selection_id=1, name="A",
+                                              back_price=2.0, back_size=100.0,
+                                              lay_price=2.1, lay_size=90.0)])
+    assert client.to_market(mf) is None
+    assert mf.unknown_type is True
+
+
+def test_betfair_to_market_needs_a_bookable_runner():
+    mf = BetfairMarket(market_id="1.500", market_type="MATCH_ODDS", catalogue_key="h2h",
+                       market_name="Match Odds", event_id="5", event_name="A v B",
+                       commence_time=None, in_play=False, runners=[])
+    assert BetfairClient().to_market(mf) is None
+
+
+def test_betfair_market_mode_is_honest_about_non_live_data():
+    """A shadow-mode market must not be labelled as executable live data."""
+    mf = BetfairMarket(market_id="1.600", market_type="CARD_ODDS", catalogue_key="cards_1x2",
+                       market_name="Cards", event_id="6", event_name="A v B",
+                       commence_time=None, in_play=False,
+                       runners=[BetfairRunner(selection_id=1, name="Home",
+                                              back_price=2.2, back_size=100.0,
+                                              lay_price=2.3, lay_size=90.0)])
+    m = BetfairClient().to_market(mf, data_mode=DataMode.LIVE_SHADOW)
+    assert m.data_source == "live_shadow"
+    assert m.data_mode.can_deploy_live_capital is False
+
+
+def test_betfair_fetch_full_card_groups_by_catalogue_key():
+    """The whole point: one call returns the wide card, keyed for pricing."""
+    class _Client(BetfairClient):
+        def __init__(self):
+            super().__init__(); self._logged_in = True
+            self.requested_types = ()
+        def market_catalogue(self, etid, market_types=CORE_MARKET_TYPES, max_results=100,
+                             in_play_only=False, hours_ahead=48):
+            self.requested_types = tuple(market_types)
+            return [
+                BetfairMarket("1.1", "MATCH_ODDS", "h2h", "Match Odds", "3", "A v B",
+                              None, False),
+                BetfairMarket("1.2", "OVER_UNDER_25", "totals", "O/U 2.5", "3", "A v B",
+                              None, False),
+                BetfairMarket("1.3", "OVER_UNDER_CORNERS", "corners_total", "Corners",
+                              "3", "A v B", None, False),
+                BetfairMarket("1.4", "BOOKING_ODDS", "booking_points", "Bookings",
+                              "3", "A v B", None, False),
+            ]
+        def market_books(self, market_ids):
+            return {mid: _book(mid, [(1, "S1", 1.9, 100.0, 1.95, 90.0, 1.92, 1000.0)])
+                    for mid in market_ids}
+
+    c = _Client()
+    grouped = fetch_full_card(c, "1", include_player_markets=True)
+    assert set(grouped) == {"h2h", "totals", "corners_total", "booking_points"}
+    # the request must include the secondary and player types, not just core
+    assert "OVER_UNDER_CORNERS" in c.requested_types
+    assert "BOOKING_ODDS" in c.requested_types
+    assert "PLAYER_GOALS" in c.requested_types
+
+
+def test_betfair_full_card_drops_unbookable_markets():
+    class _Client(BetfairClient):
+        def __init__(self):
+            super().__init__(); self._logged_in = True
+        def market_catalogue(self, etid, market_types=CORE_MARKET_TYPES, max_results=100,
+                             in_play_only=False, hours_ahead=48):
+            return [BetfairMarket("1.9", "MATCH_ODDS", "h2h", "Match Odds", "3", "A v B",
+                                  None, False)]
+        def market_books(self, market_ids):
+            return {"1.9": _book("1.9", [(1, "S1", 1.9, 100.0, None, 0.0, None, 0.0)])}
+
+    assert fetch_full_card(_Client(), "1") == {}
