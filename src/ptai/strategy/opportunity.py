@@ -23,6 +23,7 @@ from ..venues.adapter import VenueOpportunity, VenueType
 from ..venues.registry import VenueRegistry
 from .fair_value import FairValueEngine, FairValueResult
 from .edge import EdgeCalculator
+from .expected_ev import ExpectedNetEVEngine
 
 
 @dataclass
@@ -176,6 +177,7 @@ class OpportunityEngine:
         self.edge_calculator = edge_calculator or EdgeCalculator()
         self.llm_router = llm_router
         self.fast_classifier = FastModelClassifier(llm_router=llm_router)
+        self.expected_ev_engine = ExpectedNetEVEngine()
         self.min_volume_24h = 1000
         self.min_liquidity = 500
         self.max_spread = 0.08
@@ -435,13 +437,19 @@ class OpportunityEngine:
                 continue
             
             amount_usd = min(bankroll * 0.06, 3.0)
+            # V10 FIX #9: Use Expected Net EV engine for economically meaningful scoring
+            orderbook = opp.market.raw.get("orderbook", {}) if hasattr(opp.market, 'raw') and isinstance(opp.market.raw, dict) else {}
+            ev_result = self.expected_ev_engine.calculate(opp, amount_usd, orderbook)
+            
+            # Old scoring for comparison
             expected_profit = opp.effective_edge * amount_usd * opp.confidence
             fees = opp.fees_pct * amount_usd
             slippage = opp.slippage_pct * amount_usd
             risk_adjusted_ev = expected_profit - fees - slippage - opp.uncertainty * amount_usd * 0.5
             
-            if risk_adjusted_ev <= 0:
-                logger.info(f"Risk-adjusted EV negative for {opp.market.id} venue {opp.venue_id}: EV ${expected_profit:.2f} fees ${fees:.2f} slippage ${slippage:.2f} => {risk_adjusted_ev:.2f} NO TRADE")
+            # V10 FIX #9: New scoring = net EV per dollar per risk per capital-time
+            if ev_result.net_ev_usd <= 0:
+                logger.info(f"Expected Net EV blocks {opp.market.id} venue {opp.venue_id}: net EV ${ev_result.net_ev_usd:.2f} (gross ${ev_result.gross_ev_usd:.2f} costs ${ev_result.fees_usd+ev_result.spread_usd+ev_result.slippage_usd:.2f}) => NO TRADE - {ev_result.reasoning[:100]}")
                 continue
             
             liquidity_score = opp.liquidity_score
@@ -449,7 +457,6 @@ class OpportunityEngine:
                 logger.info(f"Low liquidity for {opp.market.id} venue {opp.venue_id}: score {liquidity_score:.2f} NO TRADE")
                 continue
             
-            # Check execution quality from real orderbook
             if opp.execution_quality < 0.3:
                 logger.info(f"Low execution quality for {opp.market.id} venue {opp.venue_id}: exec {opp.execution_quality:.2f} - may be mock orderbook not real CLOB - NO TRADE")
                 continue
@@ -472,10 +479,13 @@ class OpportunityEngine:
                 elif opp.time_to_resolution_hours > 720:
                     time_efficiency = 0.7
             
-            final_score = risk_adjusted_ev * liquidity_score * opp.execution_quality * time_efficiency / (opp.uncertainty + 0.01)
+            # V10 FIX #9: Final score now economically meaningful: net EV per dollar per risk per capital-time
+            final_score = ev_result.net_ev_usd * ev_result.ev_per_dollar * liquidity_score * opp.execution_quality * time_efficiency * ev_result.ev_per_risk / max(0.01, opp.uncertainty)
+            # Also incorporate capital efficiency
+            final_score *= (1 + ev_result.ev_per_capital_time)
             opp.score = final_score
             
-            logger.info(f"Selected {opp.market.id} venue {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} liq {liquidity_score:.2f} exec {opp.execution_quality:.2f} EV ${risk_adjusted_ev:.2f} final_score {final_score:.3f} - best risk-adjusted return for capital ${bankroll} | venue_id immutable {opp.venue_id}")
+            logger.info(f"Selected {opp.market.id} venue {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} liq {liquidity_score:.2f} exec {opp.execution_quality:.2f} netEV ${ev_result.net_ev_usd:.2f} ({ev_result.net_ev_pct*100:.1f}%) per$ {ev_result.ev_per_dollar*100:.1f}% perRisk {ev_result.ev_per_risk:.2f} final_score {final_score:.3f} - V10 FIX #9 Expected Net EV | venue_id immutable {opp.venue_id}")
             
             selected.append(opp)
             total_allocated += amount_usd

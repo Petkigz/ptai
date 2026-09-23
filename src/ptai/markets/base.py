@@ -13,22 +13,54 @@ class MarketSource(str, Enum):
 
 class DataMode(str, Enum):
     """
-    CRITICAL SAFETY V9: Hard separation of data types
-    LIVE = real API data, executable for real money (if qualified)
-    PAPER = real API data but paper trading mode, learning only, no live capital unless qualified
+    CRITICAL SAFETY V9 + V10: Hard separation of data types with tiered trust
+    V10 FIX #5: Distinguish synthetic vs historical vs shadow vs paper vs real
     MOCK = synthetic/fake markets for development/testing, MUST NEVER reach live execution
+    HISTORICAL_SIM = historical replay with real market data but simulated fills, paper only
+    LIVE_SHADOW = live data, shadow trading (no orders, just logging), learning only
+    LIVE_PAPER = live data, paper trading (simulated orders), qualifies venues but no live capital
+    PAPER = alias for LIVE_PAPER (backward compat)
+    LIVE = real API data, executable for real money IF qualified + account health OK
+    LIVE_REAL = alias for LIVE but explicitly verified real trading with real fills
     """
-    LIVE = "live"
-    PAPER = "paper"
     MOCK = "mock"
+    HISTORICAL_SIM = "historical_sim"
+    LIVE_SHADOW = "live_shadow"
+    LIVE_PAPER = "live_paper"
+    PAPER = "paper"  # backward compat = LIVE_PAPER
+    LIVE = "live"
+    LIVE_REAL = "live_real"  # explicitly verified real trading
 
     @property
     def is_executable(self) -> bool:
-        return self in (DataMode.LIVE, DataMode.PAPER)
+        # Only LIVE modes are executable for real money, but all non-MOCK are executable for paper
+        return self not in (DataMode.MOCK,)
 
     @property
     def can_deploy_live_capital(self) -> bool:
-        return self == DataMode.LIVE
+        return self in (DataMode.LIVE, DataMode.LIVE_REAL)
+
+    @property
+    def is_synthetic(self) -> bool:
+        return self in (DataMode.MOCK, DataMode.HISTORICAL_SIM)
+
+    @property
+    def is_paper(self) -> bool:
+        return self in (DataMode.PAPER, DataMode.LIVE_PAPER, DataMode.LIVE_SHADOW, DataMode.HISTORICAL_SIM)
+
+    @property
+    def trust_tier(self) -> int:
+        # Higher = more trustworthy for qualification
+        tiers = {
+            DataMode.MOCK: 0,
+            DataMode.HISTORICAL_SIM: 1,
+            DataMode.LIVE_SHADOW: 2,
+            DataMode.LIVE_PAPER: 3,
+            DataMode.PAPER: 3,
+            DataMode.LIVE: 4,
+            DataMode.LIVE_REAL: 5
+        }
+        return tiers.get(self, 0)
 
 @dataclass
 class Token:

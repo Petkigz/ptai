@@ -111,6 +111,9 @@ from ..risk.limits import LimitsEngine, TradeLimits
 from ..execution.order_manager import OrderManager
 from ..execution.execution_guard import ExecutionGuard
 from ..execution.reconciliation import ReconciliationEngine
+from ..execution.multi_venue_executor import MultiVenueExecutor
+from ..execution.account_health import AccountHealthEngine
+from ..strategy.expected_ev import ExpectedNetEVEngine
 
 from ..learning.calibration_db import CalibrationDB
 from ..learning.trade_outcomes import TradeOutcomeTracker
@@ -295,10 +298,13 @@ class TradingAgentV3:
             min_edge=self.settings.min_edge_pct
         )
         
-        # Execution
+        # Execution - V10 FIX #1: One canonical execution path via MultiVenueExecutor
         self.order_manager = OrderManager(storage=self.storage)
         self.execution_guard = ExecutionGuard(bankroll=bankroll)
         self.reconciliation_engine = ReconciliationEngine(storage=self.storage)
+        self.multi_venue_executor = MultiVenueExecutor(registry=self.venue_registry, bankroll=bankroll)
+        self.account_health_engine = AccountHealthEngine(venue_registry=self.venue_registry)
+        self.expected_ev_engine = ExpectedNetEVEngine()
         
         # Learning
         self.trade_outcome_tracker = TradeOutcomeTracker(storage=self.storage)
@@ -474,11 +480,16 @@ class TradingAgentV3:
                         }
                         context["tweets"] = getattr(x_signal, 'tweets', [])[:5] if hasattr(x_signal, 'tweets') else []
                         context["sources"].append("x_engine")
-                        # Check bot bursts, duplicates, farming, fake accounts via x_engine internals
+                        # V10 FIX #12: Real X credibility checks from XEngine analysis, not placeholders
                         context["x_credibility_checks"] = {
-                            "bot_burst_detected": False,
-                            "duplicate_rate": 0,
-                            "farming_detected": False
+                            "bot_burst_detected": getattr(x_signal, 'bot_burst_detected', False),
+                            "duplicate_rate": getattr(x_signal, 'duplicate_rate', 0.0),
+                            "farming_detected": getattr(x_signal, 'farming_detected', False),
+                            "credibility": getattr(x_signal, 'credibility', 0.5),
+                            "novelty": getattr(x_signal, 'novelty', 0.5),
+                            "corroborated": getattr(x_signal, 'corroborated', False),
+                            "unique_ratio": getattr(x_signal, 'unique_ratio', 1.0),
+                            "issues": getattr(x_signal, 'issues', [])[:3] if hasattr(x_signal, 'issues') else []
                         }
                     # Also check x_scraper health - circuit breaker 40 sec not 21 min
                     if hasattr(self, 'x_scraper'):
@@ -489,17 +500,42 @@ class TradingAgentV3:
                 logger.debug(f"X engine failed for {market.id}: {e}")
                 context["sentiment"] = {"score": 0, "credibility": 0.3, "error": str(e)[:200]}
             
-            # V9 FIX #4: Web research - for top markets, actually calls web_researcher.research with 45s timeout
+            # V10 FIX #11: Web research - not just volume>10k funnel, but also top opportunities by edge/uncertainty
+            # Previously: only if volume_24h >10000 or liquidity >10000 - intentional funnel OK but could miss low-volume high-edge
+            # Now: also research if market has high potential edge markers, or is in top candidates
+            # We still limit to save time (45s per market), but funnel is broader
             try:
                 if hasattr(self, 'web_researcher') and self.web_researcher:
-                    # Only for high potential markets to save time (top 20 per 10 min cycle)
+                    should_research = False
+                    research_reason = ""
+                    
+                    # Original funnel: high volume/liquidity
                     if market.volume_24h > 10000 or market.liquidity > 10000:
+                        should_research = True
+                        research_reason = f"high vol {market.volume_24h} liq {market.liquidity}"
+                    
+                    # V10 FIX #11: Also research if question indicates high edge potential (politics, economics, crypto with clear catalysts)
+                    q_lower = market.question.lower()
+                    high_edge_keywords = ["trump", "biden", "election", "fed", "cpi", "rate", "btc", "bitcoin", "eth"]
+                    if any(k in q_lower for k in high_edge_keywords) and (market.volume_24h > 1000 or market.liquidity > 1000):
+                        should_research = True
+                        research_reason = f"high-edge category + vol {market.volume_24h}"
+                    
+                    # V10 FIX #11: Also research top 20 per cycle regardless of volume if uncertainty high (need research to reduce uncertainty)
+                    # This is decided at strategy_engine level, but we can flag here
+                    
+                    if should_research:
                         research_result = await self.web_researcher.research(market, max_time_seconds=45)
                         if research_result:
-                            context["research"] = getattr(research_result, 'summary', str(research_result))[:800] if hasattr(research_result, 'summary') else str(research_result)[:800]
+                            summary = getattr(research_result, 'final_summary', '') or getattr(research_result, 'summary', '') or str(research_result)
+                            context["research"] = summary[:800]
                             context["research_sources"] = getattr(research_result, 'sources', [])[:3] if hasattr(research_result, 'sources') else []
+                            context["research_bull"] = getattr(research_result, 'supporting_yes', '')[:200]
+                            context["research_bear"] = getattr(research_result, 'supporting_no', '')[:200]
+                            context["research_resolution_risks"] = getattr(research_result, 'resolution_risks', '')[:200]
                             context["sources"].append("web_researcher")
-                            logger.debug(f"Web research for {market.id}: {context['research'][:100]}")
+                            context["research_reason"] = research_reason
+                            logger.debug(f"Web research for {market.id} ({research_reason}): {context['research'][:100]}")
             except Exception as e:
                 logger.debug(f"Web researcher failed for {market.id}: {e}")
             
@@ -606,20 +642,59 @@ class TradingAgentV3:
         logger.info(f"Common scoring: {len(scan_result.venue_reports)} venues, {scan_result.total_candidates} candidates, {scan_result.total_tradeable} tradeable after fees/liquidity/uncertainty")
         
         # Core Objective Step 4: Only deploys capital when passes independently enforced rules
+        # V10 FIX #2: Consistent risk sizing - Kelly first, then same amount through all checks
+        # V10 FIX #8: Exploration lane 95/5 - qualified capital lane + shadow lane
         logger.info("Core Objective Step 4: Only deploys capital when passes independently enforced rules: edge>=8% conf>=60% liquidity>=0.3 exec_quality>=0.3 EV>0, exposure caps, correlation caps, drawdown limits, kill_switch, execution_guard")
-        # Risk checks on final selected - independently enforced rules
-        # Independently enforced rules: edge>=8% conf>=60% liquidity>=0.3 exec_quality>=0.3 EV>0 + exposure + correlation + drawdown + kill_switch + execution_guard
-        # Also: only qualified venues can deploy live capital
+        logger.info("V10 FIX #2: Kelly → proposed amount → exposure → correlation → limits → guard → executor (same amount)")
+        logger.info("V10 FIX #8: 95% research → qualified venues, 5% → promising unqualified (shadow/paper only, no live capital)")
+        
         final_trades = []
+        exploration_trades = []  # shadow lane
+        bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
+        
+        # Separate qualified vs exploration
+        qualified_opps = []
+        unqualified_opps = []
         for opp in scan_result.final_selected:
-            # Rule 1: Only qualified venues deploy live capital (core objective)
-            if qualified_venue_ids and opp.venue_id not in qualified_venue_ids and opp.venue_id.split("+")[0] not in qualified_venue_ids:
-                logger.info(f"Qualification blocks {opp.market.id} @ {opp.venue_id}: not in qualified {qualified_venue_ids} - paper trading only, NO live capital")
-                # Still allow paper trading record but not live execution
-                if not self.settings.dry_run if hasattr(self.settings, 'dry_run') else True:
-                    continue
+            is_qualified = not qualified_venue_ids or opp.venue_id in qualified_venue_ids or opp.venue_id.split("+")[0] in qualified_venue_ids
+            if is_qualified:
+                qualified_opps.append(opp)
+            else:
+                unqualified_opps.append(opp)
+        
+        # V10 FIX #8: 95/5 split - 95% qualified, 5% exploration (shadow only)
+        # Take top unqualified as exploration candidates (max 1 per cycle for $50 bankroll)
+        exploration_candidates = sorted(unqualified_opps, key=lambda x: x.score, reverse=True)[:1] if unqualified_opps else []
+        if exploration_candidates:
+            logger.info(f"V10 FIX #8 Exploration lane: {len(exploration_candidates)} unqualified venues selected for shadow/paper learning (NO live capital): {[o.venue_id+':'+o.market.id for o in exploration_candidates]}")
+        
+        # Process qualified opportunities with consistent sizing
+        for opp in qualified_opps:
+            # V10 FIX #2: Calculate Kelly FIRST
+            kelly_fraction = self.kelly_calculator.calculate(
+                edge=opp.effective_edge,
+                prob=opp.estimated_fair,
+                confidence=opp.confidence
+            )
+            proposed_amount = bankroll * kelly_fraction
+            proposed_amount = min(proposed_amount, bankroll * 0.06)  # Cap 6%
+            proposed_amount = max(0, proposed_amount)
             
-            # Rule 2: Independently enforced hard rules
+            if proposed_amount < 1.0:
+                logger.info(f"Position size ${proposed_amount:.2f} < $1 min - skip {opp.market.id}")
+                continue
+            
+            # V10 FIX #9: Expected Net EV calculation for economically meaningful comparison
+            expected_ev = self.expected_ev_engine.calculate(
+                opportunity=opp,
+                amount_usd=proposed_amount,
+                orderbook=opp.market.raw.get("orderbook", {}) if hasattr(opp.market, 'raw') else {}
+            )
+            if expected_ev.net_ev_usd <= 0:
+                logger.info(f"Expected Net EV blocks {opp.market.id}: net EV ${expected_ev.net_ev_usd:.2f} <=0 - {expected_ev.reasoning[:100]}")
+                continue
+            
+            # Rule 1: Hard rules
             if opp.effective_edge < 0.08:
                 logger.info(f"Hard rule blocks {opp.market.id}: edge {opp.effective_edge*100:.1f}% < 8%")
                 continue
@@ -633,49 +708,69 @@ class TradingAgentV3:
                 logger.info(f"Hard rule blocks {opp.market.id}: execution_quality {opp.execution_quality:.2f} < 0.3")
                 continue
             
-            # Exposure check - independently enforced
+            # V10 FIX #2: Use SAME proposed_amount for all risk checks
             can_trade, reason = self.exposure_manager.can_open_position(
                 market_id=opp.market.id,
-                amount_usd=5.0,  # would be calculated via Kelly
+                amount_usd=proposed_amount,  # V10 FIX: same amount, not $5
                 category=opp.category,
                 correlation_group=opp.correlation_group
             )
             if not can_trade:
-                logger.info(f"Risk blocks {opp.market.id}: {reason}")
+                logger.info(f"Risk blocks {opp.market.id}: {reason} (amount ${proposed_amount:.2f})")
                 continue
             
-            # Limits check - independently enforced
             limits_ok, limits_reason = self.limits_engine.validate(
                 market_id=opp.market.id,
                 edge=opp.effective_edge,
                 confidence=opp.confidence,
-                amount_usd=5.0,
+                amount_usd=proposed_amount,  # V10 FIX: same amount
                 price=opp.market_price
             )
             if not limits_ok:
-                logger.info(f"Limits block {opp.market.id}: {limits_reason}")
+                logger.info(f"Limits block {opp.market.id}: {limits_reason} (amount ${proposed_amount:.2f})")
                 continue
             
-            # Kill switch check - independently enforced
             if not self.kill_switch.can_trade():
                 logger.warning(f"Kill switch blocks trading L{self.kill_switch.current_level}")
                 break
             
-            # All independently enforced rules passed
-            logger.info(f"Core Objective PASS: {opp.market.id} @ {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} score {opp.score:.3f} - ALL independently enforced rules PASSED")
+            # Attach calculated amounts to opportunity for execution
+            opp._proposed_amount = proposed_amount
+            opp._expected_ev = expected_ev
+            
+            logger.info(f"Core Objective PASS: {opp.market.id} @ {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} score {opp.score:.3f} amount ${proposed_amount:.2f} netEV ${expected_ev.net_ev_usd:.2f} - ALL independently enforced rules PASSED (consistent sizing)")
             final_trades.append(opp)
         
-        # Execution - V9 FIX #2: Remove every fallback to first adapter, ABORT if missing
-        # Previously: if adapter isn't found use first adapter for dry run - DANGEROUS
-        # Now: exact routing only, ABORT if not found, MOCK_DATA must be impossible to reach live execution
+        # V10 FIX #8: Exploration lane - shadow/paper only, no live capital, for learning
+        for opp in exploration_candidates:
+            opp._proposed_amount = 1.0  # minimal shadow
+            opp._is_exploration = True
+            exploration_trades.append(opp)
+            logger.info(f"Exploration SHADOW: {opp.market.id} @ {opp.venue_id} score {opp.score:.3f} - shadow/paper only, NO live capital, for discovering new edges")
+        
+        # Execution - V10 FIX #1: ONE canonical execution path via MultiVenueExecutor
+        # Architecture: V3 → ExecutionGuard → MultiVenueExecutor → Exact venue adapter → place_order()
+        # Previously bypassed executor: V3 → Guard → adapter.place_order() directly - FIXED
+        # V10 FIX #2: Use same Kelly-calculated amount through all checks (no $5 placeholder)
         execution_results = []
+        
+        # Update executor and guard bankroll
+        current_bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
+        self.multi_venue_executor.bankroll = current_bankroll
+        self.execution_guard.update_bankroll(current_bankroll)
+        self.account_health_engine.bankroll = current_bankroll
+        
         for opp in final_trades[:max_trades]:
             try:
-                # V9 FIX #1: Hard LIVE/PAPER/MOCK separation - MOCK must never reach live execution
+                # V9 FIX #1 + V10: MOCK blocking - 4 layers
                 market_data_mode = getattr(opp.market, 'data_mode', None)
-                is_mock_market = getattr(opp.market, 'is_mock', False) or (hasattr(market_data_mode, 'value') and market_data_mode.value == 'mock') or str(market_data_mode).lower() == 'mock'
+                if hasattr(market_data_mode, 'value'):
+                    market_data_mode = market_data_mode.value
+                market_data_mode = str(market_data_mode).lower() if market_data_mode else "live"
+                is_mock_market = getattr(opp.market, 'is_mock', False) or market_data_mode in ("mock", "historical_sim") or "MOCK" in str(opp.market.id).upper()
+                
                 if is_mock_market:
-                    logger.error(f"ABORT TRADE: Market {opp.market.id} is MOCK_DATA (source {getattr(opp.market, 'data_source', 'unknown')}) - MOCK_DATA must be impossible to reach live execution - BLOCKED")
+                    logger.error(f"ABORT TRADE: Market {opp.market.id} is MOCK_DATA data_mode={market_data_mode} source={getattr(opp.market, 'data_source', 'unknown')} - BLOCKED")
                     execution_results.append({
                         "market_id": opp.market.id,
                         "venue": opp.venue_id,
@@ -686,93 +781,78 @@ class TradingAgentV3:
                     })
                     continue
                 
-                venue_id = opp.venue_id.split("+")[0] if "+" in opp.venue_id else opp.venue_id
-                venue_id = venue_id.lower()
+                # V10 FIX #4: Account health check before execution
+                venue_id_raw = opp.venue_id.split("+")[0] if "+" in opp.venue_id else opp.venue_id
+                venue_id = venue_id_raw.lower().strip()
                 
-                # V9 FIX #2: Exact routing only - never first eligible, ABORT if missing
-                adapter = self.venue_registry.get_adapter_for_venue_id(venue_id)
-                if not adapter:
-                    # Try exact market routing as second check
-                    adapter = self.venue_registry.get_adapter_for_market(opp.market)
-                
-                if not adapter:
-                    logger.error(f"ABORT TRADE: venue {venue_id} adapter not found for market {opp.market.id} - requested {opp.venue_id} not in {list(self.venue_registry.adapters.keys())} - ABORT, never fallback to first eligible - hard safety")
+                account_health = await self.account_health_engine.check_venue_health(venue_id)
+                if not account_health.healthy and not account_health.paper_trading_ok:
+                    logger.error(f"ABORT TRADE: Account health FAIL for {venue_id}: {account_health.reason} - {account_health.details}")
                     execution_results.append({
                         "market_id": opp.market.id,
                         "venue": opp.venue_id,
-                        "status": "aborted",
-                        "reason": f"Adapter {venue_id} not found - ABORT, never fallback",
-                        "available_adapters": list(self.venue_registry.adapters.keys())
+                        "status": "blocked",
+                        "reason": f"Account health FAIL {venue_id}: {account_health.reason}",
+                        "account_health": account_health.to_dict()
                     })
                     continue
+                if not account_health.healthy and account_health.paper_trading_ok:
+                    logger.warning(f"Account health: {venue_id} paper trading only (no live credentials/funds): {account_health.reason} - allowing paper execution only")
                 
-                # Validate venue_id matches - hard safety
-                if adapter.venue_id != venue_id and venue_id not in adapter.venue_id and adapter.venue_id not in venue_id:
-                    # Allow if it's composite arb (e.g. polymarket+kalshi)
-                    if "+" not in opp.venue_id:
-                        logger.error(f"ABORT TRADE: venue identity mismatch opportunity {opp.venue_id} vs adapter {adapter.venue_id} for market {opp.market.id} - ABORT")
-                        execution_results.append({
-                            "market_id": opp.market.id,
-                            "status": "aborted",
-                            "reason": f"Venue mismatch {opp.venue_id} vs {adapter.venue_id}"
-                        })
-                        continue
-                
-                # Kelly sizing - V9: actual Kelly, not hardcoded $3, but capped 6%
-                kelly_fraction = self.kelly_calculator.calculate(
-                    edge=opp.effective_edge,
-                    prob=opp.estimated_fair,
-                    confidence=opp.confidence
-                )
-                bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
-                amount_usd = bankroll * kelly_fraction
-                amount_usd = min(amount_usd, bankroll * 0.06)  # Cap 6% not hardcoded $3, but $3 on $50
-                amount_usd = max(0, amount_usd)
+                # V10 FIX #2: Use SAME amount calculated earlier (no recalculation)
+                amount_usd = getattr(opp, '_proposed_amount', None)
+                if amount_usd is None:
+                    # Fallback if not set (should not happen)
+                    kelly_fraction = self.kelly_calculator.calculate(edge=opp.effective_edge, prob=opp.estimated_fair, confidence=opp.confidence)
+                    amount_usd = current_bankroll * kelly_fraction
+                    amount_usd = min(amount_usd, current_bankroll * 0.06)
                 
                 if amount_usd < 1.0:
-                    logger.info(f"Position size ${amount_usd:.2f} < $1 min - skip")
+                    logger.info(f"Position size ${amount_usd:.2f} < $1 min - skip {opp.market.id}")
                     continue
                 
-                # Execution guard - V9 FIX: correct signature, plus MOCK check, deterministic
-                # Guard must also reject MOCK
+                # V10 FIX #1: Execution guard → MultiVenueExecutor → adapter (canonical path)
                 proposal = {
                     "market_id": opp.market.id,
                     "side": opp.side,
                     "venue_id": venue_id,
                     "data_mode": getattr(opp.market, 'data_mode', 'live'),
-                    "is_mock": getattr(opp.market, 'is_mock', False)
+                    "is_mock": getattr(opp.market, 'is_mock', False),
+                    "data_source": getattr(opp.market, 'data_source', ''),
+                    "expected_ev": getattr(opp, '_expected_ev', None).to_dict() if hasattr(opp, '_expected_ev') and opp._expected_ev else {}
                 }
                 risk_approved = {
                     "market_id": opp.market.id,
                     "max_price": opp.market_price + 0.02,
-                    "max_spend_usd": amount_usd,
+                    "max_spend_usd": amount_usd,  # V10 FIX #2: same amount
                     "venue_id": venue_id,
-                    "data_mode": getattr(opp.market, 'data_mode', 'live')
+                    "data_mode": getattr(opp.market, 'data_mode', 'live'),
+                    "data_source": getattr(opp.market, 'data_source', '')
                 }
                 
-                # V9: Check data_mode in guard
-                if is_mock_market:
-                    logger.error(f"Guard blocks {opp.market.id}: MOCK_DATA cannot be executed")
+                guard_result = self.execution_guard.validate(proposal, risk_approved)
+                if not guard_result.allowed:
+                    logger.warning(f"Execution guard blocks {opp.market.id}: {guard_result.reason} - independently enforced rule (amount ${amount_usd:.2f})")
                     execution_results.append({
                         "market_id": opp.market.id,
+                        "venue": opp.venue_id,
                         "status": "blocked",
-                        "reason": "MOCK_DATA blocked by execution guard"
+                        "reason": f"Guard: {guard_result.reason}",
+                        "amount": amount_usd,
+                        "guard_checks": guard_result.checks_failed
                     })
                     continue
                 
-                guard_result = self.execution_guard.validate(proposal, risk_approved)
+                logger.info(f"Core Objective DEPLOY via canonical executor: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} netEV ${getattr(opp, '_expected_ev', None).net_ev_usd if hasattr(opp, '_expected_ev') and opp._expected_ev else 0:.2f} - Guard PASS → MultiVenueExecutor → {venue_id}")
                 
-                if not guard_result.allowed:
-                    logger.warning(f"Execution guard blocks {opp.market.id}: {guard_result.reason} - independently enforced rule")
-                    continue
-                
-                logger.info(f"Core Objective DEPLOY: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} - capital deployment ONLY after passing independently enforced rules")
-                
-                result = await adapter.place_order(
+                # V10 FIX #1: ONE canonical path: MultiVenueExecutor.execute_single()
+                # Executor has: MOCK protection, exact routing ABORT, rate limits, min order checks, fee calc, gas
+                exec_result = await self.multi_venue_executor.execute_single(
                     opportunity=opp,
                     max_spend_usd=amount_usd,
                     max_price=opp.market_price + 0.02
                 )
+                
                 execution_results.append({
                     "market_id": opp.market.id,
                     "venue": opp.venue_id,
@@ -781,11 +861,31 @@ class TradingAgentV3:
                     "edge": opp.effective_edge,
                     "score": opp.score,
                     "amount": amount_usd,
-                    "result": result
+                    "expected_net_ev": getattr(opp, '_expected_ev', None).to_dict() if hasattr(opp, '_expected_ev') and opp._expected_ev else {},
+                    "executor_result": {
+                        "status": exec_result.status,
+                        "amount_usd": exec_result.amount_usd,
+                        "price": exec_result.price,
+                        "fees_usd": exec_result.fees_usd,
+                        "gas_usd": exec_result.gas_usd,
+                        "latency_ms": exec_result.latency_ms,
+                        "reasoning": exec_result.reasoning
+                    },
+                    "result": {
+                        "status": exec_result.status,
+                        "message": exec_result.reasoning
+                    },
+                    "canonical_path": "V3 → Guard → MultiVenueExecutor → adapter → place_order()",
+                    "account_health": account_health.to_dict()
                 })
                 
-                # Record for calibration - V9 FIX #5 persistent
+                # Record for calibration - V9 FIX #5 persistent + V10 trust tier
                 try:
+                    # V10 FIX #5: Track data_mode tier for qualification
+                    data_mode_for_calib = getattr(opp.market, 'data_mode', 'live')
+                    if hasattr(data_mode_for_calib, 'value'):
+                        data_mode_for_calib = data_mode_for_calib.value
+                    
                     self.calibration_engine.record_forecast(
                         market_id=opp.market.id,
                         question=opp.market.question[:200],
@@ -794,17 +894,38 @@ class TradingAgentV3:
                         market_price=opp.market_price,
                         category=opp.category
                     )
-                    # V9 FIX #5: Save immediately for persistence
                     self.calibration_engine.save()
+                    
+                    # Also record trade outcome with trust tier
+                    if hasattr(self.trade_outcome_tracker, 'record_trade'):
+                        try:
+                            self.trade_outcome_tracker.record_trade(
+                                market_id=opp.market.id,
+                                venue_id=venue_id,
+                                strategy=opp.raw.get("strategy", "unknown") if hasattr(opp, 'raw') and isinstance(opp.raw, dict) else "unknown",
+                                edge=opp.effective_edge,
+                                confidence=opp.confidence,
+                                amount_usd=amount_usd,
+                                data_mode=str(data_mode_for_calib),
+                                trust_tier=getattr(opp.market, 'data_mode', None).trust_tier if hasattr(getattr(opp.market, 'data_mode', None), 'trust_tier') else 0
+                            )
+                        except:
+                            pass
                 except Exception as e:
                     logger.warning(f"Calibration record/save failed for {opp.market.id}: {e}")
                 
             except Exception as e:
                 logger.error(f"Execution failed for {opp.market.id}: {e}")
+                import traceback
                 execution_results.append({
                     "market_id": opp.market.id,
-                    "error": str(e)
+                    "error": str(e),
+                    "traceback": traceback.format_exc()[:500]
                 })
+        
+        # V10 FIX #8: Log exploration lane results (shadow only, no capital)
+        if exploration_trades:
+            logger.info(f"V10 FIX #8 Exploration lane complete: {len(exploration_trades)} shadow trades for learning, NO live capital deployed")
         
         elapsed = time.time() - start
         

@@ -182,12 +182,54 @@ class MultiVenueExecutor:
             )
 
     async def execute_arbitrage_pair(self, arb, amount_per_leg: float = 3.0) -> List[ExecutionResult]:
-        # Execute both legs of arb - must be atomic-ish, fund transfers slow
-        # For $50 bankroll, need to ensure both legs execute or none
+        """
+        V10 FIX #7: Arbitrage atomicity with state machine - avoid naked exposure
+        Previously: LEG A → LEG B sequential, if A fills and B fails → naked exposure
+        Now: PRECHECK → RESERVE → VERIFY BOTH BOOKS → SUBMIT A → SUBMIT B → BOTH FILLED or HEDGE
+        """
         venue_a = arb.venue_a
         venue_b = arb.venue_b
-        # Create opportunities for each leg
-        # Simplified: use market_a and market_b from arb
+        
+        logger.info(f"Arb atomic execution start: {venue_a} vs {venue_b} spread {arb.spread*100:.1f}% - V10 FIX #7 state machine")
+        
+        state = "PRECHECK"
+        if arb.spread < 0.02:
+            logger.warning(f"Arb PRECHECK FAIL: spread {arb.spread*100:.1f}% <2% - abort")
+            return [
+                ExecutionResult(venue_id=venue_a, market_id=arb.market_a.id, status="aborted", amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0, reasoning="PRECHECK FAIL spread <2%"),
+                ExecutionResult(venue_id=venue_b, market_id=arb.market_b.id, status="aborted", amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0, reasoning="PRECHECK FAIL spread <2%")
+            ]
+        
+        state = "RESERVE_CAPITAL"
+        total_needed = amount_per_leg * 2
+        if total_needed > self.bankroll * 0.20:
+            logger.warning(f"Arb RESERVE FAIL: need ${total_needed} > 20% bankroll ${self.bankroll*0.20} - abort")
+            return [
+                ExecutionResult(venue_id=venue_a, market_id=arb.market_a.id, status="rejected", amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0, reasoning=f"RESERVE FAIL need ${total_needed} > 20% bankroll"),
+                ExecutionResult(venue_id=venue_b, market_id=arb.market_b.id, status="rejected", amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0, reasoning=f"RESERVE FAIL need ${total_needed} > 20% bankroll")
+            ]
+        
+        state = "VERIFY_BOTH_BOOKS"
+        try:
+            adapter_a = self.registry.get_adapter_for_venue_id(venue_a) if hasattr(self.registry, 'get_adapter_for_venue_id') else self.registry.adapters.get(venue_a)
+            adapter_b = self.registry.get_adapter_for_venue_id(venue_b) if hasattr(self.registry, 'get_adapter_for_venue_id') else self.registry.adapters.get(venue_b)
+            
+            if adapter_a and adapter_b:
+                ob_a = await adapter_a.get_orderbook(arb.market_a)
+                ob_b = await adapter_b.get_orderbook(arb.market_b)
+                
+                if ob_a.get("spread", 0.02) > 0.08 or ob_b.get("spread", 0.08) > 0.08:
+                    logger.warning(f"Arb VERIFY_BOOKS FAIL: spread too wide A {ob_a.get('spread')} B {ob_b.get('spread')} - abort")
+                    return [
+                        ExecutionResult(venue_id=venue_a, market_id=arb.market_a.id, status="aborted", amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0, reasoning="VERIFY_BOOKS FAIL spread too wide"),
+                        ExecutionResult(venue_id=venue_b, market_id=arb.market_b.id, status="aborted", amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0, reasoning="VERIFY_BOOKS FAIL spread too wide")
+                    ]
+                
+                if not ob_a.get("is_real", False) or not ob_b.get("is_real", False):
+                    logger.warning(f"Arb VERIFY_BOOKS WARN: orderbook not real A is_real={ob_a.get('is_real')} B is_real={ob_b.get('is_real')} - estimation, higher risk")
+        except Exception as e:
+            logger.warning(f"Arb VERIFY_BOOKS error {e} - continuing with caution")
+        
         opp_a = VenueOpportunity(
             market=arb.market_a,
             venue_id=venue_a,
@@ -212,13 +254,45 @@ class MultiVenueExecutor:
             confidence=arb.confidence_same_event,
             should_trade=arb.should_trade
         )
-        # Execute sequentially with guard
+        
+        state = "SUBMIT_A"
         result_a = await self.execute_single(opp_a, max_spend_usd=amount_per_leg, max_price=opp_a.market_price+0.02)
-        if result_a.status in ["error", "rejected", "rate_limited"]:
-            logger.warning(f"Arb leg A failed, aborting leg B to avoid naked exposure")
+        
+        if result_a.status in ["error", "rejected", "rate_limited", "blocked", "aborted"]:
+            logger.warning(f"Arb {state} FAIL: leg A {result_a.status} - aborting leg B to avoid naked exposure - state machine")
             return [result_a]
-
+        
+        state = "SUBMIT_B"
         result_b = await self.execute_single(opp_b, max_spend_usd=amount_per_leg, max_price=opp_b.market_price+0.02)
+        
+        if result_b.status in ["error", "rejected", "rate_limited", "blocked", "aborted"]:
+            logger.error(f"Arb {state} FAIL: leg A FILLED {result_a.status} but leg B FAIL {result_b.status} - NAKED EXPOSURE - need HEDGE A")
+            state = "HEDGE_A"
+            try:
+                hedge_side = "NO" if opp_a.side == "YES" else "YES"
+                hedge_opp = VenueOpportunity(
+                    market=arb.market_a,
+                    venue_id=venue_a,
+                    venue_type=arb.market_a.raw.get("venue_type", "prediction"),
+                    side=hedge_side,
+                    market_price=arb.market_a.best_price,
+                    estimated_fair=arb.market_a.best_price,
+                    raw_edge=0,
+                    effective_edge=0,
+                    confidence=0.5,
+                    should_trade=False
+                )
+                hedge_result = await self.execute_single(hedge_opp, max_spend_usd=amount_per_leg, max_price=hedge_opp.market_price+0.02)
+                logger.info(f"Arb HEDGE_A result: {hedge_result.status} - attempted to close naked exposure")
+                result_a.reasoning += f" | HEDGE attempted: {hedge_result.status} {hedge_result.reasoning}"
+            except Exception as e:
+                logger.error(f"Arb HEDGE_A failed: {e} - naked exposure remains!")
+                result_a.reasoning += f" | HEDGE FAILED: {e} - NAKED EXPOSURE REMAINS"
+            
+            return [result_a, result_b]
+        
+        state = "BOTH_FILLED"
+        logger.success(f"Arb {state} SUCCESS: both legs filled A {result_a.status} B {result_b.status} spread {arb.spread*100:.1f}% - DONE")
         return [result_a, result_b]
 
     def get_report(self) -> Dict[str, Any]:

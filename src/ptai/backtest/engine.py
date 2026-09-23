@@ -101,6 +101,7 @@ class BacktestEngine:
                         "is_synthetic": True
                     })
         
+        # V10 FIX #6: High-fidelity backtest with spread/depth/fees/slippage/latency/partial fills
         for market in historical_markets:
             edge = market["edge"]
             if abs(edge) < min_edge:
@@ -108,28 +109,75 @@ class BacktestEngine:
             if market["confidence"] < 0.6:
                 continue
             
-            # Kelly sizing
-            # Simplified: f* = edge / (market_price * (1-market_price)) * kelly_frac, capped
-            kelly_raw = abs(edge) / (market["market_price"] * (1 - market["market_price"]) + 0.01) * kelly_frac
+            # V10 FIX #6: Real orderbook data if available, else estimate
+            bid = market.get("bid", market["market_price"] - market.get("spread", 0.02)/2)
+            ask = market.get("ask", market["market_price"] + market.get("spread", 0.02)/2)
+            spread = market.get("spread", ask - bid) if "spread" in market else (ask - bid)
+            depth = market.get("depth", market.get("liquidity", 5000))
+            fee_pct = market.get("fee_pct", 0.02)
+            
+            # V10 FIX #6: Kelly sizing with real spread consideration
+            # Effective price includes half spread + slippage
+            effective_price = ask if edge > 0 else (1-bid)  # buying YES at ask, NO at 1-bid
+            kelly_raw = abs(edge) / (effective_price * (1 - effective_price) + 0.01) * kelly_frac
             kelly_capped = min(kelly_raw, max_pos_pct)
             position_size = bankroll * kelly_capped
             
-            if position_size < 1:  # min $1
+            if position_size < 1:
                 continue
             
-            # Simulate trade outcome
-            # If we bet YES and actual is 1, win; if we bet NO (edge negative) and actual 0, win
+            # V10 FIX #6: Slippage based on depth - amount / liquidity
+            slippage_pct = min(0.05, position_size / max(1, depth) * 0.5)
+            slippage_usd = position_size * slippage_pct
+            
+            # Fees
+            fees_usd = position_size * fee_pct
+            
+            # Gas for on-chain
+            gas_usd = 0.05 if market.get("venue_id") in ["polymarket", "afx_dex"] else 0.0
+            
+            # V10 FIX #6: Latency - market may have moved between signal and execution
+            latency_ms = market.get("latency_ms", 200)
+            # Simulate price drift during latency: random walk proportional to sqrt(latency)
+            import math
+            drift_vol = 0.001 * math.sqrt(latency_ms / 100)  # 0.1% vol per 100ms
+            price_drift = random.gauss(0, drift_vol)
+            executed_price = market["market_price"] + price_drift
+            executed_price = max(0.01, min(0.99, executed_price))
+            
+            # V10 FIX #6: Partial fills - if size > depth, only partial fills
+            fill_ratio = min(1.0, depth / max(1, position_size * 2))  # if depth < 2*size, partial
+            if fill_ratio < 1.0:
+                # Partial fill - only part of position executes
+                filled_size = position_size * fill_ratio
+            else:
+                filled_size = position_size
+            
+            # V10 FIX #6: Queue position - not first in queue, may not get filled at best price
+            queue_position = market.get("queue_position", 0.5)  # 0=front, 1=back
+            queue_penalty = queue_position * spread * 0.5  # worse queue = pay more spread
+            executed_price += queue_penalty if edge > 0 else -queue_penalty
+            
+            # Simulate trade outcome with real costs
             side = "YES" if edge > 0 else "NO"
             won = (side == "YES" and market["actual_outcome"] == 1) or (side == "NO" and market["actual_outcome"] == 0)
             
             if won:
-                # Win: profit = size * (1-market_price)/market_price for YES, or market_price/(1-market_price) for NO
-                # Simplified: profit = size * |edge| / market_price
-                profit = position_size * abs(edge) / market["market_price"] * 2  # mock 2x
-                bankroll += profit
+                # Win: profit = filled_size * (1-executed_price)/executed_price - costs
+                # For YES: buy at executed_price, sell at 1.0 if wins
+                if side == "YES":
+                    gross_profit = filled_size * (1 - executed_price) / executed_price if executed_price > 0 else filled_size
+                else:
+                    no_price = 1 - executed_price
+                    gross_profit = filled_size * (1 - no_price) / no_price if no_price > 0 else filled_size
+                
+                net_profit = gross_profit - fees_usd - slippage_usd - gas_usd
+                bankroll += net_profit
                 winning += 1
             else:
-                bankroll -= position_size
+                # Loss: -filled_size - costs (fees still paid)
+                net_loss = filled_size + fees_usd + slippage_usd + gas_usd
+                bankroll -= net_loss
                 losing += 1
             
             # Track drawdown
@@ -139,16 +187,34 @@ class BacktestEngine:
             if dd > max_dd:
                 max_dd = dd
             
+            # V10 FIX #6: High-fidelity trade record
             trades.append({
                 "question": market["question"],
                 "market_price": market["market_price"],
+                "executed_price": executed_price,
+                "bid": bid,
+                "ask": ask,
+                "spread": spread,
+                "depth": depth,
                 "fair_value": market["fair_value"],
                 "edge": edge,
                 "side": side,
                 "size": position_size,
+                "filled_size": filled_size,
+                "fill_ratio": fill_ratio,
+                "fees_usd": fees_usd,
+                "slippage_usd": slippage_usd,
+                "gas_usd": gas_usd,
+                "latency_ms": latency_ms,
+                "price_drift": price_drift,
+                "queue_position": queue_position,
+                "queue_penalty": queue_penalty,
                 "won": won,
                 "bankroll_after": bankroll,
-                "actual_outcome": market["actual_outcome"]
+                "actual_outcome": market["actual_outcome"],
+                "net_pnl": net_profit if won else -net_loss,
+                "data_mode": market.get("data_mode", "live"),
+                "is_synthetic": market.get("is_synthetic", is_synthetic)
             })
             
             # Equity curve daily

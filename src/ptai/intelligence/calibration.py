@@ -34,14 +34,16 @@ class CalibrationEngine:
         self.memory = memory
         # In-memory cache for quick calibration - would be backed by DB
         self.points: List[CalibrationPoint] = []
-        # Historical calibration adjustments per category
-        # e.g. Politics 70% forecasts -> historically 64% => adjustment -6%
+        # V10 FIX #10: Learned calibration adjustments from history, not hardcoded
+        # Previously: hardcoded politics 70%→64% etc - should be learned from data
+        # Now: start empty, learn from actual outcomes
         self.category_adjustments: Dict[str, Dict] = {
-            "politics": {"70%": 0.64, "adjustment": -0.06},
-            "crypto": {"70%": 0.72, "adjustment": 0.02},
-            "sports": {"70%": 0.69, "adjustment": -0.01},
-            "default": {"adjustment": 0.0}
+            "default": {"adjustment": 0.0, "learned": False, "sample_size": 0}
         }
+        # Learned adjustments storage - keyed by category and prob bucket
+        self.learned_adjustments: Dict[str, Dict] = {}
+        # Keep track of when adjustments were learned
+        self.adjustment_history: List[Dict] = []
 
     def record_forecast(self, market_id: str, question: str, forecast_prob: float, confidence: float, market_price: float, category: str = "default") -> str:
         """Record a forecast before resolution"""
@@ -157,31 +159,89 @@ class CalibrationEngine:
 
     def calibrate(self, probability: float, category: str = "default", confidence: float = 0.7) -> float:
         """
-        Adjust probability based on historical calibration.
-        If Politics 70% forecasts historically 64%, adjust down.
+        V10 FIX #10: Adjust probability based on LEARNED historical calibration, not hardcoded
+        Previously: hardcoded politics 70%→64% etc
+        Now: learn from actual outcomes per category and prob bucket
         """
-        # Simple implementation: look up historical adjustment
-        # Production: use isotonic regression or Platt scaling learned from data
-        
-        # If we have enough data for this category, calculate adjustment
         relevant = [p for p in self.points if p.actual_outcome is not None and p.category == category]
+        
         if len(relevant) < 20:
-            # Not enough data, use default adjustment or no adjustment
+            # Not enough data - return as-is, no hardcoded adjustment
             return probability
 
-        # Find similar forecasts (±5%) and see actual win rate
         similar = [p for p in relevant if abs(p.forecast_prob - probability) <= 0.05]
         if len(similar) >= 10:
             actual_rate = sum(p.actual_outcome for p in similar) / len(similar)
-            # Blend forecast with historical actual rate
-            # If forecast says 70% but historically similar forecasts win 64%, calibrated = 0.7*0.7 + 0.64*0.3 etc
-            # More weight to historical if we have more data
+            adjustment = actual_rate - probability
+            
+            # V10 FIX #10: Learn and store adjustment
+            bucket_key = f"{int(probability*10)*10}-{(int(probability*10)+1)*10}%"
+            if category not in self.learned_adjustments:
+                self.learned_adjustments[category] = {}
+            self.learned_adjustments[category][bucket_key] = {
+                "forecast_prob": probability,
+                "actual_rate": actual_rate,
+                "adjustment": adjustment,
+                "sample_size": len(similar),
+                "learned_at": datetime.now(timezone.utc).isoformat()
+            }
+            if category not in self.category_adjustments:
+                self.category_adjustments[category] = {}
+            self.category_adjustments[category][bucket_key] = actual_rate
+            self.category_adjustments[category]["adjustment"] = adjustment
+            self.category_adjustments[category]["learned"] = True
+            self.category_adjustments[category]["sample_size"] = len(relevant)
+            
             weight_historical = min(0.5, len(similar) / 100)
             calibrated = probability * (1 - weight_historical) + actual_rate * weight_historical
-            logger.info(f"Calibrated {category} prob {probability:.3f} -> {calibrated:.3f} based on {len(similar)} similar (actual {actual_rate:.3f})")
+            logger.info(f"Calibrated {category} {bucket_key} prob {probability:.3f} -> {calibrated:.3f} based on {len(similar)} similar (actual {actual_rate:.3f} adj {adjustment:+.3f}) - LEARNED V10 FIX #10")
             return max(0.01, min(0.99, calibrated))
+        else:
+            if len(relevant) >= 50:
+                overall_forecast = sum(p.forecast_prob for p in relevant) / len(relevant)
+                overall_actual = sum(p.actual_outcome for p in relevant) / len(relevant)
+                category_adj = overall_actual - overall_forecast
+                calibrated = probability + category_adj * 0.3
+                logger.info(f"Calibrated {category} prob {probability:.3f} -> {calibrated:.3f} using category-level adj {category_adj:+.3f} from {len(relevant)} samples - LEARNED V10")
+                return max(0.01, min(0.99, calibrated))
         
         return probability
+
+    def learn_adjustments_from_history(self) -> Dict[str, Dict]:
+        """
+        V10 FIX #10: Explicit learning method - compute adjustments from all history
+        """
+        categories = set(p.category for p in self.points if p.actual_outcome is not None)
+        learned = {}
+        
+        for category in categories:
+            relevant = [p for p in self.points if p.actual_outcome is not None and p.category == category]
+            if len(relevant) < 20:
+                continue
+            
+            for bucket_start in [i*0.1 for i in range(10)]:
+                bucket_low = bucket_start
+                bucket_high = bucket_start + 0.1
+                bucket_points = [p for p in relevant if bucket_low <= p.forecast_prob < bucket_high]
+                
+                if len(bucket_points) >= 5:
+                    avg_forecast = sum(p.forecast_prob for p in bucket_points) / len(bucket_points)
+                    avg_actual = sum(p.actual_outcome for p in bucket_points) / len(bucket_points)
+                    adjustment = avg_actual - avg_forecast
+                    
+                    bucket_key = f"{int(bucket_start*100)}-{int(bucket_high*100)}%"
+                    if category not in learned:
+                        learned[category] = {}
+                    learned[category][bucket_key] = {
+                        "avg_forecast": avg_forecast,
+                        "avg_actual": avg_actual,
+                        "adjustment": adjustment,
+                        "sample_size": len(bucket_points)
+                    }
+        
+        self.learned_adjustments = learned
+        logger.info(f"V10 FIX #10 Learned calibration adjustments: {len(learned)} categories, total buckets {sum(len(v) for v in learned.values())} - no hardcoded values")
+        return learned
 
     def get_stats(self) -> Dict:
         """Get calibration stats"""

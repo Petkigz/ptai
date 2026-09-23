@@ -22,6 +22,12 @@ class XSignal:
     issues: List[str] = field(default_factory=list)
     adjusted_sentiment: float = 0.0  # After credibility, novelty, decay
     should_use: bool = True
+    # V10 FIX #12: Real X checks, not placeholders
+    bot_burst_detected: bool = False
+    duplicate_rate: float = 0.0
+    farming_detected: bool = False
+    unique_ratio: float = 1.0
+    farming_score: float = 0.0
 
 
 class XEngine:
@@ -43,9 +49,10 @@ class XEngine:
                 "volume": 0
             }
 
-        # Duplicate detection
+        # V10 FIX #12: Real X credibility checks - not placeholders
         texts = [t.get("text", "") for t in tweets]
         unique_ratio = len(set(texts)) / max(1, len(texts))
+        duplicate_rate = 1.0 - unique_ratio
         
         issues = []
         bot_likelihood = 0.0
@@ -54,8 +61,24 @@ class XEngine:
             issues.append("duplicate_posts")
             bot_likelihood += 0.3
 
-        # Engagement farming detection - high likes but low quality?
-        # Would check engagement ratios
+        # V10 FIX #12: Engagement farming detection - high likes but low quality, copy-paste, engagement bait
+        farming_detected = False
+        farming_score = 0.0
+        for t in tweets:
+            text_lower = t.get("text", "").lower()
+            # Farming patterns: "like and retweet", "follow me", "drop a", "comment below", engagement bait
+            farming_keywords = ["like and retweet", "follow me", "drop a", "comment below", "rt if", "like if", "giveaway", "airdrop"]
+            if any(kw in text_lower for kw in farming_keywords):
+                farming_score += 0.1
+            # High engagement but very short text = farming
+            likes = t.get("likes", 0) or t.get("like_count", 0) or 0
+            if likes > 100 and len(text_lower) < 20:
+                farming_score += 0.2
+        
+        if farming_score > 0.5:
+            issues.append("engagement_farming")
+            farming_detected = True
+            bot_likelihood += 0.25
 
         # Old info resurfacing - check timestamps
         now = datetime.now(timezone.utc)
@@ -65,7 +88,7 @@ class XEngine:
                 ts = t.get("timestamp")
                 if ts:
                     tweet_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    if (now - tweet_time).total_seconds() > 24*3600*7:  # older than week
+                    if (now - tweet_time).total_seconds() > 24*3600*7:
                         old_count += 1
             except:
                 pass
@@ -73,8 +96,28 @@ class XEngine:
             issues.append("old_info_resurfacing")
             bot_likelihood += 0.2
 
-        # Coordinated narratives - similar phrasing
-        # Simple check for demo
+        # V10 FIX #12: Bot burst detection - many tweets same minute = coordinated burst
+        bot_burst_detected = False
+        try:
+            from collections import Counter
+            minutes = []
+            for t in tweets:
+                ts = t.get("timestamp", "")
+                if ts:
+                    minutes.append(ts[:16])
+            if minutes:
+                most_common = Counter(minutes).most_common(1)[0][1]
+                if most_common >= 5:
+                    bot_burst_detected = True
+                    issues.append("bot_burst")
+                    bot_likelihood += 0.3
+        except:
+            pass
+
+        # Coordinated narratives - similar phrasing high overlap
+        if unique_ratio < 0.4 and len(tweets) >= 5:
+            issues.append("coordinated_narrative")
+            bot_likelihood += 0.2
 
         credibility = max(0.1, 1.0 - bot_likelihood - len(issues)*0.15)
 
@@ -82,9 +125,13 @@ class XEngine:
             "credibility": credibility,
             "bot_likelihood": min(1.0, bot_likelihood),
             "unique_ratio": unique_ratio,
+            "duplicate_rate": duplicate_rate,
             "issues": issues,
             "volume": len(tweets),
-            "old_count": old_count
+            "old_count": old_count,
+            "bot_burst_detected": bot_burst_detected,
+            "farming_detected": farming_detected,
+            "farming_score": farming_score
         }
 
     def calculate_novelty(self, tweets: List[Dict], existing_knowledge: str = "") -> float:
@@ -174,25 +221,12 @@ class XEngine:
         time_decay = self.calculate_time_decay(tweets)
         corroborated = self.corroborate(" ".join([t.get("text", "") for t in tweets[:5]]), news, web_research)
 
-        # V9: Bot burst detection - many tweets same minute = farming
-        bot_burst_detected = False
-        if tweets and len(tweets) >= 10:
-            # Check timestamps clustering
-            try:
-                from collections import Counter
-                minutes = []
-                for t in tweets:
-                    ts = t.get("timestamp", "")
-                    if ts:
-                        minutes.append(ts[:16])  # YYYY-MM-DDTHH:MM
-                if minutes:
-                    most_common = Counter(minutes).most_common(1)[0][1]
-                    if most_common >= 5:
-                        bot_burst_detected = True
-                        credibility_analysis["issues"].append("bot_burst")
-                        credibility_analysis["bot_likelihood"] = min(1.0, credibility_analysis["bot_likelihood"] + 0.3)
-            except:
-                pass
+        # V10 FIX #12: Use real checks from analyze_tweets, not recomputed placeholders
+        bot_burst_detected = credibility_analysis.get("bot_burst_detected", False)
+        duplicate_rate = credibility_analysis.get("duplicate_rate", 1.0 - credibility_analysis.get("unique_ratio", 1.0))
+        farming_detected = credibility_analysis.get("farming_detected", False)
+        unique_ratio = credibility_analysis.get("unique_ratio", 1.0)
+        farming_score = credibility_analysis.get("farming_score", 0.0)
 
         # Adjusted sentiment: raw * credibility * novelty * time_decay * corroboration boost
         base = sentiment_score
@@ -219,16 +253,19 @@ class XEngine:
             corroborated=corroborated,
             issues=credibility_analysis["issues"],
             adjusted_sentiment=adjusted,
-            should_use=should_use
+            should_use=should_use,
+            bot_burst_detected=bot_burst_detected,
+            duplicate_rate=duplicate_rate,
+            farming_detected=farming_detected,
+            unique_ratio=unique_ratio,
+            farming_score=farming_score
         )
         # V9: Add compatibility fields for v3_loop get_context_for_market
         signal.sentiment_score = adjusted
         signal.score = adjusted
         signal.tweets = tweets[:5]
-        signal.reasoning = f"X raw {sentiment_score:.2f} adj {adjusted:.2f} cred {credibility_analysis['credibility']:.2f} bot {credibility_analysis['bot_likelihood']:.2f} novelty {novelty:.2f} decay {time_decay:.2f} corroborated {corroborated} burst {bot_burst_detected} issues {credibility_analysis['issues']} use {should_use}"
-        signal.bot_burst_detected = bot_burst_detected
-        signal.duplicate_rate = 1.0 - credibility_analysis.get("unique_ratio", 1.0)
-        signal.farming_detected = "farming" in str(credibility_analysis["issues"]).lower() or bot_burst_detected
+        signal.reasoning = f"X raw {sentiment_score:.2f} adj {adjusted:.2f} cred {credibility_analysis['credibility']:.2f} bot {credibility_analysis['bot_likelihood']:.2f} novelty {novelty:.2f} decay {time_decay:.2f} corroborated {corroborated} burst {bot_burst_detected} dup {duplicate_rate:.2f} farming {farming_detected} issues {credibility_analysis['issues']} use {should_use}"
+        # Ensure fields are accessible for v3_loop
 
         logger.info(f"X signal for {market.id}: raw {sentiment_score:.2f} -> adjusted {adjusted:.2f} cred {credibility_analysis['credibility']:.2f} bot {credibility_analysis['bot_likelihood']:.2f} novelty {novelty:.2f} decay {time_decay:.2f} corroborated {corroborated} burst {bot_burst_detected} use {should_use}")
 

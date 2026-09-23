@@ -33,6 +33,7 @@ from .arbitrage import ArbitrageEngine
 from .event_trading import EventTradingEngine
 from .market_making import MarketMakingEngine
 from .momentum import MomentumEngine
+from .expected_ev import ExpectedNetEVEngine
 
 
 @dataclass
@@ -86,6 +87,7 @@ class StrategyEngineV3:
         self.event_engine = EventTradingEngine()
         self.mm_engine = MarketMakingEngine()
         self.momentum_engine = MomentumEngine()
+        self.expected_ev_engine = ExpectedNetEVEngine()
         
         # Filters
         self.min_volume_24h = 500
@@ -300,14 +302,38 @@ class StrategyEngineV3:
         except Exception as e:
             logger.warning(f"Arbitrage scan failed: {e}")
         
-        # Common ranking across all venues and strategies
+        # V10 FIX #9: Common ranking using Expected Net EV - economically meaningful
+        # Old: edge×prob×liquidity×execution×calibration×time/(fees+slippage+uncertainty+risk) - not $ profit
+        # New: Σ prob×payoff − fees − spread − slippage − funding − gas − execution_loss − uncertainty_penalty
+        # Then per dollar, per risk, per capital-time
+        for opp in all_opportunities:
+            try:
+                ev = self.expected_ev_engine.calculate(opp, amount_usd=3.0, orderbook=opp.market.raw.get("orderbook", {}) if hasattr(opp.market, 'raw') and isinstance(opp.market.raw, dict) else {})
+                opp._expected_ev = ev
+                # Update score to be economically meaningful
+                opp.score = ev.net_ev_usd * ev.ev_per_dollar * ev.ev_per_risk if ev.net_ev_usd > 0 else 0
+            except Exception as e:
+                logger.debug(f"EV calc failed for {opp.market.id}: {e}")
+                opp._expected_ev = None
+        
+        # Rank by net EV first, then by old score
         if self.venue_registry:
             ranked = self.venue_registry.rank_opportunities(all_opportunities)
+            # Re-rank by expected net EV where available
+            ranked = sorted(ranked, key=lambda x: (getattr(x, '_expected_ev', None).net_ev_usd if hasattr(x, '_expected_ev') and x._expected_ev else 0, x.score), reverse=True)
         else:
-            ranked = sorted(all_opportunities, key=lambda x: x.score, reverse=True)
+            ranked = sorted(all_opportunities, key=lambda x: (getattr(x, '_expected_ev', None).net_ev_usd if hasattr(x, '_expected_ev') and x._expected_ev else 0, x.score), reverse=True)
         
-        # Filter to tradeable
-        tradeable = [o for o in ranked if o.effective_edge >= 0.08 and o.confidence >= 0.6 and o.should_trade]
+        # Filter to tradeable - now also requires net EV >0
+        tradeable = []
+        for o in ranked:
+            if o.effective_edge < 0.08 or o.confidence < 0.6 or not o.should_trade:
+                continue
+            ev = getattr(o, '_expected_ev', None)
+            if ev and ev.net_ev_usd <= 0:
+                continue
+            tradeable.append(o)
+        
         final_selected = tradeable[:max_final_trades]
         
         best_opp = final_selected[0] if final_selected else (ranked[0] if ranked else None)
