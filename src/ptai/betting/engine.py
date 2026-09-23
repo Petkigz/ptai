@@ -54,6 +54,7 @@ from .derivative_markets import (
     MatchCardPrices,
     price_accumulator,
     price_anytime_scorer,
+    price_first_scorer,
     price_match_card,
     price_player_count,
 )
@@ -238,6 +239,14 @@ class BettingEngine:
                 card_count += 1
                 opps.extend(self._build_card_opportunities(
                     ev, card, consensus_by_type, data_mode, account_health_ok))
+                # Player props only exist when someone supplies lineups/shares.
+                # The engine will not guess who is playing.
+                players = (strengths.get(ev.key) or {}).get("players") or []
+                if players:
+                    self._build_player_prop_opportunities(
+                        ev, players, consensus_by_type, data_mode, account_health_ok,
+                        prop_lines=(strengths.get(ev.key) or {}).get("prop_lines"),
+                        sink=opps)
 
         self.opportunities = sorted(opps, key=lambda o: o.net_ev_usd, reverse=True)
         result = {
@@ -543,8 +552,7 @@ class BettingEngine:
         books_by_type = {mt: c for mt, c in consensus_by_type.items()}
 
         for market_key, prices in fair.items():
-            base_key = market_key.split("_")[0] if market_key[:5] not in ("asian",) else market_key
-            book = books_by_type.get(base_key)
+            book = books_by_type.get(self._feed_type_for(market_key))
             for outcome, prob in prices.items():
                 if not isinstance(prob, (int, float)) or prob <= 0:
                     continue
@@ -598,6 +606,220 @@ class BettingEngine:
                     reasoning=f"{market_key}/{outcome}: model {prob:.3f} vs "
                               f"{'book '+str(round(price,3)) if price>1.0 else 'no book price'}",
                 ))
+        return out
+
+    # Priced card market -> the feed market type that would quote it.
+    # Explicit rather than derived from the key, because "asian_handicap_-0.5"
+    # and "totals_2.5" do not decompose into a feed type by splitting on "_".
+    _CARD_TO_FEED: Dict[str, str] = {
+        "h2h": "h2h",
+        "double_chance": "double_chance",
+        "draw_no_bet": "draw_no_bet",
+        "btts": "btts",
+        "clean_sheet": "clean_sheet",
+        "win_to_nil": "win_to_nil",
+        "correct_score": "correct_score",
+        "totals_2.5": "totals",
+        "team_goals_home_1.5": "team_goals",
+        "team_goals_away_1.5": "team_goals",
+        "asian_handicap_-0.5": "spreads",
+        "asian_handicap_-0.25": "spreads",
+        "european_handicap_-1.0": "european_handicap",
+        "race_to_2_goals": "race_to_goals",
+        "half_time_result": "half_time_result",
+        "ht_ft": "ht_ft",
+        "half_time_goals_0.5": "half_time_goals",
+        "corners_total": "corners_total",
+        "corners_handicap_-1.5": "corners_handicap",
+        "corners_1x2": "corners_1x2",
+        "cards_total": "cards_total",
+        "cards_1x2": "cards_1x2",
+        "red_card": "red_card",
+        "booking_points": "booking_points",
+        "shots_total": "shots_total",
+        "shots_on_target_total": "shots_on_target_total",
+        "offsides_total": "offsides_total",
+    }
+
+    @classmethod
+    def _feed_type_for(cls, card_market_key: str) -> Optional[str]:
+        if card_market_key in cls._CARD_TO_FEED:
+            return cls._CARD_TO_FEED[card_market_key]
+        # player props are keyed "player_goals:<name>" - strip the player
+        base = card_market_key.split(":", 1)[0]
+        return cls._CARD_TO_FEED.get(base, base)
+
+    def price_player_props(self, ev: SportsEvent, players: List[Dict]) -> Dict[str, Dict[str, float]]:
+        """
+        Price player props for one fixture.
+
+        players = [{'name': 'Haaland', 'side': 'home', 'share': 0.42,
+                    'minutes_share': 0.95, 'position': 'ST'}, ...]
+
+        `share` is the player's historical share of that team's goals/shots,
+        so the prop moves with the team model rather than being treated in
+        isolation. Returns {} when no player data is supplied - the engine
+        does not guess who is playing.
+
+        Every prop carries the void warning from the catalogue: books differ
+        on what happens when a player does not start, and that is the single
+        biggest settlement risk in props.
+        """
+        card = self.priced_cards.get(ev.key)
+        if card is None or not players:
+            return {}
+
+        team_lambda = {
+            "home": card.goals.home_lambda,
+            "away": card.goals.away_lambda,
+        }
+        opp_lambda = {
+            "home": card.goals.away_lambda,
+            "away": card.goals.home_lambda,
+        }
+        shot_lambda = {}
+        if card.shots:
+            shot_lambda = {"home": card.shots.home_lambda, "away": card.shots.away_lambda}
+        sot_lambda = {}
+        if card.shots_on_target:
+            sot_lambda = {"home": card.shots_on_target.home_lambda,
+                          "away": card.shots_on_target.away_lambda}
+
+        out: Dict[str, Dict[str, float]] = {}
+        for pl in players:
+            name = pl.get("name")
+            side = pl.get("side")
+            if not name or side not in ("home", "away"):
+                continue
+            share = float(pl.get("share", 0.0))
+            minutes_share = float(pl.get("minutes_share", 1.0))
+
+            props: Dict[str, float] = {"name": name, "side": side}
+            tl = team_lambda[side]
+
+            anytime = price_anytime_scorer(tl, share, minutes_share)
+            props["anytime_scorer_yes"] = anytime["yes"]
+            props["expected_goals"] = anytime["expected_goals"]
+
+            first = price_first_scorer(tl, share, opp_lambda[side], minutes_share)
+            props["first_scorer_yes"] = first["yes"]
+
+            if shot_lambda:
+                props["expected_shots"] = price_player_count(
+                    shot_lambda[side], share * float(pl.get("shot_share_mult", 1.0)))["expected"]
+            if sot_lambda:
+                props["expected_shots_on_target"] = price_player_count(
+                    sot_lambda[side], share * float(pl.get("sot_share_mult", 1.0)))["expected"]
+
+            # A carded-player prop is a share of the team's card expectation.
+            cards_lambda = (card.cards.home_lambda if side == "home"
+                            else card.cards.away_lambda) if card.cards else 0.0
+            props["expected_cards"] = round(
+                cards_lambda * float(pl.get("card_share", 0.0)) * minutes_share, 4)
+            props["void_warning"] = ("books differ on non-starters - verify this book's "
+                                     "player-prop void rule before trading")
+
+            out[f"{name}"] = props
+            self.player_props[f"{ev.key}:{name}"] = props
+        return out
+
+    def player_prop_fair_prices(self, ev: SportsEvent, players: List[Dict],
+                                lines: Optional[Dict[str, float]] = None) -> Dict[str, Dict[str, float]]:
+        """
+        Player props expressed as market keys the catalogue recognises, so
+        they flow through the same opportunity and settlement path.
+        """
+        props = self.price_player_props(ev, players)
+        if not props:
+            return {}
+        lines = lines or {}
+        card = self.priced_cards.get(ev.key)
+        out: Dict[str, Dict[str, float]] = {}
+        for name, p in props.items():
+            side = p["side"]
+            team_goals = (card.goals.home_lambda if side == "home"
+                          else card.goals.away_lambda) if card else 1.0
+            share = p["expected_goals"] / team_goals if team_goals > 0 else 0.0
+
+            line = lines.get(name)
+            if line is not None:
+                pc = price_player_count(team_goals, share, line=line)
+                out[f"player_goals:{name}"] = {"over": pc["over"], "under": pc["under"]}
+            a = price_anytime_scorer(team_goals, share, 1.0)
+            out[f"anytime_scorer:{name}"] = {"yes": a["yes"], "no": a["no"]}
+        return out
+
+    def _build_player_prop_opportunities(self, ev: SportsEvent, players: List[Dict],
+                                         consensus_by_type: Dict[str, ConsensusOdds],
+                                         data_mode: DataMode, account_health_ok: bool,
+                                         prop_lines: Optional[Dict[str, float]] = None,
+                                         sink: Optional[List[BetOpportunity]] = None) -> List[BetOpportunity]:
+        """
+        Player props as opportunities, through the same gates as everything else.
+
+        Props carry an extra blocker class the other markets do not: the
+        void-if-not-starting rule differs between books, so a prop is never
+        marked executable without an explicit confirmation that this book's
+        rule has been checked.
+        """
+        out: List[BetOpportunity] = []
+        fair = self.player_prop_fair_prices(ev, players, prop_lines)
+
+        for market_key, prices in fair.items():
+            feed_type = self._feed_type_for(market_key)
+            book = consensus_by_type.get(feed_type)
+            for outcome, prob in prices.items():
+                if not isinstance(prob, (int, float)) or prob <= 0:
+                    continue
+                blockers = ["player prop: confirm this book's void-if-not-starting rule"]
+                warnings: List[str] = []
+                price = 0.0
+                book_name = ""
+                stake = 0.0
+                edge = 0.0
+
+                if book is not None and outcome in book.best_price:
+                    price = book.best_price[outcome]
+                    book_name = book.best_book.get(outcome, "")
+                    edge = prob * price - 1.0
+                    if edge * 100.0 < self.min_edge_pct:
+                        blockers.append(f"edge {edge*100.0:+.2f}% below {self.min_edge_pct}% threshold")
+                    sizing = size_back(self.bankroll, prob, price, self.kelly_frac,
+                                       self.max_position_pct, 0.0, self.min_stake)
+                    stake = sizing["stake"]
+                    if stake <= 0:
+                        blockers.append(f"sizing: {sizing['reason']}")
+                else:
+                    blockers.append(f"no book price for {market_key}/{outcome} - fair "
+                                    f"{prob:.3f} computed but nothing to bet against")
+
+                if data_mode.is_synthetic:
+                    blockers.append(f"data_mode {data_mode.value} is synthetic - cannot trade")
+                if data_mode.can_deploy_live_capital and not account_health_ok:
+                    blockers.append("account health not verified - refusing live capital")
+
+                opp = BetOpportunity(
+                    opportunity_id=f"prop-{ev.event_id}-{market_key}-{outcome}",
+                    event_key=ev.key, sport=ev.sport, league=ev.league,
+                    market_type=market_key.split(":", 1)[0], outcome=str(outcome),
+                    side="back", price=round(price, 4), book=book_name,
+                    stake=round(stake, 2), liability=round(stake, 2),
+                    model_prob=round(float(prob), 4), fair_prob=round(float(prob), 4),
+                    edge=round(edge, 4), edge_pct=round(edge * 100.0, 3),
+                    conservative_prob=round(float(prob), 4), conservative_edge=round(edge, 4),
+                    net_ev_usd=round(stake * edge, 4), kelly_stake=round(stake, 2),
+                    uncertainty=0.0, confidence=0.0, data_mode=data_mode.value,
+                    data_source="sports_live_feed" if data_mode.can_deploy_live_capital else data_mode.value,
+                    commission_pct=0.0, is_arb=False,
+                    executable=not blockers and stake > 0,
+                    blockers=blockers, warnings=warnings,
+                    reasoning=f"{market_key}/{outcome}: model {prob:.3f} vs "
+                              f"{'book ' + str(round(price, 3)) if price > 1.0 else 'no book price'}",
+                )
+                out.append(opp)
+
+        if sink is not None:
+            sink.extend(out)
         return out
 
     # ------------------------------------------------------------------

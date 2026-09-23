@@ -712,3 +712,149 @@ def test_engine_report_includes_the_catalogue():
     assert rep["market_catalogue"]["total_markets"] >= 33
     assert "h2h" in rep["market_types_scanned_from_feed"]
     assert "totals" in rep["market_types_scanned_from_feed"]
+
+
+# ---------------------------------------------------------------------------
+# Player props and the explicit feed mapping
+# ---------------------------------------------------------------------------
+
+PLAYERS = [
+    {"name": "Haaland", "side": "home", "share": 0.42, "minutes_share": 0.95},
+    {"name": "Saka", "side": "away", "share": 0.28, "minutes_share": 0.90},
+]
+
+
+def _engine_with_card():
+    engine = BettingEngine(bankroll=500.0)
+    ev = sample_events(1)[0]
+    strengths = {ev.key: {"home": {"attack": 1.42, "defence": 0.88, "corners": 6.6,
+                                   "cards": 1.8, "shots": 15.2, "shots_on_target": 5.4},
+                          "away": {"attack": 1.18, "defence": 1.02, "corners": 4.3,
+                                   "cards": 2.3, "shots": 9.8, "shots_on_target": 3.1},
+                          "red_rate": 0.07, "offsides": 3.2,
+                          "players": PLAYERS,
+                          "prop_lines": {"Haaland": 0.5}}}
+    card = engine.price_card(ev, strengths)
+    return engine, ev, strengths, card
+
+
+def test_feed_mapping_is_explicit_not_derived_from_the_key():
+    """
+    'asian_handicap_-0.5' and 'totals_2.5' cannot be split into a feed type
+    by splitting on '_', which is what the old code did.
+    """
+    f = BettingEngine._feed_type_for
+    assert f("asian_handicap_-0.5") == "spreads"
+    assert f("totals_2.5") == "totals"
+    assert f("corners_handicap_-1.5") == "corners_handicap"
+    assert f("shots_on_target_total") == "shots_on_target_total"
+    assert f("player_goals:Haaland") == "player_goals"
+
+
+def test_every_priced_card_key_has_a_feed_mapping():
+    engine, ev, strengths, card = _engine_with_card()
+    for key in engine.card_fair_prices(ev.key):
+        assert BettingEngine._feed_type_for(key), f"{key} has no feed mapping"
+
+
+def test_player_props_require_player_data():
+    engine = BettingEngine(bankroll=500.0)
+    ev = sample_events(1)[0]
+    engine.price_card(ev, {ev.key: {"home": {"attack": 1.2, "defence": 1.0},
+                                    "away": {"attack": 1.0, "defence": 1.1}}})
+    assert engine.price_player_props(ev, []) == {}
+
+
+def test_player_props_price_a_striker_higher_than_a_winger():
+    engine, ev, strengths, card = _engine_with_card()
+    props = engine.price_player_props(ev, PLAYERS)
+    assert set(props) == {"Haaland", "Saka"}
+    # higher share of a stronger attack -> higher goal expectation
+    assert props["Haaland"]["expected_goals"] > props["Saka"]["expected_goals"]
+    assert props["Haaland"]["anytime_scorer_yes"] > props["Saka"]["anytime_scorer_yes"]
+    assert props["Haaland"]["first_scorer_yes"] < props["Haaland"]["anytime_scorer_yes"]
+
+
+def test_player_props_carry_the_void_warning():
+    engine, ev, strengths, card = _engine_with_card()
+    props = engine.price_player_props(ev, PLAYERS)
+    for name, p in props.items():
+        assert "void" in p["void_warning"].lower()
+
+
+def test_minutes_share_reduces_the_prop():
+    engine, ev, strengths, card = _engine_with_card()
+    starter = engine.price_player_props(
+        ev, [{"name": "X", "side": "home", "share": 0.4, "minutes_share": 1.0}])
+    sub = engine.price_player_props(
+        ev, [{"name": "X", "side": "home", "share": 0.4, "minutes_share": 0.4}])
+    assert sub["X"]["anytime_scorer_yes"] < starter["X"]["anytime_scorer_yes"]
+
+
+def test_player_prop_fair_prices_use_catalogue_keys():
+    engine, ev, strengths, card = _engine_with_card()
+    fair = engine.player_prop_fair_prices(ev, PLAYERS, {"Haaland": 0.5})
+    keys = list(fair)
+    assert "anytime_scorer:Haaland" in keys
+    assert "player_goals:Haaland" in keys          # only when a line is supplied
+    assert "player_goals:Saka" not in keys
+    for k in keys:
+        base = k.split(":", 1)[0]
+        assert base in MARKET_CATALOGUE, f"{base} is not a catalogue market"
+
+
+def test_player_prop_opportunities_never_execute_without_the_void_check():
+    engine, ev, strengths, card = _engine_with_card()
+    opps = engine._build_player_prop_opportunities(
+        ev, PLAYERS, {}, DataMode.LIVE, account_health_ok=True,
+        prop_lines={"Haaland": 0.5})
+    assert opps
+    for o in opps:
+        assert not o.executable
+        assert any("void-if-not-starting" in b for b in o.blockers), o.blockers
+
+
+def test_run_cycle_prices_props_when_players_are_supplied():
+    from src.ptai.betting.sports_data import BookOdds, SportsDataEngine
+
+    ev = sample_events(1)[0]
+    ev.event_id = "evt-props"
+    books = [BookOdds(book="softbook", market="h2h",
+                      outcomes={ev.home_team: 1.75, ev.away_team: 2.20})]
+
+    class _Stub:
+        name = "stub"
+        is_synthetic = False
+        last_error = ""
+        last_fetch_at = None
+        requests_made = 0
+
+        async def events(self, leagues=()):
+            return [ev]
+
+        def odds_for_event(self, event):
+            return books
+
+        def health(self):
+            return {"provider": "stub", "reachable": True, "last_error": "",
+                    "last_fetch_at": None, "requests_made": 0, "is_synthetic": False}
+
+    engine = BettingEngine(
+        bankroll=500.0, min_edge_pct=1.0,
+        data_engine=SportsDataEngine(providers=[_Stub()]))
+    strengths = {ev.key: {"home": {"attack": 1.42, "defence": 0.88},
+                          "away": {"attack": 1.18, "defence": 1.02},
+                          "players": PLAYERS, "prop_lines": {"Haaland": 0.5}}}
+
+    import asyncio
+    result = asyncio.run(engine.run_cycle(data_mode=DataMode.LIVE_SHADOW,
+                                          strengths=strengths))
+    assert result["ok"] and result["cards_priced"] == 1
+    prop_types = {o.market_type for o in engine.opportunities
+                  if o.opportunity_id.startswith("prop-")}
+    assert "anytime_scorer" in prop_types
+    assert "player_goals" in prop_types
+    # every prop is blocked on the void rule, none silently executable
+    for o in engine.opportunities:
+        if o.opportunity_id.startswith("prop-"):
+            assert not o.executable
