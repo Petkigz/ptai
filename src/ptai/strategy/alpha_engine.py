@@ -122,13 +122,17 @@ class AlphaEngine:
         except Exception as e:
             results["favourite_longshot"] = {"extreme": 0, "tradeable": 0, "error": str(e)}
 
-        # 5. Whale tracking (mock)
+        # 5. Whale tracking - real Polymarket activity feed.
+        # An unreachable feed yields zero wallets and a reason; it used to
+        # yield three handwritten wallets that the scan then reported as real.
         try:
-            wallets, market_trades, wallets_dict = self.whale.mock_whale_data()
+            feed = self.whale.load_whales()
             results["whale"] = {
-                "wallets": len(wallets),
-                "smart": len([w for w in wallets if w.is_smart]),
-                "dumb": len([w for w in wallets if w.is_dumb])
+                "wallets": len(feed.wallets),
+                "smart": len([w for w in feed.wallets if w.is_smart]),
+                "dumb": len([w for w in feed.wallets if w.is_dumb]),
+                "source": feed.source,
+                "error": feed.last_error or None,
             }
         except Exception as e:
             results["whale"] = {"wallets": 0, "error": str(e)}

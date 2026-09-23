@@ -1977,16 +1977,38 @@ async def api_v3_whale():
     try:
         from .markets.whale_tracker import WhaleTracker
         tracker = WhaleTracker()
-        wallets, market_trades, wallets_dict = tracker.mock_whale_data()
+        # Real Polymarket activity feed. An unreachable feed means no whales,
+        # not sample whales - the endpoint reports why instead.
+        feed = tracker.load_whales()
         signals = []
-        for market_id, trades in market_trades.items():
-            sigs = tracker.get_whale_signals(market_id=market_id, market_price=0.61, whale_trades=trades, whale_wallets=wallets_dict)
-            for s in sigs:
-                signals.append({"market_id": s.market_id, "whale": s.whale_address[:15], "score": s.whale_score, "side": s.side, "amount": s.amount_usd, "type": s.signal_type, "edge": s.edge_estimate, "should_trade": s.should_trade, "reasoning": s.reasoning[:300]})
+        for market_id, trades in feed.market_trades.items():
+            # entry price of the most recent whale trade stands in for the
+            # market price when no live book is attached
+            price = float(trades[-1].get("price", 0.0) or 0.0)
+            if not (0 < price < 1):
+                continue
+            for s in tracker.get_whale_signals(market_id=market_id, market_price=price,
+                                               whale_trades=trades,
+                                               whale_wallets=feed.wallets_by_address):
+                signals.append({"market_id": s.market_id, "whale": s.whale_address[:15],
+                                "score": s.whale_score, "side": s.side,
+                                "amount": s.amount_usd, "entry": s.whale_entry_price,
+                                "market_price": s.market_price, "type": s.signal_type,
+                                "edge": s.edge_estimate, "should_trade": s.should_trade,
+                                "provenance": s.provenance,
+                                "reasoning": s.reasoning[:300]})
         return {
-            "wallets": [{"address": w.address[:15], "volume": w.total_volume, "trades": w.total_trades, "pnl": w.pnl_usd, "win_rate": w.win_rate, "is_smart": w.is_smart, "is_dumb": w.is_dumb, "score": w.score} for w in wallets],
+            "source": feed.source,
+            "fetched_at": feed.fetched_at,
+            "wallets": [{"address": w.address[:15], "volume": w.total_volume,
+                         "trades": w.total_trades, "resolved": w.resolved_trades,
+                         "pnl": w.pnl_usd, "win_rate": w.win_rate,
+                         "is_smart": w.is_smart, "is_dumb": w.is_dumb,
+                         "score": w.score, "sample_size_ok": w.sample_size_ok,
+                         "reasoning": w.reasoning} for w in feed.wallets],
             "signals": signals,
             "tradeable": len([s for s in signals if s["should_trade"]]),
+            "error": feed.last_error or None,
             "report": tracker.get_report()
         }
     except Exception as e:
@@ -2125,8 +2147,14 @@ async def api_v3_alpha_all(target_per_venue: int = 50):
         
         # Whale
         whale_tracker = WhaleTracker()
-        wallets, market_trades, wallets_dict = whale_tracker.mock_whale_data()
-        results["whale"] = {"wallets": len(wallets), "smart": len([w for w in wallets if w.is_smart]), "dumb": len([w for w in wallets if w.is_dumb])}
+        whale_feed = whale_tracker.load_whales()
+        results["whale"] = {
+            "wallets": len(whale_feed.wallets),
+            "smart": len([w for w in whale_feed.wallets if w.is_smart]),
+            "dumb": len([w for w in whale_feed.wallets if w.is_dumb]),
+            "source": whale_feed.source,
+            "error": whale_feed.last_error or None,
+        }
         
         # RAG
         rag = HistoricalRAG()

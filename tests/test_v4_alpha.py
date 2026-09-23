@@ -134,29 +134,25 @@ def test_favourite_longshot_liquid_filter():
     assert not opps[0].should_trade
 
 
-def test_whale_tracker_mock():
-    tracker = WhaleTracker()
-    wallets, market_trades, wallets_dict = tracker.mock_whale_data()
-    assert len(wallets) == 3
-    assert len(market_trades) >= 1
-    smart = [w for w in wallets if w.is_smart]
-    dumb = [w for w in wallets if w.is_dumb]
-    assert len(smart) >= 1
-    assert len(dumb) >= 1
-    assert smart[0].score > 0.6
-    assert dumb[0].score < -0.5
+def test_whale_tracker_has_no_synthetic_fallback():
+    """
+    There used to be a mock_whale_data() returning three handwritten wallets
+    that the alpha scan consumed as real. With the feed unreachable the
+    tracker must return nothing and say why.
+    """
+    tracker = WhaleTracker(http_get=lambda url, params: None)
+    assert not hasattr(tracker, "mock_whale_data"), "fabricated whale data must stay removed"
+    feed = tracker.load_whales()
+    assert feed.wallets == []
+    assert not feed.ok
+    assert feed.last_error
 
 
-def test_whale_signals():
-    tracker = WhaleTracker()
-    wallets, market_trades, wallets_dict = tracker.mock_whale_data()
-    for market_id, trades in market_trades.items():
-        signals = tracker.get_whale_signals(market_id=market_id, market_price=0.61, whale_trades=trades, whale_wallets=wallets_dict)
-        assert len(signals) >= 1
-        # Smart whale buying YES should be copy signal
-        for s in signals:
-            if s.whale_score > 0.6 and s.side == "YES":
-                assert s.signal_type == "copy_smart"
+def test_whale_signals_require_a_real_wallet_record():
+    tracker = WhaleTracker(http_get=lambda url, params: None)
+    assert tracker.get_whale_signals("m1", 0.6, [], {}) == []
+    feed = tracker.load_whales()
+    assert tracker.get_whale_signals("m1", 0.6, [], feed.wallets_by_address) == []
 
 
 def test_rag_history_retrieve():
