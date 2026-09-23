@@ -193,8 +193,23 @@ class BacktestEngine:
         )
         
         if is_synthetic:
-            logger.warning(f"Backtest done SYNTHETIC: {initial} -> {bankroll:.2f} PnL {total_pnl:.2f} {total_pnl_pct:.1%} win rate {win_rate:.1f}% trades {len(trades)} - NOT PRODUCTION-GRADE")
+            logger.warning(f"Backtest done SYNTHETIC: {initial} -> {bankroll:.2f} PnL {total_pnl:.2f} {total_pnl_pct:.1%} win rate {win_rate:.1f}% trades {len(trades)} - NOT PRODUCTION-GRADE - BLOCKS LIVE DEPLOYMENT")
         else:
             logger.success(f"Backtest done REAL DATA: {initial} -> {bankroll:.2f} PnL {total_pnl:.2f} {total_pnl_pct:.1%} win rate {win_rate:.1f}% trades {len(trades)} - production-grade: {result.is_production_grade}")
         
         return result
+
+    def can_deploy_live(self, result: BacktestResult) -> tuple[bool, str]:
+        """
+        V9 FIX #6: Block live deployment if synthetic - real historical data gate
+        If no real data, mark result synthetic and block live deployment decisions
+        """
+        if result.is_synthetic:
+            return False, f"SYNTHETIC backtest {result.strategy_name} - MUST NEVER be used for live deployment decisions - needs real historical data with fees/spreads/slippage/latency"
+        if not result.is_production_grade:
+            return False, f"Not production-grade: need >=100 real markets, got synthetic={result.is_synthetic} data_mode={result.data_mode} trades={result.total_trades} - block live deployment"
+        if result.total_trades < 100:
+            return False, f"Only {result.total_trades} trades - need 100+ for statistical significance - block live"
+        if result.win_rate < 55:
+            return False, f"Win rate {result.win_rate:.1f}% <55% - block live"
+        return True, f"Production-grade REAL DATA {result.total_trades} trades win {result.win_rate:.1f}% - can consider live with caution"
