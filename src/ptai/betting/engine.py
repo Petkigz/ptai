@@ -58,6 +58,12 @@ from .derivative_markets import (
     price_match_card,
     price_player_count,
 )
+from .in_play import (
+    LiveCard,
+    MatchState,
+    price_live_high_scoring_card,
+    price_live_soccer_card,
+)
 from .high_scoring import (
     LEAGUE_TO_SPORT,
     SPORT_PARAMS,
@@ -166,6 +172,10 @@ class BettingEngine:
         # ties variance to the mean, which understates an NBA total's spread
         # by ~30% and makes every line look further away than it is.
         self.priced_high_scoring: Dict[str, HighScoringCard] = {}
+        # Live cards, keyed by event then by the minute they were priced. A
+        # live fair price is only meaningful at the clock reading it was
+        # computed for, so the minute is recorded with it.
+        self.priced_live: Dict[str, LiveCard] = {}
         self.player_props: Dict[str, Dict[str, float]] = {}
 
     # ------------------------------------------------------------------
@@ -570,6 +580,75 @@ class BettingEngine:
         for name, v in card.periods.items():
             out[f"period_{name}"] = {"over": v["over"], "under": v["under"]}
         return out
+
+    # ------------------------------------------------------------------
+    # In-play pricing
+    # ------------------------------------------------------------------
+
+    def price_live_card(self, ev: SportsEvent, strengths: Optional[Dict] = None,
+                        state: Optional[MatchState] = None) -> Optional[LiveCard]:
+        """
+        Price every live market on one fixture at one point in time.
+
+        Returns None when there is no state or no model. Both are required:
+        a live price without a clock reading is just the pre-match price, and
+        a clock reading without a model gives nothing to compare a book price
+        against.
+
+        Live pricing routes by sport exactly as the pre-match card does, so an
+        NBA fixture gets the normal margin model with the clock applied rather
+        than the soccer scoreline grid.
+        """
+        strengths = strengths or {}
+        s = strengths.get(ev.key)
+        if not s:
+            return None
+        if state is None:
+            return None
+
+        # regulation length differs by sport; a 48-minute clock is not a
+        # 90-minute clock and using the wrong one misprices everything
+        sport = resolve_sport(ev.league) if is_high_scoring(ev.league) else (
+            resolve_sport(ev.sport) if is_high_scoring(ev.sport) else "soccer")
+        regulation = {"basketball": 48.0, "football": 60.0,
+                      "baseball": 162.0, "hockey": 60.0}.get(sport, 90.0)
+        if state.regulation_minutes == 90.0 and regulation != 90.0:
+            state = MatchState(**{**state.__dict__, "regulation_minutes": regulation,
+                                  "is_high_scoring": True})
+
+        home = s.get("home") or {}
+        away = s.get("away") or {}
+
+        if sport != "soccer":
+            exp_h = float(home.get("expected_points", 0.0))
+            exp_a = float(away.get("expected_points", 0.0))
+            if exp_h <= 0 or exp_a <= 0:
+                return None
+            card = price_live_high_scoring_card(
+                ev.key, sport, exp_h, exp_a, state,
+                lines={"total": float(s.get("total_line", SPORT_PARAMS[sport].typical_total)),
+                       "spread": float(s.get("spread_line", -2.5))})
+        else:
+            h_rate = float(home.get("attack", 1.0)) * float(away.get("defence", 1.0))
+            a_rate = float(away.get("attack", 1.0)) * float(home.get("defence", 1.0))
+            card = price_live_soccer_card(ev.key, h_rate, a_rate, state)
+
+        self.priced_live[ev.key] = card
+        return card
+
+    def live_fair_prices(self, ev_key: str) -> Dict[str, Dict[str, float]]:
+        """
+        Live fair prices, keyed like the pre-match card.
+
+        These are model prices at a specific minute, NOT bettable odds. They
+        only become opportunities when a feed supplies a real live book price
+        for the same minute - comparing a live model price against a stale
+        pre-match book price would manufacture an edge out of the time gap.
+        """
+        card = self.priced_live.get(ev_key)
+        if card is None:
+            return {}
+        return dict(card.markets)
 
     def card_fair_prices(self, ev_key: str) -> Dict[str, Dict[str, float]]:
         """

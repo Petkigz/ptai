@@ -119,6 +119,26 @@ from .derivative_markets import (
     price_player_count,
     price_red_card,
 )
+from .in_play import (
+    LiveCard,
+    MatchState,
+    live_btts,
+    live_correct_score,
+    live_double_chance,
+    live_draw_no_bet,
+    live_match_odds,
+    live_moneyline_high_scoring,
+    live_next_goal,
+    live_rates,
+    live_scoreline_matrix,
+    live_spread_high_scoring,
+    live_team_total,
+    live_total_high_scoring,
+    live_totals,
+    price_live_high_scoring_card,
+    price_live_soccer_card,
+)
+
 from .high_scoring import (
     LEAGUE_TO_SPORT,
     SPORT_PARAMS,
@@ -179,6 +199,12 @@ __all__ = [
     "price_match_card", "price_player_count", "price_red_card",
     # high-scoring sports (normal margin model, not Poisson)
     "LEAGUE_TO_SPORT", "resolve_sport",
+    "LiveCard", "MatchState",
+    "live_rates", "live_scoreline_matrix", "live_match_odds", "live_double_chance",
+    "live_draw_no_bet", "live_totals", "live_btts", "live_next_goal",
+    "live_correct_score", "live_team_total",
+    "live_total_high_scoring", "live_spread_high_scoring", "live_moneyline_high_scoring",
+    "price_live_soccer_card", "price_live_high_scoring_card",
     "SPORT_PARAMS", "HighScoringCard", "SportParams", "TotalPrices", "SpreadPrices",
     "is_high_scoring", "normal_cdf", "params_for", "price_high_scoring_card",
     "price_margin_band", "price_margin_bands", "price_moneyline_normal",

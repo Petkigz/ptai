@@ -1223,3 +1223,401 @@ def test_betfair_full_card_drops_unbookable_markets():
             return {"1.9": _book("1.9", [(1, "S1", 1.9, 100.0, None, 0.0, None, 0.0)])}
 
     assert fetch_full_card(_Client(), "1") == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# In-play pricing - fair value must decay with the clock
+# ═══════════════════════════════════════════════════════════════════════════
+
+import src.ptai.betting.in_play as in_play
+from src.ptai.betting.in_play import (
+    MatchState, LiveCard, live_btts, live_correct_score, live_double_chance,
+    live_draw_no_bet, live_match_odds, live_next_goal, live_rates,
+    live_scoreline_matrix, live_spread_high_scoring, live_team_total,
+    live_total_high_scoring, live_totals, price_live_high_scoring_card,
+    price_live_soccer_card,
+)
+
+H_RATE, A_RATE = 1.5, 1.1
+
+
+def test_profile_weight_is_normalised_to_the_full_match():
+    """
+    If the time profile does not integrate to the calibrated full-match rate,
+    every live price inherits a systematic bias.
+    """
+    assert in_play._profile_weight(1.0) == pytest.approx(1.0)
+    assert in_play._profile_weight(0.0) == 0.0
+    # back-heavy profile: half the clock leaves MORE than half the scoring
+    assert in_play._profile_weight(0.5) > 0.5
+
+
+def test_draw_price_rises_as_time_runs_out():
+    """
+    THE bug this module fixes. A 0-0 draw at kickoff and a 0-0 draw in the
+    85th minute are completely different markets. A model that returns the
+    kickoff number at minute 85 calls the draw a huge edge and bets it wrong.
+    """
+    kickoff = live_match_odds(H_RATE, A_RATE, MatchState(minutes_elapsed=0))
+    late = live_match_odds(H_RATE, A_RATE, MatchState(minutes_elapsed=85))
+    assert late["draw"] > kickoff["draw"] + 0.4
+    assert late["draw"] > 0.8
+
+
+def test_live_odds_are_a_distribution_at_every_minute():
+    for mins in (0, 15, 30, 45, 60, 75, 89, 90):
+        o = live_match_odds(H_RATE, A_RATE, MatchState(minutes_elapsed=mins))
+        assert sum(o.values()) == pytest.approx(1.0, abs=1e-3), f"minute {mins}"
+
+
+def test_finished_match_prices_exactly_the_result():
+    """No time left means no randomness: the result is the result."""
+    fin = MatchState(minutes_elapsed=90, home_score=3, away_score=1)
+    assert live_match_odds(H_RATE, A_RATE, fin) == {"home": 1.0, "draw": 0.0, "away": 0.0}
+    t = live_totals(H_RATE, A_RATE, fin, 2.5)
+    assert t == {"over": 1.0, "under": 0.0, "push": 0.0}
+    assert live_correct_score(H_RATE, A_RATE, fin) == {"3-1": 1.0}
+
+
+def test_totals_react_to_goals_already_scored():
+    """
+    At 2-0 the over 2.5 only needs one more goal, so its price must fall
+    toward zero as the clock runs out - it must not stay at the pre-match
+    number.
+    """
+    early = live_totals(H_RATE, A_RATE, MatchState(minutes_elapsed=0, home_score=2), 2.5)
+    late = live_totals(H_RATE, A_RATE, MatchState(minutes_elapsed=88, home_score=2), 2.5)
+    assert early["over"] > 0.9
+    assert late["over"] < 0.15
+    for t in (early, late):
+        assert sum(t.values()) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_whole_number_total_line_can_push_in_play():
+    st = MatchState(minutes_elapsed=30, home_score=1, away_score=1)
+    assert live_totals(H_RATE, A_RATE, st, 2.0)["push"] > 0.02
+    assert live_totals(H_RATE, A_RATE, st, 2.5)["push"] == 0.0
+
+
+def test_btts_is_certain_or_impossible_when_already_decided():
+    both = MatchState(minutes_elapsed=20, home_score=1, away_score=1)
+    assert live_btts(H_RATE, A_RATE, both) == {"yes": 1.0, "no": 0.0}
+    finished = MatchState(minutes_elapsed=90, home_score=1, away_score=0)
+    assert live_btts(H_RATE, A_RATE, finished) == {"yes": 0.0, "no": 1.0}
+
+
+def test_btts_decays_when_one_side_has_not_scored():
+    st_60 = MatchState(minutes_elapsed=60, home_score=1)
+    st_85 = MatchState(minutes_elapsed=85, home_score=1)
+    assert live_btts(H_RATE, A_RATE, st_60)["yes"] > live_btts(H_RATE, A_RATE, st_85)["yes"]
+
+
+def test_next_goal_keeps_a_real_none_outcome():
+    """
+    Next-goal is a race between two Poisson processes. Normalising the two
+    rates to 1 would erase the chance nobody scores again.
+    """
+    for mins in (10, 60, 88):
+        ng = live_next_goal(H_RATE, A_RATE, MatchState(minutes_elapsed=mins))
+        assert sum(ng.values()) == pytest.approx(1.0, abs=1e-3)
+        assert ng["none"] > 0.0, f"minute {mins} must leave a no-further-goal chance"
+    # the heavier side is still more likely to score next
+    ng = live_next_goal(H_RATE, A_RATE, MatchState(minutes_elapsed=30))
+    assert ng["home"] > ng["away"]
+
+
+def test_next_goal_at_full_time_is_only_none():
+    assert live_next_goal(H_RATE, A_RATE, MatchState(minutes_elapsed=90)) == {
+        "home": 0.0, "away": 0.0, "none": 1.0}
+
+
+def test_red_card_shifts_the_market_against_the_short_handed_side():
+    st_11 = MatchState(minutes_elapsed=30)
+    st_10 = MatchState(minutes_elapsed=30, home_red_cards=1)
+    even = live_match_odds(H_RATE, A_RATE, st_11)
+    down = live_match_odds(H_RATE, A_RATE, st_10)
+    assert down["home"] < even["home"] - 0.05
+    assert down["away"] > even["away"] + 0.05
+
+
+def test_trailing_side_gets_a_higher_attack_rate():
+    """Game state moves both lambdas - chasing raises your own and the counter."""
+    level = live_rates(H_RATE, A_RATE, MatchState(minutes_elapsed=45))
+    trailing = live_rates(H_RATE, A_RATE,
+                          MatchState(minutes_elapsed=45, home_score=0, away_score=2))
+    # home is two down at half time, so its remaining rate is relatively higher
+    home_share_level = level[0] / sum(level)
+    home_share_trailing = trailing[0] / sum(trailing)
+    assert home_share_trailing > home_share_level
+
+
+def test_live_rates_reach_zero_at_full_time():
+    assert live_rates(H_RATE, A_RATE, MatchState(minutes_elapsed=90)) == (0.0, 0.0)
+
+
+def test_scoreline_matrix_shifts_onto_the_current_score():
+    """Goals already scored are certain and must not be re-randomised."""
+    st = MatchState(minutes_elapsed=60, home_score=2, away_score=1)
+    grid = live_scoreline_matrix(H_RATE, A_RATE, st)
+    assert sum(grid.values()) == pytest.approx(1.0, abs=1e-3)
+    # the minimum possible scoreline is the current one
+    assert min(h for h, _ in grid) == 2
+    assert min(a for _, a in grid) == 1
+
+
+def test_live_double_chance_and_dnb_stay_consistent():
+    st = MatchState(minutes_elapsed=50, home_score=1)
+    o = live_match_odds(H_RATE, A_RATE, st)
+    dc = live_double_chance(H_RATE, A_RATE, st)
+    dnb = live_draw_no_bet(H_RATE, A_RATE, st)
+    assert dc["home_or_draw"] == pytest.approx(o["home"] + o["draw"], abs=1e-3)
+    assert dnb["push"] == pytest.approx(o["draw"], abs=1e-3)
+    assert sum(dnb.values()) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_live_team_total_accounts_for_goals_already_on_the_board():
+    st = MatchState(minutes_elapsed=80, home_score=2)
+    over_15 = live_team_total(H_RATE, A_RATE, st, "home", 1.5)
+    over_25 = live_team_total(H_RATE, A_RATE, st, "home", 2.5)
+    assert over_15["over"] == 1.0          # already on 2, cannot fall
+    assert over_15["under"] == 0.0
+    assert over_25["over"] < 0.5           # needs one more with 10 minutes left
+    assert sum(over_25.values()) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_state_validation_catches_impossible_states():
+    assert MatchState(minutes_elapsed=0).validate() == []
+    assert MatchState(minutes_elapsed=120).validate()          # past regulation
+    assert MatchState(minutes_elapsed=-5).validate()           # negative clock
+    assert MatchState(home_score=-1).validate()                # negative score
+    assert MatchState(home_red_cards=5).validate()             # impossible
+    # past regulation is legal when flagged as extra time
+    assert MatchState(minutes_elapsed=105, in_extra_time=True).validate() == []
+
+
+def test_in_extra_time_leaves_no_regulation_time():
+    st = MatchState(minutes_elapsed=105, in_extra_time=True)
+    assert st.minutes_remaining == 0.0
+    assert st.fraction_remaining == 0.0
+
+
+# --- high-scoring in-play -------------------------------------------------
+
+def _nba_state(mins, home, away):
+    return MatchState(minutes_elapsed=mins, regulation_minutes=48,
+                      home_score=home, away_score=away)
+
+
+def test_live_high_scoring_total_matches_the_pre_match_price_at_kickoff():
+    """
+    At tip-off the live price must equal the pre-match price. If it does not,
+    the time profile is not normalised and every in-play price is biased.
+    """
+    from src.ptai.betting.high_scoring import price_total_normal, SPORT_PARAMS
+    live = live_total_high_scoring(112.5, 112.5, _nba_state(0, 0, 0), 225.0)
+    pre = price_total_normal(SPORT_PARAMS["basketball"].typical_total,
+                             SPORT_PARAMS["basketball"].total_std, 225.0)
+    assert live.over == pytest.approx(pre.over, abs=1e-3)
+    assert live.push == pytest.approx(pre.push, abs=1e-3)
+
+
+def test_live_high_scoring_uncertainty_shrinks_with_sqrt_not_linearly():
+    """
+    Variance adds over independent possessions, so the standard deviation
+    scales with the square root of time remaining. Scaling it linearly would
+    badly understate late-game uncertainty.
+    """
+    full = live_total_high_scoring(114.0, 110.0, _nba_state(0, 0, 0), 225.0)
+    half = live_total_high_scoring(114.0, 110.0, _nba_state(24, 57, 55), 225.0)
+    ratio = half.remaining_std / full.remaining_std
+    # half the time left -> about 1/sqrt(2) of the std, not half
+    assert 0.6 < ratio < 0.85
+
+
+def test_live_high_scoring_total_sums_to_one_across_the_game():
+    for mins, h, a in [(0, 0, 0), (12, 28, 27), (24, 57, 55), (36, 85, 82), (47, 111, 107)]:
+        t = live_total_high_scoring(114.0, 110.0, _nba_state(mins, h, a), 225.0)
+        assert t.over + t.under + t.push == pytest.approx(1.0, abs=1e-3), f"minute {mins}"
+
+
+def test_live_high_scoring_whole_line_pushes_and_half_line_does_not():
+    st = _nba_state(24, 57, 55)
+    assert live_total_high_scoring(114.0, 110.0, st, 225.0).push > 0.01
+    assert live_total_high_scoring(114.0, 110.0, st, 225.5).push == 0.0
+
+
+def test_live_high_scoring_finished_game_is_the_final_score():
+    t = live_total_high_scoring(114.0, 110.0, _nba_state(48, 114, 110), 225.0)
+    assert t == in_play.LiveTotalPrices(line=225.0, over=0.0, under=1.0, push=0.0,
+                                        expected_total=224.0, remaining_std=0.0)
+    sp = live_spread_high_scoring(114.0, 110.0, _nba_state(48, 114, 110), -2.5)
+    assert sp.home == 1.0 and sp.away == 0.0
+
+
+def test_live_high_scoring_blowout_is_decided_late():
+    st = _nba_state(47, 110, 80)
+    ml = in_play.live_moneyline_high_scoring(114.0, 110.0, st)
+    assert ml["home"] > 0.99
+
+
+def test_live_high_scoring_spread_tracks_the_score():
+    early = live_spread_high_scoring(114.0, 110.0, _nba_state(6, 14, 12), -2.5)
+    late = live_spread_high_scoring(114.0, 110.0, _nba_state(40, 95, 78), -2.5)
+    assert late.home > early.home + 0.2
+    for sp in (early, late):
+        assert sp.home + sp.away + sp.push == pytest.approx(1.0, abs=1e-3)
+
+
+def test_live_high_scoring_whole_spread_can_push():
+    sp = live_spread_high_scoring(114.0, 110.0, _nba_state(24, 57, 55), -2.0)
+    assert sp.push > 0.01
+
+
+def test_live_soccer_card_prices_the_whole_live_card():
+    card = price_live_soccer_card("epl:mci-ars", H_RATE, A_RATE,
+                                  MatchState(minutes_elapsed=65, home_score=1))
+    assert isinstance(card, LiveCard)
+    assert card.model == "live_poisson_time_decay"
+    assert card.score == "1-0" and card.minutes_elapsed == 65
+    for key in ("h2h", "double_chance", "draw_no_bet", "btts", "next_goal",
+                "correct_score", "totals_2.5", "team_total_home_1.5"):
+        assert key in card.markets, f"live card missing {key}"
+    assert card.state_warnings == []
+
+    # Double chance outcomes OVERLAP by construction - 1X, X2 and 12 each
+    # include the draw, so the three together double-count it and sum to 2.
+    # Asserting 1.0 here would be asserting a partition that is not one.
+    dc = card.markets["double_chance"]
+    o = card.markets["h2h"]
+    assert dc["home_or_draw"] == pytest.approx(o["home"] + o["draw"], abs=1e-3)
+    assert dc["draw_or_away"] == pytest.approx(o["draw"] + o["away"], abs=1e-3)
+    assert dc["home_or_away"] == pytest.approx(o["home"] + o["away"], abs=1e-3)
+    assert sum(dc.values()) == pytest.approx(2.0, abs=1e-3)
+
+    # correct_score is a deliberate top-N truncation, so it covers most but
+    # not all of the probability mass
+    cs = card.markets["correct_score"]
+    assert 0.9 < sum(cs.values()) <= 1.0
+    assert all(0.0 < p < 1.0 for p in cs.values())
+
+    # every other market is a genuine partition
+    for key, m in card.markets.items():
+        if key in ("double_chance", "correct_score"):
+            continue
+        assert sum(m.values()) == pytest.approx(1.0, abs=1e-2), f"{key} does not sum to 1"
+
+
+def test_live_high_scoring_card_prices_a_full_nba_card():
+    card = price_live_high_scoring_card(
+        "nba:lal-gsw", "nba", 114.0, 110.0, _nba_state(36, 88, 82),
+        lines={"total": 225.0, "spread": -2.5})
+    assert card.model == "live_normal_time_decay"
+    assert card.sport == "basketball"
+    assert "moneyline" in card.markets and "totals_225.0" in card.markets
+    assert "spreads_-2.5" in card.markets
+    assert card.markets["moneyline"]["home"] > 0.7      # up 6 in Q4
+
+
+def test_live_card_carries_state_warnings_not_silent_nonsense():
+    """An impossible clock must be reported, not quietly priced anyway."""
+    card = price_live_soccer_card("epl:x-y", H_RATE, A_RATE, MatchState(minutes_elapsed=140))
+    assert card.state_warnings
+
+
+def test_live_pricing_never_invents_when_rates_are_zero():
+    """A model with no information must not fabricate a confident price."""
+    st = MatchState(minutes_elapsed=0)
+    assert live_rates(0.0, 0.0, st) == (0.0, 0.0)
+    ng = live_next_goal(0.0, 0.0, st)
+    assert ng == {"home": 0.0, "away": 0.0, "none": 1.0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Engine-level in-play wiring
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_engine_routes_a_live_nba_fixture_to_the_normal_model():
+    """Same routing bug as pre-match: an NBA clock is 48 minutes, not 90."""
+    engine = BettingEngine(bankroll=500.0)
+    ev = sample_events(1)[0]
+    card = engine.price_live_card(
+        ev, {ev.key: {"home": {"expected_points": 114.0},
+                      "away": {"expected_points": 110.0},
+                      "total_line": 225.0, "spread_line": -2.5}},
+        MatchState(minutes_elapsed=36, home_score=88, away_score=82))
+    assert card is not None
+    assert card.model == "live_normal_time_decay"
+    assert card.sport == "basketball"
+    assert "moneyline" in card.markets
+    assert "correct_score" not in card.markets       # soccer market, not NBA
+
+
+def test_engine_routes_a_live_soccer_fixture_to_the_poisson_model():
+    engine = BettingEngine(bankroll=500.0)
+    ev = soccer_event()
+    card = engine.price_live_card(
+        ev, {ev.key: {"home": {"attack": 1.7, "defence": 0.85},
+                      "away": {"attack": 1.25, "defence": 1.05}}},
+        MatchState(minutes_elapsed=65, home_score=1))
+    assert card.model == "live_poisson_time_decay"
+    assert "h2h" in card.markets and "btts" in card.markets
+    assert "moneyline" not in card.markets
+
+
+def test_engine_live_pricing_refuses_without_state_or_model():
+    """
+    A live price needs a clock reading AND a model. Without either there is
+    nothing to price, and the engine must say so rather than fall back to the
+    pre-match number and present it as live.
+    """
+    engine = BettingEngine(bankroll=500.0)
+    ev = soccer_event()
+    strengths = {ev.key: {"home": {"attack": 1.5, "defence": 1.0},
+                          "away": {"attack": 1.0, "defence": 1.0}}}
+    assert engine.price_live_card(ev, strengths, None) is None
+    assert engine.price_live_card(ev, {}, MatchState(minutes_elapsed=30)) is None
+    assert engine.live_fair_prices(ev.key) == {}
+
+
+def test_engine_live_fair_prices_are_keyed_like_the_prematch_card():
+    engine = BettingEngine(bankroll=500.0)
+    ev = soccer_event()
+    engine.price_live_card(
+        ev, {ev.key: {"home": {"attack": 1.7, "defence": 0.85},
+                      "away": {"attack": 1.25, "defence": 1.05}}},
+        MatchState(minutes_elapsed=65, home_score=1))
+    fair = engine.live_fair_prices(ev.key)
+    assert "totals_2.5" in fair and set(fair["totals_2.5"]) == {"over", "under", "push"}
+
+
+def test_engine_records_the_minute_a_live_price_was_taken_at():
+    """
+    A live fair price is only valid at the clock reading it was computed for.
+    Recording the minute is what makes it auditable later.
+    """
+    engine = BettingEngine(bankroll=500.0)
+    ev = soccer_event()
+    card = engine.price_live_card(
+        ev, {ev.key: {"home": {"attack": 1.5, "defence": 1.0},
+                      "away": {"attack": 1.0, "defence": 1.0}}},
+        MatchState(minutes_elapsed=73, home_score=0, away_score=0))
+    assert card.priced_at_minute == 73
+    assert engine.priced_live[ev.key].minutes_elapsed == 73
+
+
+def test_engine_live_price_differs_from_the_prematch_price():
+    """
+    Regression guard on the whole point of the module: if the live price
+    equals the pre-match price at minute 73, nothing is decaying.
+    """
+    engine = BettingEngine(bankroll=500.0)
+    ev = soccer_event()
+    strengths = {ev.key: {"home": {"attack": 1.5, "defence": 1.0},
+                          "away": {"attack": 1.0, "defence": 1.0}}}
+    pre = engine.price_card(ev, strengths)
+    live = engine.price_live_card(ev, strengths,
+                                  MatchState(minutes_elapsed=73, home_score=0, away_score=0))
+    pre_draw = engine.card_fair_prices(ev.key)["h2h"]["draw"]
+    live_draw = live.markets["h2h"]["draw"]
+    assert live_draw > pre_draw + 0.2, (pre_draw, live_draw)
+    assert pre.goals is not None

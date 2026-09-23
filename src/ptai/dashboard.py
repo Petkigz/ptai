@@ -1752,6 +1752,81 @@ async def api_v3_betting_card(league: str = "epl", data_mode: str = "live_shadow
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
+@app.get("/api/v3/betting/live")
+async def api_v3_betting_live(league: str = "epl", sport: str = "soccer",
+                              minute: float = 60.0,
+                              home_score: int = 0, away_score: int = 0,
+                              home_red: int = 0, away_red: int = 0,
+                              home_expected: float = 1.5, away_expected: float = 1.1):
+    """
+    In-play fair value at a given clock reading and score.
+
+    The caller supplies the match state because that is the honest contract:
+    this project has no live score feed, so it will not pretend to know what
+    minute a match is at. Give it a real state and it returns a real fair
+    value; the pre-match price is never substituted for a live one.
+
+    For soccer, home_expected/away_expected are goal rates. For basketball,
+    gridiron, baseball and hockey they are expected points, and the normal
+    margin model is used instead of the Poisson scoreline grid.
+    """
+    try:
+        from .betting.engine import BettingEngine
+        from .betting.in_play import MatchState
+        from .betting.high_scoring import is_high_scoring, resolve_sport
+
+        resolved = resolve_sport(sport) if is_high_scoring(sport) else "soccer"
+        regulation = {"basketball": 48.0, "football": 60.0,
+                      "baseball": 162.0, "hockey": 60.0}.get(resolved, 90.0)
+
+        state = MatchState(minutes_elapsed=minute, home_score=home_score,
+                           away_score=away_score, home_red_cards=home_red,
+                           away_red_cards=away_red, regulation_minutes=regulation,
+                           is_high_scoring=(resolved != "soccer"))
+        warnings = state.validate()
+        if warnings:
+            return {"error": "impossible match state", "warnings": warnings,
+                    "state": {"minute": minute, "home_score": home_score,
+                              "away_score": away_score}}
+
+        from .betting.sports_data import SportsEvent
+        from datetime import datetime, timezone
+        ev = SportsEvent(event_id=f"live:{league}", sport=sport, league=league,
+                         home_team="home", away_team="away",
+                         commence_time=datetime.now(timezone.utc),
+                         provider="dashboard", raw={})
+
+        engine = BettingEngine(bankroll=50.0)
+        if resolved == "soccer":
+            strengths = {ev.key: {"home": {"attack": home_expected, "defence": 1.0},
+                                  "away": {"attack": away_expected, "defence": 1.0}}}
+        else:
+            strengths = {ev.key: {"home": {"expected_points": home_expected},
+                                  "away": {"expected_points": away_expected}}}
+
+        card = engine.price_live_card(ev, strengths, state)
+        if card is None:
+            return {"error": "could not price this state - no model available",
+                    "resolved_sport": resolved}
+
+        return {
+            "league": league,
+            "resolved_sport": resolved,
+            "model": card.model,
+            "minute": card.minutes_elapsed,
+            "score": card.score,
+            "fraction_of_match_remaining": round(state.fraction_remaining, 4),
+            "markets": card.markets,
+            "market_count": len(card.markets),
+            "state_warnings": card.state_warnings,
+            "note": ("these are model fair values at this clock reading, not bettable "
+                     "odds - no live book price is compared here"),
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/api/v3/betting/markets")
 async def api_v3_betting_markets():
     """The market catalogue: what can be bet, how it settles, when it voids."""
