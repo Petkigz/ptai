@@ -56,7 +56,7 @@ from ..storage.db import Storage
 from ..vault import Vault
 from ..memory import Memory
 from ..llm.provider import LLMRouter
-from ..markets.base import Market
+from ..markets.base import Market, DataMode
 
 from ..venues.registry import VenueRegistry
 from ..venues.polymarket_adapter import PolymarketAdapter
@@ -72,6 +72,8 @@ from ..venues.afx_adapter import AFXAdapter
 from ..venues.grvt_adapter import GRVTAdapter
 from ..venues.pionex_adapter import PionexAdapter
 from ..venues.betfair_adapter import BetfairAdapter, BetdaqAdapter, BetConnectAdapter
+from ..betting.engine import BettingEngine
+from ..betting.market_types import catalogue_report as betting_catalogue_report
 from ..venues.ccxt_adapter import CCXTUnifiedAdapter
 from ..venues.veynor_adapter import VeynorAdapter
 from ..venues.openpx_adapter import OpenPXAdapter
@@ -186,6 +188,25 @@ class TradingAgentV3:
         
         # Alpha engine - all additional alpha ideas
         self.alpha_engine = AlphaEngine(bankroll=self.storage.get_performance_summary().get("bankroll", 50.0))
+
+        # Betting / sports exchange engine - full match-card pricing (goals,
+        # corners, cards, handicaps, halves, props) with per-market settlement.
+        # Separate from the prediction-market path because exchange back/lay
+        # liability and commission-on-winnings are different maths.
+        # Settings store the edge threshold as a FRACTION (0.08 = 8%); the
+        # betting engine compares in PERCENT. Converting here rather than
+        # passing the raw value, which would mean "0.08%" and accept
+        # essentially any price as an edge.
+        _edge_frac = getattr(self.settings, "min_edge_pct", None)
+        _edge_pct = _edge_frac * 100.0 if isinstance(_edge_frac, (int, float)) else 8.0
+        _kelly = getattr(self.settings, "kelly_fraction", 0.25)
+        self.betting_engine = BettingEngine(
+            settings=self.settings,
+            bankroll=self.storage.get_performance_summary().get("bankroll", 50.0),
+            min_edge_pct=_edge_pct,
+            kelly_frac=_kelly if isinstance(_kelly, (int, float)) else 0.25,
+            max_position_pct=getattr(self.settings, "max_position_pct", 0.06),
+        )
         
         # Venue/Strategy Qualification Engine - V8 - properly connected to main loop
         self.qualification_engine = VenueQualificationEngine()
@@ -630,6 +651,25 @@ class TradingAgentV3:
         except Exception as e:
             logger.warning(f"Alpha scan failed: {e}")
             alpha_results = {"error": str(e)}
+
+        # Betting / sports exchange scan - full match card, not just 1X2.
+        # Runs in LIVE_SHADOW by default: it prices goals, corners, cards,
+        # handicaps, halves and props, but no capital deploys unless the mode
+        # is LIVE and account health is verified.
+        betting_results: Dict[str, Any] = {}
+        try:
+            betting_results = await self.betting_engine.run_cycle(
+                leagues=("nba", "epl"),
+                data_mode=DataMode.LIVE_SHADOW,
+                account_health_ok=False,
+            )
+            logger.info(
+                f"Betting scan: {betting_results.get('events', 0)} fixtures, "
+                f"{betting_results.get('opportunities', 0)} markets priced, "
+                f"{betting_results.get('executable', 0)} executable")
+        except Exception as e:
+            logger.warning(f"Betting scan failed: {e}")
+            betting_results = {"error": str(e)}
         
         # V3 Strategy Engine: venue × market × strategy
         # Core Objective Step 3: Measures the opportunity on a common risk-adjusted basis
@@ -1025,6 +1065,19 @@ class TradingAgentV3:
                 }
             },
             "alpha": alpha_results,
+            "betting": {
+                "ok": betting_results.get("ok", False),
+                "events": betting_results.get("events", 0),
+                "markets_scanned_by_type": betting_results.get("markets_scanned_by_type", {}),
+                "cards_priced": betting_results.get("cards_priced", 0),
+                "market_types_available": betting_results.get("market_types_available", 0),
+                "opportunities": betting_results.get("opportunities", 0),
+                "executable": betting_results.get("executable", 0),
+                "arbs": betting_results.get("arbs", 0),
+                "data_mode": betting_results.get("data_mode", "unknown"),
+                "sharpness": betting_results.get("sharpness", {}),
+                "blockers": betting_results.get("blockers", [])[:3],
+            },
             "execution": execution_results,
             "reasoning": scan_result.reasoning,
             "execution_time": elapsed,

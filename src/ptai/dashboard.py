@@ -1705,6 +1705,75 @@ async def api_v3_combinatorial(target_per_venue: int = 100):
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
 
+@app.get("/api/v3/betting/card")
+async def api_v3_betting_card(league: str = "epl", data_mode: str = "live_shadow"):
+    """
+    Full match-card pricing: goals, corners, cards, handicaps, halves, props.
+
+    Runs in shadow mode by default. A market is only marked executable when a
+    real book price exists AND the data mode allows live capital AND account
+    health is verified - a model price with nothing to bet against is
+    reported as a fair value, never as a bet.
+    """
+    try:
+        from .betting.engine import BettingEngine
+        from .betting.market_types import catalogue_report, MARKET_CATALOGUE
+        from .markets.base import DataMode
+
+        try:
+            mode = DataMode(data_mode.lower())
+        except ValueError:
+            return {"error": f"unknown data_mode '{data_mode}'",
+                    "valid": [m.value for m in DataMode]}
+
+        engine = BettingEngine(bankroll=50.0)
+        result = await engine.run_cycle(leagues=(league,), data_mode=mode,
+                                        account_health_ok=False)
+        return {
+            "league": league,
+            "data_mode": mode.value,
+            "events": result.get("events", 0),
+            "with_odds": result.get("with_odds", 0),
+            "cards_priced": result.get("cards_priced", 0),
+            "markets_scanned_by_type": result.get("markets_scanned_by_type", {}),
+            "opportunities": result.get("opportunities", 0),
+            "executable": result.get("executable", 0),
+            "arbs": result.get("arbs", 0),
+            "top": result.get("top", [])[:10],
+            "providers": result.get("health", {}),
+            "blockers": result.get("blockers", []),
+            "catalogue": catalogue_report(),
+            "market_types": sorted(MARKET_CATALOGUE),
+            "note": ("no fixtures returned means no feed was reachable - the engine "
+                     "refuses to invent sports prices"),
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+@app.get("/api/v3/betting/markets")
+async def api_v3_betting_markets():
+    """The market catalogue: what can be bet, how it settles, when it voids."""
+    try:
+        from .betting.market_types import MARKET_CATALOGUE, catalogue_report
+        return {
+            "report": catalogue_report(),
+            "markets": {
+                k: {
+                    "name": v.name, "sports": list(v.sports),
+                    "outcome_kind": v.outcome_kind, "needs_line": v.needs_line,
+                    "line_is_quarterable": v.line_is_quarterable,
+                    "push_possible": v.push_possible, "model": v.model,
+                    "void_rules": list(v.void_rules), "notes": v.notes,
+                } for k, v in MARKET_CATALOGUE.items()
+            },
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/api/v3/alpha/reference-odds")
 async def api_v3_reference_odds(target_count: int = 50):
     try:
