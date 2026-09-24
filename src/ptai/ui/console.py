@@ -96,7 +96,14 @@ def get_storage() -> Storage:
 # capital
 # ----------------------------------------------------------------------
 
-async def _venue_balances(agent=None) -> Dict[str, Dict[str, Any]]:
+# A short cache. The console polls every 15 seconds and asks every venue for a
+# balance; without this a browser tab left open becomes a sustained load on every
+# venue's API, which is how an account gets rate limited for no reason.
+_BALANCE_CACHE: Dict[str, Any] = {"at": 0.0, "values": {}}
+_BALANCE_TTL_SECONDS = 20.0
+
+
+async def _venue_balances(agent=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     """
     Ask each venue what the balance is. Never guesses.
 
@@ -105,6 +112,13 @@ async def _venue_balances(agent=None) -> Dict[str, Dict[str, Any]]:
     typed into the budget box - is an agent that believes it has money because
     someone filled in a form.
     """
+    import time as _time
+
+    now = _time.monotonic()
+    if not force and _BALANCE_CACHE["values"] and \
+            now - _BALANCE_CACHE["at"] < _BALANCE_TTL_SECONDS:
+        return dict(_BALANCE_CACHE["values"])
+
     balances: Dict[str, Dict[str, Any]] = {}
     registry = getattr(agent, "venue_registry", None)
     adapters = getattr(registry, "adapters", {}) if registry is not None else {}
@@ -126,6 +140,8 @@ async def _venue_balances(agent=None) -> Dict[str, Dict[str, Any]]:
                 "balance": float(result.get("balance") or 0.0),
                 "source": result.get("source", ""),
             }
+    _BALANCE_CACHE["at"] = _time.monotonic()
+    _BALANCE_CACHE["values"] = dict(balances)
     return balances
 
 
@@ -308,6 +324,7 @@ async def api_status() -> JSONResponse:
 
     balances = await _venue_balances(agent)
     plan = _build_plan(state, storage, balances)
+    answering = sum(1 for b in balances.values() if b.get("available"))
 
     out["steps"] = [
         {"step": "capital", "label": "Capital authorised",
@@ -321,9 +338,12 @@ async def api_status() -> JSONResponse:
          "detail": ("not verified this session - the order probe needs a real "
                     "account, and it has not been run since startup")},
         {"step": "data", "label": "Market data",
-         "ok": bool(balances),
-         "detail": (f"{len(balances)} venue(s) answered"
-                    if balances else "no venue was reachable from this process")},
+         "ok": answering > 0,
+         "detail": ((f"{answering} of {len(balances)} venue(s) reported a balance"
+                     if balances else "no venue was reachable from this process")
+                    + ("" if answering else
+                       " - asked, but none answered. A venue that does not answer "
+                       "is not a venue with a zero balance."))},
         {"step": "qualification", "label": "Venue qualified",
          "ok": False,
          "detail": ("needs 100+ resolved trades per venue: win rate, Brier, "
@@ -471,11 +491,41 @@ async def api_run_cycle(request: Request) -> JSONResponse:
 
     agent = _agent()
     if agent is None:
-        return JSONResponse(status_code=503, content={
-            "error": ("the engine is not running in this process. Start it with "
-                      "`python -m ptai.cli run` and it will report here."),
-            "mode": requested_mode,
-        })
+        if requested_mode == "live":
+            # A live engine must be the supervised process, not something this
+            # web handler constructs. Two things would otherwise become real
+            # money: the button, and whatever loads the page.
+            return JSONResponse(status_code=503, content={
+                "error": ("live cycles run in the engine process, not in the "
+                          "console. Start it with `python -m src.ptai.cli run "
+                          "--no-dry-run`; it appears here when it is running."),
+                "mode": requested_mode,
+            })
+        # PAPER cycles are safe to construct here, and deliberately so: the
+        # agent is built with dry_run=True, which propagates to every adapter,
+        # so no order can be sent. No credentials are needed and no capital is
+        # at risk, which is what makes paper mode the right place to start.
+        try:
+            from ..agent.v3_loop import TradingAgentV3
+
+            agent = TradingAgentV3(country_code="UG", dry_run=True)
+            _agent_cache["agent"] = agent
+            logger.info("Paper engine constructed in-process for the console")
+        except Exception as e:
+            logger.error(f"Could not start a paper engine: {type(e).__name__}: {e}")
+            return JSONResponse(status_code=500, content={
+                "error": f"could not start a paper engine: {type(e).__name__}: {e}",
+                "mode": "paper",
+            })
+        # A paper engine constructed on demand must not be mistaken for a
+        # supervised live one.
+        if getattr(agent, "dry_run", None) is not True:
+            _agent_cache.pop("agent", None)
+            return JSONResponse(status_code=500, content={
+                "error": ("refusing to run: the engine built here was not in "
+                          "dry run, so a paper cycle could have sent a real order"),
+                "mode": "paper",
+            })
 
     try:
         result = await agent.run_cycle()

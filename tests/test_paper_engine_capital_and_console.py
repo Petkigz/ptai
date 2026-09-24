@@ -416,6 +416,38 @@ class TestTheConsoleRefuses:
         assert "no account to send money to" in body["principle"].lower()
         assert body["routes"]["polymarket"]["deposit_steps"]
 
+    def test_a_paper_cycle_runs_from_the_console(self, client):
+        """
+        Paper mode has to be runnable, or the operator has to launch a second
+        process to see the thing they asked to see. It is safe to construct here
+        precisely because dry_run propagates to every adapter.
+        """
+        response = client.post("/api/console/run-cycle", json={"mode": "paper"})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["mode"] == "paper"
+        assert "status" in body and "settlement" in body
+
+    def test_a_live_cycle_is_never_run_from_the_console(self, client):
+        """
+        A live engine must be the supervised process. If the web handler could
+        construct one, then loading the page and pressing a button would both be
+        enough to trade real money.
+        """
+        response = client.post("/api/console/run-cycle", json={"mode": "live"})
+        assert response.status_code in (409, 503)
+        assert "live" in response.json()["error"].lower()
+
+    def test_a_venue_that_does_not_answer_is_not_a_zero_balance(self, client):
+        """
+        "Asked and did not answer" is not "has no money", and the difference is
+        what stops the operator chasing a funding problem that does not exist.
+        """
+        body = client.get("/api/console/status").json()
+        data = [s for s in body["steps"] if s["step"] == "data"][0]
+        assert "reported a balance" in data["detail"] or \
+            "no venue was reachable" in data["detail"]
+
     def test_the_page_loads_and_shows_the_mode(self, client):
         response = client.get("/")
         assert response.status_code == 200
