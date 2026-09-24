@@ -2167,7 +2167,14 @@ async def api_v3_alpha_all(target_per_venue: int = 50):
         
         # Liquidity rewards
         liq_engine = LiquidityRewardsEngine(bankroll=50.0)
-        results["liquidity_rewards"] = {"active": liq_engine.mock_rewards["active"], "apr": liq_engine.mock_rewards["reward_rate_per_day"]*365*100}
+        rewards = liq_engine.rewards
+        results["liquidity_rewards"] = {
+            "reward_configured": rewards.reward_available,
+            "apr": round(rewards.reward_apr * 100, 2),
+            "source": rewards.source or "not configured",
+            "note": ("no default reward rate is assumed; without a configured rate the "
+                     "strategy can only earn spread"),
+        }
         
         # Correlation
         corr_manager = CorrelationAwareRiskManager(bankroll=50.0)

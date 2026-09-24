@@ -215,27 +215,61 @@ def test_dynamic_threshold_illiquid():
         assert thresh_illiquid.total_threshold >= 0.15
 
 
+# A real two-sided book. Quoting requires one: the engine no longer assumes a
+# 2% spread or treats market.best_price as a midpoint.
+BOOK = {"bids": [{"price": 0.58, "size": 400}], "asks": [{"price": 0.62, "size": 350}]}
+
+
+def _market_with_book(price=0.6, liquidity=10000, book=None):
+    m = make_market(price=price, liquidity=liquidity)
+    m.volume_24h = 50000
+    m.raw["orderbook"] = book if book is not None else BOOK
+    return m
+
+
 def test_liquidity_rewards():
-    market = make_market(price=0.6, liquidity=10000)
     engine = LiquidityRewardsEngine(bankroll=50.0)
-    est = engine.estimate_rewards(market=market, amount_usd=5.0)
+    est = engine.estimate_rewards(market=_market_with_book(), amount_usd=5.0)
     assert est.reward_per_day_usd >= 0
-    assert est.should_provide_liquidity or not est.should_provide_liquidity  # bool
-    quote = engine.create_quotes(market=market, inventory=0, amount_usd=5.0)
+    assert isinstance(est.should_provide_liquidity, bool)
+    quote = engine.create_quotes(market=_market_with_book(), inventory=0, amount_usd=5.0)
     assert quote.bid_price < quote.ask_price
     assert quote.should_quote
 
 
-def test_liquidity_rewards_inventory_limit():
+def test_no_orderbook_means_no_quote():
+    """
+    The old code quoted anyway, around market.best_price with an assumed 2%
+    spread. A two-sided quote needs a two-sided book.
+    """
+    engine = LiquidityRewardsEngine(bankroll=50.0)
     market = make_market(price=0.6, liquidity=10000)
+    quote = engine.create_quotes(market=market, inventory=0, amount_usd=5.0)
+    assert quote.should_quote is False
+    assert quote.bid_price == 0.0 and quote.ask_price == 0.0
+    assert quote.blockers
+
+
+def test_liquidity_rewards_inventory_limit():
     engine = LiquidityRewardsEngine(bankroll=50.0)  # $50 bankroll, max $5 inventory 10%
-    # With 0 inventory should quote
-    quote0 = engine.create_quotes(market=market, inventory=0, amount_usd=5.0)
+    quote0 = engine.create_quotes(market=_market_with_book(), inventory=0, amount_usd=5.0)
     assert quote0.should_quote
-    # With high inventory should not quote or skew
-    quote_high = engine.create_quotes(market=market, inventory=10, amount_usd=5.0)
-    # Should still create quotes but with skew or not should_quote if too high
-    assert quote_high.bid_price <= quote0.bid_price or not quote_high.should_quote
+    # At the inventory limit the engine must stop quoting
+    quote_high = engine.create_quotes(market=_market_with_book(), inventory=5, amount_usd=5.0)
+    assert quote_high.should_quote is False
+    assert any("inventory" in b for b in quote_high.blockers)
+
+
+def test_inventory_skews_quotes_toward_unwinding():
+    engine = LiquidityRewardsEngine(bankroll=50.0)
+    flat = engine.create_quotes(market=_market_with_book(), inventory=0, amount_usd=5.0)
+    long_ = engine.create_quotes(market=_market_with_book(), inventory=2.5, amount_usd=5.0)
+    short = engine.create_quotes(market=_market_with_book(), inventory=-2.5, amount_usd=5.0)
+    # long -> quote down to sell; short -> quote up to buy back
+    assert long_.ask_price < flat.ask_price
+    assert short.bid_price > flat.bid_price
+    assert long_.ask_size_usd > long_.bid_size_usd
+    assert short.bid_size_usd > short.ask_size_usd
 
 
 def test_orderbook_imbalance():

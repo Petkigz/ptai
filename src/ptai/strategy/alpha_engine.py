@@ -21,7 +21,7 @@ Additional:
 """
 
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loguru import logger
 
 from ..markets.base import Market
@@ -40,6 +40,29 @@ from ..risk.correlation_enhanced import CorrelationAwareRiskManager
 from ..intelligence.calibration_tracker import CalibrationTracker
 from ..execution.slippage import SlippageModel
 from ..markets.whale_tracker import WhaleTracker
+
+
+@dataclass
+class AlphaAdjustment:
+    """
+    The multiplier applied to a base score, and exactly what produced it.
+
+    A score adjustment with no record of what was applied cannot be audited,
+    which is how a direction-blind multiplier survived unnoticed: nothing
+    anywhere said which signal had moved the number.
+    """
+    multiplier: float
+    applied: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def boosted(self) -> bool:
+        return self.multiplier > 1.0 + 1e-9
+
+    @property
+    def penalised(self) -> bool:
+        return self.multiplier < 1.0 - 1e-9
 
 
 @dataclass
@@ -161,8 +184,8 @@ class AlphaEngine:
         # 8. Liquidity rewards
         try:
             results["liquidity_rewards"] = {
-                "apr": self.liquidity.mock_rewards["reward_rate_per_day"] * 365 * 100,
-                "active": self.liquidity.mock_rewards["active"]
+                "apr": round(self.liquidity.rewards.reward_apr * 100, 2),
+                "reward_configured": self.liquidity.rewards.reward_available
             }
         except Exception as e:
             results["liquidity_rewards"] = {"error": str(e)}
@@ -196,45 +219,172 @@ class AlphaEngine:
 
         return results
 
-    def calculate_alpha_adjusted_score(self, base_score: float, market: Market, context: Dict = None) -> float:
+    # ------------------------------------------------------------------
+    # Alpha score adjustment
+    # ------------------------------------------------------------------
+
+    def _trade_direction(self, side: str) -> int:
+        """+1 when the trade wants the probability higher than the market says."""
+        s = (side or "YES").upper()
+        if s in ("YES", "BUY", "LONG", "BACK", "OVER", "HOME"):
+            return 1
+        if s in ("NO", "SELL", "SHORT", "LAY", "UNDER", "AWAY"):
+            return -1
+        return 0
+
+    def calculate_alpha_adjustment(self, market: Market, side: str = "YES",
+                                   kalshi_markets: Optional[List[Market]] = None,
+                                   whale_signals: Optional[List[Any]] = None,
+                                   context: Optional[Dict] = None) -> AlphaAdjustment:
         """
-        Adjust base V3 score with alpha signals
-        score = expected_edge × prob_correct × liquidity × execution × calibration × time / (fees+slippage+uncertainty+risk)
-        Additional multipliers from alpha engines
+        Directional multiplier from the alpha signals, with an audit trail.
+
+        Every signal here is compared against the DIRECTION of the trade. The
+        previous version tested magnitudes only:
+
+            if max_edge_ref > 0.05: score *= 1.2
+
+        so a reference price that contradicted the trade by 5% boosted it by
+        20%, a RAG base rate pointing the other way boosted it, and the
+        favourite-longshot rule boosted buying an overpriced longshot - which
+        is precisely the trade the bias says to fade. Three signals that were
+        supposed to be confirmation were confirming their own opposite.
+
+        Signals that fail are recorded in `errors`, not swallowed by a bare
+        `except: pass`.
         """
         context = context or {}
-        score = base_score
-        
-        # Reference odds multiplier: if external source confirms edge, boost
+        direction = self._trade_direction(side)
+        price = float(getattr(market, "best_price", 0.0) or 0.0)
+        applied: List[str] = []
+        errors: List[str] = []
+        detail: Dict[str, Any] = {"side": side, "direction": direction, "price": price}
+        multiplier = 1.0
+
+        if direction == 0:
+            errors.append(f"unknown trade side '{side}' - no alpha signals applied")
+            return AlphaAdjustment(1.0, applied, errors, detail)
+
+        # ---- 1. cross-venue reference odds -----------------------------
         try:
-            refs = self.reference_odds.get_all_reference_odds(market)
-            if refs:
-                max_edge_ref = max([abs(r.edge) for r in refs], default=0)
-                if max_edge_ref > 0.05:
-                    score *= 1.2  # 20% boost if reference odds confirm
-        except:
-            pass
-        
-        # RAG base rate adjustment: if historical base rate aligns with edge, boost confidence
+            refs = self.reference_odds.get_all_reference_odds(market, kalshi_markets)
+            confirming = [r for r in refs if r.edge * direction > 0.05 and r.should_trade]
+            contradicting = [r for r in refs if r.edge * direction < -0.05 and r.should_trade]
+            detail["references"] = len(refs)
+            detail["references_confirming"] = len(confirming)
+            detail["references_contradicting"] = len(contradicting)
+            if confirming and len(confirming) >= len(contradicting):
+                best = max(confirming, key=lambda r: abs(r.edge) * r.confidence)
+                multiplier *= 1.20
+                applied.append(f"reference odds confirm ({best.source} edge "
+                               f"{best.edge*direction*100:+.1f}% in favour) x1.20")
+            elif contradicting:
+                worst = max(contradicting, key=lambda r: abs(r.edge))
+                multiplier *= 0.75
+                applied.append(f"reference odds contradict ({worst.source} edge "
+                               f"{worst.edge*direction*100:+.1f}% against) x0.75")
+        except Exception as e:
+            errors.append(f"reference_odds: {type(e).__name__}: {e}")
+
+        # ---- 2. RAG historical base rate -------------------------------
         try:
-            base_rate = self.rag.estimate_base_rate(market_id=market.id, question=market.question, category="unknown")
-            if base_rate.confidence > 0.6:
-                score *= (1.0 + base_rate.confidence * 0.1)
-        except:
-            pass
-        
-        # Favourite-longshot: if extreme price and matches bias, boost
+            category = (getattr(market, "raw", {}) or {}).get("category") \
+                or context.get("category") or "unknown"
+            base_rate = self.rag.estimate_base_rate(
+                market_id=market.id, question=market.question, category=category)
+            detail["rag_base_rate"] = base_rate.base_rate
+            detail["rag_confidence"] = base_rate.confidence
+            detail["rag_similar"] = base_rate.num_similar
+            # A base rate only confirms if it sits on the same side of the
+            # market price as the trade does.
+            if base_rate.confidence > 0.6 and base_rate.num_similar > 0:
+                agreement = (base_rate.base_rate - price) * direction
+                if agreement > 0.03:
+                    boost = 1.0 + min(0.10, base_rate.confidence * 0.10)
+                    multiplier *= boost
+                    applied.append(f"RAG base rate {base_rate.base_rate:.2f} vs price "
+                                   f"{price:.2f} agrees (n={base_rate.num_similar}) "
+                                   f"x{boost:.3f}")
+                elif agreement < -0.03:
+                    multiplier *= 0.90
+                    applied.append(f"RAG base rate {base_rate.base_rate:.2f} vs price "
+                                   f"{price:.2f} disagrees x0.90")
+        except Exception as e:
+            errors.append(f"rag: {type(e).__name__}: {e}")
+
+        # ---- 3. favourite-longshot bias --------------------------------
         try:
-            if market.best_price < 0.05 or market.best_price > 0.95:
-                if market.liquidity > 10000:  # liquid only
-                    score *= 1.15
-        except:
-            pass
-        
-        # Whale signal: mock boost
-        # In real implementation, would check if smart whales are on same side
-        
-        return score
+            liquidity = float(getattr(market, "liquidity", 0.0) or 0.0)
+            if liquidity > 10000:
+                # Longshots are OVERpriced, so fading them (side NO) is with
+                # the bias. Favourites are UNDERpriced, so buying them (side
+                # YES) is with the bias. Boosting either tail regardless of
+                # side - as before - boosted the losing trade.
+                with_bias = (price < 0.05 and direction < 0) or (price > 0.95 and direction > 0)
+                against_bias = (price < 0.05 and direction > 0) or (price > 0.95 and direction < 0)
+                if with_bias:
+                    multiplier *= 1.15
+                    applied.append(f"price {price:.3f} is a mispriced tail and this trade "
+                                   "fades it with the bias x1.15")
+                elif against_bias:
+                    multiplier *= 0.85
+                    applied.append(f"price {price:.3f} is a mispriced tail and this trade "
+                                   "buys into the bias x0.85")
+        except Exception as e:
+            errors.append(f"favourite_longshot: {type(e).__name__}: {e}")
+
+        # ---- 4. whale confirmation -------------------------------------
+        try:
+            signals = whale_signals if whale_signals is not None else context.get("whale_signals")
+            if signals:
+                aligned = [s for s in signals if getattr(s, "should_trade", False)
+                           and self._whale_aligns(s, direction)]
+                detail["whale_signals"] = len(signals)
+                detail["whale_aligned"] = len(aligned)
+                if aligned:
+                    best = max(aligned, key=lambda s: abs(getattr(s, "edge_estimate", 0.0)))
+                    multiplier *= 1.10
+                    applied.append(f"{len(aligned)} whale signal(s) aligned, best edge "
+                                   f"{getattr(best, 'edge_estimate', 0.0)*100:+.1f}% x1.10")
+        except Exception as e:
+            errors.append(f"whale: {type(e).__name__}: {e}")
+
+        return AlphaAdjustment(multiplier=round(multiplier, 4), applied=applied,
+                               errors=errors, detail=detail)
+
+    @staticmethod
+    def _whale_aligns(signal: Any, direction: int) -> bool:
+        """
+        Whether a whale signal points the same way as the trade.
+
+        A copy signal follows the whale's side; a fade signal takes the
+        opposite side. Comparing without accounting for that would treat
+        "fade this dumb whale's YES" as agreement with a YES trade.
+        """
+        sig_type = str(getattr(signal, "signal_type", ""))
+        side = str(getattr(signal, "side", "YES")).upper()
+        whale_wants_yes = side in ("YES", "BUY")
+        if sig_type == "fade_dumb":
+            whale_wants_yes = not whale_wants_yes
+        return (1 if whale_wants_yes else -1) == direction
+
+    def calculate_alpha_adjusted_score(self, base_score: float, market: Market,
+                                       context: Optional[Dict] = None) -> float:
+        """
+        Apply the alpha multiplier to a base score.
+
+        Kept for backward compatibility. `context` may carry `side`,
+        `kalshi_markets` and `whale_signals`; the default side is YES because
+        that is what every existing caller assumed.
+        """
+        context = context or {}
+        adjustment = self.calculate_alpha_adjustment(
+            market,
+            side=context.get("side", "YES"),
+            kalshi_markets=context.get("kalshi_markets"),
+            whale_signals=context.get("whale_signals"),
+            context=context)
+        return base_score * adjustment.multiplier
 
     def get_report(self) -> Dict[str, Any]:
         return {

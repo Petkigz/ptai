@@ -178,6 +178,16 @@ class OpportunityEngine:
         self.llm_router = llm_router
         self.fast_classifier = FastModelClassifier(llm_router=llm_router)
         self.expected_ev_engine = ExpectedNetEVEngine()
+        # Alpha adjustment engine. Imported lazily: alpha_engine pulls in most
+        # of the strategy package, and a hard import here would risk a cycle.
+        # If it cannot be constructed the scorer simply applies no adjustment
+        # rather than failing the whole selection pass.
+        try:
+            from .alpha_engine import AlphaEngine
+            self.alpha_engine = AlphaEngine()
+        except Exception as e:
+            logger.warning(f"AlphaEngine unavailable, scores will not be adjusted: {e}")
+            self.alpha_engine = None
         self.min_volume_24h = 1000
         self.min_liquidity = 500
         self.max_spread = 0.08
@@ -483,6 +493,30 @@ class OpportunityEngine:
             final_score = ev_result.net_ev_usd * ev_result.ev_per_dollar * liquidity_score * opp.execution_quality * time_efficiency * ev_result.ev_per_risk / max(0.01, opp.uncertainty)
             # Also incorporate capital efficiency
             final_score *= (1 + ev_result.ev_per_capital_time)
+
+            # Alpha adjustment. This was dead code for the whole life of the
+            # project: calculate_alpha_adjusted_score existed but nothing in
+            # the live path ever called it, so none of the alpha signals
+            # (reference odds, RAG base rates, favourite-longshot, whales)
+            # ever moved a ranking. It is applied here, directionally, with
+            # the multiplier and its reasons recorded on the opportunity so a
+            # boosted score can be audited afterwards.
+            if self.alpha_engine is not None:
+                try:
+                    adjustment = self.alpha_engine.calculate_alpha_adjustment(
+                        opp.market, side=opp.side, context=context)
+                    final_score *= adjustment.multiplier
+                    opp.raw["alpha_adjustment"] = {
+                        "multiplier": adjustment.multiplier,
+                        "applied": adjustment.applied,
+                        "errors": adjustment.errors,
+                    }
+                    if adjustment.applied:
+                        logger.info(f"Alpha adjustment {opp.market.id}: x{adjustment.multiplier:.3f} - "
+                                    f"{'; '.join(adjustment.applied)[:200]}")
+                except Exception as e:
+                    logger.warning(f"Alpha adjustment failed for {opp.market.id}: {e}")
+
             opp.score = final_score
             
             logger.info(f"Selected {opp.market.id} venue {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} liq {liquidity_score:.2f} exec {opp.execution_quality:.2f} netEV ${ev_result.net_ev_usd:.2f} ({ev_result.net_ev_pct*100:.1f}%) per$ {ev_result.ev_per_dollar*100:.1f}% perRisk {ev_result.ev_per_risk:.2f} final_score {final_score:.3f} - V10 FIX #9 Expected Net EV | venue_id immutable {opp.venue_id}")
