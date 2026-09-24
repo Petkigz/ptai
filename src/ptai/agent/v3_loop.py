@@ -1211,7 +1211,18 @@ class TradingAgentV3:
             if adapter is not None and hasattr(adapter, "get_portfolio"):
                 portfolio = await adapter.get_portfolio()
                 venue_positions = portfolio.get("venue_only_positions")
-                venue_state_complete = not portfolio.get("account_state_incomplete", True)
+                # An unreadable account only blocks sizing when there is an
+                # account to read. In paper mode no credentials exist yet, so the
+                # venue legitimately has nothing to tell us and "could not read"
+                # would be a false alarm that stops the simulation - which is
+                # step 6 of the sequence, the thing that has to run before any
+                # real capital moves. Armed for real orders, the verdict is
+                # enforced.
+                if bool(getattr(adapter, "can_place_real_orders", False)):
+                    venue_state_complete = not portfolio.get(
+                        "account_state_incomplete", True)
+                else:
+                    venue_state_complete = None
         except Exception as e:
             # Fail closed: an account we could not read is not a flat account.
             logger.warning(

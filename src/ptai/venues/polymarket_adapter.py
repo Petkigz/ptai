@@ -588,6 +588,12 @@ class PolymarketAdapter(MarketAdapter):
                 "venue_open_orders": venue_open_orders,
                 "fills": fills[:20],
                 "fills_count": len(fills),
+                # Named plainly, because it is the one part of the account state
+                # that is still ours. The venue's balance, positions and working
+                # orders are read from the venue; the fill list is PTAI's own
+                # record of its own orders. A fill from an order PTAI did not
+                # place would not appear, so nothing here claims it would.
+                "fills_source": "local_storage",
                 "total_trades": total_trades,
                 "win_rate": win_rate,
                 "venue": "polymarket",

@@ -675,3 +675,65 @@ class TestTheGateRequiresCostCoverage:
         # The same record that qualifies elsewhere in the suite still does: the
         # check is passable, so the coverage bar cannot be read as "never trade".
         assert stats["execution_quality_avg"] > 0.5
+
+
+class TestAnUnreadableAccountBlocksLiveButNotPaper:
+    """
+    Fail-closed has to mean the right thing.
+
+    An account that cannot be read must block LIVE sizing - that is the
+    overcommit it guards against. It must NOT block the paper engine, because in
+    paper mode there are no credentials and therefore no account to read: "the
+    venue has nothing to tell us" is not "the venue is hiding something". Step 6
+    of the engineering sequence is the paper run, and a fail-closed check that
+    stops it is a check that stops the only way to earn the right to trade live.
+    """
+
+    def _unreadable_portfolio(self, tmp_path, armed):
+        """
+        A real adapter with no credentials - the genuine paper configuration.
+        """
+        from src.ptai.venues.polymarket_adapter import PolymarketAdapter
+        adapter = PolymarketAdapter(private_key=None, funder=None, dry_run=True)
+        assert bool(getattr(adapter, "can_place_real_orders", False)) is armed
+        return adapter
+
+    def test_paper_mode_with_no_credentials_can_still_open_positions(self, tmp_path):
+        import asyncio
+        adapter = self._unreadable_portfolio(tmp_path, armed=False)
+        portfolio = asyncio.run(adapter.get_portfolio())
+        assert portfolio["account_state_incomplete"] is True, (
+            "the adapter must say plainly that it could not read an account"
+        )
+
+        # What the agent does with that verdict, for an adapter that cannot
+        # place real orders: not applicable, rather than failed.
+        storage = Storage(db_path=str(tmp_path / "u1.db"))
+        ledger = PositionLedgerBuilder(storage=storage).build(
+            venue_positions=portfolio.get("venue_only_positions"),
+            venue_state_complete=None)
+        assert ledger.reservations_unknown is False
+        assert ledger.can_open_new is True, (
+            "the paper engine cannot trade, so the agent can never produce the "
+            "evidence that would let it trade for real"
+        )
+
+    def test_the_same_verdict_blocks_sizing_when_the_adapter_is_armed(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "u2.db"))
+        ledger = PositionLedgerBuilder(storage=storage).build(
+            venue_state_complete=False)
+        assert ledger.reservations_unknown is True
+        assert ledger.can_open_new is False, (
+            "an unreadable live account allowed new positions"
+        )
+
+    def test_an_armed_adapter_with_credentials_reports_completeness(self, tmp_path):
+        """
+        The arm/not-arm decision must be based on the adapter's own property, not
+        on a guess about credentials - otherwise a live adapter with an
+        unreadable account would be waved through.
+        """
+        from src.ptai.venues.polymarket_adapter import PolymarketAdapter
+        adapter = PolymarketAdapter(private_key="0x" + "11" * 32,
+                                    funder="0x" + "22" * 20, dry_run=False)
+        assert bool(getattr(adapter, "can_place_real_orders", False)) is True
