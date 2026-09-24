@@ -194,3 +194,39 @@ def read_spread(orderbook: Optional[Dict] = None, default: float = 0.02) -> tupl
     if book.get("is_real") is False or book.get("spread_source") == "assumed_default":
         return spread, False
     return spread, True
+
+
+def execution_quality_from_book(orderbook, market) -> float:
+    """
+    How well an order is likely to execute, from the book in front of it.
+
+    A tight spread on a deep book is a 1.0; a wide spread or thin depth is worse.
+    When there is no book the value is 0.0, not a confident-looking default - an
+    unmeasured execution is not a good one, and the same rule already applies to
+    spreads and balances elsewhere in this codebase.
+
+    This is the single implementation. It used to exist only inside
+    `strategy_engine`, while `opportunity.py` read
+    `orderbook.get("execution_quality", 0.8)` - a key the real books do not
+    carry, so every opportunity on that path was scored with a constant 0.8 that
+    fed the EV penalty and the ranking.
+    """
+    if not isinstance(orderbook, dict) or not orderbook.get("is_real"):
+        return 0.0
+    spread = orderbook.get("spread")
+    depth = orderbook.get("depth")
+    if spread is None and depth is None:
+        return 0.0
+    score = 1.0
+    try:
+        if spread is not None:
+            # 1c is excellent; 10c is bad.
+            score = min(score, max(0.0, 1.0 - (float(spread) - 0.01) / 0.09))
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        if depth is not None and float(getattr(market, "liquidity", 0) or 0) >= 0:
+            score = min(score, max(0.0, min(1.0, float(depth) / 5000.0)))
+    except (TypeError, ValueError):
+        pass
+    return round(score, 3)

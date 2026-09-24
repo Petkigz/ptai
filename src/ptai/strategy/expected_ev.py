@@ -17,6 +17,7 @@ from loguru import logger
 
 from ..venues.adapter import VenueOpportunity
 from ..markets.orderbook import read_spread
+from .edge import HUNT_MISPRICING_MIN, hunted_mispricing
 
 @dataclass
 class ExpectedEVResult:
@@ -186,11 +187,31 @@ class ExpectedNetEVEngine:
         hours = opportunity.time_to_resolution_hours or 24
         ev_per_capital_time = net_ev_usd / max(1, amount_usd * hours) * 24  # per dollar per day
         
+        # The >8% hunt criterion is a MISPRICING threshold, so it is measured on
+        # the RAW edge. Applying it to the effective edge charges every cost
+        # twice: once when the costs push the edge back under 8%, and again in
+        # the net EV terms right above, which are the terms that actually know
+        # what a cost is. It refused trades the cost-aware gates had already
+        # approved, on both sides of the same mispricing:
+        #
+        #   market 0.70, YES fair 0.85, NO fair 0.55 - raw +0.150 either way
+        #     YES: gross +21.4%, net +$0.22 (+7.3% of stake), eff 0.052 -> refused
+        #     NO : gross +50.0%, net +$1.07 (+35.8% of stake), eff 0.028 -> refused
+        #
+        # Both passed net>0, net%>=3% and confidence>=60%. The only failing
+        # condition was the effective edge, and the NO case - the one V16's
+        # symmetric edge was built to reach - was the more profitable of the two.
+        #
+        # `raw_edge` is absent on hand-built opportunities, so an unset value
+        # falls back to the effective edge rather than refusing a trade for a
+        # field the caller never filled in.
+        mispricing = hunted_mispricing(opportunity)
+
         # Should trade if net EV >0 and meets thresholds
         should_trade = (
             net_ev_usd > 0 and
             net_ev_pct >= 0.03 and  # at least 3% net after all costs
-            edge >= 0.08 and
+            mispricing >= HUNT_MISPRICING_MIN and  # 8% gross, costs charged below
             confidence >= 0.60
         )
         
@@ -199,7 +220,10 @@ class ExpectedNetEVEngine:
             f"Costs: fees ${fees_usd:.2f} ({fee_pct*100:.1f}%) spread ${spread_usd:.2f} ({spread_pct*100:.1f}%) slippage ${slippage_usd:.2f} ({slippage_pct*100:.1f}%) "
             f"gas ${gas_usd:.2f} funding ${funding_usd:.2f} exec_loss ${execution_loss_usd:.2f} unc_penalty ${uncertainty_penalty_usd:.2f} = total ${total_costs:.2f} | "
             f"Net EV ${net_ev_usd:.2f} ({net_ev_pct*100:.1f}%) per $ {ev_per_dollar*100:.1f}% per risk {ev_per_risk:.2f} per $/day {ev_per_capital_time*100:.2f}% | "
-            f"Should trade: {should_trade} (net>0, net%>=3%, edge>=8%, conf>=60%)"
+            f"Should trade: {should_trade} (net>0, net%>=3%, "
+            f"mispricing {mispricing*100:.1f}%>=8% raw, conf>=60% - "
+            f"effective edge {edge*100:.1f}% is informational, the costs are "
+            f"charged once in net EV)"
         )
         
         return ExpectedEVResult(

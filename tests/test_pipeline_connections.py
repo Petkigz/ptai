@@ -47,7 +47,7 @@ from src.ptai.learning.trade_outcomes import (
 from src.ptai.markets.base import Market, MarketSource
 from src.ptai.storage.db import Storage
 from src.ptai.strategy.edge import EdgeCalculator
-from src.ptai.venues.adapter import EligibilityStatus
+from src.ptai.venues.adapter import EligibilityStatus, VenueOpportunity, VenueType
 
 
 def _market(price: float = 0.70, liquidity: float = 50000.0) -> Market:
@@ -460,3 +460,225 @@ class TestQualificationMetricsAreMeasured:
         # With a $1000 starting point a $1.80 loss is 0.18% - the drawdown would
         # look trivial. Anchored at the recorded initial bankroll it does not.
         assert stats["drawdown_max"] > 0.001
+
+
+class TestOneMispricingOneArithmetic:
+    """
+    8% was a post-cost bar in five separate places, and the units were mixed.
+
+    Two engines costed the same trade and disagreed by everything:
+
+        market 0.70, YES fair 0.85 / NO fair 0.55 - the same +0.150 mispricing
+          EdgeCalculator:    effective edge  -0.004 per share  -> refused
+          ExpectedNetEV:     gross $1.50, costs $0.42, net +$1.07 -> profitable
+
+    The EdgeCalculator's deductions were right (0.154 of notional = $0.41 in
+    cash on a $3 position; the EV engine independently said $0.42) but they were
+    subtracted, unconverted, from an edge measured in dollars per share. On a
+    cheap side that is a 1/price over-charge - 3.33x at 0.30 - so a trade both
+    models agree is profitable, by plain arithmetic, was refused before it was
+    ever constructed: `UncertaintyEngine.should_trade` refused it, so
+    `FairValueResult.should_trade` was False, so the strategy engine skipped
+    building the opportunity at all.
+
+    These tests hold the whole chain, not one stage of it.
+    """
+
+    def _market(self):
+        return Market(
+            id="M1",
+            source=MarketSource.POLYMARKET,
+            question="Will the stub event happen?",
+            outcome_prices=[0.70, 0.30],
+            liquidity=50000,
+            raw={"venue": "polymarket"},
+        )
+
+    def _chain(self, side, fair_yes, amount_usd=3.0, conf=0.8, unc=0.15):
+        """The real chain: edge -> uncertainty gate -> EV gate -> hard rules."""
+        from src.ptai.intelligence.uncertainty import UncertaintyEngine
+        from src.ptai.strategy.edge import EdgeCalculator
+        from src.ptai.strategy.expected_ev import ExpectedNetEVEngine
+
+        market = self._market()
+        edge = EdgeCalculator().calculate(
+            market=market, fair_prob=fair_yes, uncertainty=unc,
+            amount_usd=amount_usd, side=side)
+        opp = VenueOpportunity(
+            market=market, venue_id="polymarket",
+            venue_type=VenueType.PREDICTION, side=side,
+            market_price=market.best_price, estimated_fair=fair_yes,
+            raw_edge=edge.raw_edge, effective_edge=edge.effective_edge,
+            confidence=conf, uncertainty=unc)
+        gate_ok, reason = UncertaintyEngine().should_trade(
+            effective_edge=edge.effective_edge, confidence=conf,
+            uncertainty=unc, raw_edge=edge.raw_edge)
+        ev = ExpectedNetEVEngine().calculate(
+            opp, amount_usd, {"is_real": True, "venue": "polymarket"})
+        return edge, opp, gate_ok, reason, ev
+
+    def test_cost_model_converts_costs_into_price_units(self):
+        """
+        The two engines must agree about the money, on both sides.
+
+        Per-share effective edge (price units) against the EV engine's net
+        profit divided by the shares bought. They were out by 3x on the NO side.
+        """
+        for side, fair_yes in (("YES", 0.85), ("NO", 0.55)):
+            edge, opp, _, _, ev = self._chain(side, fair_yes)
+            shares = 3.0 / (market_price := (0.30 if side == "NO" else 0.70))
+            per_share = ev.net_ev_usd / shares
+            assert edge.effective_edge == pytest.approx(per_share, abs=0.02), (
+                f"{side}: edge engine says {edge.effective_edge:+.4f} per share, "
+                f"the EV engine's cash says {per_share:+.4f}"
+            )
+            assert per_share > 0
+
+    def test_both_sides_of_one_mispricing_pass_the_whole_chain(self):
+        """
+        V16 made the edge symmetric. This is what symmetry is worth: before it,
+        the profitable NO side was invisible; with it, and the old post-cost
+        bars still in place, it was visible and still refused.
+        """
+        for side, fair_yes in (("YES", 0.85), ("NO", 0.55)):
+            edge, opp, gate_ok, reason, ev = self._chain(side, fair_yes)
+            assert edge.raw_edge == pytest.approx(0.15, abs=0.001)
+            assert gate_ok, f"{side} refused by the first gate: {reason}"
+            assert ev.should_trade, f"{side} refused by the EV gate: {ev.reasoning}"
+            assert ev.net_ev_usd > 0
+            # And the live path's Rule 1 agrees with both.
+            from src.ptai.agent.v3_loop import TradingAgentV3
+            ok, rule_reason = TradingAgentV3._hard_rules_pass(
+                _BareAgent(), opp)
+            assert ok, f"{side} refused by the live hard rules: {rule_reason}"
+
+    def test_a_mispricing_under_the_hunt_threshold_is_still_refused(self):
+        edge, opp, gate_ok, reason, ev = self._chain("NO", 0.64)  # raw +0.06
+        assert abs(edge.raw_edge - 0.06) < 0.005
+        assert not gate_ok and "8%" in reason
+        assert not ev.should_trade
+
+    def test_costs_that_consume_the_edge_are_still_refused(self):
+        """
+        The guard that replaced the post-cost percentage bar. Raw edge over 8%,
+        but the effective edge is not positive - no trade.
+        """
+        from src.ptai.intelligence.uncertainty import UncertaintyEngine
+        ok, reason = UncertaintyEngine().should_trade(
+            effective_edge=-0.02, confidence=0.8, uncertainty=0.15,
+            raw_edge=0.09)
+        assert not ok
+        assert "consumed the edge" in reason
+
+    def test_the_price_used_for_the_conversion_is_the_side_being_bought(self):
+        """
+        Costs convert by the price actually paid, which is the mirrored side.
+        A YES at 0.70 and a NO at 0.30 pay different prices and must not be
+        charged the same.
+        """
+        yes_edge, _, _, _, _ = self._chain("YES", 0.85)
+        no_edge, _, _, _, _ = self._chain("NO", 0.55)
+        # Same raw mispricing, different price paid (0.70 vs 0.30): the cheaper
+        # side keeps more of its edge.
+        assert yes_edge.raw_edge == pytest.approx(no_edge.raw_edge, abs=1e-6)
+        assert no_edge.effective_edge > yes_edge.effective_edge
+
+
+class _BareAgent:
+    """Rule 1 uses no agent state; this keeps the check honest about that."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_hard_rules_pass reached for self.{name}")
+
+
+class TestTheOpportunitySurvivesTheWholeFrontOfThePipeline:
+    """
+    The chain from a forecast to the live gate, with only the forecast stubbed.
+
+    `UncertaintyEngine.should_trade` refusing a post-cost edge under 8% is what
+    made the opportunity itself unreachable: `FairValueResult.should_trade` was
+    False, so the strategy engine skipped building it. Fixing the EV gate or the
+    live hard rules without this would have been decoration - there would have
+    been nothing to evaluate - and this test is what says so out loud.
+    """
+
+    # The book production attaches to the market before the scan, so the
+    # execution-quality term is measured rather than the fail-closed 0.0.
+    BOOK = {
+        "is_real": True, "spread": 0.02, "depth": 5000,
+        "bids": [{"price": "0.69", "size": "5000"}],
+        "asks": [{"price": "0.70", "size": "5000"}],
+    }
+
+    def _engine_with_forecast(self, fair_yes, price_yes=0.70):
+        from types import SimpleNamespace
+        from src.ptai.strategy.strategy_engine import StrategyEngineV3
+        from src.ptai.strategy.fair_value import FairValueEngine
+        from src.ptai.intelligence.ensemble import ForecastResult
+
+        market = Market(
+            id="M1", source=MarketSource.POLYMARKET,
+            question="Will the stub event happen?",
+            outcome_prices=[price_yes, 1 - price_yes], liquidity=50000,
+            raw={"venue": "polymarket", "orderbook": dict(self.BOOK)},
+        )
+        fair = FairValueEngine()
+
+        def stub_forecast(m, context=None, **kw):
+            return ForecastResult(
+                market_id=m.id, question=m.question, market_price=m.best_price,
+                fair_probability=fair_yes, confidence=0.8, uncertainty=0.10,
+                edge=fair_yes - m.best_price, reasoning="stub")
+        fair.ensemble_forecaster.forecast_market = stub_forecast
+
+        engine = StrategyEngineV3.__new__(StrategyEngineV3)
+        engine.fair_value_engine = fair
+        # The other strategy families are not part of what is under test; they
+        # must simply not add opportunities.
+        inert = SimpleNamespace(evaluate=lambda *a, **k: SimpleNamespace(
+            should_trade=False))
+        engine.event_engine = inert
+        engine.mm_engine = inert
+        engine.momentum_engine = inert
+        return engine, market
+
+    def test_a_no_side_mispricing_is_built_into_an_opportunity(self):
+        engine, market = self._engine_with_forecast(fair_yes=0.55)
+        opps = engine.evaluate_market_with_all_strategies(
+            market, context={"orderbook": self.BOOK, "category": "general"})
+        assert opps, (
+            "the profitable NO side produced no opportunity at all - the "
+            "front of the pipeline is refusing it again and every gate "
+            "downstream is decoration"
+        )
+        opp = opps[0]
+        assert opp.side == "NO"
+        # Raw edge is on the NO side; market_price stays the YES price, which is
+        # what the EV engine's own NO branch expects.
+        assert opp.raw_edge == pytest.approx(0.15, abs=0.001)
+        assert opp.market_price == pytest.approx(0.70, abs=0.001)
+        assert opp.effective_edge > 0
+        assert opp.should_trade
+
+    def test_the_built_opportunity_passes_the_live_hard_rules(self):
+        engine, market = self._engine_with_forecast(fair_yes=0.55)
+        opp = engine.evaluate_market_with_all_strategies(
+            market, context={"orderbook": self.BOOK, "category": "general"})[0]
+        from src.ptai.agent.v3_loop import TradingAgentV3
+        ok, reason = TradingAgentV3._hard_rules_pass(_BareAgent(), opp)
+        assert ok, reason
+        assert "mispricing 15.0%" in reason
+        # And the EV gate agrees, in cash.
+        from src.ptai.strategy.expected_ev import ExpectedNetEVEngine
+        ev = ExpectedNetEVEngine().calculate(opp, 3.0, {"is_real": True})
+        assert ev.should_trade and ev.net_ev_usd > 0
+
+    def test_an_opportunity_whose_costs_eat_the_edge_is_not_built(self):
+        """
+        The counter-case: raw mispricing under 8% must still be refused at the
+        very first gate, so this cannot be read as "anything with an edge
+        trades".
+        """
+        engine, market = self._engine_with_forecast(fair_yes=0.64)
+        assert engine.evaluate_market_with_all_strategies(
+            market, context={"orderbook": self.BOOK, "category": "general"}) == []

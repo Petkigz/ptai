@@ -27,7 +27,7 @@ from ..venues.adapter import VenueOpportunity, VenueType
 from ..venues.registry import VenueRegistry
 
 from .fair_value import FairValueEngine
-from .edge import EdgeCalculator
+from .edge import HUNT_MISPRICING_MIN, EdgeCalculator, hunted_mispricing
 from .strategy_selector import StrategyType, StrategySelector
 from .arbitrage import ArbitrageEngine
 from .event_trading import EventTradingEngine
@@ -68,33 +68,9 @@ class MultiVenueScanResult:
 
 
 def _execution_quality_from_book(orderbook, market) -> float:
-    """
-    How well an order is likely to execute, from the book in front of it.
-
-    A tight spread on a deep book is a 1.0; a wide spread or thin depth is worse.
-    When there is no book the value is 0.0, not a confident-looking default -
-    an unmeasured execution is not a good one, and the same rule already applies
-    to spreads and balances elsewhere in this codebase.
-    """
-    if not isinstance(orderbook, dict) or not orderbook.get("is_real"):
-        return 0.0
-    spread = orderbook.get("spread")
-    depth = orderbook.get("depth")
-    if spread is None and depth is None:
-        return 0.0
-    score = 1.0
-    try:
-        if spread is not None:
-            # 1c is excellent; 10c is bad.
-            score = min(score, max(0.0, 1.0 - (float(spread) - 0.01) / 0.09))
-    except (TypeError, ValueError):
-        return 0.0
-    try:
-        if depth is not None and float(market.liquidity or 0) >= 0:
-            score = min(score, max(0.0, min(1.0, float(depth) / 5000.0)))
-    except (TypeError, ValueError):
-        pass
-    return round(score, 3)
+    """Kept as the name this module's tests import; see the shared implementation."""
+    from ..markets.orderbook import execution_quality_from_book
+    return execution_quality_from_book(orderbook, market)
 
 
 class StrategyEngineV3:
@@ -159,7 +135,11 @@ class StrategyEngineV3:
         # Strategy 1: Mispricing (fair value vs market) - existing engine
         try:
             fv_result = self.fair_value_engine.estimate(market, context=context)
-            if fv_result.should_trade and abs(fv_result.effective_edge) >= 0.05:
+            # The opportunity is built on the hunt criterion plus a positive
+            # post-cost edge. A 5% POST-COST floor also stood here, so the same
+            # profitable NO trade (effective 0.028) was refused before it existed
+            # - the mispricing was never evaluated by anything downstream.
+            if fv_result.should_trade and fv_result.effective_edge > 0:
                 opp = VenueOpportunity(
                     market=market,
                     venue_id=venue_id_str,
@@ -289,7 +269,11 @@ class StrategyEngineV3:
         
         # Candidates after strategy evaluation
         candidates = [o for o in all_opps if o.effective_edge >= 0.03]
-        tradeable = [o for o in all_opps if o.effective_edge >= 0.08 and o.confidence >= 0.6 and o.should_trade]
+        # 8% of MISPRICING, not 8% of post-cost edge - see
+        # `hunted_mispricing`. Costs are charged in the net EV terms.
+        tradeable = [o for o in all_opps
+                     if hunted_mispricing(o) >= HUNT_MISPRICING_MIN
+                     and o.confidence >= 0.6 and o.should_trade]
         
         # Sort tradeable by score
         tradeable_sorted = sorted(tradeable, key=lambda x: x.score, reverse=True)
@@ -395,10 +379,18 @@ class StrategyEngineV3:
         else:
             ranked = sorted(all_opportunities, key=lambda x: (getattr(x, '_expected_ev', None).net_ev_usd if hasattr(x, '_expected_ev') and x._expected_ev else 0, x.score), reverse=True)
         
-        # Filter to tradeable - now also requires net EV >0
+        # Filter to tradeable - now also requires net EV >0.
+        #
+        # This is the filter that actually decides `final_selected`, so the same
+        # double-count here would have made the EV gate's fix decoration: a NO
+        # trade with raw +0.150, net +$1.07 and 2.8% of edge surviving the costs
+        # cleared the EV gate and was then dropped on this line. The 8% is the
+        # hunt criterion and is measured on the raw mispricing; the net EV check
+        # below is where the costs are charged.
         tradeable = []
         for o in ranked:
-            if o.effective_edge < 0.08 or o.confidence < 0.6 or not o.should_trade:
+            if (hunted_mispricing(o) < HUNT_MISPRICING_MIN
+                    or o.confidence < 0.6 or not o.should_trade):
                 continue
             ev = getattr(o, '_expected_ev', None)
             if ev and ev.net_ev_usd <= 0:

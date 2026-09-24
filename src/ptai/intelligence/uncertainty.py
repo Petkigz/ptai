@@ -142,27 +142,61 @@ class UncertaintyEngine:
         logger.info(reasoning)
         return effective_edge, conservative_fair, reasoning
 
-    def should_trade(self, effective_edge: float, confidence: float, uncertainty: float, resolution_risks: List[str] = None) -> Tuple[bool, str]:
+    def should_trade(self, effective_edge: float, confidence: float,
+                     uncertainty: float, resolution_risks: List[str] = None,
+                     raw_edge: float = None) -> Tuple[bool, str]:
         """
         Final decision: should we trade?
-        If uncertainty interval overlaps market substantially, no trade.
+
+        The 8% and 12% bars are on the MISPRICING (raw edge), not on the
+        effective edge. This function is the first gate in the chain and it was
+        the one that made the rest unreachable: it returned False for any
+        opportunity whose POST-COST edge was under 8%, so `FairValueResult
+        .should_trade` was False and the strategy engine never even CONSTRUCTED
+        the opportunity. Fixing the EV gate further down would have been
+        decoration, because there would have been nothing to evaluate.
+
+        Charging costs here and again in the net EV double-counts them, and it
+        refuses trades that are profitable after those same costs:
+
+            market 0.70, YES fair 0.85 / NO fair 0.55 - raw +0.150 either way
+              YES: net +$0.22 (+7.3% of a $3 stake), effective 0.052 -> refused
+              NO : net +$1.07 (+35.8% of a $3 stake), effective 0.028 -> refused
+
+        Costs are still enforced, once, and not as a percentage bar: an edge the
+        costs have eaten entirely is not a trade, and the net EV terms decide
+        whether what is left is worth doing.
+
+        `raw_edge` is optional so existing callers keep their behaviour; the
+        mispricing falls back to the effective edge when it is not supplied.
         """
         resolution_risks = resolution_risks or []
+        mispricing = raw_edge if raw_edge else effective_edge
 
         # If resolution risks exist, no trade regardless of edge
         if resolution_risks:
             return False, f"Resolution risks: {resolution_risks}"
 
-        # If effective edge < 8%, no trade
-        if abs(effective_edge) < 0.08:
-            return False, f"Effective edge {effective_edge:.3f} < 8% threshold"
+        # If mispricing < 8%, no trade
+        if abs(mispricing) < 0.08:
+            return False, (f"Mispricing {mispricing:.3f} < 8% threshold "
+                           f"(effective {effective_edge:.3f} after costs)")
+
+        # Costs must not consume the whole edge. This is the cost check that
+        # replaces the post-cost percentage bar, and it is the one that matters.
+        if effective_edge <= 0:
+            return False, (f"Costs consumed the edge: effective "
+                           f"{effective_edge:.3f} from mispricing {mispricing:.3f}")
 
         # If confidence < 60%, no trade
         if confidence < 0.6:
             return False, f"Confidence {confidence:.3f} < 60%"
 
-        # If uncertainty > 15%, be cautious - require higher edge
-        if uncertainty > 0.15 and abs(effective_edge) < 0.12:
-            return False, f"High uncertainty {uncertainty:.3f} requires edge >12%, got {effective_edge:.3f}"
+        # If uncertainty > 15%, be cautious - require higher mispricing
+        if uncertainty > 0.15 and abs(mispricing) < 0.12:
+            return False, (f"High uncertainty {uncertainty:.3f} requires "
+                           f"mispricing >12%, got {mispricing:.3f}")
 
-        return True, f"Pass: edge {effective_edge:.3f} conf {confidence:.3f} unc {uncertainty:.3f}"
+        return True, (f"Pass: mispricing {mispricing:.3f} effective "
+                      f"{effective_edge:.3f} conf {confidence:.3f} "
+                      f"unc {uncertainty:.3f}")

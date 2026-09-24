@@ -22,7 +22,8 @@ from ..markets.base import Market
 from ..venues.adapter import VenueOpportunity, VenueType
 from ..venues.registry import VenueRegistry
 from .fair_value import FairValueEngine, FairValueResult
-from .edge import EdgeCalculator
+from .edge import HUNT_MISPRICING_MIN, EdgeCalculator, hunted_mispricing
+from ..markets.orderbook import execution_quality_from_book
 from .expected_ev import ExpectedNetEVEngine
 
 
@@ -393,15 +394,27 @@ class OpportunityEngine:
                 market=market,
                 venue_id=venue_id,
                 venue_type=VenueType.PREDICTION,
-                side="YES" if fv.fair_value > market.best_price else "NO",
+                # The side comes from the valuation when it has one, so the
+                # opportunity's `raw_edge` (which is signed for that side) cannot
+                # disagree with it about which side is being bought.
+                side=getattr(fv, "side", None) or (
+                    "YES" if fv.fair_value > market.best_price else "NO"),
                 market_price=market.best_price,
                 estimated_fair=fv.fair_value,
-                raw_edge=fv.edge,
+                # `FairValueResult.edge` is the mispricing on the traded side. A
+                # valuation object with no `side` predates that and still carries
+                # the YES-space edge, so mirror it here rather than let a NO
+                # opportunity inherit a negative one.
+                raw_edge=fv.edge if getattr(fv, "side", None) else (
+                    fv.edge if (getattr(fv, "side", None) or
+                                ("YES" if fv.fair_value > market.best_price else "NO")) == "YES"
+                    else -fv.edge),
                 effective_edge=fv.effective_edge,
                 confidence=fv.confidence,
                 uncertainty=fv.uncertainty,
                 liquidity_score=min(1.0, market.liquidity / 10000),
-                execution_quality=context.get("orderbook", {}).get("execution_quality", 0.8) if isinstance(context.get("orderbook"), dict) else 0.8,
+                execution_quality=execution_quality_from_book(
+                    context.get("orderbook"), market),
                 category=context.get("category", market.raw.get("category", "unknown")),
                 sources=fv.forecast_result.sources if fv.forecast_result else [],
                 reasoning=fv.reasoning + f" | venue_id immutable {venue_id} from market.venue_id | orderbook source {context.get('orderbook', {}).get('source', 'unknown')} is_real {context.get('orderbook', {}).get('is_real', False)}",
@@ -436,7 +449,12 @@ class OpportunityEngine:
             if len(selected) >= max_trades:
                 break
             
-            if opp.effective_edge < 0.08:
+            # 8% of mispricing, not of post-cost edge - see
+            # `hunted_mispricing`. Costs are charged in the net EV terms and in
+            # the positive-effective-edge check below.
+            if hunted_mispricing(opp) < HUNT_MISPRICING_MIN:
+                continue
+            if opp.effective_edge <= 0:
                 continue
             if opp.confidence < 0.6:
                 continue

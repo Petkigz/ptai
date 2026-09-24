@@ -457,3 +457,93 @@ def test_a_failing_engine_result_blocks_capability_qualification(tmp_path):
         "a venue the qualification engine refused was qualified by the "
         "capability engine's weaker test"
     )
+
+
+def test_one_execution_quality_rule_for_every_stage():
+    """
+    `execution_quality` was a constant in three stages of the pipeline.
+
+    `strategy_engine` measured it from the book; `opportunity.py` read
+    `orderbook.get("execution_quality", 0.8)` - a key real books do not carry,
+    so that path scored every opportunity 0.8 - and the dashboard demo hard-coded
+    0.8 on hand-written markets. One rule, one implementation, one answer.
+    """
+    from src.ptai.markets.orderbook import execution_quality_from_book
+    from src.ptai.strategy.strategy_engine import _execution_quality_from_book
+
+    real_book = {"is_real": True, "spread": 0.02, "depth": 5000}
+    market = _market()
+
+    # The strategy engine's name and the shared implementation agree.
+    assert _execution_quality_from_book(real_book, market) == \
+        execution_quality_from_book(real_book, market)
+
+    # No book, and a book that declared a quality but is not real: both 0.0.
+    assert execution_quality_from_book(None, market) == 0.0
+    assert execution_quality_from_book({}, market) == 0.0
+    assert execution_quality_from_book(
+        {"is_real": False, "execution_quality": 0.9}, market) == 0.0, (
+        "an estimated quality on a non-real book is not a measured one"
+    )
+    # A real book measures, and a tight deep one beats a wide thin one.
+    assert execution_quality_from_book(real_book, market) > 0.0
+    wide = {"is_real": True, "spread": 0.09, "depth": 200}
+    assert execution_quality_from_book(wide, market) < \
+        execution_quality_from_book(real_book, market)
+
+
+def test_the_ranking_demo_cannot_be_mistaken_for_live_opportunities():
+    """
+    The dashboard's ranking demo built hand-written markets and hand-written
+    opportunities (fair = price + 0.10 for all of them) with `Market`'s default
+    `data_mode=LIVE`. Nothing but the fact that the endpoint never feeds the
+    agent kept them out of an order. Now they say what they are, and the
+    selector refuses them for the honest reason: no real orderbook.
+    """
+    import asyncio
+    from src.ptai.dashboard import api_v6_opportunity_ranking
+
+    out = asyncio.run(api_v6_opportunity_ranking())
+    assert "error" not in out, out.get("error")
+    demo = out["demo_data"]
+    assert demo["is_mock"] is True
+    assert demo["data_mode"] == "mock"
+    assert demo["orderbook"] is None
+    # Every demo market carries MOCK provenance, so the guard would refuse them.
+    assert out["opportunity_ranking"]["ranked"] == [], (
+        "mock markets with no real book were ranked as tradeable"
+    )
+
+
+def test_the_dashboard_routes_that_should_work_do_work():
+    """
+    Almost every dashboard route catches its own exception and returns
+    `{"error": ..., "traceback": ...}` with HTTP 200, so a broken route looks
+    healthy to anything that only checks the status code - and nothing was
+    checking at all. One was found broken this way (an import that landed in a
+    neighbouring function), which is exactly what a smoke test is for.
+
+    `/api/llm/status` is excluded: it reports on a local LLM server, and there
+    is deliberately none in test conditions.
+    """
+    import asyncio
+    import src.ptai.dashboard as dashboard
+
+    checked = {"/api/status", "/api/v2/status", "/api/v3/status",
+               "/api/v7/status", "/api/vault/status",
+               "/api/v6/opportunity-ranking"}
+    seen = set()
+    for route in dashboard.app.routes:
+        path = getattr(route, "path", None)
+        if path not in checked:
+            continue
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            continue
+        seen.add(path)
+        out = asyncio.run(endpoint())
+        assert not (isinstance(out, dict) and "error" in out), (
+            f"{path} returned an error payload: "
+            f"{out.get('error') if isinstance(out, dict) else out}"
+        )
+    assert seen == checked, f"routes not found: {checked - seen}"

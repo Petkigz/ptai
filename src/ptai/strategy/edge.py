@@ -29,6 +29,29 @@ from ..venues.adapter import VenueOpportunity
 from ..markets.orderbook import read_spread
 
 
+# The >8% hunt criterion, defined ONCE. It is a MISPRICING threshold, so it
+# belongs on the raw edge. It used to be applied to the effective edge in three
+# separate places (here, the ranking filter, and the EV gate), which charges
+# every cost twice - once to push the edge back under 8%, and again in the net
+# EV terms that actually know what a cost is. Both sides of one mispricing were
+# refused for it: market 0.70, YES fair 0.85, NO fair 0.55 - raw +0.150 either
+# way, and both would have cleared net EV (+$0.22 and +$1.07 on a $3 stake).
+HUNT_MISPRICING_MIN = 0.08
+
+
+def hunted_mispricing(opportunity) -> float:
+    """
+    The mispricing being hunted, before costs, on the side being traded.
+
+    Raw edge is what the >8% rule is about. An opportunity whose raw edge was
+    never filled in falls back to the effective edge rather than being refused
+    for a field its constructor never set.
+    """
+    raw = getattr(opportunity, "raw_edge", 0.0) or 0.0
+    effective = getattr(opportunity, "effective_edge", 0.0) or 0.0
+    return raw if raw else effective
+
+
 @dataclass
 class EffectiveEdge:
     raw_edge: float
@@ -168,24 +191,52 @@ class EdgeCalculator:
             gas_deduction = 0.016
         
         total_deductions = fees + gas_deduction + spread + slippage + liquidity_penalty + uncertainty_penalty + correlation_penalty + time_penalty
-        effective_edge = raw_edge - total_deductions
 
-        # Conservative fair after uncertainty
+        # UNITS. `raw_edge` is in PRICE UNITS - dollars per share, where a share
+        # pays $1. Every deduction above is a FRACTION OF THE POSITION (fee_pct
+        # and gas_pct_of_position are, spread/slippage/penalties are written as
+        # if they are). Subtracting one from the other is a unit error, and it
+        # is worst on the cheap side, because $1 of position buys 1/price shares:
+        #
+        #   buying NO at 0.30, fair 0.45, raw +0.150
+        #     deductions 0.154 of notional = $0.41 in CASH on a $3 position
+        #     (the EV engine, by a different route, says $0.42 - the two models
+        #     agree on the money and disagreed only on this conversion)
+        #     charged incorrectly as 0.154 of edge  -> effective -0.004, refused
+        #     charged as cash, 0.154 * 0.30 = 0.046 -> effective +0.109
+        #     and the EV engine's own answer was +$0.1075 per share
+        #
+        # So the deductions convert to price units by the price actually paid,
+        # which is the side-mirrored `market_price` set above. At 0.70 that is a
+        # 1.43x correction; at 0.30 it is 3.33x. This is why a NO side that was
+        # genuinely profitable, by both the EV engine and plain arithmetic, read
+        # as a marginal loss to everything downstream of here.
+        paid_price = max(1e-9, market_price)
+        total_deductions_price_units = total_deductions * paid_price
+        effective_edge = raw_edge - total_deductions_price_units
+
+        # Conservative fair after uncertainty - same conversion, same reason.
+        uncertainty_cost_price_units = uncertainty_penalty * paid_price
         if fair_prob > market_price:
-            conservative_fair = fair_prob - uncertainty_penalty
+            conservative_fair = fair_prob - uncertainty_cost_price_units
         else:
-            conservative_fair = fair_prob + uncertainty_penalty
+            conservative_fair = fair_prob + uncertainty_cost_price_units
         conservative_fair = max(0.01, min(0.99, conservative_fair))
 
-        # Should trade? Effective edge >=8% and positive
-        should_trade = effective_edge >= 0.08
+        # Should trade? The 8% is the same mispricing rule as everywhere else,
+        # and the costs must not have eaten the edge entirely. This flag is
+        # informational (nothing consumes it), but leaving it on the post-cost
+        # edge would have been a second, weaker copy of the rule.
+        should_trade = raw_edge >= 0.08 and effective_edge > 0
 
         reasoning = (
             f"[{side}] Raw {raw_edge:.3f} (fair {fair_prob:.3f} - mkt {market_price:.3f}) | "
-            f"Deductions: fees {fees:.3f} gas {gas_deduction:.3f} spread {spread:.3f} slip {slippage:.3f} liq {liquidity_penalty:.3f} "
-            f"unc {uncertainty_penalty:.3f} corr {correlation_penalty:.3f} time {time_penalty:.3f} total {total_deductions:.3f} | "
+            f"Deductions ({total_deductions*paid_price:.3f} of edge = "
+            f"{total_deductions:.3f} of notional x price {paid_price:.3f}): "
+            f"fees {fees:.3f} gas {gas_deduction:.3f} spread {spread:.3f} slip {slippage:.3f} liq {liquidity_penalty:.3f} "
+            f"unc {uncertainty_penalty:.3f} corr {correlation_penalty:.3f} time {time_penalty:.3f} | "
             f"Effective {effective_edge:.3f} conservative_fair {conservative_fair:.3f} | "
-            f"Should trade: {should_trade} | $50 math: fee {fees*100:.1f}% + gas {gas_deduction*100:.1f}% + spread {spread*100:.1f}% = { (fees+gas_deduction+spread)*100:.1f}% cost must exceed to break even"
+            f"Should trade: {should_trade} (raw>=8%, effective>0) | $50 math: fee {fees*100:.1f}% + gas {gas_deduction*100:.1f}% + spread {spread*100:.1f}% = { (fees+gas_deduction+spread)*100:.1f}% cost must exceed to break even"
         )
 
         logger.info(f"Edge calc {market.id}: {reasoning}")

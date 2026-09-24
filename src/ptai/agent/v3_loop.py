@@ -100,8 +100,7 @@ from ..markets.market_normalizer import MarketNormalizer
 from ..markets.orderbook import OrderbookAnalyzer
 
 from ..strategy.fair_value import FairValueEngine
-from ..strategy.edge import EdgeCalculator
-from ..strategy.opportunity import OpportunityEngine
+from ..strategy.edge import HUNT_MISPRICING_MIN, EdgeCalculator, hunted_mispricing
 from ..strategy.strategy_selector import StrategySelector
 from ..strategy.strategy_engine import StrategyEngineV3, MultiVenueScanResult
 from ..strategy.alpha_engine import AlphaEngine
@@ -1290,17 +1289,9 @@ class TradingAgentV3:
                 continue
             
             # Rule 1: Hard rules
-            if opp.effective_edge < 0.08:
-                logger.info(f"Hard rule blocks {opp.market.id}: edge {opp.effective_edge*100:.1f}% < 8%")
-                continue
-            if opp.confidence < 0.60:
-                logger.info(f"Hard rule blocks {opp.market.id}: confidence {opp.confidence:.2f} < 60%")
-                continue
-            if hasattr(opp, 'liquidity_score') and opp.liquidity_score < 0.3:
-                logger.info(f"Hard rule blocks {opp.market.id}: liquidity {opp.liquidity_score:.2f} < 0.3")
-                continue
-            if hasattr(opp, 'execution_quality') and opp.execution_quality < 0.3:
-                logger.info(f"Hard rule blocks {opp.market.id}: execution_quality {opp.execution_quality:.2f} < 0.3")
+            rules_ok, rules_reason = self._hard_rules_pass(opp)
+            if not rules_ok:
+                logger.info(f"Hard rule blocks {opp.market.id}: {rules_reason}")
                 continue
             
             # V10 FIX #2: Use SAME proposed_amount for all risk checks
@@ -1958,6 +1949,39 @@ class TradingAgentV3:
         finally:
             if adapter is not None and saved_dry_run is not None:
                 adapter.dry_run = saved_dry_run
+
+    def _hard_rules_pass(self, opp):
+        """
+        Rule 1 of the core objective, in one place.
+
+        The 8% here was applied to the POST-COST edge, so it charged the fees,
+        spread, slippage and uncertainty penalties a second time - on top of the
+        terms in the net EV gate three lines above, which is where costs belong.
+        A NO trade that cleared net EV (+$1.07 on a $3 stake) was refused by
+        this line because only 2.8% of edge had survived the costs.
+
+        The 8% is the mispricing rule the strategy hunts on; the costs are
+        enforced once, as a positive effective edge here and as net EV above.
+
+        Returns (ok, reason) so the live gate can be driven directly by a test
+        instead of only being reachable through a whole cycle.
+        """
+        mispricing = hunted_mispricing(opp)
+        if mispricing < HUNT_MISPRICING_MIN:
+            return False, (f"mispricing {mispricing*100:.1f}% < 8% "
+                           f"(effective {opp.effective_edge*100:.1f}% after costs)")
+        if opp.effective_edge <= 0:
+            return False, (f"costs consumed the edge: effective "
+                           f"{opp.effective_edge*100:.1f}% from mispricing "
+                           f"{mispricing*100:.1f}%")
+        if opp.confidence < 0.60:
+            return False, f"confidence {opp.confidence:.2f} < 60%"
+        if hasattr(opp, 'liquidity_score') and opp.liquidity_score < 0.3:
+            return False, f"liquidity {opp.liquidity_score:.2f} < 0.3"
+        if hasattr(opp, 'execution_quality') and opp.execution_quality < 0.3:
+            return False, f"execution_quality {opp.execution_quality:.2f} < 0.3"
+        return True, (f"mispricing {mispricing*100:.1f}% effective "
+                      f"{opp.effective_edge*100:.1f}% conf {opp.confidence:.2f}")
 
     @staticmethod
     def _execution_quality(exec_result) -> Optional[float]:

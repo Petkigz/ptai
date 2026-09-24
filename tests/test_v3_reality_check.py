@@ -13,7 +13,7 @@ from src.ptai.data_ingestion.polymarket_ingestion import PolymarketIngestion
 from src.ptai.data_ingestion.news_ingestion import NewsIngestion
 from src.ptai.data_ingestion.x_ingestion import XIngestion
 from src.ptai.data_ingestion.orchestrator import DataIngestionOrchestrator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 class TestFeeModels:
@@ -272,17 +272,57 @@ class TestEdgeWithFeesGas:
         assert "gas" in opp.reasoning.lower()
         assert "$50 math" in opp.reasoning
 
-    def test_edge_10pct_raw_not_enough(self):
+    def test_edge_10pct_raw_is_thin_but_is_still_a_positive_expectancy(self):
+        """
+        A 10% mispricing at 0.60 with 11.1% of notional in costs.
+
+        This used to assert `not should_trade`, on the arithmetic "11.1% of
+        costs against a 10% edge". That arithmetic compares a fraction of the
+        POSITION with an edge in PRICE UNITS, and on a $3 stake it is simply
+        wrong: the costs are $0.28 in cash, the gross edge is $0.50, and the
+        trade nets +$0.22 - about 7% of the stake. A thin trade, and the sizing
+        and net-EV gates are free to refuse it, but not a losing one.
+
+        The 8% bar is a MISPRICING bar; the cost is charged once, and an edge
+        the costs have actually eaten still refuses the trade (see
+        `test_costs_that_consume_the_edge_still_refuse_it`).
+        """
         calc = EdgeCalculator()
         market = Market(
             id="M1", source=MarketSource.POLYMARKET, question="Will Trump win election?",
             volume=50000, liquidity=10000, raw={}
         )
         market.outcome_prices = [0.60, 0.40]
-        # 10% raw edge 0.60->0.70, but fees 2.4%+gas 1.7%+spread 2%+uncertainty 5% = 11.1% total, effective -1.1%
         opp = calc.calculate(market=market, fair_prob=0.70, uncertainty=0.1, amount_usd=3.0)
         assert abs(opp.raw_edge - 0.10) < 0.001
-        assert opp.effective_edge < 0.08  # not enough to trade
+        # The post-cost edge is under 8% - and 8% is not a post-cost bar.
+        assert opp.effective_edge < 0.08
+        # 5 shares * 0.10 edge = $0.50 gross; costs 0.0941 of $3 = $0.28.
+        assert opp.effective_edge > 0
+        assert opp.should_trade
+
+    def test_costs_that_consume_the_edge_still_refuse_it(self):
+        """
+        The guard that replaced the post-cost percentage bar.
+
+        Raw edge above 8%, heavy penalties, and a price high enough that the
+        costs are large in price units: the trade is refused because the costs
+        have eaten the entire edge. This is what the old `effective_edge >= 8%`
+        was trying to express, applied once instead of twice.
+        """
+        calc = EdgeCalculator()
+        market = Market(
+            id="M1", source=MarketSource.POLYMARKET, question="Will it happen?",
+            volume=1000, liquidity=400, raw={},
+            end_date=datetime.now(timezone.utc) + timedelta(minutes=30),
+        )
+        market.outcome_prices = [0.95, 0.05]
+        # liquidity 400 -> 3% liquidity penalty and a 4% spread; 30 minutes left
+        # -> 2% time penalty; 0.30 uncertainty -> 15% penalty.
+        opp = calc.calculate(market=market, fair_prob=0.95 + 0.09, uncertainty=0.30,
+                             amount_usd=3.0)
+        assert opp.raw_edge >= 0.08
+        assert opp.effective_edge <= 0
         assert not opp.should_trade
 
     def test_edge_20pct_raw_enough(self):

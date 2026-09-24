@@ -122,7 +122,18 @@ class FairValueEngine:
         # is measured for is the same side the trade is placed on. These used to
         # be decided in two different files.
         side = str(context.get("side") or (
-            "YES" if forecast_result.fair_probability > market.best_price else "NO"))
+            "YES" if forecast_result.fair_probability > market.best_price else "NO")).upper()
+
+        # The raw edge has to be on the side being traded, exactly like the
+        # effective edge below it and for the same reason. It was the ensemble's
+        # YES-space `fair - market` on an object whose `side` was NO, so a
+        # genuinely profitable NO mispricing carried a raw edge of -0.15: the
+        # effective edge said +0.106, the raw edge said -0.15, and every
+        # downstream check that reads the raw edge saw the wrong sign. The
+        # opportunity was built and then refused by the gate that hunts for
+        # mispricing, on a market it had just correctly identified as mispriced.
+        raw_edge = forecast_result.edge if side == "YES" else -forecast_result.edge
+
         from .edge import EdgeCalculator
         edge_calc = EdgeCalculator(uncertainty_engine=self.uncertainty_engine)
         effective = edge_calc.calculate(
@@ -141,17 +152,26 @@ class FairValueEngine:
             effective_edge=effective.effective_edge,
             confidence=adjusted_confidence,
             uncertainty=forecast_result.uncertainty,
-            resolution_risks=resolution_analysis.risks
+            resolution_risks=resolution_analysis.risks,
+            # The 8% rule is about mispricing; the costs are charged once, here
+            # and in the net EV, not twice.
+            raw_edge=raw_edge,
         )
 
-        # Override if contradiction report says high risk
-        if contradiction_report.confidence_adjustment < -0.15 and effective.effective_edge < 0.12:
+        # Override if contradiction report says high risk.
+        # Measured on the same mispricing scale as the 12% in the uncertainty
+        # gate above, not on the post-cost edge - otherwise contradictory
+        # evidence and the costs already deducted both count against the same
+        # edge, and the two thresholds that were written as one rule disagree.
+        if (contradiction_report.confidence_adjustment < -0.15
+                and abs(raw_edge) < 0.12):
             should_trade = False
-            reason = f"High conflicting evidence + edge {effective.effective_edge:.3f} < 12%"
+            reason = (f"High conflicting evidence + mispricing "
+                      f"{raw_edge:.3f} < 12%")
 
         final_reasoning = (
             f"Ensemble fair {forecast_result.fair_probability:.3f} market {market.best_price:.3f} "
-            f"raw edge {forecast_result.edge:.3f} effective {effective.effective_edge:.3f} | "
+            f"raw edge [{side}] {raw_edge:.3f} effective {effective.effective_edge:.3f} | "
             f"Conf {adjusted_confidence:.2f} unc {forecast_result.uncertainty:.2f} | "
             f"Resolution risk {resolution_analysis.risk_score:.2f} | "
             f"Contradiction net {contradiction_report.net_score:.2f} | "
@@ -164,7 +184,7 @@ class FairValueEngine:
             fair_value=forecast_result.fair_probability,
             confidence=adjusted_confidence,
             uncertainty=forecast_result.uncertainty,
-            edge=forecast_result.edge,
+            edge=raw_edge,  # the mispricing on `side`, not the ensemble's YES edge
             effective_edge=effective.effective_edge,
             side=side,
             should_trade=should_trade,

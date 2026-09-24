@@ -2632,14 +2632,22 @@ async def api_v6_portfolio(venue_id: str = "polymarket"):
 async def api_v6_opportunity_ranking():
     try:
         from .strategy.opportunity import OpportunityEngine, FastModelClassifier
-        from .markets.base import Market, MarketSource, Token
+        from .markets.base import DataMode, Market, MarketSource, Token
+        from .markets.orderbook import execution_quality_from_book
         
-        # Create mock markets with different categories
+        # Create mock markets with different categories.
+        #
+        # They are marked MOCK explicitly. `Market` defaults to `data_mode=LIVE`,
+        # so these hand-written markets - and the hand-written opportunities
+        # below them (fair = price + 0.10, edge 0.09, for every one of them) -
+        # carried live provenance, and the only thing keeping them out of an
+        # order was that this endpoint never feeds the agent. Now the data mode
+        # says what they are, and the guard would refuse them.
         markets = [
-            Market(id="M1", source=MarketSource.POLYMARKET, question="Will Trump win election?", outcomes=["YES","NO"], outcome_prices=[0.60,0.40], tokens=[Token(token_id="M1", outcome="YES", price=0.60)], volume=50000, volume_24h=20000, liquidity=25000, raw={}),
-            Market(id="M2", source=MarketSource.POLYMARKET, question="Will Lakers win championship? NBA finals", outcomes=["YES","NO"], outcome_prices=[0.55,0.45], tokens=[Token(token_id="M2", outcome="YES", price=0.55)], volume=100000, volume_24h=50000, liquidity=50000, raw={}),
-            Market(id="M3", source=MarketSource.POLYMARKET, question="Will Fed cut rates in June? CPI inflation", outcomes=["YES","NO"], outcome_prices=[0.50,0.50], tokens=[Token(token_id="M3", outcome="YES", price=0.50)], volume=80000, volume_24h=30000, liquidity=30000, raw={}),
-            Market(id="M4", source=MarketSource.POLYMARKET, question="Will BTC be above $100k? Bitcoin crypto", outcomes=["YES","NO"], outcome_prices=[0.62,0.38], tokens=[Token(token_id="M4", outcome="YES", price=0.62)], volume=20000, volume_24h=8000, liquidity=8000, raw={}),
+            Market(id="M1", source=MarketSource.POLYMARKET, question="Will Trump win election?", outcomes=["YES","NO"], outcome_prices=[0.60,0.40], tokens=[Token(token_id="M1", outcome="YES", price=0.60)], volume=50000, volume_24h=20000, liquidity=25000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
+            Market(id="M2", source=MarketSource.POLYMARKET, question="Will Lakers win championship? NBA finals", outcomes=["YES","NO"], outcome_prices=[0.55,0.45], tokens=[Token(token_id="M2", outcome="YES", price=0.55)], volume=100000, volume_24h=50000, liquidity=50000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
+            Market(id="M3", source=MarketSource.POLYMARKET, question="Will Fed cut rates in June? CPI inflation", outcomes=["YES","NO"], outcome_prices=[0.50,0.50], tokens=[Token(token_id="M3", outcome="YES", price=0.50)], volume=80000, volume_24h=30000, liquidity=30000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
+            Market(id="M4", source=MarketSource.POLYMARKET, question="Will BTC be above $100k? Bitcoin crypto", outcomes=["YES","NO"], outcome_prices=[0.62,0.38], tokens=[Token(token_id="M4", outcome="YES", price=0.62)], volume=20000, volume_24h=8000, liquidity=8000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
         ]
         
         classifier = FastModelClassifier()
@@ -2658,7 +2666,7 @@ async def api_v6_opportunity_ranking():
         from .venues.adapter import VenueOpportunity, VenueType
         opps = []
         for m in markets:
-            opp = VenueOpportunity(market=m, venue_id="polymarket", venue_type=VenueType.PREDICTION, side="YES", market_price=m.best_price, estimated_fair=m.best_price+0.10, raw_edge=0.10, effective_edge=0.09, confidence=0.7, uncertainty=0.1, liquidity_score=min(1.0, m.liquidity/20000), execution_quality=0.8, category=classifier.classify(m)["category"], should_trade=True, fees_pct=0.02, slippage_pct=0.01, spread_pct=0.02)
+            opp = VenueOpportunity(market=m, venue_id="polymarket", venue_type=VenueType.PREDICTION, side="YES", market_price=m.best_price, estimated_fair=m.best_price+0.10, raw_edge=0.10, effective_edge=0.09, confidence=0.7, uncertainty=0.1, liquidity_score=min(1.0, m.liquidity/20000), execution_quality=execution_quality_from_book(None, m), category=classifier.classify(m)["category"], should_trade=True, fees_pct=0.02, slippage_pct=0.01, spread_pct=0.02)
             opp.calculate_common_score()
             opps.append(opp)
         
@@ -2681,7 +2689,24 @@ async def api_v6_opportunity_ranking():
                     for opp in ranked
                 ],
                 "reasoning": "Best risk-adjusted expected return for capital available, not just edge>8%, portfolio impact same event across venues one bet not two max 12% per event, total exposure max 50%"
-            }
+            },
+            # Said plainly rather than left for the operator to work out from an
+            # empty list: these are hand-written markets with hand-written
+            # opportunities and no real orderbook, and the selector refuses an
+            # unmeasured execution. A demo that showed a confident ranking here
+            # would be showing a constant.
+            "demo_data": {
+                "is_mock": True,
+                "data_mode": "mock",
+                "orderbook": None,
+                "note": (
+                    "Hand-written markets and opportunities for demonstrating the "
+                    "ranking logic. They are marked MOCK, and with no real "
+                    "orderbook the execution quality is 0.0, so the selector "
+                    "correctly returns no tradeable opportunities - mock data "
+                    "must never look tradeable."
+                ),
+            },
         }
     except Exception as e:
         import traceback
