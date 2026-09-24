@@ -364,6 +364,11 @@ class TradingAgentV3:
         # Redemption closes the loop after settlement: a settled win that is
         # never redeemed is a bookkeeping profit and unusable capital. Refuses
         # to claim anything without a signer, and reports what it left locked.
+        # Findings the cycle records for the operator: which venues have earned
+        # live capital, and what the health engine actually saw of each account.
+        self._last_qualified_venue_ids: List[str] = []
+        self._last_qualification_total = 0
+        self._last_account_health: Dict[str, Any] = {}
         self.redeemer = Redeemer(
             funder=getattr(self, "funder", None),
             private_key=getattr(self, "private_key", None),
@@ -940,6 +945,11 @@ class TradingAgentV3:
             qualification_report = await self.capability_engine.evaluate_all_venues(target_per_venue=20)
             logger.info(f"Qualification: {qualification_report.reasoning}")
             qualified_venue_ids = qualification_report.qualified_venue_ids
+            # Kept on the instance: "which venue has earned live capital" is the
+            # first question an operator asks, and it was a local variable that
+            # died with the cycle.
+            self._last_qualified_venue_ids = list(qualified_venue_ids)
+            self._last_qualification_total = qualification_report.total_venues
             logger.info(f"Core Objective - Qualified venues: {qualified_venue_ids} out of {qualification_report.total_venues} total")
         except Exception as e:
             logger.warning(f"Qualification engine failed {e}, using all venues for paper trading learning")
@@ -1288,6 +1298,13 @@ class TradingAgentV3:
                 # demonstrated on a real market or not at all.
                 account_health = await self.account_health_engine.check_venue_health(
                     venue_id, opportunity=opp)
+                # Cached for the venue selection at the end of the cycle. These
+                # reads already happened, so reporting which venues are funded
+                # and verified costs no additional calls.
+                try:
+                    self._last_account_health[venue_id] = account_health.to_dict()
+                except Exception as e:
+                    logger.debug(f"Could not cache account health for {venue_id}: {e}")
                 if not account_health.healthy and not account_health.paper_trading_ok:
                     logger.error(f"ABORT TRADE: Account health FAIL for {venue_id}: {account_health.reason} - {account_health.details}")
                     execution_results.append({
@@ -1722,6 +1739,10 @@ class TradingAgentV3:
                 "blockers": betting_results.get("blockers", [])[:3],
             },
             "execution": execution_results,
+            # Which venue the money is on, and why. Computed from the evidence
+            # this cycle gathered: qualification, the balances the health engine
+            # read, and the per-venue results in the trades table.
+            "venue_selection": self._venue_selection(qualified_venue_ids),
             "reasoning": scan_result.reasoning,
             "execution_time": elapsed,
             "do_nothing_success": len(final_trades) == 0
@@ -1734,6 +1755,76 @@ class TradingAgentV3:
         logger.info(f"V3 Report: {scan_result.reasoning}")
         
         return result
+
+    def _venue_selection(self, qualified_venue_ids=None) -> Optional[Dict[str, Any]]:
+        """
+        Decide and record which venue holds the live capital.
+
+        Recorded every cycle rather than computed on demand in the UI, so the
+        answer is part of the run's own output and can be read back later.
+        """
+        try:
+            from ..execution.capital import (
+                FUNDING_ROUTES,
+                CapitalLedger,
+                authorised_budgets,
+                operator_mode,
+            )
+            from ..strategy.venue_selection import VenueSelector
+
+            selector = VenueSelector(storage=self.storage,
+                                     funding_routes=FUNDING_ROUTES)
+            # Falls back to what the last cycle recorded, so the selection can be
+            # recomputed on demand (by the console, or by the operator) without
+            # running a cycle first.
+            qualified_venue_ids = list(
+                qualified_venue_ids or self._last_qualified_venue_ids or [])
+            registered = list(getattr(self.venue_registry, "adapters", {}) or {})
+            # The health engine's own evidence, not a parallel reading. A venue
+            # counts as funded only if it reached the FUNDED rung or above, which
+            # is the rung the engine raises after reading a real balance from an
+            # authenticated call.
+            funded_rungs = {"funded", "trade_permitted"}
+            balances = {}
+            for venue in registered:
+                health = self._last_account_health.get(venue) or {}
+                evidence = health.get("evidence") or {}
+                reached = str(health.get("readiness") or "")
+                balances[venue] = {
+                    "available": reached in funded_rungs,
+                    "balance": float(evidence.get("balance_usd") or 0.0),
+                    "source": str(evidence.get("balance_provenance") or ""),
+                }
+            # The operator's own authorisation, read from the same place the
+            # console writes it. Passing an empty budget map here would make the
+            # agent's choice blind to the money the operator authorised, and the
+            # screen and the loop would then disagree about what is funded.
+            plan = CapitalLedger(storage=self.storage).build(
+                mode=operator_mode(self.storage),
+                budgets=authorised_budgets(self.storage),
+                venue_labels={v: r["label"] for v, r in FUNDING_ROUTES.items()},
+                balances=balances)
+            selection = selector.select(
+                selector.assess(
+                    registered or sorted(qualified_venue_ids),
+                    accounts=[a.to_dict() for a in plan.accounts],
+                    qualified_ids=qualified_venue_ids,
+                    tracker=getattr(self, "trade_outcome_tracker", None),
+                    labels={v: r["label"] for v, r in FUNDING_ROUTES.items()},
+                ),
+                # Falls back to the bankroll the agent is actually sizing
+                # against, which is the stored one - there is no self.bankroll.
+                total_budget_usd=(plan.total_budget_usd
+                                  or self.storage.get_bankroll()))
+            logger.info(f"Venue selection: {selection.verdict}")
+            for reason in selection.reasons:
+                logger.info(f"  venue: {reason}")
+            return selection.to_dict()
+        except Exception as e:
+            # Never silent: if the selection cannot be computed, the operator
+            # must not be left reading a stale or absent answer.
+            logger.error(f"Venue selection failed: {type(e).__name__}: {e}")
+            return {"error": f"{type(e).__name__}: {e}"}
 
     async def run_continuous(self, interval_minutes: int = 10):
         """Run V3 loop every 10 minutes"""

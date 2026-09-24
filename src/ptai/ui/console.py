@@ -31,8 +31,18 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from loguru import logger
 
-from ..execution.capital import CapitalLedger, FUNDING_ROUTES, UNFUNDABLE_SMALL, plan_for_budget
+from ..execution.capital import (
+    CapitalLedger,
+    FUNDING_ROUTES,
+    UNFUNDABLE_SMALL,
+    authorised_budgets,
+    operator_mode,
+    plan_for_budget,
+    set_authorised_budget,
+    set_operator_mode,
+)
 from ..storage.db import Storage
+from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
 
 app = FastAPI(title="PTAI Console", version="console-1")
 
@@ -50,41 +60,24 @@ class ConsoleState:
     account to live.
     """
 
-    KEYS = ("mode", "budget.polymarket", "budget.kalshi")
+    # Mode and budget are read and written through execution.capital, which is
+    # the one definition of both, shared with the trading loop. This class no
+    # longer owns a key namespace: a second copy of these key names is how the
+    # screen ends up showing $50 authorised while the cycle sizes against $0.
 
     def __init__(self, storage: Storage):
         self.storage = storage
 
-    def get(self, key: str, default: str = "") -> str:
-        value = self.storage.get_state(f"console.{key}")
-        return default if value is None else value
-
-    def set(self, key: str, value: str) -> None:
-        self.storage.set_state(f"console.{key}", str(value))
-
     @property
     def mode(self) -> str:
-        mode = (self.get("mode", "paper") or "paper").lower()
-        return mode if mode in ("paper", "live") else "paper"
+        return operator_mode(self.storage)
 
     @mode.setter
     def mode(self, value: str) -> None:
-        mode = str(value).lower()
-        if mode not in ("paper", "live"):
-            raise ValueError(f"mode must be paper or live, got {value!r}")
-        self.set("mode", mode)
+        set_operator_mode(self.storage, value)
 
     def budgets(self) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for key in ("polymarket", "kalshi"):
-            raw = self.get(f"budget.{key}", "0")
-            try:
-                value = float(raw)
-            except ValueError:
-                value = 0.0
-            if value > 0:
-                out[key] = value
-        return out
+        return authorised_budgets(self.storage)
 
 
 def get_storage() -> Storage:
@@ -260,7 +253,7 @@ async def api_set_budget(request: Request) -> JSONResponse:
             "note": "Authorise no more than the account holds.",
         })
 
-    state.set(f"budget.{venue}", f"{amount:.2f}")
+    set_authorised_budget(storage, venue, amount)
     plan = _build_plan(state, storage, balances)
     return JSONResponse({"budget": amount, "venue": venue, "plan": plan})
 
@@ -467,6 +460,52 @@ async def api_orders() -> JSONResponse:
     return JSONResponse(out)
 
 
+@app.get("/api/console/venue")
+async def api_venue() -> JSONResponse:
+    """
+    Which venue the agent is using right now, and why.
+
+    The agent holds live capital at exactly one venue, because money cannot be
+    moved between venues by the agent - a withdrawal and a deposit are the
+    operator's actions. Everything else is scanned and paper-traded for free.
+    """
+    storage = get_storage()
+    state = ConsoleState(storage)
+    agent = _agent()
+    balances = await _venue_balances(agent)
+    plan = _build_plan(state, storage, balances)
+
+    qualified = list(getattr(agent, "_last_qualified_venue_ids", []) or [])
+    labels = {v: r["label"] for v, r in FUNDING_ROUTES.items()}
+    adapters = getattr(getattr(agent, "venue_registry", None), "adapters", {}) or {}
+    selector = VenueSelector(storage=storage, funding_routes=FUNDING_ROUTES)
+    # With the engine running, rank everything it has registered. Without it,
+    # rank the venues that have a funding route or a trade history - the set that
+    # could actually hold money or already has evidence.
+    registered = list(adapters) or sorted(set(labels) | set(selector.known_venues()))
+    assessments = selector.assess(
+        registered,
+        accounts=plan.get("accounts", []),
+        qualified_ids=qualified,
+        labels=labels,
+    )
+    selection = selector.select(assessments, total_budget_usd=plan.get("total_budget_usd") or 0.0)
+
+    return JSONResponse({
+        "mode": state.mode,
+        "selection": selection.to_dict(),
+        "assessments": [a.to_dict() for a in assessments],
+        "ranking_basis": selection.ranking_basis,
+        "min_sample_for_evidence": MIN_SAMPLE_FOR_EVIDENCE,
+        "one_live_venue_cap": True,
+        "balances_read": sum(1 for b in balances.values() if b.get("available")),
+        "venues_asked": len(balances),
+        # Distinguishes "every venue stayed silent" from "nothing was asked".
+        # They read the same on a dashboard and mean opposite things.
+        "engine_running": agent is not None,
+    })
+
+
 @app.post("/api/console/run-cycle")
 async def api_run_cycle(request: Request) -> JSONResponse:
     """
@@ -660,6 +699,7 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
 <main>
   <div class="tabs">
     <div class="tab on" data-tab="overview" onclick="showTab('overview')">Overview</div>
+    <div class="tab" data-tab="venue" onclick="showTab('venue')">Venue</div>
     <div class="tab" data-tab="capital" onclick="showTab('capital')">Capital &amp; Funding</div>
     <div class="tab" data-tab="orders" onclick="showTab('orders')">Orders</div>
     <div class="tab" data-tab="activity" onclick="showTab('activity')">Activity</div>
@@ -698,6 +738,39 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
     <div class="card" style="margin-top:16px">
       <h2>Not yet measurable</h2>
       <div id="unavailable" class="note"></div>
+    </div>
+  </section>
+
+  <!-- VENUE -->
+  <section id="tab-venue" class="hide">
+    <div class="card">
+      <h2>Which venue the agent is using</h2>
+      <div id="venueNow"></div>
+    </div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="card">
+        <h2>Why this one</h2>
+        <div id="venueWhy" class="note"></div>
+      </div>
+      <div class="card">
+        <h2>Ranking</h2>
+        <div id="venueRank"></div>
+        <div class="note" style="margin-top:10px">
+          Ranked on realised net P&amp;L per resolved trade, with the sample size
+          shown next to it. Below the evidence floor a venue has no score at all -
+          an unmeasured venue is not a zero, and it is not a winner either.
+        </div>
+      </div>
+    </div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="card">
+        <h2>Moving to another venue</h2>
+        <div id="venueSwitch"></div>
+      </div>
+      <div class="card">
+        <h2>What runs without asking</h2>
+        <div id="venueAutonomy"></div>
+      </div>
     </div>
   </section>
 
@@ -778,10 +851,14 @@ const $ = id => document.getElementById(id);
 const money = v => (v===null||v===undefined) ? '&mdash;' : '$' + Number(v).toFixed(2);
 const pct = v => (v===null||v===undefined) ? '&mdash;' : Number(v).toFixed(1) + '%';
 
+const esc = v => String(v===null||v===undefined?'':v)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on', t.dataset.tab===name));
-  ['overview','capital','orders','activity'].forEach(n=>
+  ['overview','venue','capital','orders','activity'].forEach(n=>
     $('tab-'+n).classList.toggle('hide', n!==name));
+  if(name==='venue') loadVenue();
   if(name==='capital'){ loadCapital(); loadFunding(); }
   if(name==='orders') loadOrders();
   if(name==='activity') loadResults();
@@ -858,6 +935,109 @@ async function setMode(mode){
 }
 
 // ---- capital ----
+async function loadVenue(){
+  const {body} = await api('/api/console/venue');
+  const sel = body.selection || {};
+  const live = sel.live_venue;
+  const candidate = sel.candidate;
+  const byId = {};
+  (body.assessments||[]).forEach(a=>{ byId[a.venue_id]=a; });
+
+  // ---- which venue, stated plainly ----
+  const liveLabel = live ? ((byId[live]||{}).label || live) : null;
+  const candLabel = candidate ? ((byId[candidate]||{}).label || candidate) : null;
+  let headline;
+  if(liveLabel){
+    headline = `<div class="pill ok" style="font-size:13px">TRADING LIVE ON
+      ${esc(liveLabel).toUpperCase()}</div>`;
+  } else {
+    headline = `<div class="pill wait" style="font-size:13px">NO VENUE IS LIVE YET
+      &mdash; PAPER ONLY</div>`;
+  }
+  $('venueNow').innerHTML = headline + `
+    <div class="note" style="margin-top:10px">${esc(sel.verdict||'')}</div>
+    <table style="margin-top:12px">
+      <tr><td style="color:var(--dim);width:190px">Venue holding live capital</td>
+          <td class="mono">${liveLabel?esc(liveLabel):'<span class="warn">none</span>'}</td></tr>
+      <tr><td style="color:var(--dim)">Next venue to fund</td>
+          <td class="mono">${candLabel?esc(candLabel):'&mdash;'}</td></tr>
+      <tr><td style="color:var(--dim)">How many may hold capital</td>
+          <td class="mono">1 &mdash; the agent cannot move money between venues</td></tr>
+      <tr><td style="color:var(--dim)">Balances actually read</td>
+          <td class="mono">${ body.engine_running
+              ? `${body.balances_read||0} of ${body.venues_asked||0} venue(s) answered`
+              : 'no engine is running in this process yet, so none was asked' }</td></tr>
+    </table>
+    <div class="note" style="margin-top:10px">
+      Every other venue is still scanned and paper-traded. It is only the money
+      that sits in one place.
+    </div>`;
+
+  // ---- why ----
+  $('venueWhy').innerHTML = (sel.reasons||[]).length
+    ? '<ul style="margin:0;padding-left:18px">' + sel.reasons.map(r=>
+        `<li style="margin-bottom:7px">${esc(r)}</li>`).join('') + '</ul>'
+    : '<span class="warn">No reason was recorded for the current selection.</span>';
+
+  // ---- ranking, with the sample size next to the score ----
+  const rows = (body.assessments||[]);
+  $('venueRank').innerHTML = `<table>
+    <tr><th>Venue</th><th>Role</th><th>Resolved</th><th>Net P&amp;L / trade</th>
+        <th>Total net P&amp;L</th></tr>` +
+    rows.map(a=>{
+      const noEv = !a.has_evidence;
+      const pnl = noEv ? '<span style="color:var(--dim)">no score &mdash; too few trades</span>'
+                       : `<span class="${a.pnl_per_trade>=0?'pos':'neg'} mono">${money(a.pnl_per_trade)}</span>`;
+      const tot = noEv ? '&mdash;'
+                       : `<span class="mono ${a.net_pnl_usd>=0?'pos':'neg'}">${money(a.net_pnl_usd)}</span>`;
+      const roleTxt = a.role==='live' ? '<span class="pill ok">live</span>'
+                    : a.role==='paper' ? '<span class="pill dim">paper</span>'
+                    : '<span class="pill wait">unavailable</span>';
+      return `<tr>
+        <td><b>${esc(a.label)}</b>${a.qualified?' <span class="pill ok">qualified</span>':''}</td>
+        <td>${roleTxt}</td>
+        <td class="mono">${a.resolved_trades}${noEv?` <span style="color:var(--dim)">/ ${body.min_sample_for_evidence} to score</span>`:''}</td>
+        <td>${pnl}</td><td>${tot}</td>
+      </tr>`;
+    }).join('') + '</table>';
+
+  // ---- switching ----
+  const sp = sel.switch_plan || {};
+  const stepList = (sp.steps||[]).map(x=>`<li style="margin-bottom:5px">${esc(x)}</li>`).join('');
+  $('venueSwitch').innerHTML = sp.reason
+    ? `<div class="note">${esc(sp.reason)}</div>` +
+      (stepList ? `<ol style="margin:10px 0 0;padding-left:18px">${stepList}</ol>` : '')
+    : '<span class="warn">No switch plan was recorded.</span>';
+
+  // ---- autonomy ----
+  const au = sel.autonomy || {};
+  const act = (au.operator_only_actions||[]).map(x=>
+    `<li style="margin-bottom:6px"><b>${esc(x.action)}</b> <span style="color:var(--dim)">
+     &mdash; ${esc(x.how_often)}</span><br><span class="note">${esc(x.why)}</span></li>`).join('');
+  $('venueAutonomy').innerHTML = `
+    <table>
+      <tr><td style="color:var(--dim);width:170px">Trades without approval</td>
+          <td class="mono ${au.trades_without_approval?'pos':'neg'}">${
+            au.trades_without_approval?'YES':'no'}</td></tr>
+      <tr><td style="color:var(--dim)">Approval per trade</td>
+          <td class="mono">${au.per_trade_approval?'required':'none'}</td></tr>
+      <tr><td style="color:var(--dim)">Cycle</td>
+          <td class="mono">every ${au.cycle_minutes||10} minutes, indefinitely</td></tr>
+    </table>
+    <div style="margin-top:12px"><b style="font-size:12.5px">Done on its own</b>
+      <ul style="margin:7px 0 0;padding-left:18px">${
+        (au.agent_does_autonomously||[]).map(x=>
+          `<li style="margin-bottom:4px">${esc(x)}</li>`).join('')}</ul></div>
+    <div style="margin-top:12px"><b style="font-size:12.5px">Never needs</b>
+      <ul style="margin:7px 0 0;padding-left:18px">${
+        (au.what_it_never_needs||[]).map(x=>
+          `<li style="margin-bottom:4px">${esc(x)}</li>`).join('')}</ul></div>
+    <div style="margin-top:12px"><b style="font-size:12.5px">Your actions only</b>
+      <ol style="margin:7px 0 0;padding-left:18px">${act}</ol></div>
+    ${au.honest_limit?`<div class="errbox" style="margin-top:12px;margin-bottom:0">${
+      esc(au.honest_limit)}</div>`:''}`;
+}
+
 async function loadCapital(){
   const {body} = await api('/api/console/capital');
   const accts = body.accounts || [];

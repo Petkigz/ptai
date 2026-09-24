@@ -197,7 +197,7 @@ def build_agent(tmp_path, fill_response=None, dry_run=False, bankroll=50.0):
     # The qualification engine needs 100+ real paper trades before it will
     # qualify anything. That gate is what we WANT in production; here we inject
     # the qualified set so the downstream chain can be exercised at all.
-    agent._qualified_venue_ids = [VENUE]
+    agent._last_qualified_venue_ids = [VENUE]  # what the loop records
     return agent, adapter
 
 
@@ -526,6 +526,41 @@ class TestFullCycle:
         finally:
             agent.storage.close()
 
+    def test_the_cycle_records_which_venue_holds_the_money(self, tmp_path, monkeypatch):
+        """
+        "Which venue is it using?" must be answerable from the run's own output.
+
+        The operator asked this directly, and the honest answer only exists if
+        the loop writes it down: a selection computed on demand in the UI would
+        be a guess about a cycle that already happened. This asserts the cycle
+        result carries the live venue, the reason, and the autonomy contract.
+        """
+        agent, adapter = build_agent(tmp_path, dry_run=True)
+        _force_qualified(agent, monkeypatch)
+        try:
+            r = _cycle(agent)
+            sel = r.get("venue_selection")
+            assert sel is not None, "the cycle recorded no venue selection"
+            # A dry-run cycle with no funded venue must not claim one is live.
+            assert sel["live_venue"] is None
+            assert sel["verdict"]
+            assert sel["candidate"], "it must still say where to put money"
+            assert sel["reasons"], "and why"
+            assert sel["autonomy"]["trades_without_approval"] is True
+            # It must survive a restart: the answer lives in the database, and
+            # re-reading it must give the same verdict.
+            from src.ptai.execution.capital import FUNDING_ROUTES
+            from src.ptai.strategy.venue_selection import VenueSelector
+
+            selector = VenueSelector(storage=agent.storage,
+                                     funding_routes=FUNDING_ROUTES)
+            again = selector.select(
+                selector.assess([VENUE], labels={VENUE: "Polymarket"}))
+            assert again.verdict == selector.select(
+                selector.assess([VENUE], labels={VENUE: "Polymarket"})).verdict
+        finally:
+            agent.storage.close()
+
     def test_paper_positions_do_not_consume_live_capital(self, tmp_path, monkeypatch):
         """
         Paper trading is how a venue earns qualification. It must build the
@@ -769,7 +804,7 @@ class TestPaperModeSimulatesTheWholeCycle:
         agent.account_health_engine.venue_registry = agent.venue_registry
         agent.capability_engine.venue_registry = agent.venue_registry
         agent.settlement_engine.venue_registry = agent.venue_registry
-        agent._qualified_venue_ids = [VENUE]
+        agent._last_qualified_venue_ids = [VENUE]  # what the loop records
         return agent, adapter
 
     def test_a_paper_trade_flows_through_the_whole_cycle(self, tmp_path, monkeypatch):

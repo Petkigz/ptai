@@ -65,6 +65,10 @@ FUNDING_ROUTES = {
     "polymarket": {
         "label": "Polymarket",
         "currency": "USDC on Polygon (converted to pUSD on deposit)",
+        # Who can actually open this account. Recorded so venue selection can
+        # rank on it rather than picking alphabetically.
+        "available_from": "global, excluding restricted jurisdictions",
+        "residency_required": None,
         "minimum_deposit_usd": 1.0,
         "recommended_deposit_usd": 20.0,
         "smallest_practical_usd": 10.0,
@@ -102,6 +106,8 @@ FUNDING_ROUTES = {
     "kalshi": {
         "label": "Kalshi",
         "currency": "USD (regulated US exchange)",
+        "available_from": "United States only",
+        "residency_required": "US bank account and US identity verification",
         "minimum_deposit_usd": 10.0,
         "recommended_deposit_usd": 50.0,
         "smallest_practical_usd": 25.0,
@@ -539,3 +545,62 @@ def plan_for_budget(total_usd: float, mode: str = "paper",
         "The agent trades the account you fund. Deposit at the venue, not to "
         "the agent: it has no account of its own and never needs your seed phrase.")
     return result
+
+
+# ----------------------------------------------------------------------
+# the operator's authorisation, in one place
+# ----------------------------------------------------------------------
+#
+# Mode and budget are the operator's permission to spend. They are read by the
+# console (to show them), by the cycle (to size against them) and by the venue
+# selection (to know which account is authorised). Three readers, so one
+# definition: a second copy of these key names is how the screen and the trading
+# loop end up disagreeing about how much money is authorised.
+
+BUDGET_KEY_PREFIX = "console.budget."
+MODE_KEY = "console.mode"
+
+
+def authorised_budgets(storage) -> Dict[str, float]:
+    """
+    The budget the operator authorised, per venue.
+
+    Only positive amounts are returned: a venue that is authorised $0 is not
+    authorised, and returning it would make an unfunded venue look configured.
+    """
+    out: Dict[str, float] = {}
+    if storage is None:
+        return out
+    for venue_id in FUNDING_ROUTES:
+        raw = storage.get_state(f"{BUDGET_KEY_PREFIX}{venue_id}")
+        try:
+            value = float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            # A budget that cannot be read is not a budget. Never guess.
+            continue
+        if value > 0:
+            out[venue_id] = value
+    return out
+
+
+def authorised_budget(storage, venue_id: str) -> float:
+    return float(authorised_budgets(storage).get(venue_id, 0.0))
+
+
+def set_authorised_budget(storage, venue_id: str, amount_usd: float) -> None:
+    storage.set_state(f"{BUDGET_KEY_PREFIX}{venue_id}", f"{float(amount_usd):.2f}")
+
+
+def operator_mode(storage, default: str = "paper") -> str:
+    """The mode the operator set. Paper unless they have said otherwise."""
+    if storage is None:
+        return default
+    mode = (storage.get_state(MODE_KEY) or default).lower()
+    return mode if mode in ("paper", "live") else default
+
+
+def set_operator_mode(storage, mode: str) -> None:
+    mode = str(mode).lower()
+    if mode not in ("paper", "live"):
+        raise ValueError(f"mode must be paper or live, got {mode!r}")
+    storage.set_state(MODE_KEY, mode)
