@@ -87,7 +87,8 @@ async def test_capability_check_historical_edge():
     poly = PolymarketAdapter()
     # Simulate performance with edge
     poly.performance_stats = {
-        "total_paper_trades": 120,
+        "total_resolved_trades": 120,
+        "paper_trades": 120,
         "win_rate": 0.60,
         "avg_edge": 0.05,
         "brier_score": 0.18,
@@ -100,7 +101,8 @@ async def test_capability_check_historical_edge():
     qual = VenueQualificationEngine(data_dir=tempfile.mkdtemp())
     # Also add qualification result
     qual.qualifications["polymarket"] = qual.evaluate_qualification("polymarket", {
-        "total_paper_trades": 120,
+        "total_resolved_trades": 120,
+        "paper_trades": 120,
         "win_rate": 0.60,
         "avg_edge": 0.05,
         "brier_score": 0.18,
@@ -145,7 +147,8 @@ def test_qualified_adapters_only():
     registry = VenueRegistry(country_code="UG")
     poly = PolymarketAdapter()
     poly.performance_stats = {
-        "total_paper_trades": 120,
+        "total_resolved_trades": 120,
+        "paper_trades": 120,
         "win_rate": 0.60,
         "avg_edge": 0.05,
         "brier_score": 0.18,

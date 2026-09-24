@@ -283,7 +283,18 @@ class PositionLedgerBuilder:
                 f"them is wrong"
             )
 
-        ledger.equity = ledger.free_cash + ledger.open_position_value
+        # Equity is everything the account owns: the position at market, the
+        # cash committed to working orders (which is still the account's money,
+        # just promised to an order), and the free remainder.
+        #
+        # It used to be free_cash + position_value, which dropped the resting
+        # capital entirely - so an account with $50, a $3 position and a $3 GTC
+        # order reported $47 of equity. The free-cash figure stays deliberately
+        # conservative; the equity figure has to describe the account, and an
+        # understated equity is read by the operator as a loss that did not
+        # happen.
+        ledger.equity = (ledger.free_cash + ledger.open_position_value
+                         + ledger.resting_order_cost)
 
         return ledger
 

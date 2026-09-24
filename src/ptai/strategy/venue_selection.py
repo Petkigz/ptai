@@ -80,6 +80,17 @@ class VenueAssessment:
     net_pnl_usd: float = 0.0
     win_rate: float = 0.0
     avg_brier: float = 0.0
+    # The same figures, split by what actually happened to the money. Never
+    # summed: a paper win does not prove a live venue, and a live loss must not
+    # be hidden by paper gains.
+    live_resolved_trades: int = 0
+    live_net_pnl_usd: float = 0.0
+    paper_resolved_trades: int = 0
+    paper_net_pnl_usd: float = 0.0
+    # Which of the two the ranking above was actually given: "live", "paper", or
+    # "none". Named, because a venue ranked on simulated results while the
+    # operator reads it as performance is the confusion this split removes.
+    pnl_evidence: str = "none"
     # Current state.
     open_positions: int = 0
     paper_positions: int = 0
@@ -139,6 +150,14 @@ class VenueAssessment:
             "deployable_live": self.deployable_live,
             "resolved_trades": self.resolved_trades,
             "net_pnl_usd": round(self.net_pnl_usd, 2),
+            # Both figures, and which one the ranking used, so the console can
+            # show a real P&L next to a simulated one without either pretending
+            # to be the other.
+            "live_resolved_trades": self.live_resolved_trades,
+            "live_net_pnl_usd": round(self.live_net_pnl_usd, 2),
+            "paper_resolved_trades": self.paper_resolved_trades,
+            "paper_net_pnl_usd": round(self.paper_net_pnl_usd, 2),
+            "pnl_evidence": self.pnl_evidence,
             "pnl_per_trade": round(self.pnl_per_trade, 4),
             "win_rate": round(self.win_rate, 4),
             "avg_brier": round(self.avg_brier, 4),
@@ -251,11 +270,19 @@ class VenueSelector:
             return None
 
     def remember_live_venue(self, venue_id: Optional[str]) -> None:
-        """Write down which venue holds the live capital. Survives a restart."""
-        if self.storage is None or not venue_id:
+        """
+        Write down which venue holds the live capital. Survives a restart.
+
+        `None` means "no venue holds it" and CLEARS the record. Treating it as a
+        no-op - which is what this did - made the one call that says "stop
+        trading live" silently keep the old venue live, and the caller had no way
+        to tell.
+        """
+        if self.storage is None:
             return
         try:
-            self.storage.set_state(self.LIVE_VENUE_KEY, str(venue_id))
+            self.storage.set_state(self.LIVE_VENUE_KEY,
+                                   str(venue_id) if venue_id else "")
         except Exception as e:
             # Never silent: a choice that cannot be recorded would be re-made
             # from the ranking next cycle, which is the drift this prevents.
@@ -296,7 +323,34 @@ class VenueSelector:
                        SUM(CASE WHEN resolved = 1 THEN pnl ELSE 0 END) AS net_pnl,
                        SUM(CASE WHEN resolved = 1 AND pnl > 0 THEN 1 ELSE 0 END) AS wins,
                        SUM(CASE WHEN resolved = 0 AND status = 'paper' THEN 1 ELSE 0 END) AS open_paper,
-                       SUM(CASE WHEN resolved = 0 AND status != 'paper' THEN 1 ELSE 0 END) AS open_live
+                       SUM(CASE WHEN resolved = 0 AND status != 'paper' THEN 1 ELSE 0 END) AS open_live,
+                       -- The same three figures, split by EXECUTION mode.
+                       --
+                       -- The docstring of this method already promised that
+                       -- "a paper win does not prove a live venue, and a live
+                       -- loss must not be hidden by paper gains", while `net_pnl`
+                       -- summed both into one number. The selector then ranks
+                       -- venues for REAL capital on a mixture of real and
+                       -- simulated results. These are the honest figures, and
+                       -- the caller decides which one answers its question.
+                       SUM(CASE WHEN resolved = 1
+                                AND COALESCE(execution_mode,'live') = 'live'
+                                THEN pnl ELSE 0 END) AS live_net_pnl,
+                       SUM(CASE WHEN resolved = 1
+                                AND COALESCE(execution_mode,'live') = 'paper'
+                                THEN pnl ELSE 0 END) AS paper_net_pnl,
+                       SUM(CASE WHEN resolved = 1
+                                AND COALESCE(execution_mode,'live') = 'live'
+                                THEN 1 ELSE 0 END) AS live_resolved,
+                       SUM(CASE WHEN resolved = 1
+                                AND COALESCE(execution_mode,'live') = 'paper'
+                                THEN 1 ELSE 0 END) AS paper_resolved,
+                       SUM(CASE WHEN resolved = 1 AND pnl > 0
+                                AND COALESCE(execution_mode,'live') = 'live'
+                                THEN 1 ELSE 0 END) AS live_wins,
+                       SUM(CASE WHEN resolved = 1 AND pnl > 0
+                                AND COALESCE(execution_mode,'live') = 'paper'
+                                THEN 1 ELSE 0 END) AS paper_wins
                 FROM trades
                 GROUP BY venue_id
                 """
@@ -310,6 +364,10 @@ class VenueSelector:
         for row in rows:
             resolved = int(row["resolved"] or 0)
             wins = int(row["wins"] or 0)
+            live_resolved = int(row["live_resolved"] or 0)
+            paper_resolved = int(row["paper_resolved"] or 0)
+            live_wins = int(row["live_wins"] or 0)
+            paper_wins = int(row["paper_wins"] or 0)
             out[str(row["venue_id"] or "")] = {
                 "total": int(row["total"] or 0),
                 "resolved": resolved,
@@ -317,6 +375,16 @@ class VenueSelector:
                 "win_rate": (wins / resolved) if resolved else 0.0,
                 "open_paper": int(row["open_paper"] or 0),
                 "open_live": int(row["open_live"] or 0),
+                # Split by mode. `live_*` is what the real account did;
+                # `paper_*` is the simulation, which is evidence toward
+                # qualification and NOT evidence of what the venue will do with
+                # real money.
+                "live_resolved": live_resolved,
+                "live_net_pnl": float(row["live_net_pnl"] or 0.0),
+                "live_win_rate": (live_wins / live_resolved) if live_resolved else 0.0,
+                "paper_resolved": paper_resolved,
+                "paper_net_pnl": float(row["paper_net_pnl"] or 0.0),
+                "paper_win_rate": (paper_wins / paper_resolved) if paper_resolved else 0.0,
             }
         return out
 
@@ -358,12 +426,37 @@ class VenueSelector:
         for venue_id in sorted(set(venue_ids) | set(accounts_by_venue)):
             account = accounts_by_venue.get(venue_id) or {}
             row = stats.get(venue_id, {})
+            live_resolved = int(row.get("live_resolved", 0) or 0)
+            paper_resolved = int(row.get("paper_resolved", 0) or 0)
+            # The ranking is given LIVE results when there are any, and the
+            # PAPER results otherwise - never their sum. The first venue a fresh
+            # install chooses has only paper evidence to go on, and that is
+            # legitimate for QUALIFICATION; what would not be legitimate is
+            # presenting it as what the venue did with real money.
+            if live_resolved:
+                ranked_pnl = float(row.get("live_net_pnl", 0.0))
+                ranked_win_rate = float(row.get("live_win_rate", 0.0))
+                evidence = "live"
+            elif paper_resolved:
+                ranked_pnl = float(row.get("paper_net_pnl", 0.0))
+                ranked_win_rate = float(row.get("paper_win_rate", 0.0))
+                evidence = "paper"
+            else:
+                ranked_pnl = 0.0
+                ranked_win_rate = 0.0
+                evidence = "none"
+
             assessed = VenueAssessment(
                 venue_id=venue_id,
                 label=labels.get(venue_id, account.get("venue_label") or venue_id),
                 resolved_trades=int(row.get("resolved", 0)),
-                net_pnl_usd=float(row.get("net_pnl", 0.0)),
-                win_rate=float(row.get("win_rate", 0.0)),
+                net_pnl_usd=ranked_pnl,
+                win_rate=ranked_win_rate,
+                live_resolved_trades=live_resolved,
+                live_net_pnl_usd=float(row.get("live_net_pnl", 0.0)),
+                paper_resolved_trades=paper_resolved,
+                paper_net_pnl_usd=float(row.get("paper_net_pnl", 0.0)),
+                pnl_evidence=evidence,
                 avg_brier=brier.get(venue_id, 0.0),
                 open_positions=int(account.get("live_position_count",
                                               row.get("open_live", 0)) or 0),
@@ -372,7 +465,12 @@ class VenueSelector:
                 fundable=venue_id in self.funding_routes,
                 funded=bool(account.get("funded")),
                 balance_is_real=bool(account.get("balance_is_real")),
-                reported_balance_usd=float(account.get("deposited_usd") or 0.0),
+                # `deposited_usd` in the capital ledger is the AUTHORISED BUDGET,
+                # not the venue's own balance. Labelling it "reported balance"
+                # showed the operator a number the venue never reported - and the
+                # venue's actual figure was sitting in `reported_balance_usd` all
+                # along, one field away.
+                reported_balance_usd=float(account.get("reported_balance_usd") or 0.0),
                 authorised_usd=float(account.get("budget_usd", 0.0) or 0.0),
                 available_usd=float(account.get("available_usd", 0.0) or 0.0),
             )

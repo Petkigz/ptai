@@ -303,7 +303,13 @@ class VenueStrategyQualificationEngine:
         brier = perf.get("brier_score", 1.0)
         profit_factor = perf.get("profit_factor", 0) if "profit_factor" in perf else 0
         net_pnl = perf.get("profit_paper", 0)
-        sample_size = perf.get("total_paper_trades", 0)
+        # ALL resolved evidence, not the paper subset: `total_paper_trades`
+        # used to hold every outcome, and now that it honestly holds only the
+        # paper ones, reading it here would report "no evidence" for a venue
+        # the qualification gate just judged on 120 outcomes. Fallback keeps
+        # older producers, which only know the old key, working.
+        sample_size = perf.get(
+            "total_resolved_trades", perf.get("total_paper_trades", 0))
         
         # Also check qualification engine file
         qual_result = self.qualification_engine.qualifications.get(venue_id)
@@ -312,7 +318,8 @@ class VenueStrategyQualificationEngine:
             brier = qual_result.brier_score
             net_pnl = qual_result.net_pnl
             profit_factor = qual_result.profit_factor
-            sample_size = qual_result.total_paper_trades
+            sample_size = (qual_result.total_resolved_trades
+                           or qual_result.total_paper_trades)
             avg_edge = qual_result.avg_edge
         
         # Historical edge.

@@ -862,12 +862,35 @@ class TradingAgentV3:
             strategy = "resting_order_fill"
 
         try:
+            # The fill price is the price of the TOKEN this order was for, so
+            # the YES price is derived from it and both are stored. Writing the
+            # fill price into `market_price` - which means the YES price - is how
+            # a NO position came to settle as though its shares had cost the YES
+            # price.
+            fill_token_price = float(price)
+            bought_yes = str(side or "").upper() in ("YES", "1", "LONG", "BUY", "TRUE")
+            fill_yes_price = (fill_token_price if bought_yes
+                              else round(1.0 - fill_token_price, 6))
+
             trade_id = self.storage.log_trade({
                 "market_id": market_id,
                 "venue_id": order.get("venue_id") or "polymarket",
                 "side": side,
                 "position_size_usd": float(add_usd),
-                "market_price": float(price),
+                "market_price": fill_yes_price,
+                "yes_price_at_entry": fill_yes_price,
+                "token_price_at_entry": fill_token_price,
+                # The execution mode the ORDER was submitted with. A delayed
+                # fill must state its own mode rather than inherit whatever
+                # `status` happens to imply, or a simulated order that filled
+                # hours later is filed as a live position.
+                "execution_mode": (order.get("execution_mode")
+                                   or ("paper" if str(order.get("data_mode") or "")
+                                       in ("paper", "live_paper") else "live")),
+                # Costs and the prediction, from the order they were recorded
+                # on. None where the order does not carry them, which the
+                # learning layer reads as "not measured" rather than as zero.
+                "fees_usd": order.get("fees_usd"),
                 # `fair_value` is the column that exists. The old call passed
                 # `fair_price`, which log_trade ignores, so this row carried no
                 # fair value at all.
@@ -901,6 +924,17 @@ class TradingAgentV3:
                 edge=float(edge or 0.0),
                 side=side,
                 amount_usd=float(add_usd),
+                # The execution facts the order carried. Without them a delayed
+                # fill's outcome was unclassified in the paper/live split, and
+                # carried no costs and no prediction - so the trades the agent
+                # waited longest for taught it the least.
+                execution_mode=(order.get("execution_mode") or None),
+                expected_net_ev=order.get("expected_net_ev"),
+                expected_net_ev_pct=order.get("expected_net_ev_pct"),
+                fees_usd=order.get("fees_usd"),
+                slippage_bps=order.get("slippage_bps"),
+                execution_quality=order.get("execution_quality"),
+                data_mode=order.get("data_mode"),
                 delayed_fill=True,
                 attributed=bool(attributed),
             )
@@ -1199,6 +1233,7 @@ class TradingAgentV3:
         # asking the venue a second time and possibly getting a different answer.
         venue_positions = None
         venue_state_complete = None
+        portfolio = None
         try:
             # The venue that actually holds capital, READ from storage - the
             # same place the console reads it, so the agent and the operator
@@ -1236,6 +1271,29 @@ class TradingAgentV3:
         ledger = self.ledger_builder.build(
             venue_positions=venue_positions,
             venue_state_complete=venue_state_complete)
+
+        # ------------------------------------------------------------------
+        # THE CONTROL BOUNDARY.
+        #
+        # Venue selection and the operator's authorised budget existed, and
+        # neither was a gate at the point where money actually moved. The
+        # selector said "one venue holds the live capital" and stored it; the
+        # capital ledger computed an authorised budget per venue; and then the
+        # execution loop dispatched to whatever venue the opportunity happened to
+        # be on, sized against the GLOBAL bankroll. So the architecture's rule
+        # and the system's behaviour were two different things:
+        #
+        #     selection:  only Polymarket is the live venue
+        #     execution:  Polymarket live, and any other funded venue live too
+        #
+        # Selection and authorisation are now computed once per cycle and
+        # enforced at three points below: the sizing cap, the pre-dispatch hard
+        # gate, and the executor call itself.
+        # ------------------------------------------------------------------
+        self._cycle_live_venue, self._cycle_live_capital = \
+            self._resolve_live_capital(
+                portfolio=portfolio,
+                free_cash=ledger.free_cash)
         free_capital = ledger.free_cash
         self.last_ledger = ledger
         logger.info(
@@ -1284,6 +1342,12 @@ class TradingAgentV3:
         if exploration_candidates:
             logger.info(f"V10 FIX #8 Exploration lane: {len(exploration_candidates)} unqualified venues selected for shadow/paper learning (NO live capital): {[o.venue_id+':'+o.market.id for o in exploration_candidates]}")
         
+        # Live-capital refusals that happen before dispatch (at SIZING, where a
+        # cap can zero an order). Kept here because `execution_results` is
+        # created after this loop, and an operator-visible refusal must not be
+        # dropped on the floor just because the place that records it comes later.
+        sizing_refusals: List[Dict[str, Any]] = []
+
         # Process qualified opportunities with consistent sizing
         for opp in qualified_opps:
             # V10 FIX #2: Calculate Kelly FIRST.
@@ -1315,9 +1379,45 @@ class TradingAgentV3:
             # against equity, not against the free cash we just used.
             proposed_amount = free_capital * kelly_result.kelly_fraction_adj
             proposed_amount = min(proposed_amount, bankroll * 0.06)  # Cap 6% of equity
+
+            # ...and by the capital THIS VENUE may actually spend.
+            #
+            # Sizing was global: free cash times Kelly, capped at 6% of the
+            # account's equity. The operator's per-venue budget and the venue's
+            # own balance were computed by the capital ledger and never consulted
+            # here, so the agent could size a trade at a venue it had been
+            # authorised $0 for - or more than the venue actually held.
+            #
+            # Only binds for capital that can move for real; paper sizing is
+            # governed by free cash alone.
+            venue_cap = None
+            cap_detail = None
+            cap_entry = (getattr(self, "_cycle_live_capital", None) or {}).get(
+                opp.venue_id)
+            if cap_entry is not None and not self._adapter_is_paper(opp):
+                venue_cap = float(cap_entry.get("cap_usd") or 0.0)
+                cap_detail = cap_entry.get("detail")
+                if proposed_amount > venue_cap:
+                    logger.info(
+                        f"Live capital cap binds for {opp.market.id} @ "
+                        f"{opp.venue_id}: ${proposed_amount:.2f} -> "
+                        f"${venue_cap:.2f} ({cap_detail})")
+                    proposed_amount = venue_cap
             proposed_amount = max(0, proposed_amount)
             
             if proposed_amount < 1.0:
+                if venue_cap is not None and venue_cap < 1.0:
+                    # A live order the capital boundary sized to nothing is not
+                    # "too small to bother with" - it is a refusal by the
+                    # boundary, and the operator's record has to name which one.
+                    logger.warning(
+                        f"LIVE CAPITAL BLOCKED {opp.market.id} @ {opp.venue_id} "
+                        f"at sizing: ${venue_cap:.2f} deployable - "
+                        f"{cap_detail}")
+                    sizing_refusals.append(self._blocked_live_entry(
+                        opp, proposed_amount,
+                        cap_detail or "no live capital available"))
+                    continue
                 logger.info(f"Position size ${proposed_amount:.2f} < $1 min - skip {opp.market.id}")
                 continue
             
@@ -1431,7 +1531,7 @@ class TradingAgentV3:
         # Architecture: V3 → ExecutionGuard → MultiVenueExecutor → Exact venue adapter → place_order()
         # Previously bypassed executor: V3 → Guard → adapter.place_order() directly - FIXED
         # V10 FIX #2: Use same Kelly-calculated amount through all checks (no $5 placeholder)
-        execution_results = []
+        execution_results = list(sizing_refusals)
         
         # Update executor and guard bankroll
         current_bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
@@ -1543,7 +1643,20 @@ class TradingAgentV3:
                     })
                     continue
                 
-                logger.info(f"Core Objective DEPLOY via canonical executor: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} netEV ${getattr(opp, '_expected_ev', None).net_ev_usd if hasattr(opp, '_expected_ev') and opp._expected_ev else 0:.2f} - Guard PASS → MultiVenueExecutor → {venue_id}")
+                # THE HARD GATE. Everything upstream may have approved this
+                # trade, and none of it decides where real money goes: the
+                # selected live venue and the operator's authorised budget do,
+                # here, immediately before the order is placed.
+                live_ok, live_reason = self._live_execution_allowed(opp, amount_usd)
+                if not live_ok:
+                    logger.warning(
+                        f"LIVE CAPITAL BLOCKED {opp.market.id} @ {opp.venue_id} "
+                        f"${amount_usd:.2f}: {live_reason}")
+                    execution_results.append(
+                        self._blocked_live_entry(opp, amount_usd, live_reason))
+                    continue
+
+                logger.info(f"Core Objective DEPLOY via canonical executor: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} netEV ${getattr(opp, '_expected_ev', None).net_ev_usd if hasattr(opp, '_expected_ev') and opp._expected_ev else 0:.2f} - Guard PASS → MultiVenueExecutor → {venue_id} | {live_reason}")
                 
                 # V10 FIX #1: ONE canonical path: MultiVenueExecutor.execute_single()
                 # Executor has: MOCK protection, exact routing ABORT, rate limits, min order checks, fee calc, gas
@@ -2041,6 +2154,125 @@ class TradingAgentV3:
             if adapter is not None and saved_dry_run is not None:
                 adapter.dry_run = saved_dry_run
 
+    def _resolve_live_capital(self, portfolio, free_cash: float) -> tuple:
+        """
+        Which venue may spend real money this cycle, and how much.
+
+        Returns (live_venue_id, {venue_id: {"cap_usd": float, "detail": str}}).
+
+        The cap is the smallest of the three things that all have to agree before
+        real money moves:
+
+          * the VENUE's own available balance, as the venue reported it,
+          * the budget the OPERATOR authorised for that venue,
+          * local free cash, i.e. what is not already committed.
+
+        A missing term is not treated as unlimited. No venue balance read means no
+        venue-confirmed money to spend, which means no live deployment - the agent
+        may still paper-trade there, and paper is where it belongs until the
+        account can be read.
+        """
+        from ..execution.capital import authorised_budget
+        from ..strategy.venue_selection import VenueSelector
+
+        caps: Dict[str, Any] = {}
+        try:
+            live_venue = VenueSelector(storage=self.storage).remembered_live_venue()
+        except Exception as e:
+            logger.warning(f"Could not read the selected live venue: {e}")
+            live_venue = None
+
+        if not live_venue:
+            return None, caps
+
+        try:
+            authorised = float(authorised_budget(self.storage, live_venue) or 0.0)
+        except Exception as e:
+            logger.warning(f"Could not read the authorised budget: {e}")
+            authorised = 0.0
+
+        venue_balance = None
+        if isinstance(portfolio, dict):
+            raw = portfolio.get("venue_confirmed_balance")
+            try:
+                venue_balance = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                venue_balance = None
+
+        parts = {
+            "venue_balance_usd": venue_balance,
+            "authorised_usd": authorised,
+            "free_cash_usd": float(free_cash or 0.0),
+        }
+        # Live capital needs all three. Any one missing is a refusal, not a
+        # default: venue balance unread -> fail closed; nothing authorised ->
+        # the operator has not given this agent the money; free cash 0 -> already
+        # committed.
+        if venue_balance is None:
+            caps[live_venue] = {
+                "cap_usd": 0.0, "parts": parts,
+                "detail": ("the venue's balance could not be read, so no live "
+                           "capital is deployable at this venue")}
+        elif authorised <= 0:
+            caps[live_venue] = {
+                "cap_usd": 0.0, "parts": parts,
+                "detail": (f"no budget authorised for {live_venue}: paper only "
+                           f"until the operator sets one")}
+        else:
+            cap = max(0.0, min(venue_balance, authorised, float(free_cash or 0.0)))
+            caps[live_venue] = {
+                "cap_usd": cap, "parts": parts,
+                "detail": (f"min(venue ${venue_balance:.2f}, authorised "
+                           f"${authorised:.2f}, free ${float(free_cash or 0.0):.2f})")}
+        return live_venue, caps
+
+    def _live_execution_allowed(self, opp, amount_usd: float) -> tuple:
+        """
+        May this specific order move real money? Returns (allowed, reason).
+
+        The last gate before dispatch, and the one that makes the architecture
+        true: if the opportunity's venue is not the selected live venue, this
+        trade does not touch real capital regardless of how good it looks or how
+        qualified the venue is. Paper is not affected - an unarmed adapter has no
+        real money to move - and neither is exploration, which is forced to paper
+        before it reaches here.
+        """
+        venue_id = str(getattr(opp, "venue_id", "") or "")
+        if not venue_id:
+            return False, "opportunity has no venue_id, so its capital is unaccountable"
+
+        # Paper executions are governed by the paper engine, not this boundary.
+        try:
+            adapter = self.venue_registry.adapters.get(venue_id)
+        except Exception:
+            adapter = None
+        armed = bool(getattr(adapter, "can_place_real_orders", False))
+        if not armed:
+            return True, "paper: the adapter cannot place real orders"
+        if getattr(opp, "_is_exploration", False):
+            return True, "exploration: forced to paper before dispatch"
+
+        live_venue = getattr(self, "_cycle_live_venue", None)
+        if not live_venue:
+            return False, ("no live venue is selected, so real capital may not "
+                           "be deployed anywhere")
+        if venue_id != live_venue:
+            return False, (f"{venue_id} is not the selected live venue "
+                           f"({live_venue}) - one venue holds the live capital "
+                           f"at a time")
+
+        entry = (getattr(self, "_cycle_live_capital", None) or {}).get(venue_id)
+        if not entry:
+            return False, (f"no authorised capital computed for {venue_id} this "
+                           f"cycle")
+        cap = float(entry.get("cap_usd") or 0.0)
+        if cap <= 0:
+            return False, entry.get("detail") or "no live capital available"
+        if float(amount_usd) > cap + 1e-9:
+            return False, (f"amount ${float(amount_usd):.2f} exceeds the live "
+                           f"capital cap ${cap:.2f} for {venue_id}")
+        return True, f"within {entry.get('detail')}"
+
     def _hard_rules_pass(self, opp):
         """
         Rule 1 of the core objective, in one place.
@@ -2107,6 +2339,17 @@ class TradingAgentV3:
         "resting_order_fill" with edge 0, which teaches the agent nothing about
         the decision it actually made.
         """
+        # The entry prices are recorded on the SIDE being bought: `token_price`
+        # is what a share of the token this order is for costs, `yes_price` is
+        # the same market on the YES scale. Both, so a fill that arrives later
+        # cannot confuse them - which is exactly how a NO position ended up
+        # settling on the wrong price.
+        yes_price = float(getattr(opp, "market_price", 0.0) or 0.0)
+        side = str(getattr(opp, "side", "YES") or "YES").upper()
+        bought_yes = side in ("YES", "1", "LONG", "BUY", "TRUE")
+        token_price = yes_price if bought_yes else round(1.0 - yes_price, 6)
+
+        expected_ev = getattr(opp, "_expected_ev", None)
         return {
             "fair_price": getattr(opp, "estimated_fair", None),
             "edge": getattr(opp, "effective_edge", None),
@@ -2114,7 +2357,77 @@ class TradingAgentV3:
             "strategy": getattr(opp, "strategy", None) or getattr(opp, "strategy_name", None),
             "category": getattr(opp, "category", None),
             "data_mode": str(getattr(data_mode, "value", data_mode)),
+            # What the trade was predicted to earn, at entry.
+            "expected_net_ev": getattr(expected_ev, "net_ev_usd", None),
+            "expected_net_ev_pct": getattr(expected_ev, "net_ev_pct", None),
+            # The prices, on both scales.
+            "yes_price": yes_price,
+            "token_price": token_price,
+            # PAPER or LIVE. Read from the adapter rather than assumed: a
+            # dry-run venue simulates, and that is what the row must say.
+            "execution_mode": ("paper" if self._adapter_is_paper(opp)
+                               else "live"),
         }
+
+    def _blocked_live_entry(self, opp, amount_usd: float, reason: str) -> Dict[str, Any]:
+        """
+        The record for a live order the capital boundary refused.
+
+        One definition, because every entry in `execution_results` is read the
+        same way downstream: a refusal that omitted a field made callers that
+        index it raise instead of read the refusal. Nothing was sent, so the
+        amount committed is honestly zero rather than the amount proposed.
+        """
+        return {
+            "market_id": opp.market.id,
+            "venue": opp.venue_id,
+            "strategy": (opp.raw.get("strategy", "unknown")
+                         if hasattr(opp, "raw") and isinstance(opp.raw, dict)
+                         else "unknown"),
+            "side": opp.side,
+            "edge": opp.effective_edge,
+            "score": opp.score,
+            "amount": amount_usd,
+            "status": "blocked_live_capital",
+            "reason": reason,
+            "live_venue": getattr(self, "_cycle_live_venue", None),
+            "executor_result": {
+                "status": "blocked",
+                "amount_usd": 0.0,
+                "price": 0.0,
+                "fees_usd": 0.0,
+                "gas_usd": 0.0,
+                "latency_ms": 0,
+                "reasoning": reason,
+            },
+            "result": {"status": "blocked", "message": reason},
+            "canonical_path": ("V3 -> live-capital gate -> BLOCKED "
+                               "(no order sent)"),
+            "position_recorded": False,
+            "position_reason": "no live capital was authorised here",
+        }
+
+    def _adapter_is_paper(self, opp) -> bool:
+        """
+        Whether the venue for this opportunity can only simulate.
+
+        THE predicate for "will this order spend real money": the sizing clamp
+        and the last gate before dispatch both read it. When they disagreed, the
+        clamp sized a PAPER order against the live venue's budget - so a venue
+        with no authorisation (or an unreadable balance) had every paper trade
+        clamped to $0 and skipped, which is how exploration stops executing and
+        a fresh install can never earn the qualification it needs.
+        """
+        try:
+            adapter = self.venue_registry.adapters.get(
+                str(getattr(opp, "venue_id", "") or ""))
+        except Exception:
+            adapter = None
+        if adapter is None:
+            return True
+        if getattr(opp, "_is_exploration", False):
+            return True
+        return not bool(getattr(adapter, "can_place_real_orders", False))
 
     def _refresh_qualifications(self) -> int:
         """

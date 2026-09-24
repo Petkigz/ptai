@@ -37,7 +37,9 @@ class SettledItem:
     applied: bool
     reason: str
     outcome: Optional[float] = None
-    pnl: Optional[float] = None
+    pnl: Optional[float] = None          # NET of the fees actually paid
+    gross_pnl: Optional[float] = None    # payout - stake, before costs
+    fees_usd: Optional[float] = None     # what was charged, as recorded at entry
     source: str = ""
 
 
@@ -51,6 +53,11 @@ class SettlementReport:
     ambiguous: int = 0
     errors: int = 0
     realised_pnl_usd: float = 0.0
+    # Fees charged on the positions this settlement closed, and the gross P&L
+    # before them. The bankroll moves by the net; keeping all three means the
+    # cost is visible rather than folded into a single number nobody can check.
+    fees_paid_usd: float = 0.0
+    gross_pnl_usd: float = 0.0
     # Reported SEPARATELY from the real figure above. Both used to be summed
     # into one number, so a report reading "realised +$9.20" could be $8.00 of
     # simulation and $1.20 of real money - and the operator has no way to tell,
@@ -71,6 +78,8 @@ class SettlementReport:
             "ambiguous": self.ambiguous,
             "errors": self.errors,
             "realised_pnl_usd": round(self.realised_pnl_usd, 2),
+            "fees_paid_usd": round(self.fees_paid_usd, 2),
+            "gross_pnl_usd": round(self.gross_pnl_usd, 2),
             "paper_pnl_usd": round(self.paper_pnl_usd, 2),
             "live_settled": self.live_settled,
             "paper_settled": self.paper_settled,
@@ -379,13 +388,38 @@ class SettlementEngine:
                 if entry_price is None:
                     entry_price = trade.get("market_price")
                     price_source = "market_price (legacy: YES-scale re-derived)"
-                pnl = compute_pnl(
+                gross_pnl = compute_pnl(
                     side=trade.get("side"),
                     entry_price=entry_price,
                     stake_usd=trade.get("position_size_usd"),
                     outcome=float(outcome),
                     price_is_token_price=True,
                 )
+                # NET OF THE FEES ACTUALLY PAID.
+                #
+                # Settling on the gross booked money the account never received:
+                # a $3 NO at 0.30 that won was banked as +$7.00 when the venue
+                # had already taken its fee, so the bankroll drifted above the
+                # account a little more with every settlement - in the agent's
+                # own favour, which is the direction that makes it trade bigger.
+                # The fee was recorded at entry and is subtracted here; the gross
+                # and the fee are both reported so the arithmetic can be checked.
+                #
+                # The expectation the trade was taken on already included this
+                # cost, so netting it here is what makes the realised result
+                # comparable with the number that justified the trade.
+                recorded_fee = trade.get("fees_usd")
+                if gross_pnl is not None and recorded_fee is not None:
+                    try:
+                        fee = float(recorded_fee)
+                    except (TypeError, ValueError):
+                        fee = 0.0
+                    pnl = round(gross_pnl - fee, 6)
+                    logger.info(
+                        f"Settlement: trade {trade.get('id')} gross "
+                        f"${gross_pnl:+.4f} - fees ${fee:.4f} = net ${pnl:+.4f}")
+                else:
+                    pnl = gross_pnl
                 if pnl is None:
                     item.pnl = None
                     logger.warning(
@@ -407,8 +441,13 @@ class SettlementEngine:
                         closed = False
                     if closed:
                         item.pnl = pnl
+                        item.gross_pnl = gross_pnl
+                        item.fees_usd = (float(recorded_fee)
+                                         if recorded_fee is not None else None)
                         item.kind = "trade"
                         applied_something = True
+                        report.gross_pnl_usd += gross_pnl or 0.0
+                        report.fees_paid_usd += float(recorded_fee or 0.0)
                         logger.info(
                             f"Settlement: trade {trade.get('id')} side="
                             f"{trade.get('side')} entry={entry_price} "

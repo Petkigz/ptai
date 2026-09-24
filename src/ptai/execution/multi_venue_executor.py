@@ -220,6 +220,40 @@ def _resting_usd(fill: Dict[str, Any], requested_usd: float) -> float:
     return round(remaining * float(price), 6)
 
 
+def _coerce_venue_type(value):
+    """
+    A VenueType from whatever the market carried.
+
+    Missing or unrecognised becomes PREDICTION, which is what the old fallback
+    string meant - but as the enum member, so an equality check against
+    VenueType.PREDICTION actually matches.
+    """
+    from ..venues.adapter import VenueType
+    if isinstance(value, VenueType):
+        return value
+    text = str(value or "").strip().lower()
+    for member in VenueType:
+        if member.value == text or member.name.lower() == text:
+            return member
+    return VenueType.PREDICTION
+
+
+def _side_aware_cap(opportunity, slippage: float = 0.02) -> float:
+    """
+    The most this order may pay per share, on the token it is buying.
+
+    A NO position is a BUY of the NO token, priced at 1 - YES. Capping both legs
+    at `yes_price + 0.02` gives a NO order a ceiling above 1.0 or below its own
+    price depending on the market - the same defect that was fixed on the single
+    path when it grew `_execute_with_side_aware_cap`.
+    """
+    price = float(getattr(opportunity, "market_price", 0.0) or 0.0)
+    side = str(getattr(opportunity, "side", "YES") or "YES").upper()
+    if side in ("NO", "SELL", "SHORT", "0"):
+        return min(0.999, (1.0 - price) + slippage)
+    return min(0.999, price + slippage)
+
+
 class MultiVenueExecutor:
     def __init__(self, registry: VenueRegistry, bankroll: float = 50.0):
         self.registry = registry
@@ -593,7 +627,10 @@ class MultiVenueExecutor:
         opp_a = VenueOpportunity(
             market=arb.market_a,
             venue_id=venue_a,
-            venue_type=arb.market_a.raw.get("venue_type", "prediction"),
+            # A VenueType, not a bare string. `raw.get("venue_type", "prediction")`
+            # produces a str wherever the market does not carry that key - which
+            # is everywhere - and downstream code compares against the enum.
+            venue_type=_coerce_venue_type(arb.market_a.raw.get("venue_type")),
             side="YES" if arb.price_a < arb.price_b else "NO",
             market_price=arb.price_a,
             estimated_fair=arb.price_b,
@@ -605,7 +642,7 @@ class MultiVenueExecutor:
         opp_b = VenueOpportunity(
             market=arb.market_b,
             venue_id=venue_b,
-            venue_type=arb.market_b.raw.get("venue_type", "prediction"),
+            venue_type=_coerce_venue_type(arb.market_b.raw.get("venue_type")),
             side="NO" if arb.price_a < arb.price_b else "YES",
             market_price=arb.price_b,
             estimated_fair=arb.price_a,
@@ -616,14 +653,22 @@ class MultiVenueExecutor:
         )
         
         state = "SUBMIT_A"
-        result_a = await self.execute_single(opp_a, max_spend_usd=amount_per_leg, max_price=opp_a.market_price+0.02)
+        # The side-aware cap, same rule as the single-opportunity path. A flat
+        # `market_price + 0.02` caps the YES price, which for a NO leg is a cap
+        # on a number that token never reaches - so the NO order was either
+        # rejected or admitted at a price it could not fill at.
+        result_a = await self.execute_single(
+            opp_a, max_spend_usd=amount_per_leg,
+            max_price=_side_aware_cap(opp_a))
         
         if result_a.status in ["error", "rejected", "rate_limited", "blocked", "aborted"]:
             logger.warning(f"Arb {state} FAIL: leg A {result_a.status} - aborting leg B to avoid naked exposure - state machine")
             return [result_a]
         
         state = "SUBMIT_B"
-        result_b = await self.execute_single(opp_b, max_spend_usd=amount_per_leg, max_price=opp_b.market_price+0.02)
+        result_b = await self.execute_single(
+            opp_b, max_spend_usd=amount_per_leg,
+            max_price=_side_aware_cap(opp_b))
         
         if result_b.status in ["error", "rejected", "rate_limited", "blocked", "aborted"]:
             logger.error(f"Arb {state} FAIL: leg A FILLED {result_a.status} but leg B FAIL {result_b.status} - NAKED EXPOSURE - need HEDGE A")
@@ -633,7 +678,7 @@ class MultiVenueExecutor:
                 hedge_opp = VenueOpportunity(
                     market=arb.market_a,
                     venue_id=venue_a,
-                    venue_type=arb.market_a.raw.get("venue_type", "prediction"),
+                    venue_type=_coerce_venue_type(arb.market_a.raw.get("venue_type")),
                     side=hedge_side,
                     market_price=arb.market_a.best_price,
                     estimated_fair=arb.market_a.best_price,
@@ -642,7 +687,9 @@ class MultiVenueExecutor:
                     confidence=0.5,
                     should_trade=False
                 )
-                hedge_result = await self.execute_single(hedge_opp, max_spend_usd=amount_per_leg, max_price=hedge_opp.market_price+0.02)
+                hedge_result = await self.execute_single(
+                    hedge_opp, max_spend_usd=amount_per_leg,
+                    max_price=_side_aware_cap(hedge_opp))
                 logger.info(f"Arb HEDGE_A result: {hedge_result.status} - attempted to close naked exposure")
                 result_a.reasoning += f" | HEDGE attempted: {hedge_result.status} {hedge_result.reasoning}"
             except Exception as e:

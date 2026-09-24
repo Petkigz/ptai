@@ -427,7 +427,7 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "execution_quality_measured": 0, "cost_coverage": 0.0,
         "execution_quality_coverage": 0.0,
         "modes": [], "live_trades": 0, "paper_trades": 0,
-        "unclassified_trades": 0,
+        "unclassified_trades": 0, "total_resolved_trades": 0,
         # None, not 0.0: nothing was ever predicted, which is not the same as
         # having predicted no profit. The gate fails on None.
         "expected_value": None, "expected_value_usd": None,
@@ -590,7 +590,19 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
             drawdown = max(drawdown, (peak - equity) / peak)
 
     return {
-        "total_paper_trades": n,
+        # THE QUALIFICATION CONTRACT, stated rather than implied.
+        #
+        # `total_paper_trades` held EVERY resolved outcome - paper and live - so
+        # the name was wrong and, worse, the gate's `min_trades` check read it.
+        # What the gate is actually given is:
+        #   * `total_resolved_trades` - all evidence, which is the sample size for
+        #     calibration and for whether a venue has been observed enough,
+        #   * `paper_trades` / `live_trades` - the two populations separately,
+        #   * profit gates, which read the paper curve.
+        # The old key is kept so existing callers keep working, and now equals
+        # what its name says: the PAPER trade count.
+        "total_resolved_trades": n,
+        "total_paper_trades": len(paper_rows),
         "win_rate": wins / n,
         "avg_edge": sum(edges) / n,
         "brier_score": brier,

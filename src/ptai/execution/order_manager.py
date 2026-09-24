@@ -270,6 +270,17 @@ class OrderManager:
                          "reconciled and its fill will be lost")
             return None
 
+        # What actually happened to the money, and what the trade was predicted
+        # to earn, recorded WITH the order. A fill hours later has none of this
+        # and cannot reconstruct it.
+        forecast = dict(forecast or {})
+        if getattr(exec_result, "is_simulated", None) is not None:
+            forecast.setdefault(
+                "execution_mode",
+                "paper" if getattr(exec_result, "is_simulated") else "live")
+        if side is not None:
+            forecast.setdefault("side", side)
+
         venue_order_id = str(getattr(exec_result, "order_id", "") or "")
         key = venue_order_id or f"local-{uuid.uuid4().hex[:12]}"
         status = str(getattr(exec_result, "status", "") or "unknown")
@@ -308,6 +319,13 @@ class OrderManager:
                 "strategy": forecast.get("strategy"),
                 "category": forecast.get("category"),
                 "data_mode": forecast.get("data_mode"),
+                # The execution facts. Named here or `upsert_order` drops them,
+                # and this INSERT has silently lost columns before.
+                "execution_mode": forecast.get("execution_mode"),
+                "yes_price": forecast.get("yes_price"),
+                "token_price": forecast.get("token_price"),
+                "expected_net_ev": forecast.get("expected_net_ev"),
+                "expected_net_ev_pct": forecast.get("expected_net_ev_pct"),
             })
         if not self.storage.upsert_order(recorded):
             return None

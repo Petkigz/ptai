@@ -26,7 +26,6 @@ from pathlib import Path
 @dataclass
 class QualificationResult:
     venue_id: str
-    total_paper_trades: int
     win_rate: float
     avg_edge: float
     brier_score: float
@@ -39,6 +38,12 @@ class QualificationResult:
     reasoning: str
     # FIXED V7: Additional metrics beyond win rate
     net_pnl: float = 0.0
+    # All resolved evidence, and the two populations separately.
+    # `total_paper_trades` holds the PAPER count; the sample-size gate uses the
+    # total.
+    total_resolved_trades: int = 0
+    total_paper_trades: int = 0
+    live_trades: int = 0
     expected_value: float = 0.0
     fees_total: float = 0.0
     slippage_total: float = 0.0
@@ -109,7 +114,9 @@ class VenueQualificationEngine:
             for venue_id, qual in self.qualifications.items():
                 data[venue_id] = {
                     "venue_id": qual.venue_id,
+                    "total_resolved_trades": qual.total_resolved_trades,
                     "total_paper_trades": qual.total_paper_trades,
+                    "live_trades": qual.live_trades,
                     "win_rate": qual.win_rate,
                     "avg_edge": qual.avg_edge,
                     "brier_score": qual.brier_score,
@@ -137,7 +144,14 @@ class VenueQualificationEngine:
             logger.warning(f"Qualification save failed: {e}")
 
     def evaluate_qualification(self, venue_id: str, performance_stats: Dict[str, Any]) -> QualificationResult:
-        total = performance_stats.get("total_paper_trades", 0)
+        # The SAMPLE SIZE is all resolved evidence; the PROFIT gate reads the
+        # paper curve. Both are deliberate, and both are now named for what they
+        # are - this line used to read `total_paper_trades`, which held every
+        # outcome including live ones, so the name said paper while the number
+        # was the whole record.
+        total = performance_stats.get(
+            "total_resolved_trades",
+            performance_stats.get("total_paper_trades", 0))
         win_rate = performance_stats.get("win_rate", 0)
         avg_edge = performance_stats.get("avg_edge", 0)
         brier = performance_stats.get("brier_score", 1.0)
@@ -241,7 +255,9 @@ class VenueQualificationEngine:
 
         result = QualificationResult(
             venue_id=venue_id,
-            total_paper_trades=total,
+            total_resolved_trades=total,
+            total_paper_trades=int(performance_stats.get("paper_trades") or 0),
+            live_trades=int(performance_stats.get("live_trades") or 0),
             win_rate=win_rate,
             avg_edge=avg_edge,
             brier_score=brier,

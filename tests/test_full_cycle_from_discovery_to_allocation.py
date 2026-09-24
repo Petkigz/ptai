@@ -28,7 +28,9 @@ import pytest
 
 from src.ptai.agent.v3_loop import TradingAgentV3
 from src.ptai.markets.base import Market, MarketSource, Token
+from src.ptai.execution.capital import set_authorised_budget
 from src.ptai.storage.db import Storage
+from src.ptai.strategy.venue_selection import VenueSelector
 from src.ptai.venues.registry import VenueRegistry
 from src.ptai.venues.adapter import (
     AdapterCapability,
@@ -88,7 +90,12 @@ class StubVenue(MarketAdapter):
         return EligibilityStatus.ELIGIBLE
 
     async def get_portfolio(self):
-        return {"available": True, "balance": 50.0, "source": "stub_live"}
+        # `venue_confirmed_balance` is the contract for "the VENUE said my money
+        # is X", as opposed to local state that claims it. The live-capital gate
+        # reads that key and fails closed without it, so a stub that reported
+        # only a local `balance` would be unable to place a live order - correctly.
+        return {"available": True, "balance": 50.0,
+                "venue_confirmed_balance": 50.0, "source": "stub_live"}
 
     async def discover_markets(self, target_count: int = 500, filters=None):
         return [self._market()]
@@ -177,6 +184,14 @@ def build_agent(tmp_path, fill_response=None, dry_run=False, bankroll=50.0):
     agent = TradingAgentV3(country_code="UG", dry_run=dry_run)
     agent.storage = Storage(db_path=str(tmp_path / "cycle.db"))
     agent.storage.set_bankroll(bankroll)
+    # The two live-capital inputs the OPERATOR supplies, recorded where
+    # production records them: which venue holds the live account, and the budget
+    # authorised for it. `set_bankroll` is the account balance, not the
+    # authorisation - the cycle reads them separately and refuses to move real
+    # money without both, so a fixture that set only the bankroll would be
+    # running a paper cycle while believing it was running a live one.
+    VenueSelector(storage=agent.storage).remember_live_venue(VENUE)
+    set_authorised_budget(agent.storage, VENUE, bankroll)
     # The registry must be swapped EVERYWHERE it was captured. V3 passes its
     # registry into the executor, the health engine and the capability engine at
     # construction time, so replacing only agent.venue_registry leaves those
@@ -561,6 +576,113 @@ class TestFullCycle:
         finally:
             agent.storage.close()
 
+    def _live_agent_minus(self, tmp_path, monkeypatch, *, venue=True, budget=True):
+        """
+        The full-cycle fixture, with one live-capital input withdrawn.
+
+        Both directions matter: the fixture WITH the inputs must reach the venue
+        (test_discovery_through_settlement_to_pnl asserts `orders_placed >= 1`),
+        and with either input withdrawn the loop must refuse. Without the first
+        half these tests would pass on an agent that never trades anyway.
+
+        Withdrawing the venue means clearing the remembered selection AND
+        removing the authorisation, because the cycle re-adopts a funded,
+        authorised, qualified venue by itself - that autonomy is the point. What
+        it will not do is invent an authorisation: no budget means nothing is
+        deployable, and then there is no live venue to send an order to.
+        """
+        agent, adapter = build_agent(tmp_path)
+        _force_qualified(agent, monkeypatch)
+        _inject_opportunity(agent, adapter._market(), monkeypatch)
+        if not venue:
+            VenueSelector(storage=agent.storage).remember_live_venue(None)
+        if not (budget and venue):
+            set_authorised_budget(agent.storage, VENUE, 0.0)
+        return agent, adapter
+
+    def test_a_live_order_with_no_selected_venue_is_blocked(self, tmp_path, monkeypatch):
+        """
+        The control boundary, in the loop: no live venue means no real order.
+
+        A venue can be qualified, the opportunity can pass every risk rule, and
+        the adapter can hold credentials - if the operator has not selected a
+        live venue, the order must not be sent. This is the last gate before
+        dispatch, so it is the one that decides where real money goes.
+        """
+        agent, adapter = self._live_agent_minus(tmp_path, monkeypatch, venue=False)
+        try:
+            r = _cycle(agent)
+            assert adapter.orders_placed == 0, "an order was sent with no live venue"
+            entry = r["execution"][0]
+            assert entry["status"] == "blocked_live_capital"
+            assert "no live venue is selected" in entry["reason"]
+            assert entry["position_recorded"] is False
+            # The entry keeps the shape every other execution entry has, so a
+            # consumer that reads executor_result sees a refusal, not a KeyError.
+            assert entry["executor_result"]["status"] == "blocked"
+            assert entry["executor_result"]["amount_usd"] == 0.0
+            assert entry["result"]["status"] == "blocked"
+            assert agent.storage.get_open_positions() == []
+            assert agent.trade_outcome_tracker.outcomes == []
+        finally:
+            agent.storage.close()
+
+    def test_a_paper_order_is_not_sized_by_the_live_capital_cap(self, tmp_path,
+                                                               monkeypatch):
+        """
+        The cap governs real money, not the simulation.
+
+        A venue can be the remembered live venue and hold $0 of authorised
+        budget - the operator may have funded it and then withdrawn the
+        authorisation, or the balance read may be failing. If the sizing clamp
+        read that $0 as a limit on the PAPER lane too, every paper trade at that
+        venue would be sized to nothing and skipped: exploration would stop
+        executing and a fresh install could never earn the qualification it
+        needs. Paper sizing answers to free cash alone.
+        """
+        agent, adapter = build_agent(tmp_path, dry_run=True)
+        _force_qualified(agent, monkeypatch)
+        adapter.place_order = _simulating_place_order(adapter)
+        _inject_opportunity(agent, adapter._market(), monkeypatch)
+        set_authorised_budget(agent.storage, VENUE, 0.0)
+        try:
+            r = _cycle(agent)
+            assert adapter.orders_placed >= 1, (
+                "the live capital cap suppressed a PAPER order - the venue has "
+                "no authorised budget, but no real money was at risk"
+            )
+            assert r["execution"] and r["execution"][0].get("position_recorded") is True
+            trades = agent.storage.conn.execute(
+                "SELECT COUNT(*) FROM trades").fetchone()[0]
+            assert trades >= 1, "the paper trade produced no position row"
+        finally:
+            agent.storage.close()
+
+    def test_a_live_order_with_no_authorised_budget_is_blocked(self, tmp_path, monkeypatch):
+        """
+        An account balance is not an authorisation.
+
+        `set_bankroll` says how much is in the account; the per-venue budget says
+        how much of it this agent may deploy. The loop reads them separately, so
+        an operator who funded a wallet but authorised nothing keeps the agent on
+        paper - the money is theirs until they say otherwise.
+        """
+        agent, adapter = self._live_agent_minus(tmp_path, monkeypatch, budget=False)
+        try:
+            r = _cycle(agent)
+            assert adapter.orders_placed == 0, "an order was sent with no budget"
+            entry = r["execution"][0]
+            assert entry["status"] == "blocked_live_capital"
+            # The venue is still the remembered live venue - the money is still
+            # at that account - so the refusal names the missing authorisation
+            # rather than claiming there is no live venue.
+            assert "no budget authorised" in entry["reason"], entry["reason"]
+            assert entry["live_venue"] == VENUE
+            assert entry["position_recorded"] is False
+            assert agent.storage.get_open_positions() == []
+        finally:
+            agent.storage.close()
+
     def test_the_cycle_refreshes_qualification_from_recorded_outcomes(
             self, tmp_path, monkeypatch):
         """
@@ -594,7 +716,8 @@ class TestFullCycle:
                 tracker.record_trade(trade_id=str(tid), market_id=f"Q{i}",
                                      venue_id=VENUE, strategy="value",
                                      forecast_prob=0.9, market_price=0.5,
-                                     edge=-0.3, side="YES", amount_usd=3.0)
+                                     edge=-0.3, side="YES", amount_usd=3.0,
+                                     execution_mode="paper")
                 tracker.record_resolution(str(tid), actual_outcome=0.0, pnl=-3.0)
 
             _cycle(agent)
@@ -603,9 +726,14 @@ class TestFullCycle:
             assert qual is not None, (
                 "the cycle never refreshed qualification, so the gate has no "
                 "numbers for a venue with 120 recorded outcomes")
-            assert qual.total_paper_trades == 120, (
-                f"the gate read {qual.total_paper_trades} trades, not the 120 "
+            # The sample-size gate reads ALL resolved evidence; the paper count
+            # is the subset. Both must see the 120 outcomes the fixture wrote.
+            assert qual.total_resolved_trades == 120, (
+                f"the gate read {qual.total_resolved_trades} trades, not the 120 "
                 f"recorded - the cycle is not feeding it from the outcome log"
+            )
+            assert qual.total_paper_trades == 120, (
+                f"the gate read {qual.total_paper_trades} paper trades, not 120"
             )
             assert qual.is_qualified is False, (
                 "a venue losing $3 on every trade was qualified"
@@ -639,7 +767,8 @@ class TestFullCycle:
                 tracker.record_trade(trade_id=str(tid), market_id=f"V{i}",
                                      venue_id=VENUE, strategy="value",
                                      forecast_prob=0.9, market_price=0.5,
-                                     edge=-0.3, side="YES", amount_usd=3.0)
+                                     edge=-0.3, side="YES", amount_usd=3.0,
+                                     execution_mode="paper")
                 tracker.record_resolution(str(tid), actual_outcome=0.0, pnl=-3.0)
 
             monkeypatch.setattr(type(agent), "_refresh_qualifications",
@@ -647,7 +776,7 @@ class TestFullCycle:
             _cycle(agent)
 
             qual = agent.qualification_engine.qualifications.get(VENUE)
-            assert qual is None or qual.total_paper_trades == 0, (
+            assert qual is None or qual.total_resolved_trades == 0, (
                 "the gate filled itself without the refresh, so the assertion "
                 "in the previous test does not depend on the call site"
             )

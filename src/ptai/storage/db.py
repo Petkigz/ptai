@@ -78,7 +78,12 @@ CREATE TABLE IF NOT EXISTS bankroll_history (
     daily_pnl REAL,
     total_pnl REAL,
     open_positions INTEGER,
-    daily_cost REAL
+    daily_cost REAL,
+    -- Which account this row describes. The real bankroll and the paper
+    -- bankroll both wrote into this one table, so the equity curve the operator
+    -- reads - and the "unprofitable days" check - could be built from simulated
+    -- events. One table, every query filtered by this.
+    account_mode TEXT DEFAULT 'live'
 );
 
 CREATE TABLE IF NOT EXISTS agent_state (
@@ -300,6 +305,22 @@ class Storage:
         ("trade_outcomes", "expected_net_ev", "REAL"),
         ("trade_outcomes", "expected_net_ev_pct", "REAL"),
         ("trade_outcomes", "execution_mode", "TEXT"),
+        ("bankroll_history", "account_mode", "TEXT"),
+        # The execution facts that a DELAYED FILL needs, written down with the
+        # order at submission.
+        #
+        # A fill has no memory: it knows the order id and the price that matched.
+        # Without these, a position opened hours later was recorded with no
+        # execution mode (so the paper/live split could not classify it), no
+        # entry prices (so settlement had to re-derive the token price from the
+        # YES price) and no expected EV (so the gate could not tell what the
+        # trade was predicted to earn). The forecast was already being kept here
+        # for the same reason; these belong beside it.
+        ("orders", "execution_mode", "TEXT"),
+        ("orders", "yes_price", "REAL"),
+        ("orders", "token_price", "REAL"),
+        ("orders", "expected_net_ev", "REAL"),
+        ("orders", "expected_net_ev_pct", "REAL"),
     )
 
     def _migrate(self):
@@ -341,6 +362,11 @@ class Storage:
             conn.execute(
                 "UPDATE trades SET execution_mode = 'live' "
                 "WHERE execution_mode IS NULL")
+            # The only writer of bankroll_history before this column existed was
+            # `set_bankroll`, i.e. the real account.
+            conn.execute(
+                "UPDATE bankroll_history SET account_mode = 'live' "
+                "WHERE account_mode IS NULL")
             conn.commit()
             if backfilled:
                 logger.info(
@@ -381,8 +407,36 @@ class Storage:
         v = self.get_state("bankroll")
         return float(v) if v else 50.0
 
-    def set_bankroll(self, amount: float):
+    def set_bankroll(self, amount: float, record_history: bool = True):
         self.set_state("bankroll", str(amount))
+        if record_history:
+            self._record_bankroll_history(float(amount), LIVE)
+
+    def _record_bankroll_history(self, amount: float, mode: str):
+        """
+        Append one point to an account's equity curve.
+
+        `mode` is LIVE or PAPER and is written with the row rather than inferred
+        later, because the two curves are read for different decisions: the live
+        one drives what the operator sees and the self-preservation check, the
+        paper one is the evidence the paper run produces. Yesterday they were one
+        curve.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        initial = float(self.get_state("initial_bankroll") or 50.0)
+        total_pnl = amount - initial
+        cur = self.conn.execute(
+            "SELECT bankroll FROM bankroll_history WHERE account_mode = ? "
+            "ORDER BY id DESC LIMIT 1", (mode,))
+        row = cur.fetchone()
+        prev = float(row["bankroll"]) if row else initial
+        daily_pnl = amount - prev if row else 0.0
+        self.conn.execute(
+            "INSERT INTO bankroll_history (timestamp, bankroll, daily_pnl, "
+            "total_pnl, open_positions, daily_cost, account_mode) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (now, amount, daily_pnl, total_pnl, self.count_open_positions(), 0, mode))
+        self.conn.commit()
 
     def get_paper_bankroll(self) -> float:
         """
@@ -396,24 +450,10 @@ class Storage:
             return float(v)
         return float(self.get_state("initial_bankroll") or 50.0)
 
-    def set_paper_bankroll(self, amount: float):
+    def set_paper_bankroll(self, amount: float, record_history: bool = True):
         self.set_state("paper_bankroll", str(amount))
-        # Also log to history
-        now = datetime.now(timezone.utc).isoformat()
-        initial = float(self.get_state("initial_bankroll") or 50.0)
-        total_pnl = amount - initial
-        # Get today's pnl
-        cur = self.conn.execute(
-            "SELECT bankroll FROM bankroll_history ORDER BY id DESC LIMIT 1"
-        )
-        row = cur.fetchone()
-        prev = row["bankroll"] if row else initial
-        daily_pnl = amount - prev if row else 0
-        self.conn.execute(
-            "INSERT INTO bankroll_history (timestamp, bankroll, daily_pnl, total_pnl, open_positions, daily_cost) VALUES (?, ?, ?, ?, ?, ?)",
-            (now, amount, daily_pnl, total_pnl, self.count_open_positions(), 0)
-        )
-        self.conn.commit()
+        if record_history:
+            self._record_bankroll_history(float(amount), PAPER)
 
     def log_trade(self, trade: Dict[str, Any]) -> int:
         now = datetime.now(timezone.utc).isoformat()
@@ -501,6 +541,13 @@ class Storage:
             "strategy": order.get("strategy"),
             "category": order.get("category"),
             "data_mode": order.get("data_mode"),
+            # The execution facts, kept with the order so the delayed fill can
+            # state them rather than infer them.
+            "execution_mode": order.get("execution_mode"),
+            "yes_price": order.get("yes_price"),
+            "token_price": order.get("token_price"),
+            "expected_net_ev": order.get("expected_net_ev"),
+            "expected_net_ev_pct": order.get("expected_net_ev_pct"),
         }
         try:
             if existing:
@@ -602,7 +649,8 @@ class Storage:
         what was actually paid.
         """
         cur = self.conn.execute(
-            "SELECT position_size_usd, market_price, resolved FROM trades WHERE id = ?",
+            "SELECT position_size_usd, market_price, token_price_at_entry, "
+            "yes_price_at_entry, side, resolved FROM trades WHERE id = ?",
             (trade_id,))
         row = cur.fetchone()
         if row is None:
@@ -617,18 +665,43 @@ class Storage:
             return False
 
         old_size = float(row["position_size_usd"] or 0.0)
-        old_price = float(row["market_price"] or 0.0)
         new_size = old_size + float(add_usd)
         if new_size <= 0:
             return False
-        new_price = ((old_size * old_price) + (float(add_usd) * float(add_price))) / new_size
+
+        # THE WEIGHTED PRICE IS ON THE TOKEN THAT WAS BOUGHT.
+        #
+        # `add_price` arrives from reconciliation as the venue's fill price for
+        # the token this order is on - for a NO order, the NO token. And
+        # `market_price` is the YES price. Averaging them together is a unit
+        # error of exactly the kind the token/YES split was introduced to end: a
+        # NO position filled at 0.30 and then at 0.28 was being averaged as
+        # (3 x 0.70 + 2 x 0.28) / 5, a number that corresponds to nothing.
+        #
+        # The token price is the canonical record; the YES price is DERIVED from
+        # it so the two cannot drift apart. A row written before the split has
+        # its fill price in `market_price` (the fill is always on the token), so
+        # that is the fallback.
+        old_token_price = row["token_price_at_entry"]
+        if old_token_price is None:
+            old_token_price = row["market_price"]
+        old_token_price = float(old_token_price or 0.0)
+        new_token_price = ((old_size * old_token_price) +
+                           (float(add_usd) * float(add_price))) / new_size
+
+        side_norm = str(row["side"] or "").strip().upper()
+        bought_yes = side_norm in ("YES", "1", "LONG", "BUY", "TRUE")
+        new_yes_price = new_token_price if bought_yes else 1.0 - new_token_price
+
         self.conn.execute(
-            "UPDATE trades SET position_size_usd = ?, market_price = ? WHERE id = ?",
-            (new_size, new_price, trade_id))
+            "UPDATE trades SET position_size_usd = ?, market_price = ?, "
+            "yes_price_at_entry = ?, token_price_at_entry = ? WHERE id = ?",
+            (new_size, new_yes_price, new_yes_price, new_token_price, trade_id))
         self.conn.commit()
         logger.info(
-            f"Position {trade_id} grown by ${add_usd:.4f} at {add_price:.4f} -> "
-            f"${new_size:.4f} at {new_price:.4f} entry")
+            f"Position {trade_id} grown by ${add_usd:.4f} at token "
+            f"{add_price:.4f} -> ${new_size:.4f} at token {new_token_price:.4f} "
+            f"(YES {new_yes_price:.4f})")
         return True
 
     def log_market_analysis(self, analysis: Dict[str, Any]):
@@ -748,7 +821,9 @@ class Storage:
         return [dict(r) for r in cur.fetchall()]
 
     def get_performance_summary(self) -> Dict:
-        cur = self.conn.execute("SELECT * FROM bankroll_history ORDER BY timestamp DESC LIMIT 30")
+        cur = self.conn.execute(
+            "SELECT * FROM bankroll_history WHERE COALESCE(account_mode,'live')='live' "
+            "ORDER BY timestamp DESC LIMIT 30")
         history = [dict(r) for r in cur.fetchall()]
         bankroll = self.get_bankroll()
         initial = float(self.get_state("initial_bankroll") or 50.0)
@@ -846,8 +921,11 @@ class Storage:
         initial = summary["initial_bankroll"]
         total_pnl = summary["total_pnl"]
 
-        # Days since start (approx from bankroll_history)
-        cur = self.conn.execute("SELECT COUNT(DISTINCT DATE(timestamp)) as days FROM bankroll_history")
+        # Days since start (approx from bankroll_history), LIVE rows only: a
+        # paper run must not be able to declare the agent unprofitable.
+        cur = self.conn.execute(
+            "SELECT COUNT(DISTINCT DATE(timestamp)) as days FROM bankroll_history "
+            "WHERE COALESCE(account_mode,'live')='live'")
         days = cur.fetchone()["days"] or 1
         if days == 0:
             days = 1
@@ -860,6 +938,7 @@ class Storage:
         # Check unprofitable days
         cur2 = self.conn.execute("""
             SELECT DATE(timestamp) as day, SUM(daily_pnl) as pnl FROM bankroll_history
+            WHERE COALESCE(account_mode,'live')='live' 
             GROUP BY DATE(timestamp) ORDER BY day DESC LIMIT ?
         """, (max_unprofitable_days,))
         recent_days = cur2.fetchall()
