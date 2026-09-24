@@ -686,7 +686,7 @@ async def api_backtest_run(request: Request):
         allow_synthetic = bool(data.get("allow_synthetic", False))
         historical_markets = data.get("historical_markets")  # real historical data if provided
         
-        from .backtest import BacktestEngine
+        from .backtest import BacktestEngine, HistoricalDataProvider
         engine = BacktestEngine()
         config = {
             "name": data.get("name", f"Backtest {days}d edge {min_edge}"),
@@ -696,7 +696,15 @@ async def api_backtest_run(request: Request):
             "kelly_fraction": float(data.get("kelly_fraction", 0.5))
         }
         # V9 FIX #6: Real historical data gate
-        result = engine.run(strategy_config=config, historical_markets=historical_markets, days=days, allow_synthetic=allow_synthetic)
+        dataset = None
+        if not historical_markets and not allow_synthetic:
+            # Fetch real resolved markets so the command works out of the box.
+            # Without this the gate raises and the handler below returns
+            # {"error": ...} - a 200 carrying a failure, which the UI cannot
+            # distinguish from a real result. The caller can still pass data.
+            dataset = HistoricalDataProvider().build_dataset(days_back=max(days, 1))
+        result = engine.run(strategy_config=config, historical_markets=historical_markets,
+                            dataset=dataset, days=days, allow_synthetic=allow_synthetic)
         
         return {
             "strategy": result.strategy_name,

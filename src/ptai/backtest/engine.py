@@ -42,15 +42,28 @@ class BacktestEngine:
         self.storage = storage
         logger.info("BacktestEngine initialized")
     
-    def run(self, strategy_config: Dict[str, Any], historical_markets: List[Dict] = None, days: int = 30, allow_synthetic: bool = False) -> BacktestResult:
+    def run(self, strategy_config: Dict[str, Any], historical_markets: List[Dict] = None, days: int = 30, allow_synthetic: bool = False,
+            dataset: Any = None, seed: int = 0) -> BacktestResult:
         """
         V9 FIX #6: Replace synthetic backtester with real historical data requirement
         Previously generated random synthetic markets if no data - misleading
         Now: requires real historical data, or if allow_synthetic=True clearly marks as synthetic and warns not production-grade
-        
+
         strategy_config: {min_edge: 0.08, max_pos_pct: 0.06, kelly_fraction: 0.5, model: "qwen/qwen3-32b"}
         historical_markets: list of markets with resolved outcomes (if None, must set allow_synthetic=True to generate mock, but result marked synthetic)
+        dataset: a HistoricalDataset from backtest.historical - its rows are used
+                 in preference to historical_markets, and its warnings are carried
+                 onto the result so assumed costs are never silently dropped.
+        seed: seeds the latency-drift simulation. The V10 cost model perturbs the
+                 execution price with a random walk, which previously used the
+                 module-level RNG - so the same data and the same strategy
+                 produced a different PnL on every run, and comparing two
+                 configs compared their noise. A fixed seed makes a backtest
+                 reproducible; seed=0 is deterministic by default.
         """
+        if dataset is not None:
+            historical_markets = list(dataset.rows)
+        rng = random.Random(seed)
         logger.info(f"Backtest starting: {strategy_config} for {days} days - V9 requires real historical data")
         
         initial = strategy_config.get("bankroll", 50.0)
@@ -83,11 +96,11 @@ class BacktestEngine:
             historical_markets = []
             for day in range(days):
                 for i in range(10):
-                    market_price = random.uniform(0.2, 0.8)
-                    fair_value = market_price + random.uniform(-0.15, 0.15)
+                    market_price = rng.uniform(0.2, 0.8)
+                    fair_value = market_price + rng.uniform(-0.15, 0.15)
                     edge = fair_value - market_price
                     actual_prob = fair_value
-                    actual_outcome = 1 if random.random() < actual_prob else 0
+                    actual_outcome = 1 if rng.random() < actual_prob else 0
                     
                     historical_markets.append({
                         "day": day,
@@ -96,7 +109,7 @@ class BacktestEngine:
                         "fair_value": fair_value,
                         "edge": edge,
                         "actual_outcome": actual_outcome,
-                        "confidence": random.uniform(0.5, 0.9),
+                        "confidence": rng.uniform(0.5, 0.9),
                         "data_mode": "mock",
                         "is_synthetic": True
                     })
@@ -141,7 +154,7 @@ class BacktestEngine:
             # Simulate price drift during latency: random walk proportional to sqrt(latency)
             import math
             drift_vol = 0.001 * math.sqrt(latency_ms / 100)  # 0.1% vol per 100ms
-            price_drift = random.gauss(0, drift_vol)
+            price_drift = rng.gauss(0, drift_vol)
             executed_price = market["market_price"] + price_drift
             executed_price = max(0.01, min(0.99, executed_price))
             
@@ -230,6 +243,13 @@ class BacktestEngine:
         sharpe = (total_pnl_pct / max(0.01, max_dd)) if max_dd > 0 else total_pnl_pct * 10
         
         warnings = []
+        dataset_warnings: List[str] = []
+        if dataset is not None:
+            dataset_warnings = list(getattr(dataset, "warnings", []) or [])
+            if getattr(dataset, "is_baseline", False):
+                warnings.append("BASELINE RUN - no strategy signal was supplied, so fair "
+                                "value equals the market price and edge is zero. This "
+                                "measures costs, not skill, and is not production-grade")
         if is_synthetic:
             warnings.append("SYNTHETIC DATA - NOT production-grade, random markets, no real fees/spreads/slippage/latency/liquidity")
             warnings.append("DO NOT use synthetic backtest for live trading decisions - misleading results")
@@ -254,8 +274,12 @@ class BacktestEngine:
             equity_curve=equity_curve,
             is_synthetic=is_synthetic,
             data_mode="mock" if is_synthetic else "live",
-            warnings=warnings,
-            is_production_grade=not is_synthetic and len(historical_markets) >= 100
+            warnings=warnings + dataset_warnings,
+            # A baseline run cannot be production-grade: with no signal there is
+            # no strategy being evaluated, so a passing result would prove nothing.
+            is_production_grade=(not is_synthetic
+                                 and not (dataset is not None and getattr(dataset, "is_baseline", False))
+                                 and len(historical_markets) >= 100)
         )
         
         if is_synthetic:

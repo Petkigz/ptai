@@ -534,10 +534,27 @@ def backtest(
     edge: float = typer.Option(8.0, "--edge", help="Min edge %"),
 ):
     """Backtest - Test strategies on historical data before live (premium)"""
-    from .backtest import BacktestEngine
+    from .backtest import BacktestEngine, HistoricalDataProvider
     engine = BacktestEngine()
     config = {"name": f"Backtest {days}d edge {edge}%", "bankroll": bankroll, "min_edge": edge/100, "max_pos_pct": 0.06, "kelly_fraction": 0.5}
-    result = engine.run(strategy_config=config, days=days)
+
+    # The V9 gate refuses synthetic data, and it is right to - but that means
+    # real resolved markets have to be fetched first, or the command raises on
+    # every invocation.
+    provider = HistoricalDataProvider()
+    dataset = provider.build_dataset(days_back=max(days, 1))
+    if not dataset.ok:
+        console.print(f"[yellow]No historical data available: {(dataset.warnings or ['unknown'])[0]}[/yellow]")
+        console.print("[yellow]Backtest needs real resolved markets; synthetic data is refused by the V9 gate.[/yellow]")
+        raise typer.Exit(code=1)
+    if dataset.is_baseline:
+        console.print("[yellow]No recorded strategy signal for these markets, so this is a[/yellow]")
+        console.print("[yellow]NO-SKILL BASELINE: edge is zero and no trades are taken. It[/yellow]")
+        console.print("[yellow]measures costs, not skill, and cannot authorise live trading.[/yellow]")
+
+    result = engine.run(strategy_config=config, dataset=dataset, days=days)
+    for w in (result.warnings or [])[:3]:
+        console.print(f"[dim]{w}[/dim]")
     
     table = Table(title=f"Backtest Result: {result.strategy_name}")
     table.add_column("Metric")
