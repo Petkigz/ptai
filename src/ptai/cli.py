@@ -273,7 +273,7 @@ def run(
         f"Country: {country}\n"
         f"Headless: {headless}\n"
         f"LLM: {llm} (LM Studio {settings.lm_studio_host} / Ollama {settings.ollama_host})\n"
-        f"Goal: Earn ${settings.daily_cost_to_cover}/day or shutdown[/bold]",
+        f"Objective: grow capital under a risk budget[/bold]",
         title="PTAI Autonomous Agent"
     ))
 
@@ -308,23 +308,58 @@ def status():
     perf = storage.get_performance_summary()
     sp = storage.check_self_preservation()
 
-    table = Table(title="PTAI Status")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="magenta")
+    # Capital first, as separate quantities. "Bankroll: $47" does not tell an
+    # operator how much of it is already committed to an open position.
+    from .execution.position_ledger import PositionLedgerBuilder
+    ledger = PositionLedgerBuilder(storage=storage).build()
 
-    table.add_row("Bankroll", f"${perf['bankroll']:.2f}")
-    table.add_row("Initial", f"${perf['initial_bankroll']:.2f}")
-    table.add_row("Total PnL", f"${perf['total_pnl']:.2f} ({perf['total_pnl_pct']:.1f}%)")
-    table.add_row("Total Trades", str(perf["total_trades"]))
-    table.add_row("Win Rate", f"{perf['win_rate']:.1f}%" if perf['win_rate'] else "N/A")
-    table.add_row("Open Positions", str(perf["open_positions"]))
-    table.add_row("Days Active", str(sp["days_active"]))
-    table.add_row("Required Profit", f"${sp['required_profit']:.2f}")
-    table.add_row("Profitable Enough", str(sp["is_profitable_enough"]))
-    table.add_row("Unprofitable Streak", str(sp["unprofitable_streak"]))
-    table.add_row("Should Shutdown", "[red]YES[/red]" if sp["should_shutdown"] else "[green]NO[/green]")
+    capital = Table(title="Capital")
+    capital.add_column("Metric", style="cyan")
+    capital.add_column("Value", style="magenta")
+    capital.add_row("Equity", f"${ledger.equity:.2f}")
+    capital.add_row("Free capital", f"${ledger.free_cash:.2f}")
+    capital.add_row("Reserved capital",
+                    f"${ledger.reserved_capital:.2f} ({ledger.reserved_pct:.1f}%)")
+    capital.add_row("Open position value", f"${ledger.open_position_value:.2f}")
+    capital.add_row("Realised P&L", f"${ledger.realised_pnl:+.2f}")
+    capital.add_row("Unrealised P&L",
+                    f"${ledger.unrealised_pnl:+.2f}"
+                    + (" [dim](unmarked positions carried at cost)[/dim]"
+                       if any("carried at cost" in w for w in ledger.warnings) else ""))
+    capital.add_row("Positions", f"{ledger.live_position_count} live, "
+                                 f"{ledger.paper_position_count} paper")
+    console.print(capital)
 
-    console.print(table)
+    performance = Table(title="Performance")
+    performance.add_column("Metric", style="cyan")
+    performance.add_column("Value", style="magenta")
+    performance.add_row("Initial", f"${perf['initial_bankroll']:.2f}")
+    performance.add_row("Total return",
+                        f"${perf['total_pnl']:+.2f} ({perf['total_pnl_pct']:+.1f}%)")
+    performance.add_row("Total trades", str(perf["total_trades"]))
+    performance.add_row("Win rate", f"{perf['win_rate']:.1f}%" if perf['win_rate'] else "no resolved trades yet")
+    performance.add_row("Days active", str(sp["days_active"]))
+    # Drawdown is the risk figure that matters; the daily-cost comparison is
+    # advisory context about running costs, not a target the agent is judged on.
+    performance.add_row("Max drawdown", f"{min(0.0, perf['total_pnl_pct']):.1f}%")
+    performance.add_row("Running cost comparison",
+                        f"${sp['required_profit']:.2f} budgeted "
+                        f"({'covered' if sp['is_profitable_enough'] else 'not covered'}) "
+                        f"[dim]- operator's budget, not a target[/dim]")
+    console.print(performance)
+
+    risk = Table(title="Risk state")
+    risk.add_column("Metric", style="cyan")
+    risk.add_column("Value", style="magenta")
+    risk.add_row("Unprofitable streak", str(sp["unprofitable_streak"]))
+    risk.add_row("Trading halted",
+                 "[red]YES[/red]" if sp["should_shutdown"] else "[green]NO[/green]")
+    if sp["should_shutdown"]:
+        risk.add_row("Reason", str(sp.get("shutdown_reason", "")))
+    console.print(risk)
+
+    for warning in ledger.warnings:
+        console.print(f"[yellow]Ledger warning: {warning}[/yellow]")
 
     trades = storage.get_recent_trades(10)
     if trades:

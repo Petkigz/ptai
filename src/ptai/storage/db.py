@@ -133,6 +133,32 @@ CREATE TABLE IF NOT EXISTS calibration (
 
 CREATE INDEX IF NOT EXISTS idx_calibration_unresolved
     ON calibration (actual_outcome, market_id);
+
+-- TradeOutcomeTracker kept its outcomes in a plain in-memory list, so venue,
+-- strategy and category performance vanished on every restart: the tracker was
+-- rebuilt empty each run and the agent re-estimated allocation from nothing.
+-- Learning has to survive a restart to be learning.
+CREATE TABLE IF NOT EXISTS trade_outcomes (
+    trade_id TEXT PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    venue_id TEXT,
+    strategy TEXT,
+    category TEXT,
+    forecast_prob REAL,
+    market_price REAL,
+    edge REAL,
+    side TEXT,
+    amount_usd REAL,
+    actual_outcome REAL,
+    pnl REAL DEFAULT 0,
+    resolved_at TEXT,
+    brier_score REAL,
+    was_correct INTEGER,
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_outcomes_venue
+    ON trade_outcomes (venue_id, strategy, category);
 """
 
 class Storage:
@@ -362,7 +388,22 @@ class Storage:
         }
 
     def check_self_preservation(self, daily_cost: float = 5.0, max_unprofitable_days: int = 3) -> Dict:
-        """Check if agent should shut down per 'earn enough to pay for yourself or shut down'"""
+        """
+        Capital PRESERVATION checks - the reasons trading should stop.
+
+        The three shutdown conditions here are risk controls and stay:
+          * the bankroll is depleted,
+          * the drawdown exceeds the limit,
+          * the account has lost money for N consecutive days.
+
+        `daily_cost` is NOT a target. It used to be framed as "earn enough to
+        pay for yourself or shut down", which made a $50 account responsible for
+        covering a server bill. Whether the profit covers running costs is the
+        operator's decision about what to do with the money, not a goal for the
+        trading engine, and treating it as one pushed the agent to trade when it
+        should have done nothing. It is now reported as an advisory comparison
+        and drives no decision.
+        """
         summary = self.get_performance_summary()
         bankroll = summary["bankroll"]
         initial = summary["initial_bankroll"]
@@ -374,6 +415,8 @@ class Storage:
         if days == 0:
             days = 1
 
+        # Advisory only: how the realised P&L compares with a running-cost
+        # budget the operator supplied. Nothing downstream branches on it.
         required_profit = days * daily_cost
         is_profitable_enough = total_pnl >= required_profit
 

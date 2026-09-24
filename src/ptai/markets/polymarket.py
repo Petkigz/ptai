@@ -333,6 +333,69 @@ class PolymarketExecutor:
             logger.error(f"Order placement failed: {e}")
             return {"status": "failed", "error": str(e)}
 
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """
+        Cancel a live order. Required by the order-permission probe, which
+        places a minimum-size order and must withdraw it.
+
+        A cancel that fails is reported, never swallowed: an order left resting
+        in the book is real exposure the agent believes it does not have.
+        """
+        if not self.client:
+            return {"status": "no_client",
+                    "reason": "no CLOB client (missing key or credentials failed)"}
+        if not order_id:
+            return {"status": "rejected", "reason": "no order_id to cancel"}
+        try:
+            response = self.client.cancel(order_id)
+        except Exception as e:
+            logger.error(f"Cancel failed for {order_id}: {type(e).__name__}: {e}")
+            return {"status": "error", "order_id": order_id,
+                    "error": f"{type(e).__name__}: {e}"}
+
+        # Polymarket returns {"canceled": [...], "not_canceled": {...}}.
+        if isinstance(response, dict):
+            not_cancelled = response.get("not_canceled") or {}
+            if not_cancelled:
+                logger.error(
+                    f"Order {order_id} was NOT cancelled: {not_cancelled}. It may "
+                    f"still be resting in the book.")
+                return {"status": "not_cancelled", "order_id": order_id,
+                        "raw": response}
+        logger.info(f"Order cancelled: {order_id}")
+        return {"status": "cancelled", "order_id": order_id, "raw": response}
+
+    def get_balance_allowance(self) -> Dict[str, Any]:
+        """
+        Ask the CLOB for available balance and allowance.
+
+        This is a venue-side authenticated read: it returns real collateral
+        (USDC) and allowance figures for this account, so it is the honest
+        source for "is there money and is it permitted to trade".
+        """
+        if not self.client:
+            return {"available": False, "is_real": False,
+                    "reason": "no CLOB client"}
+        try:
+            response = self.client.get_balance_allowance(None)
+        except Exception as e:
+            logger.warning(f"Balance/allowance read failed: {type(e).__name__}: {e}")
+            return {"available": False, "is_real": False,
+                    "reason": f"{type(e).__name__}: {e}"}
+
+        if not isinstance(response, dict):
+            return {"available": False, "is_real": False,
+                    "reason": f"unexpected response type {type(response).__name__}"}
+
+        return {
+            "available": True,
+            "is_real": True,
+            "source": "polymarket_data_api",
+            "balance": response.get("balance"),
+            "allowance": response.get("allowance"),
+            "raw": response,
+        }
+
     def get_balance(self) -> Dict:
         if not self.client:
             return {"balance": 0, "mock": True}

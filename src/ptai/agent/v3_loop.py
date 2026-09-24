@@ -119,6 +119,7 @@ from ..execution.reconciliation import ReconciliationEngine
 from ..execution.multi_venue_executor import MultiVenueExecutor
 from ..execution.account_health import AccountHealthEngine
 from ..execution.settlement import SettlementEngine
+from ..execution.position_ledger import PositionLedgerBuilder
 from ..strategy.expected_ev import ExpectedNetEVEngine
 
 from ..learning.calibration_db import CalibrationDB
@@ -391,6 +392,11 @@ class TradingAgentV3:
         # stays at 0, `is_degrading()` can never return True (it needs 50
         # resolved forecasts) and the kill switch on calibration collapse is
         # dead code. The agent would trade forever on its priors.
+        # Sizing reads FREE cash from here, never the stored bankroll. The
+        # stored figure does not distinguish money already committed to an open
+        # position, so sizing against it lets concurrent positions each claim
+        # 6% of the same dollars.
+        self.ledger_builder = PositionLedgerBuilder(storage=self.storage)
         self.settlement_engine = SettlementEngine(
             venue_registry=self.venue_registry,
             storage=self.storage,
@@ -400,7 +406,18 @@ class TradingAgentV3:
         self.performance_tracker = PerformanceTracker(storage=self.storage)
         
         # Mission
-        self.mission = "Find best legitimate opportunity across all venues and strategies. Trade only when evidence, calibration, liquidity, risk agree. DO NOTHING is successful."
+        # The mission is to grow capital under a risk budget. It is NOT to pay
+        # for hardware, cover a server bill, or earn a daily figure - those are
+        # the operator's decisions about what to do with the money, and
+        # hardwiring them into the agent made a $50 account chase a daily target
+        # instead of taking the opportunities that were actually there.
+        self.mission = (
+            "Given available capital, continuously search accessible markets and "
+            "strategies, identify opportunities with positive expected net "
+            "return, manage risk, execute, learn from outcomes, and grow the "
+            "capital. Trade only when evidence, calibration, liquidity and risk "
+            "agree. DO NOTHING is a successful outcome."
+        )
         
         logger.info(f"PTAI V3 initialized: {self.mission} | Country {country_code} | Bankroll ${bankroll} | Venues {list(self.venue_registry.adapters.keys())}")
         logger.info(
@@ -846,16 +863,52 @@ class TradingAgentV3:
         final_trades = []
         exploration_trades = []  # shadow lane
         bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
+
+        # Free cash, not bankroll. `bankroll` is still used for the per-trade
+        # percentage caps because those are expressed against account equity,
+        # but the amount actually deployable is what is uncommitted.
+        ledger = self.ledger_builder.build()
+        free_capital = ledger.free_cash
+        self.last_ledger = ledger
+        logger.info(
+            f"Capital: equity ${ledger.equity:.2f} = free ${ledger.free_cash:.2f} "
+            f"+ reserved ${ledger.reserved_capital:.2f} "
+            f"({ledger.live_position_count} live, {ledger.paper_position_count} paper); "
+            f"realised ${ledger.realised_pnl:+.2f}, unrealised ${ledger.unrealised_pnl:+.2f}")
+        for _warning in ledger.warnings:
+            logger.warning(f"Ledger: {_warning}")
         
-        # Separate qualified vs exploration
+        # Separate qualified vs exploration.
+        #
+        # `not qualified_venue_ids` used to be OR-ed in here, which inverted the
+        # gate at the worst possible moment: when NO venue had qualified,
+        # everything was treated as qualified. Combined with the fact that no
+        # venue qualifies on a fresh install (they are all unverified), the
+        # default state of a new deployment was "live capital is permitted".
+        #
+        # The rule is now one-way: a venue that has not qualified can only ever
+        # be explored in paper/shadow. An empty qualified set means the
+        # qualified lane is empty, not that the gate is open.
         qualified_opps = []
         unqualified_opps = []
         for opp in scan_result.final_selected:
-            is_qualified = not qualified_venue_ids or opp.venue_id in qualified_venue_ids or opp.venue_id.split("+")[0] in qualified_venue_ids
+            base_venue = opp.venue_id.split("+")[0]
+            is_qualified = (
+                bool(qualified_venue_ids)
+                and (opp.venue_id in qualified_venue_ids
+                     or base_venue in qualified_venue_ids)
+            )
             if is_qualified:
                 qualified_opps.append(opp)
             else:
                 unqualified_opps.append(opp)
+
+        if not qualified_venue_ids:
+            logger.warning(
+                f"No venue qualified this cycle ({len(unqualified_opps)} "
+                f"candidate(s) found). Everything goes to the paper/shadow "
+                f"exploration lane - no live capital is deployable without a "
+                f"qualified venue.")
         
         # V10 FIX #8: 95/5 split - 95% qualified, 5% exploration (shadow only)
         # Take top unqualified as exploration candidates (max 1 per cycle for $50 bankroll)
@@ -865,14 +918,35 @@ class TradingAgentV3:
         
         # Process qualified opportunities with consistent sizing
         for opp in qualified_opps:
-            # V10 FIX #2: Calculate Kelly FIRST
-            kelly_fraction = self.kelly_calculator.calculate(
-                edge=opp.effective_edge,
-                prob=opp.estimated_fair,
-                confidence=opp.confidence
+            # V10 FIX #2: Calculate Kelly FIRST.
+            #
+            # This call used to pass edge=/prob=/confidence=, which are not
+            # parameters of KellyCalculator.calculate() - its signature is
+            # (market_price, fair_prob, bankroll) and it returns a KellyResult.
+            # Every qualified opportunity therefore raised TypeError here and
+            # no position was ever sized. No test caught it because the path
+            # only runs once a venue has qualified, which nothing in the suite
+            # did: the sizing code was reachable in principle and dead in
+            # practice.
+            #
+            # Sizing against free_capital, not equity, so positions in one batch
+            # cannot each claim 6% of the same dollars.
+            kelly_result = self.kelly_calculator.calculate(
+                market_price=opp.market_price,
+                fair_prob=opp.estimated_fair,
+                bankroll=free_capital,
             )
-            proposed_amount = bankroll * kelly_fraction
-            proposed_amount = min(proposed_amount, bankroll * 0.06)  # Cap 6%
+            if not kelly_result.should_bet:
+                logger.info(
+                    f"Kelly declines {opp.market.id}: {kelly_result.reason} "
+                    f"(edge {kelly_result.edge:+.3f}, EV "
+                    f"${kelly_result.expected_value:+.2f})")
+                continue
+            # kelly_fraction_adj is already half-Kelly and already capped at 6%
+            # of the bankroll it was given; the min() below is a second cap
+            # against equity, not against the free cash we just used.
+            proposed_amount = free_capital * kelly_result.kelly_fraction_adj
+            proposed_amount = min(proposed_amount, bankroll * 0.06)  # Cap 6% of equity
             proposed_amount = max(0, proposed_amount)
             
             if proposed_amount < 1.0:
@@ -904,26 +978,54 @@ class TradingAgentV3:
                 continue
             
             # V10 FIX #2: Use SAME proposed_amount for all risk checks
-            can_trade, reason = self.exposure_manager.can_open_position(
+            #
+            # Three consecutive calls in this risk chain were dead:
+            # ExposureManager has no `can_open_position` (it is `can_open`),
+            # LimitsEngine has no `validate` (it is `validate_proposal`), and
+            # the Kelly call above passed parameters that do not exist. Each
+            # would have raised on the first qualified opportunity. They were
+            # written as a chain of independent guards, executed as a chain of
+            # independent exceptions - and none of it had ever run, because no
+            # venue had qualified.
+            can_trade, reason = self.exposure_manager.can_open(
                 market_id=opp.market.id,
                 amount_usd=proposed_amount,  # V10 FIX: same amount, not $5
                 category=opp.category,
-                correlation_group=opp.correlation_group
+                correlation_group=opp.correlation_group,
+                venue=opp.venue_id,
             )
             if not can_trade:
                 logger.info(f"Risk blocks {opp.market.id}: {reason} (amount ${proposed_amount:.2f})")
                 continue
             
-            limits_ok, limits_reason = self.limits_engine.validate(
-                market_id=opp.market.id,
-                edge=opp.effective_edge,
-                confidence=opp.confidence,
-                amount_usd=proposed_amount,  # V10 FIX: same amount
-                price=opp.market_price
-            )
+            # LimitsEngine reads a specific proposal shape and returns an
+            # ADJUSTED order. It is given the fields it actually reads, or it
+            # defaults `trade` to False and rejects every opportunity as "LLM
+            # says no trade" - a rejection that looks like a risk decision and
+            # is really a missing key.
+            limits_ok, limits_reason, adjusted = self.limits_engine.validate_proposal({
+                "market_id": opp.market.id,
+                "side": opp.side,
+                "venue_id": opp.venue_id,
+                "trade": True,
+                "fair_probability": opp.estimated_fair,
+                "market_probability": opp.market_price,
+                "edge": opp.effective_edge,
+                "confidence": opp.confidence,
+            })
             if not limits_ok:
                 logger.info(f"Limits block {opp.market.id}: {limits_reason} (amount ${proposed_amount:.2f})")
                 continue
+            # Use the size limits approved, not the size we proposed.
+            if isinstance(adjusted, dict):
+                _approved = adjusted.get("max_spend_usd")
+                if _approved is not None and float(_approved) < proposed_amount:
+                    logger.info(
+                        f"Limits reduced {opp.market.id} from "
+                        f"${proposed_amount:.2f} to ${float(_approved):.2f}: "
+                        f"{limits_reason}")
+                    proposed_amount = float(_approved)
+                opp._max_price = adjusted.get("max_price", opp.market_price)
             
             if not self.kill_switch.can_trade():
                 logger.warning(f"Kill switch blocks trading L{self.kill_switch.current_level}")
@@ -980,7 +1082,11 @@ class TradingAgentV3:
                 venue_id_raw = opp.venue_id.split("+")[0] if "+" in opp.venue_id else opp.venue_id
                 venue_id = venue_id_raw.lower().strip()
                 
-                account_health = await self.account_health_engine.check_venue_health(venue_id)
+                # The opportunity is passed through so the order probe can test
+                # against the very market we are about to trade. Permission is
+                # demonstrated on a real market or not at all.
+                account_health = await self.account_health_engine.check_venue_health(
+                    venue_id, opportunity=opp)
                 if not account_health.healthy and not account_health.paper_trading_ok:
                     logger.error(f"ABORT TRADE: Account health FAIL for {venue_id}: {account_health.reason} - {account_health.details}")
                     execution_results.append({
@@ -997,9 +1103,19 @@ class TradingAgentV3:
                 # V10 FIX #2: Use SAME amount calculated earlier (no recalculation)
                 amount_usd = getattr(opp, '_proposed_amount', None)
                 if amount_usd is None:
-                    # Fallback if not set (should not happen)
-                    kelly_fraction = self.kelly_calculator.calculate(edge=opp.effective_edge, prob=opp.estimated_fair, confidence=opp.confidence)
-                    amount_usd = current_bankroll * kelly_fraction
+                    # Fallback if not set (should not happen). Same corrected
+                    # signature as the primary sizing path above.
+                    _kr = self.kelly_calculator.calculate(
+                        market_price=opp.market_price,
+                        fair_prob=opp.estimated_fair,
+                        bankroll=current_bankroll,
+                    )
+                    if not _kr.should_bet:
+                        logger.info(
+                            f"Kelly declines {opp.market.id} at the execution "
+                            f"gate: {_kr.reason}")
+                        continue
+                    amount_usd = current_bankroll * _kr.kelly_fraction_adj
                     amount_usd = min(amount_usd, current_bankroll * 0.06)
                 
                 if amount_usd < 1.0:
@@ -1074,6 +1190,42 @@ class TradingAgentV3:
                     "account_health": account_health.to_dict()
                 })
                 
+                # --- ONLY a proven fill may become a position ------------------
+                #
+                # Recording used to happen unconditionally after execution, so a
+                # result of rejected, error, rate_limited or blocked still
+                # created an "open" position - sized at the REQUESTED amount and
+                # priced at the REQUESTED price, because the executor copied
+                # those straight through. That is a position in the ledger that
+                # never existed at the venue: settlement would later close it
+                # against a real outcome and book a P&L for a trade that never
+                # happened, and the bankroll would drift away from reality.
+                if not exec_result.should_record_position:
+                    logger.warning(
+                        f"NO POSITION: {opp.market.id} @ {venue_id} status="
+                        f"{exec_result.status} - recorded nothing. {exec_result.reasoning[:120]}")
+                    execution_results[-1]["position_recorded"] = False
+                    execution_results[-1]["position_reason"] = (
+                        f"execution status {exec_result.status} committed no "
+                        f"capital, so no position exists to settle"
+                    )
+                    continue
+
+                execution_results[-1]["position_recorded"] = True
+                execution_results[-1]["fill"] = exec_result.to_position_dict()
+
+                # Draw the committed amount down as we go. Within one cycle the
+                # ledger is a snapshot taken before any of these trades, so
+                # without this every position in the batch would size against
+                # the same free cash - the original bug, one level down.
+                _committed = (exec_result.filled_usd
+                              if exec_result.committed_capital else amount_usd)
+                free_capital = max(0.0, free_capital - _committed)
+                if free_capital <= 0:
+                    logger.warning(
+                        "Free capital exhausted mid-cycle - no further positions "
+                        "will be opened in this batch.")
+
                 # --- Record the position so it can later be SETTLED -----------
                 #
                 # This block did not persist anything usable:
@@ -1105,17 +1257,30 @@ class TradingAgentV3:
                         "market_id": opp.market.id,
                         "market_question": opp.market.question[:200],
                         "side": opp.side,
-                        "market_price": opp.market_price,
+                        # The FILL price, not the requested max price. A limit
+                        # order at 0.52 that filled at 0.49 changes the P&L and
+                        # the edge, and settlement uses this price.
+                        "market_price": (exec_result.filled_price
+                                         or opp.market_price),
                         "fair_value": opp.estimated_fair,
                         "edge": opp.effective_edge,
                         "kelly_fraction": getattr(opp, "_kelly_fraction", None),
-                        "position_size_usd": amount_usd,
+                        # The FILLED size, not the intended size.
+                        "position_size_usd": (exec_result.filled_usd
+                                              if exec_result.committed_capital
+                                              else amount_usd),
                         "position_size_pct": (amount_usd / current_bankroll
                                               if current_bankroll else None),
                         "confidence": opp.confidence,
-                        "status": "open",
+                        # A simulated execution is recorded as paper, never as a
+                        # live position holding real capital.
+                        "status": "paper" if exec_result.is_simulated else "open",
                         "notes": f"venue={venue_id} strategy={strategy_name} "
-                                 f"mode={data_mode_for_calib}",
+                                 f"mode={data_mode_for_calib} "
+                                 f"exec_status={exec_result.status} "
+                                 f"order_id={exec_result.order_id} "
+                                 f"filled=${exec_result.filled_usd:.2f}"
+                                 f"@{exec_result.filled_price or 0:.4f}",
                     })
                 except Exception as e:
                     learning_problems.append(f"trade not persisted: {type(e).__name__}: {e}")
@@ -1144,15 +1309,27 @@ class TradingAgentV3:
 
                 # Venue/strategy/category performance, for allocation later.
                 try:
+                    # The fields this tracker actually needs. It used to
+                    # receive confidence/data_mode/trust_tier and none of
+                    # trade_id/category/forecast_prob/market_price/side, so
+                    # every call raised TypeError and no venue or strategy
+                    # outcome was ever recorded.
                     self.trade_outcome_tracker.record_trade(
+                        trade_id=trade_id,
                         market_id=opp.market.id,
                         venue_id=venue_id,
                         strategy=strategy_name,
+                        category=opp.category,
+                        forecast_prob=opp.estimated_fair,
+                        market_price=(exec_result.filled_price
+                                      or opp.market_price),
                         edge=opp.effective_edge,
+                        side=opp.side,
+                        amount_usd=(exec_result.filled_usd
+                                    if exec_result.committed_capital
+                                    else amount_usd),
                         confidence=opp.confidence,
-                        amount_usd=amount_usd,
                         data_mode=str(data_mode_for_calib),
-                        trust_tier=getattr(getattr(opp.market, 'data_mode', None), 'trust_tier', 0)
                     )
                 except Exception as e:
                     learning_problems.append(f"venue/strategy outcome not recorded: {type(e).__name__}: {e}")
@@ -1231,6 +1408,7 @@ class TradingAgentV3:
                 "polymarket_is_venue_1": "There is no Polymarket step - Polymarket becomes Venue #1 rather than PTAI = Polymarket bot"
             },
             "health": health,
+            "capital": self.last_ledger.to_dict() if getattr(self, "last_ledger", None) else None,
             "settlement": settlement_report.to_dict() if settlement_report else None,
             "eligibility": {k: v.value for k, v in eligibility.items()},
             "qualification": qual_report_dict,

@@ -140,27 +140,42 @@ class SettlementEngine:
 
     async def settle_pending(self, max_markets: int = 50) -> SettlementReport:
         """
-        Settle up to `max_markets` open positions this cycle.
+        Settle up to `max_markets` markets this cycle.
 
         Bounded deliberately: settlement is a network round trip per market, and
         a cycle must not block scanning for minutes.
+
+        Two defects lived here and both had the same shape - settlement was
+        considered a side effect of the CALIBRATION store rather than a
+        responsibility of the position ledger:
+
+          * `if not pending: return report` meant that with no unresolved
+            forecasts, NO trade was ever settled. A fresh install, or any run
+            where the calibration store is empty or was reset, would leave every
+            open position open forever.
+          * the loop iterated `pending` forecasts only, so an open trade whose
+            market had no forecast entry was invisible to settlement. A position
+            could be opened, never closed, and never contribute a P&L - the
+            agent would keep accounting for capital it had already lost.
+
+        The set of markets to ask about is now the UNION of markets with a
+        pending forecast and markets with an open trade. Whether a forecast
+        exists is irrelevant to whether a position needs closing.
         """
         import time
         start = time.time()
         report = SettlementReport()
 
-        if self.calibration_engine is None:
-            logger.warning("SettlementEngine has no calibration engine - cannot learn")
-            report.execution_time = time.time() - start
-            return report
-
-        pending = self.calibration_engine.pending_forecasts()
+        pending = []
+        if self.calibration_engine is not None:
+            pending = self.calibration_engine.pending_forecasts()
+        else:
+            # Settlement of POSITIONS does not require a calibration engine.
+            # Only the forecast half of the work below does.
+            logger.warning(
+                "SettlementEngine has no calibration engine - forecasts cannot "
+                "be resolved, open positions still will be")
         report.checked_forecasts = len(pending)
-
-        if not pending:
-            report.execution_time = time.time() - start
-            logger.info("Settlement: no pending forecasts")
-            return report
 
         # Trades awaiting settlement, keyed by market, so a settlement can close
         # the position as well as the forecast.
@@ -171,23 +186,45 @@ class SettlementEngine:
                     open_trades.setdefault(str(t.get("market_id")), t)
             except Exception as e:
                 logger.error(f"Settlement: could not read open trades: {e}")
+        report.checked_trades = len(open_trades)
+
+        # Forecasts first (they carry a venue hint), then trade-only markets.
+        pending_by_market: Dict[str, Any] = {}
+        market_order: List[str] = []
+        for point in pending:
+            market_id = str(point.market_id)
+            if market_id not in pending_by_market:
+                pending_by_market[market_id] = point
+                market_order.append(market_id)
+        for market_id in open_trades:
+            if market_id not in pending_by_market:
+                market_order.append(market_id)
+
+        if not market_order:
+            report.execution_time = time.time() - start
+            logger.info("Settlement: no pending forecasts and no open positions")
+            return report
 
         seen_markets = set()
-        for point in pending:
+        for market_id in market_order:
             if len(seen_markets) >= max_markets:
                 break
-            market_id = str(point.market_id)
             if market_id in seen_markets:
                 continue
             seen_markets.add(market_id)
+
+            point = pending_by_market.get(market_id)
+            trade = open_trades.get(market_id)
+            has_forecast = point is not None
 
             venue_id = self._venue_for_market(market_id, open_trades, point)
             if not venue_id:
                 report.unreadable += 1
                 report.items.append(SettledItem(
-                    market_id=market_id, venue_id="", kind="forecast",
+                    market_id=market_id, venue_id="",
+                    kind="forecast" if has_forecast else "trade",
                     applied=False, source="no_venue",
-                    reason="no venue associated with this forecast, so nothing "
+                    reason="no venue associated with this market, so nothing "
                            "can be asked about its resolution",
                 ))
                 continue
@@ -200,7 +237,8 @@ class SettlementEngine:
             if adapter is None:
                 report.unreadable += 1
                 report.items.append(SettledItem(
-                    market_id=market_id, venue_id=venue_id, kind="forecast",
+                    market_id=market_id, venue_id=venue_id,
+                    kind="forecast" if has_forecast else "trade",
                     applied=False, source="no_adapter",
                     reason=f"no adapter registered for {venue_id}",
                 ))
@@ -211,7 +249,8 @@ class SettlementEngine:
             except Exception as e:
                 report.errors += 1
                 report.items.append(SettledItem(
-                    market_id=market_id, venue_id=venue_id, kind="forecast",
+                    market_id=market_id, venue_id=venue_id,
+                    kind="forecast" if has_forecast else "trade",
                     applied=False, source="error",
                     reason=f"{type(e).__name__}: {e}",
                 ))
@@ -228,7 +267,8 @@ class SettlementEngine:
                         f"asking every cycle")
                 report.unreadable += 1
                 report.items.append(SettledItem(
-                    market_id=market_id, venue_id=venue_id, kind="forecast",
+                    market_id=market_id, venue_id=venue_id,
+                    kind="forecast" if has_forecast else "trade",
                     applied=False, source=str(source),
                     reason=(verdict or {}).get("reason", "no real settlement data"),
                 ))
@@ -242,47 +282,45 @@ class SettlementEngine:
             if outcome is None:
                 report.ambiguous += 1
                 report.items.append(SettledItem(
-                    market_id=market_id, venue_id=venue_id, kind="forecast",
+                    market_id=market_id, venue_id=venue_id,
+                    kind="forecast" if has_forecast else "trade",
                     applied=False, source=str(verdict.get("source", "")),
                     reason=verdict.get("reason", "settled but outcome ambiguous"),
                 ))
                 continue
 
-            # --- the forecast can now be resolved ---
-            try:
-                applied = self.calibration_engine.record_resolution(
-                    point.forecast_id, float(outcome))
-            except Exception as e:
-                report.errors += 1
-                logger.error(
-                    f"Settlement: recording resolution for {market_id} failed: "
-                    f"{type(e).__name__}: {e}")
-                report.items.append(SettledItem(
-                    market_id=market_id, venue_id=venue_id, kind="forecast",
-                    applied=False, source="record_error", outcome=float(outcome),
-                    reason=f"{type(e).__name__}: {e}",
-                ))
-                continue
-
-            if not applied:
-                report.items.append(SettledItem(
-                    market_id=market_id, venue_id=venue_id, kind="forecast",
-                    applied=False, source=str(verdict.get("source", "")),
-                    outcome=float(outcome),
-                    reason="calibration engine did not apply the resolution",
-                ))
-                continue
-
-            report.settled += 1
             item = SettledItem(
-                market_id=market_id, venue_id=venue_id, kind="forecast",
-                applied=True, outcome=float(outcome),
+                market_id=market_id, venue_id=venue_id,
+                kind="forecast" if has_forecast else "trade",
+                applied=False, outcome=float(outcome),
                 source=str(verdict.get("source", "")),
                 reason=verdict.get("reason", "settled"),
             )
+            applied_something = False
 
-            # --- and the trade, if one is open on this market ---
-            trade = open_trades.get(market_id)
+            # --- the forecast, if one is pending for this market ---
+            #
+            # A failure to resolve the forecast no longer `continue`s past the
+            # trade. Forecast bookkeeping and position closure are separate
+            # jobs, and a calibration problem must not strand a position.
+            if has_forecast:
+                try:
+                    applied = self.calibration_engine.record_resolution(
+                        point.forecast_id, float(outcome))
+                except Exception as e:
+                    report.errors += 1
+                    logger.error(
+                        f"Settlement: recording resolution for {market_id} failed: "
+                        f"{type(e).__name__}: {e}")
+                    applied = False
+                if applied:
+                    applied_something = True
+                else:
+                    logger.warning(
+                        f"Settlement: forecast {point.forecast_id} on "
+                        f"{market_id} was not applied")
+
+            # --- the trade, if one is open on this market ---
             if trade is not None:
                 pnl = compute_pnl(
                     side=trade.get("side"),
@@ -311,6 +349,8 @@ class SettlementEngine:
                         closed = False
                     if closed:
                         item.pnl = pnl
+                        item.kind = "trade"
+                        applied_something = True
                         report.realised_pnl_usd += pnl
                         if self.trade_outcome_tracker is not None:
                             try:
@@ -325,12 +365,17 @@ class SettlementEngine:
                                 logger.error(
                                     f"Settlement: trade outcome not recorded for "
                                     f"trade {trade.get('id')}: {type(e).__name__}: {e}")
+                    else:
+                        logger.warning(
+                            f"Settlement: trade {trade.get('id')} on {market_id} "
+                            f"was already resolved or could not be closed")
 
+            if applied_something:
+                item.applied = True
+                report.settled += 1
             report.items.append(item)
 
-        report.checked_trades = len(open_trades)
         report.execution_time = time.time() - start
-
         logger.info(
             f"Settlement: {report.settled} settled, {report.unresolved} still open, "
             f"{report.ambiguous} ambiguous, {report.unreadable} unreadable, "

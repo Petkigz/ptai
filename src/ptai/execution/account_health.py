@@ -269,15 +269,20 @@ class AccountHealthEngine:
 
     # -- rung 5: may this account actually submit an order? ----------------
 
-    async def _probe_order_permission(self, adapter) -> Tuple[bool, str]:
+    async def _probe_order_permission(self, adapter, opportunity=None) -> Tuple[bool, str]:
         """
         Prove an order can be submitted, by submitting one.
 
         Requires the adapter to declare `supports_order_probe`, which means it
-        can place a minimum-size order and cancel it. No adapter declares it
-        today, so this returns False everywhere - deliberately. An unproven
-        permission is reported as unproven rather than assumed, because
-        assuming it is how "configured" quietly becomes "ready".
+        can place a minimum-size order and cancel it. Polymarket does;
+        everything else does not yet, and an adapter that does not declare it is
+        reported as unproven rather than assumed - assuming it is how
+        "configured" quietly becomes "ready".
+
+        `opportunity` is passed through because a probe needs a specific
+        tradeable market to test against. Probing "this account" in the abstract
+        is not possible: permission is demonstrated on a real market or not at
+        all.
         """
         caps = getattr(adapter, "capabilities", None)
         if caps is None or not getattr(caps, "supports_order_probe", False):
@@ -294,7 +299,13 @@ class AccountHealthEngine:
                 "probe_order_permission()"
             )
         try:
-            ok = await probe()
+            ok = await probe(opportunity)
+        except TypeError:
+            # An adapter whose probe takes no opportunity.
+            try:
+                ok = await probe()
+            except Exception as e:
+                return False, f"order probe raised {type(e).__name__}: {e}"
         except Exception as e:
             return False, f"order probe raised {type(e).__name__}: {e}"
         if ok:
@@ -303,8 +314,14 @@ class AccountHealthEngine:
 
     # -- main ---------------------------------------------------------------
 
-    async def check_venue_health(self, venue_id: str) -> AccountHealthResult:
-        """Determine how far up the readiness ladder this venue has been proven."""
+    async def check_venue_health(self, venue_id: str,
+                                 opportunity=None) -> AccountHealthResult:
+        """
+        Determine how far up the readiness ladder this venue has been proven.
+
+        `opportunity` is used only by the order probe, which needs a market to
+        test against.
+        """
         venue_id = venue_id.lower().strip()
 
         if venue_id in self.health_cache:
@@ -456,7 +473,7 @@ class AccountHealthEngine:
         checks.append(f"Balance ${balance:.2f} (via {provenance}) >= min order ${min_order:.2f}")
 
         # -- rung 5: can an order be submitted? --
-        permitted, probe_note = await self._probe_order_permission(adapter)
+        permitted, probe_note = await self._probe_order_permission(adapter, opportunity)
         evidence["order_probe"] = probe_note
         if not permitted:
             checks_failed.append(probe_note)

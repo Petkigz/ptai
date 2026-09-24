@@ -4,13 +4,23 @@ Multi-Venue Executor - handles execution across 18 venues with per-venue guards
 Operational overhead: each venue has own API auth model rate limits failure modes
 """
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loguru import logger
 import asyncio
 
 from ..venues.registry import VenueRegistry
 from ..venues.adapter import VenueOpportunity
 from ..markets.orderbook import read_spread
+
+# Outcomes that mean real (or simulated) capital is now committed. Anything
+# else means no position exists and none may be recorded.
+FILLED_STATUSES = frozenset({"filled", "partial", "submitted"})
+SIMULATED_STATUSES = frozenset({"dry_run", "simulated", "paper"})
+# Explicitly no position: the venue refused, or we refused to ask.
+NO_POSITION_STATUSES = frozenset({
+    "blocked", "aborted", "rejected", "rate_limited", "error", "unknown",
+})
+
 
 @dataclass
 class ExecutionResult:
@@ -23,6 +33,50 @@ class ExecutionResult:
     gas_usd: float
     latency_ms: float
     reasoning: str
+    # What the venue actually did, as opposed to what we asked for. Only a
+    # filled (or partially filled) result may become a position.
+    filled_usd: float = 0.0
+    filled_price: float = 0.0
+    order_id: str = ""
+    raw_response: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def committed_capital(self) -> bool:
+        """
+        Did this execution actually commit capital?
+
+        The three states are distinct and must not be conflated:
+
+          filled/partial/submitted -> capital committed, record a position
+          dry_run/simulated/paper  -> no real capital, record a PAPER position
+          everything else          -> nothing happened, record nothing
+        """
+        return self.status in FILLED_STATUSES and self.filled_usd > 0
+
+    @property
+    def is_simulated(self) -> bool:
+        return self.status in SIMULATED_STATUSES
+
+    @property
+    def should_record_position(self) -> bool:
+        return self.committed_capital or self.is_simulated
+
+    def to_position_dict(self) -> Dict[str, Any]:
+        """The facts of what filled. Zeros are honest: nothing filled."""
+        return {
+            "venue_id": self.venue_id,
+            "market_id": self.market_id,
+            "status": self.status,
+            "requested_usd": self.amount_usd,
+            "filled_usd": self.filled_usd,
+            "filled_price": self.filled_price,
+            "fees_usd": self.fees_usd,
+            "gas_usd": self.gas_usd,
+            "order_id": self.order_id,
+            "simulated": self.is_simulated,
+            "reasoning": self.reasoning,
+        }
+
 
 class MultiVenueExecutor:
     def __init__(self, registry: VenueRegistry, bankroll: float = 50.0):
@@ -156,16 +210,23 @@ class MultiVenueExecutor:
             fees = adapter.calculate_fees(opportunity.market, max_spend_usd)
             # Gas for on-chain venues
             gas = 0.05 if venue_id in ["polymarket", "afx_dex"] else 0.0
+
+            fill = self._read_fill(result, max_spend_usd, max_price)
+
             return ExecutionResult(
                 venue_id=venue_id,
                 market_id=opportunity.market.id,
-                status=result.get("status", "unknown"),
+                status=fill["status"],
                 amount_usd=max_spend_usd,
-                price=max_price,
+                price=fill["price"] or max_price,
                 fees_usd=fees,
                 gas_usd=gas,
                 latency_ms=latency,
-                reasoning=f"{venue_id} execution latency {latency:.1f}ms fees ${fees:.4f} gas ${gas:.4f} | {result.get('message', '')[:100]}"
+                reasoning=f"{venue_id} execution latency {latency:.1f}ms fees ${fees:.4f} gas ${gas:.4f} | {result.get('message', '')[:100] if isinstance(result, dict) else str(result)[:100]}",
+                filled_usd=fill["filled_usd"],
+                filled_price=fill["price"],
+                order_id=fill["order_id"],
+                raw_response=result if isinstance(result, dict) else {"raw": str(result)},
             )
         except Exception as e:
             latency = (time.time() - start) * 1000
@@ -181,6 +242,99 @@ class MultiVenueExecutor:
                 latency_ms=latency,
                 reasoning=f"Error {e}"
             )
+
+    # Venue status strings that mean the order was accepted. Adapters differ
+    # ("matched" from Polymarket's CLOB, "submitted", "placed", "ok"), so the
+    # mapping is explicit rather than a substring guess.
+    _FILLED_ALIASES = {
+        "filled": "filled", "matched": "filled", "complete": "filled",
+        "completed": "filled", "executed": "filled",
+        "partial": "partial", "partially_filled": "partial",
+        "submitted": "submitted", "placed": "submitted", "accepted": "submitted",
+        "open": "submitted", "ok": "submitted", "success": "submitted",
+        "dry_run": "dry_run", "simulated": "dry_run", "paper": "dry_run",
+        # Keep refusals under their own names. They are all no-position
+        # outcomes, but collapsing them into "unknown" would throw away the
+        # reason, and the reason is what an operator needs.
+        "rejected": "rejected", "error": "error", "blocked": "blocked",
+        "aborted": "aborted", "rate_limited": "rate_limited",
+        "insufficient_funds": "rejected", "unauthorized": "rejected",
+        "invalid": "rejected",
+    }
+
+    def _read_fill(self, result: Any, requested_usd: float,
+                   requested_price: float) -> Dict[str, Any]:
+        """
+        Extract what ACTUALLY filled from an adapter response.
+
+        The old code took the adapter's raw status string straight into
+        ExecutionResult and copied the REQUESTED amount and price into the
+        result. Downstream, a position was opened from that - so a request that
+        was rejected, rate limited or simply never acknowledged still produced
+        an "open" position at a price nobody traded at, sized at an amount that
+        never left the account.
+
+        Nothing is assumed here. An unrecognised status is "unknown", which is
+        a no-position outcome. Missing size or price fields are treated as
+        zero-filled, because a fill we cannot quantify is not a fill we can
+        account for.
+        """
+        if not isinstance(result, dict):
+            return {"status": "unknown", "filled_usd": 0.0, "price": 0.0,
+                    "order_id": "", "note": "adapter returned no dict"}
+
+        raw_status = str(result.get("status", "") or "").strip().lower()
+        status = self._FILLED_ALIASES.get(raw_status, "unknown")
+
+        order_id = ""
+        for key in ("orderID", "order_id", "id", "orderId", "tx_hash"):
+            value = result.get(key)
+            if value:
+                order_id = str(value)
+                break
+
+        # Size: adapters report shares or USD. Prefer an explicit USD figure.
+        filled_usd = 0.0
+        for key in ("filled_usd", "amount_usd", "cost_usd", "size_usd",
+                    "notional_usd"):
+            value = result.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                filled_usd = float(value)
+                break
+        if filled_usd <= 0:
+            for key in ("size", "filled_size", "matched_size", "shares",
+                        "quantity", "amount"):
+                value = result.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    price_hint = self._read_price(result, requested_price)
+                    filled_usd = float(value) * (price_hint or requested_price)
+                    break
+
+        price = self._read_price(result, requested_price)
+
+        if status in ("filled", "partial", "submitted"):
+            if filled_usd <= 0:
+                # The venue says it took the order but gave us no size. We
+                # cannot account for capital we cannot quantify.
+                return {"status": "unknown", "filled_usd": 0.0, "price": price,
+                        "order_id": order_id,
+                        "note": f"status {raw_status!r} but no fill size reported - "
+                                f"cannot account for an unquantified position"}
+        else:
+            filled_usd = 0.0
+
+        return {"status": status, "filled_usd": filled_usd, "price": price,
+                "order_id": order_id, "raw_status": raw_status}
+
+    @staticmethod
+    def _read_price(result: Dict[str, Any], fallback: float) -> float:
+        for key in ("filled_price", "average_price", "avg_price", "price",
+                    "fill_price"):
+            value = result.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if 0.0 < float(value) <= 1.0:
+                    return float(value)
+        return 0.0
 
     async def execute_arbitrage_pair(self, arb, amount_per_leg: float = 3.0) -> List[ExecutionResult]:
         """

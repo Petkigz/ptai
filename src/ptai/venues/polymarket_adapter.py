@@ -35,9 +35,16 @@ class PolymarketAdapter(MarketAdapter):
             supports_browser_fallback=True,
             fee_taker_pct=0.02,
             fee_maker_pct=0.0,
-            min_order_usd=1.0
+            min_order_usd=1.0,
+            # This adapter can prove order permission: it can place a
+            # minimum-size order and cancel it. Declaring it is what lets
+            # AccountHealthEngine reach TRADE_PERMITTED for Polymarket.
+            supports_order_probe=True,
         )
         self.restricted_countries = {"US"}
+        # Evidence from the last order probe, or None if it has never run.
+        # AccountHealthEngine reads this to report WHAT was proven.
+        self.last_order_probe = None
 
     def check_eligibility(self, country_code: str = "UG") -> EligibilityStatus:
         country_code = country_code.upper()
@@ -604,6 +611,126 @@ class PolymarketAdapter(MarketAdapter):
             result.setdefault("price", price)
             result.setdefault("size", size)
         return result
+
+    async def probe_order_permission(self, opportunity=None) -> bool:
+        """
+        Prove this account can actually submit and withdraw an order.
+
+        This is the rung that turns "configured" into "ready to trade", and it
+        is the one thing no amount of credential inspection can establish.
+
+        Design constraints, all deliberate:
+
+          * Refuses in dry_run. A probe that places a live order while the agent
+            believes it is simulating is the exact failure the dry_run gate
+            exists to prevent.
+          * Posts a price far enough below the market that it cannot cross, so
+            the probe tests PERMISSION without taking a position. A probe that
+            can fill is a trade.
+          * Always attempts the cancel, including when the place half-succeeded.
+            An order left resting is exposure the caller does not know about.
+          * Returns True only if the order was posted AND confirmed cancelled.
+            Anything else is "not verified", never "verified".
+
+        Returns a bool for the AccountHealthEngine contract; the reasoning is
+        logged and recorded in the health result's evidence.
+        """
+        if self.dry_run:
+            logger.warning(
+                "Order probe refused: adapter is in dry_run. A probe places a "
+                "real order, so it cannot run while the agent is simulating.")
+            return False
+        if not (self.private_key and self.funder):
+            logger.warning("Order probe refused: no live credentials")
+            return False
+
+        market = opportunity.market if opportunity is not None else None
+        token_id = self._resolve_token_id(opportunity) if opportunity else ""
+        if not token_id:
+            logger.warning(
+                "Order probe refused: no opportunity/token supplied. Probing "
+                "requires a specific tradeable market.")
+            return False
+
+        from ..markets.polymarket import PolymarketExecutor
+        executor = PolymarketExecutor(private_key=self.private_key,
+                                      funder=self.funder)
+
+        # A minimum-size BUY placed far below the best bid cannot cross. The
+        # tick size is 0.01, so 0.01 is the lowest expressible price and is
+        # effectively never a marketable bid.
+        probe_price = 0.01
+        probe_size_usd = float(getattr(self.capabilities, "min_order_usd", 1.0) or 1.0)
+
+        client = getattr(executor, "client", None)
+        if client is None:
+            logger.error(
+                "Order probe refused: the CLOB client did not initialise "
+                "(credentials present but auth failed).")
+            return False
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+        except Exception as e:
+            logger.error(f"Order probe refused: py_clob_client unavailable ({e})")
+            return False
+
+        shares = max(1.0, round(probe_size_usd / probe_price, 2))
+        order_id = ""
+        reason = ""
+
+        try:
+            order_args = OrderArgs(price=probe_price, size=shares, side=BUY,
+                                   token_id=token_id)
+            signed = client.create_order(order_args)
+            response = client.post_order(signed, OrderType.GTC)
+            if isinstance(response, dict):
+                order_id = str(response.get("orderID")
+                               or response.get("order_id") or "")
+                if response.get("success") is False:
+                    reason = f"post rejected: {response}"
+            if not order_id:
+                reason = reason or f"post returned no order id: {response}"
+        except Exception as e:
+            reason = f"place failed: {type(e).__name__}: {e}"
+            logger.error(f"Order probe: {reason}")
+
+        # Cancel whatever we may have created, even on a partial failure.
+        cancelled = False
+        cancel_result = None
+        if order_id:
+            try:
+                cancel_result = executor.cancel_order(order_id)
+                cancelled = isinstance(cancel_result, dict) and \
+                    cancel_result.get("status") == "cancelled"
+                if not cancelled:
+                    reason = f"cancel failed: {cancel_result}"
+            except Exception as e:
+                reason = f"cancel raised: {type(e).__name__}: {e}"
+
+        self.last_order_probe = {
+            "attempted": True,
+            "token_id": token_id,
+            "market_id": market.id if market is not None else None,
+            "probe_price": probe_price,
+            "probe_shares": shares,
+            "order_id": order_id,
+            "cancelled": cancelled,
+            "reason": reason,
+            "cancel_result": cancel_result,
+        }
+
+        if order_id and cancelled:
+            logger.success(
+                f"Order permission VERIFIED for polymarket: placed and cancelled "
+                f"{shares} shares @ {probe_price} (order {order_id})")
+            return True
+
+        logger.error(
+            f"Order permission NOT verified for polymarket: {reason or 'unknown'}. "
+            f"Recorded as unproven; live capital stays disabled.")
+        return False
 
     async def get_settlement(self, market_id: str) -> Dict[str, Any]:
         """
