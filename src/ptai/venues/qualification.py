@@ -141,7 +141,34 @@ class VenueQualificationEngine:
         profit_paper = performance_stats.get("profit_paper", 0)
         profit_live = performance_stats.get("profit_live", 0)
         net_pnl = performance_stats.get("net_pnl", profit_paper)
-        expected_value = performance_stats.get("expected_value", avg_edge)
+        # The RECORDED expected net EV at entry - what the agent predicted it
+        # would make - not the average edge.
+        #
+        # This read `performance_stats["expected_value"]` with a fallback to
+        # `avg_edge`, and `expected_value` was itself `sum(edges)/n`: the mean of
+        # the recorded EFFECTIVE EDGES, a probability-scale number. The check
+        # below compares it with `min_expected_value = 0.01` and calls it
+        # "EV > 1% per trade". Mean edge and expected monetary value are not the
+        # same quantity, and a venue could clear the EV bar on its edge while
+        # every trade lost money to fees.
+        #
+        # None when nothing was measured, and None fails the gate rather than
+        # defaulting to zero: "never measured" must not pass, and must not read
+        # as "measurably zero" either.
+        ev_samples = int(performance_stats.get("expected_value_samples") or 0)
+        ev_coverage = float(performance_stats.get("expected_value_coverage") or 0.0)
+        expected_value = performance_stats.get("expected_value")
+        if expected_value is None and ev_samples == 0:
+            # Older rows carry no expected EV. Falling back to the mean edge is
+            # the old behaviour and is allowed, but only when there is nothing
+            # measured - and it is labelled, so a reader can tell which number
+            # they were given.
+            expected_value = avg_edge
+            ev_source = "avg_edge fallback (no recorded expected net EV)"
+        else:
+            expected_value = float(expected_value or 0.0)
+            ev_source = (f"recorded expected net EV over {ev_samples} trade(s), "
+                         f"{ev_coverage*100:.0f}% coverage")
         fees_total = performance_stats.get("fees_total", 0)
         slippage_total = performance_stats.get("slippage_total", 0)
         drawdown_max = performance_stats.get("drawdown_max", 0)
@@ -159,7 +186,8 @@ class VenueQualificationEngine:
             "min_skill": skill >= self.requirements["min_forecast_skill"],
             "min_profit": profit_paper >= self.requirements["min_profit_paper"],
             "min_net_pnl": net_pnl >= self.requirements["min_net_pnl"],
-            "min_ev": expected_value >= self.requirements["min_expected_value"],
+            "min_ev": (expected_value is not None and
+                       expected_value >= self.requirements["min_expected_value"]),
             "min_edge": avg_edge >= self.requirements["min_avg_edge"],
             "max_drawdown": drawdown_max <= self.requirements["max_drawdown"],
             "min_profit_factor": profit_factor >= self.requirements["min_profit_factor"],
@@ -174,7 +202,7 @@ class VenueQualificationEngine:
             f"total {total} >= {self.requirements['min_trades']}? {checks['min_trades']} | "
             f"win_rate {win_rate:.2f} >= {self.requirements['min_win_rate']}? {checks['min_win_rate']} BUT win rate alone NOT profitability - example 90% wins +$0.01 10% losses -$1.00 fantastic win rate still lose money | "
             f"net_pnl ${net_pnl:.2f} >= ${self.requirements['min_net_pnl']}? {checks['min_net_pnl']} | "
-            f"expected_value {expected_value*100:.2f}% >= {self.requirements['min_expected_value']*100:.1f}%? {checks['min_ev']} | "
+            f"expected_value {expected_value*100:.2f}% >= {self.requirements['min_expected_value']*100:.1f}%? {checks['min_ev']} ({ev_source}) | "
             f"profit_factor {profit_factor:.2f} >= {self.requirements['min_profit_factor']}? {checks['min_profit_factor']} | "
             f"brier {brier:.3f} <= {self.requirements['max_brier']}? {checks['max_brier']} | "
             f"log_loss {log_loss:.3f} <= {self.requirements['max_log_loss']}? {checks['max_log_loss']} | "

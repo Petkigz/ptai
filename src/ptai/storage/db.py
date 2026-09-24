@@ -189,6 +189,34 @@ CREATE INDEX IF NOT EXISTS idx_trade_outcomes_venue
     ON trade_outcomes (venue_id, strategy, category);
 """
 
+PAPER = "paper"
+LIVE = "live"
+
+
+def _execution_mode(value, status=None) -> str:
+    """
+    Normalise the execution mode of a trade to 'paper' or 'live'.
+
+    Fail-closed in the direction that matters: anything unrecognised is treated
+    as PAPER, because the only other option is to treat an unknown trade as one
+    that moved real money - and that is what would corrupt the bankroll.
+    """
+    text = str(value or "").strip().lower()
+    if text in ("paper", "simulated", "sim", "dry_run", "shadow"):
+        return PAPER
+    if text in ("live", "real", "executed"):
+        return LIVE
+    # No explicit mode, so fall back to the status the row was written with.
+    # The writer sets status='paper' for a simulated execution and 'open' for a
+    # real one, so 'open' means live - reading it as paper would be the worst
+    # possible mistake in this function: real P&L would never reach the real
+    # bankroll, and the account would look frozen.
+    status_text = str(status or "").strip().lower()
+    if status_text in ("open", "executed", "pending", "settled"):
+        return LIVE
+    return PAPER
+
+
 class Storage:
     def __init__(self, db_path: str = "./data/ptai.db"):
         self.db_path = Path(db_path)
@@ -249,6 +277,29 @@ class Storage:
         ("orders", "strategy", "TEXT"),
         ("orders", "category", "TEXT"),
         ("orders", "data_mode", "TEXT"),
+        # EXECUTION MODE, separate from data mode.
+        #
+        # `data_mode` describes the MARKET DATA (real prices and books from a
+        # live venue) and `execution_mode` describes what actually happened to
+        # the money (a simulated fill, or real capital). One paper exploration
+        # trade against live market data reads `data_mode='live'` - which is
+        # factually correct and tells you nothing about whether money moved.
+        # The paper/live split in qualification was computed from `data_mode`,
+        # so a simulated trade could be counted as a live outcome.
+        ("trades", "execution_mode", "TEXT"),
+        # The price actually paid per share, in the units the P&L needs.
+        #
+        # `market_price` meant the YES price when the opportunity was built and
+        # the TOKEN price once a fill price existed, so the same column held two
+        # different numbers depending on whether the order had filled - and
+        # settlement, which needs the token price, was given whichever it was.
+        # Both are now stored, explicitly.
+        ("trades", "token_price_at_entry", "REAL"),
+        ("trades", "yes_price_at_entry", "REAL"),
+        ("trades", "fees_usd", "REAL"),
+        ("trade_outcomes", "expected_net_ev", "REAL"),
+        ("trade_outcomes", "expected_net_ev_pct", "REAL"),
+        ("trade_outcomes", "execution_mode", "TEXT"),
     )
 
     def _migrate(self):
@@ -265,10 +316,44 @@ class Storage:
             except Exception as e:
                 logger.error(f"Migration {table}.{column} failed: {e}")
 
+    @staticmethod
+    def _backfill_execution_mode(conn):
+        """
+        Label the rows written before `execution_mode` existed.
+
+        The trade's own `notes` carry the execution status that was recorded at
+        the time (`exec_status=paper_filled`), and `status` is 'paper' for a
+        simulated position that has not settled yet. Anything else is treated as
+        live, which is the conservative direction: a mislabelled paper trade
+        would corrupt the real bankroll, whereas a mislabelled live trade only
+        leaves paper statistics slightly pessimistic.
+
+        Deliberately NOT derived from `data_mode` in the notes: that is the
+        market data mode, and using it is the bug this column exists to fix.
+        """
+        try:
+            cur = conn.execute(
+                "UPDATE trades SET execution_mode = 'paper' "
+                "WHERE execution_mode IS NULL AND "
+                "(LOWER(COALESCE(status,'')) = 'paper' "
+                " OR LOWER(COALESCE(notes,'')) LIKE '%exec_status=paper%')")
+            backfilled = cur.rowcount
+            conn.execute(
+                "UPDATE trades SET execution_mode = 'live' "
+                "WHERE execution_mode IS NULL")
+            conn.commit()
+            if backfilled:
+                logger.info(
+                    f"Backfilled execution_mode=paper on {backfilled} "
+                    f"pre-existing trade row(s)")
+        except Exception as e:
+            logger.error(f"execution_mode backfill failed: {e}")
+
     def _init_db(self):
         self.conn.executescript(DB_SCHEMA)
         self.conn.commit()
         self._migrate()
+        self._backfill_execution_mode(self.conn)
         # Initialize bankroll if not exists
         if not self.get_state("bankroll"):
             self.set_state("bankroll", "50.0")
@@ -298,6 +383,21 @@ class Storage:
 
     def set_bankroll(self, amount: float):
         self.set_state("bankroll", str(amount))
+
+    def get_paper_bankroll(self) -> float:
+        """
+        The paper account's own bankroll - real capital's shadow, and never it.
+
+        Kept in state beside the real bankroll so a simulation has somewhere to
+        accumulate its results without touching the number that is true.
+        """
+        v = self.get_state("paper_bankroll")
+        if v:
+            return float(v)
+        return float(self.get_state("initial_bankroll") or 50.0)
+
+    def set_paper_bankroll(self, amount: float):
+        self.set_state("paper_bankroll", str(amount))
         # Also log to history
         now = datetime.now(timezone.utc).isoformat()
         initial = float(self.get_state("initial_bankroll") or 50.0)
@@ -318,8 +418,8 @@ class Storage:
     def log_trade(self, trade: Dict[str, Any]) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cur = self.conn.execute("""
-            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes, venue_id, strategy, category, order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes, venue_id, strategy, category, order_id, execution_mode, token_price_at_entry, yes_price_at_entry, fees_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now,
             trade.get("market_id"),
@@ -340,6 +440,13 @@ class Storage:
             trade.get("strategy"),
             trade.get("category"),
             trade.get("order_id"),
+            # Named, or silently dropped on the floor. This INSERT has already
+            # lost columns that way once (strategy/category/order_id), and a
+            # dropped execution_mode would put paper P&L back into the bankroll.
+            _execution_mode(trade.get("execution_mode"), trade.get("status")),
+            trade.get("token_price_at_entry"),
+            trade.get("yes_price_at_entry"),
+            trade.get("fees_usd"),
         ))
         self.conn.commit()
         # Update total trades
@@ -577,7 +684,8 @@ class Storage:
         double settlement cannot pay out twice.
         """
         cur = self.conn.execute(
-            "SELECT id, resolved, position_size_usd FROM trades WHERE id = ?",
+            "SELECT id, resolved, position_size_usd, execution_mode, status "
+            "FROM trades WHERE id = ?",
             (trade_id,))
         row = cur.fetchone()
         if row is None:
@@ -587,15 +695,36 @@ class Storage:
             logger.warning(f"resolve_trade: trade {trade_id} already resolved, ignoring")
             return False
 
+        # The MODE IS READ FROM THE ROW, not taken from the caller.
+        #
+        # It used to bank every settlement the same way, so a simulated
+        # exploration trade that resolved in a live market did this:
+        #
+        #   paper trade -> paper P&L -> set_bankroll(get_bankroll() + pnl)
+        #
+        # and the agent's real capital changed because a simulation said so. A
+        # caller cannot now mislabel a trade to make it bank, and a paper row
+        # banks into the paper account even if someone asks for otherwise.
+        mode = _execution_mode(row["execution_mode"], row["status"])
+
         self.conn.execute(
             "UPDATE trades SET resolved = 1, outcome = ?, pnl = ?, status = 'settled', notes = ? WHERE id = ?",
             (outcome, pnl, notes, trade_id))
         self.conn.commit()
 
-        self.set_bankroll(self.get_bankroll() + pnl)
-        logger.info(
-            f"Trade {trade_id} settled: outcome={outcome} pnl=${pnl:+.2f} "
-            f"bankroll=${self.get_bankroll():.2f}")
+        if mode == PAPER:
+            paper_before = self.get_paper_bankroll()
+            self.set_paper_bankroll(paper_before + pnl)
+            logger.info(
+                f"Trade {trade_id} settled (PAPER): outcome={outcome} "
+                f"pnl=${pnl:+.2f} paper bankroll="
+                f"${self.get_paper_bankroll():.2f} | REAL bankroll unchanged "
+                f"at ${self.get_bankroll():.2f}")
+        else:
+            self.set_bankroll(self.get_bankroll() + pnl)
+            logger.info(
+                f"Trade {trade_id} settled (LIVE): outcome={outcome} "
+                f"pnl=${pnl:+.2f} bankroll=${self.get_bankroll():.2f}")
         return True
 
     def get_unresolved_trades(self, limit: int = 200) -> List[Dict]:
@@ -625,10 +754,21 @@ class Storage:
         initial = float(self.get_state("initial_bankroll") or 50.0)
         total_pnl = bankroll - initial
         total_trades = int(self.get_state("total_trades") or 0)
-        # Calculate win rate from resolved trades
-        cur2 = self.conn.execute("SELECT COUNT(*) as total, SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins, AVG(pnl) as avg_pnl FROM trades WHERE resolved=1")
+        # Win rate and average P&L over LIVE trades only.
+        #
+        # Every resolved trade used to be counted here, so simulated wins moved
+        # the operator's win rate - and `total_pnl` is bankroll minus initial,
+        # which used to include paper P&L banked into the real bankroll. The
+        # two account for different things and are now reported separately.
+        cur2 = self.conn.execute(
+            "SELECT COUNT(*) as total, "
+            "SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins, "
+            "AVG(pnl) as avg_pnl FROM trades "
+            "WHERE resolved=1 AND COALESCE(execution_mode,'live')='live'")
         row = cur2.fetchone()
         win_rate = (row["wins"] / row["total"] * 100) if row and row["total"] else 0
+
+        paper = self.get_paper_performance()
         return {
             "bankroll": bankroll,
             "initial_bankroll": initial,
@@ -638,7 +778,50 @@ class Storage:
             "win_rate": win_rate,
             "avg_pnl": row["avg_pnl"] if row else 0,
             "history": history,
-            "open_positions": self.count_open_positions()
+            "open_positions": self.count_open_positions(),
+            # The simulation's own record, kept apart so it can inform learning
+            # without ever being mistaken for real capital.
+            "paper": paper,
+        }
+
+    def get_paper_performance(self) -> Dict:
+        """
+        The paper account's results, separate from the real one.
+
+        A paper equity curve is what makes step 6 of the engineering sequence
+        possible - proving the loop on real data before risking capital - so it
+        has to be kept honestly, and it has to be kept somewhere other than the
+        bankroll.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) AS wins, "
+                "SUM(COALESCE(pnl,0)) AS net_pnl, "
+                "AVG(CASE WHEN pnl IS NOT NULL THEN pnl END) AS avg_pnl "
+                "FROM trades WHERE resolved=1 "
+                "AND COALESCE(execution_mode,'live')='paper'").fetchone()
+            open_paper = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM trades "
+                "WHERE resolved=0 AND COALESCE(execution_mode,'live')='paper'"
+            ).fetchone()
+        except Exception as e:
+            logger.error(f"get_paper_performance failed: {e}")
+            return {"error": str(e)}
+
+        initial = float(self.get_state("initial_bankroll") or 50.0)
+        total = int(row["total"] or 0) if row else 0
+        net = float(row["net_pnl"] or 0.0) if row else 0.0
+        bankroll = self.get_paper_bankroll()
+        return {
+            "bankroll": bankroll,
+            "initial_bankroll": initial,
+            "net_pnl": net,
+            "net_pnl_pct": (net / initial * 100) if initial else 0.0,
+            "settled_trades": total,
+            "open_positions": int(open_paper["c"] or 0) if open_paper else 0,
+            "win_rate": ((row["wins"] / total * 100) if total else 0.0) if row else 0.0,
+            "avg_pnl": float(row["avg_pnl"] or 0.0) if row else 0.0,
         }
 
     def check_self_preservation(self, daily_cost: float = 5.0, max_unprofitable_days: int = 3) -> Dict:

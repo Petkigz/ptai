@@ -705,6 +705,75 @@ class TestFullCycle:
         finally:
             agent.storage.close()
 
+    def test_a_settled_paper_position_never_moves_real_capital(
+            self, tmp_path, monkeypatch):
+        """
+        The whole contamination path, end to end through the real cycle.
+
+        Exploration executes on paper against live market data, then the market
+        resolves - and `SettlementEngine` used to call `resolve_trade`, which
+        banked the P&L into the BANKROLL for every trade it closed. So:
+
+            paper trade -> paper position -> real market settles
+            -> paper P&L -> real bankroll += paper P&L
+
+        The agent could grow real capital by simulating. This runs the real
+        cycle twice and asserts which account moved.
+        """
+        agent, adapter = build_agent(tmp_path, dry_run=True)
+        adapter.place_order = _simulating_place_order(adapter)
+        _inject_opportunity(agent, adapter._market(), monkeypatch, edge=0.15)
+
+        async def nothing_qualified(self, target_per_venue=20, **kwargs):
+            return _report(qualified=[])
+        monkeypatch.setattr(type(agent.capability_engine),
+                            "evaluate_all_venues", nothing_qualified,
+                            raising=True)
+        agent._last_qualified_venue_ids = []
+
+        try:
+            real_before = agent.storage.get_bankroll()
+            paper_before = agent.storage.get_paper_bankroll()
+
+            _cycle(agent)
+
+            positions = agent.storage.get_open_positions()
+            assert len(positions) == 1, "the exploration trade did not record"
+            assert positions[0]["execution_mode"] == "paper"
+            assert agent.storage.get_bankroll() == pytest.approx(real_before), (
+                "opening a paper position moved real capital"
+            )
+
+            # The market resolves YES, and settlement closes the paper position.
+            adapter.settled_outcome = 1.0
+            r2 = _cycle(agent)
+            assert r2["settlement"]["settled"] == 1, (
+                f"the paper position was not settled: {r2['settlement']}"
+            )
+
+            row = agent.storage.conn.execute(
+                "SELECT pnl, execution_mode, resolved FROM trades").fetchone()
+            assert row["resolved"] == 1
+            pnl = float(row["pnl"])
+            assert pnl != 0.0, "a settled trade with no P&L tests nothing"
+
+            assert agent.storage.get_bankroll() == pytest.approx(real_before), (
+                f"a settled PAPER trade moved the real bankroll by "
+                f"${agent.storage.get_bankroll() - real_before:.2f}. Simulated "
+                f"results must never manufacture real capital."
+            )
+            assert agent.storage.get_paper_bankroll() == pytest.approx(
+                paper_before + pnl), (
+                "the paper account did not record the result, so the "
+                "simulation cannot be learned from"
+            )
+            # And the outcome it learned from is labelled paper.
+            outcome = agent.storage.conn.execute(
+                "SELECT execution_mode, pnl FROM trade_outcomes").fetchone()
+            assert outcome["execution_mode"] == "paper"
+        finally:
+            agent.storage.close()
+
     def test_paper_positions_do_not_consume_live_capital(self, tmp_path, monkeypatch):
         """
         Paper trading is how a venue earns qualification. It must build the
@@ -998,8 +1067,23 @@ class TestPaperModeSimulatesTheWholeCycle:
             f"${filled:.4f} simulated fill"
         )
         # The average price came from walking the ladder, so it is above the
-        # touch the strategy was looking at.
-        assert position["market_price"] > 0.56
+        # touch the strategy was looking at - and it is recorded as the TOKEN
+        # price, which is the number settlement has to use.
+        #
+        # `market_price` used to hold the fill price after a fill and the YES
+        # price before one, so the same column meant two different numbers
+        # depending on timing, and settlement was handed whichever it happened
+        # to be. It is the YES price at entry now, with the token price beside
+        # it; for a YES buy they differ only by the slippage of the walk.
+        assert position["token_price_at_entry"] > 0.56
+        assert position["market_price"] == pytest.approx(0.55, abs=0.01), (
+            "market_price is the YES price at entry, not the fill"
+        )
+        assert position["yes_price_at_entry"] == pytest.approx(0.55, abs=0.01)
+        assert position["execution_mode"] == "paper", (
+            "a simulated fill must be labelled paper in the execution mode that "
+            "the bankroll split reads"
+        )
 
     def test_a_paper_fill_does_not_consume_live_capital(self, tmp_path, monkeypatch):
         """

@@ -51,6 +51,13 @@ class SettlementReport:
     ambiguous: int = 0
     errors: int = 0
     realised_pnl_usd: float = 0.0
+    # Reported SEPARATELY from the real figure above. Both used to be summed
+    # into one number, so a report reading "realised +$9.20" could be $8.00 of
+    # simulation and $1.20 of real money - and the operator has no way to tell,
+    # which makes the one number they care about unreliable.
+    paper_pnl_usd: float = 0.0
+    live_settled: int = 0
+    paper_settled: int = 0
     items: List[SettledItem] = field(default_factory=list)
     execution_time: float = 0.0
 
@@ -64,6 +71,9 @@ class SettlementReport:
             "ambiguous": self.ambiguous,
             "errors": self.errors,
             "realised_pnl_usd": round(self.realised_pnl_usd, 2),
+            "paper_pnl_usd": round(self.paper_pnl_usd, 2),
+            "live_settled": self.live_settled,
+            "paper_settled": self.paper_settled,
             "execution_time": round(self.execution_time, 2),
             "items": [
                 {"market_id": i.market_id, "venue_id": i.venue_id, "kind": i.kind,
@@ -75,14 +85,26 @@ class SettlementReport:
 
 
 def compute_pnl(side: str, entry_price: float, stake_usd: float,
-                outcome: float) -> Optional[float]:
+                outcome: float, price_is_token_price: bool = False) -> Optional[float]:
     """
     P&L for a binary position held to settlement.
 
     `side` is what we bought: YES/1/LONG pays when outcome is 1.0, NO/0/SHORT
-    pays when outcome is 0.0. Polymarket has no separate NO token price here, so
-    buying NO at `entry_price` on the YES scale means paying (1 - entry_price)
-    per share, and a winning NO share settles at 1.
+    pays when outcome is 0.0.
+
+    `price_is_token_price` says which of the two meanings `entry_price` has, and
+    the two are NOT interchangeable:
+
+      * False (the original contract) - `entry_price` is the YES price, so a NO
+        buy paid 1 - entry. Callers holding only a YES price use this, and
+        Polymarket's NO price is 1 - YES price to within the spread.
+      * True - `entry_price` is the price of the token actually bought, which is
+        what the execution path fills at and now stores as
+        `token_price_at_entry`. Buying NO at 0.30 means paying 0.30 a share.
+
+    Reading one as the other is not a rounding error. Buying NO at 0.30 and
+    settling on the YES scale pays out as though the shares cost 0.70, turning a
+    +$7.00 win on a $3 stake into +$1.29.
 
     Returns None when the inputs cannot produce an honest number - a settlement
     P&L computed from a missing price is worse than no P&L, because it moves the
@@ -107,7 +129,7 @@ def compute_pnl(side: str, entry_price: float, stake_usd: float,
         price_paid = entry
         won = outcome == 1.0
     else:
-        price_paid = 1.0 - entry
+        price_paid = entry if price_is_token_price else 1.0 - entry
         won = outcome == 0.0
 
     if price_paid <= 0:
@@ -322,11 +344,47 @@ class SettlementEngine:
 
             # --- the trade, if one is open on this market ---
             if trade is not None:
+                # The price ACTUALLY PAID per share, from the token that was
+                # bought - not re-derived from the YES price.
+                #
+                # `market_price` used to hold the fill price after the order
+                # filled, and `compute_pnl` was handed it as though it were the
+                # YES price, from which it computed 1 - entry for a NO buy. Once
+                # execution moved to pricing the NO token, that was applied to a
+                # number that was already the NO price:
+                #
+                #   YES 0.70, NO token bought at 0.30, $3 stake
+                #     correct:  $3 / 0.30 - $3 = +$7.00 when NO wins
+                #     as read:  $3 / (1 - 0.30) - $3 = +$1.29
+                #
+                # so a winning NO was paid out as if it had cost 0.70 a share.
+                #
+                # `token_price_at_entry` is stored now. Rows written before it
+                # existed put the FILL price in `market_price`, and the fill is
+                # always on the token that was bought (the paper path resolves
+                # the same token and reads its book), so the same reading is the
+                # correct one for them - it corrects their NO accounting rather
+                # than preserving the old under-count.
+                # Which account this settlement pays into. Read from the row,
+                # the same way `resolve_trade` decides, so the report cannot
+                # disagree with what actually moved.
+                paper_settlement = (
+                    str(trade.get("execution_mode") or "").strip().lower()
+                    == "paper"
+                    or (not trade.get("execution_mode")
+                        and str(trade.get("status") or "").lower() == "paper"))
+
+                entry_price = trade.get("token_price_at_entry")
+                price_source = "token_price_at_entry"
+                if entry_price is None:
+                    entry_price = trade.get("market_price")
+                    price_source = "market_price (legacy: YES-scale re-derived)"
                 pnl = compute_pnl(
                     side=trade.get("side"),
-                    entry_price=trade.get("market_price"),
+                    entry_price=entry_price,
                     stake_usd=trade.get("position_size_usd"),
                     outcome=float(outcome),
+                    price_is_token_price=True,
                 )
                 if pnl is None:
                     item.pnl = None
@@ -351,7 +409,17 @@ class SettlementEngine:
                         item.pnl = pnl
                         item.kind = "trade"
                         applied_something = True
-                        report.realised_pnl_usd += pnl
+                        logger.info(
+                            f"Settlement: trade {trade.get('id')} side="
+                            f"{trade.get('side')} entry={entry_price} "
+                            f"({price_source}) outcome={outcome} "
+                            f"pnl={pnl:+.2f}")
+                        if paper_settlement:
+                            report.paper_pnl_usd += pnl
+                            report.paper_settled += 1
+                        else:
+                            report.realised_pnl_usd += pnl
+                            report.live_settled += 1
                         if self.trade_outcome_tracker is not None:
                             try:
                                 self.trade_outcome_tracker.record_resolution(
@@ -380,6 +448,7 @@ class SettlementEngine:
             f"Settlement: {report.settled} settled, {report.unresolved} still open, "
             f"{report.ambiguous} ambiguous, {report.unreadable} unreadable, "
             f"{report.errors} errors, realised ${report.realised_pnl_usd:+.2f} "
+            f"paper ${report.paper_pnl_usd:+.2f} "
             f"in {report.execution_time:.1f}s")
         return report
 

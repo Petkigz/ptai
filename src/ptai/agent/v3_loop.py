@@ -1189,10 +1189,42 @@ class TradingAgentV3:
         exploration_trades = []  # shadow lane
         bankroll = self.storage.get_performance_summary().get("bankroll", 50.0)
 
+        # The VENUE's view of the account, read before sizing.
+        #
+        # Free cash was computed from the local trade log alone, so a position
+        # the venue holds and PTAI does not know about - placed by hand, or
+        # filled while the process was down - was invisible, and the next cycle
+        # could spend that capital again. The adapter's read is cached, so the
+        # readiness ladder later in the cycle uses this same snapshot rather than
+        # asking the venue a second time and possibly getting a different answer.
+        venue_positions = None
+        venue_state_complete = None
+        try:
+            # The venue that actually holds capital, READ from storage - the
+            # same place the console reads it, so the agent and the operator
+            # cannot disagree about which account is live. Until one is chosen,
+            # the only venue with a real order path is the one worth asking.
+            from ..strategy.venue_selection import VenueSelector
+            live_venue = (VenueSelector(storage=self.storage)
+                          .remembered_live_venue() or "polymarket")
+            adapter = self.venue_registry.adapters.get(live_venue)
+            if adapter is not None and hasattr(adapter, "get_portfolio"):
+                portfolio = await adapter.get_portfolio()
+                venue_positions = portfolio.get("venue_only_positions")
+                venue_state_complete = not portfolio.get("account_state_incomplete", True)
+        except Exception as e:
+            # Fail closed: an account we could not read is not a flat account.
+            logger.warning(
+                f"Venue account state unavailable ({type(e).__name__}: {e}) - "
+                f"treating committed capital as unknown")
+            venue_state_complete = False
+
         # Free cash, not bankroll. `bankroll` is still used for the per-trade
         # percentage caps because those are expressed against account equity,
         # but the amount actually deployable is what is uncommitted.
-        ledger = self.ledger_builder.build()
+        ledger = self.ledger_builder.build(
+            venue_positions=venue_positions,
+            venue_state_complete=venue_state_complete)
         free_capital = ledger.free_cash
         self.last_ledger = ledger
         logger.info(
@@ -1614,9 +1646,29 @@ class TradingAgentV3:
                 # Failures here are now loud and recorded on the execution result,
                 # so a position that was taken but cannot be learned from is
                 # visible rather than assumed.
+                # TWO labels, and they answer different questions.
+                #
+                # `data_mode` describes the market data - real books and prices
+                # from a live venue. `execution_mode` describes what happened to
+                # the money. An exploration trade is executed in paper against
+                # live data, so it is data_mode=live AND execution_mode=paper,
+                # and the learning chain must read the second one or it counts
+                # simulated trades as live outcomes.
                 data_mode_for_calib = getattr(opp.market, 'data_mode', 'live')
                 if hasattr(data_mode_for_calib, 'value'):
                     data_mode_for_calib = data_mode_for_calib.value
+                execution_mode = "paper" if exec_result.is_simulated else "live"
+
+                # The price actually paid per share, on the token being bought.
+                # `filled_price` is that price; `opp.market_price` is the YES
+                # price, so it is only usable as the token price for a YES buy.
+                yes_price_at_entry = float(opp.market_price or 0.0)
+                if exec_result.filled_price:
+                    token_price_at_entry = float(exec_result.filled_price)
+                elif str(opp.side or "").upper() == "YES":
+                    token_price_at_entry = yes_price_at_entry
+                else:
+                    token_price_at_entry = round(1.0 - yes_price_at_entry, 6)
                 strategy_name = (opp.raw.get("strategy", "unknown")
                                  if hasattr(opp, 'raw') and isinstance(opp.raw, dict)
                                  else "unknown")
@@ -1633,8 +1685,17 @@ class TradingAgentV3:
                         # the edge, and settlement uses this price. For a paper
                         # fill it is the average of the levels the simulation
                         # walked, which is how slippage enters the P&L at all.
-                        "market_price": (exec_result.filled_price
-                                         or opp.market_price),
+                        # Kept as the YES price it means to the strategy, with
+                        # the token price beside it. This column used to hold
+                        # the fill price when there was one and the YES price
+                        # when there was not, so it meant two different numbers
+                        # in the same column - and settlement, which needs the
+                        # token price, was given whichever it happened to be.
+                        "yes_price_at_entry": yes_price_at_entry,
+                        "token_price_at_entry": token_price_at_entry,
+                        "market_price": yes_price_at_entry,
+                        "execution_mode": execution_mode,
+                        "fees_usd": getattr(exec_result, "fees_usd", None),
                         "fair_value": opp.estimated_fair,
                         "edge": opp.effective_edge,
                         "kelly_fraction": getattr(opp, "_kelly_fraction", None),
@@ -1728,6 +1789,25 @@ class TradingAgentV3:
                         edge=opp.effective_edge,
                         side=opp.side,
                         confidence=opp.confidence,
+                        # PAPER or LIVE - the money, not the data.
+                        execution_mode=execution_mode,
+                        # The expected net EV computed BEFORE the trade was
+                        # taken, so qualification can weigh what was actually
+                        # predicted instead of the average edge.
+                        #
+                        # Read from THIS opportunity, not from a local: `expected_ev`
+                        # belongs to the sizing loop, and on the exploration path
+                        # it was never assigned at all - passing it raised
+                        # UnboundLocalError, which refused the whole learning
+                        # record. An outcome that is not written teaches nothing.
+                        # None when this trade was never scored, which the gate
+                        # treats as unmeasured rather than as zero.
+                        expected_net_ev=getattr(
+                            getattr(opp, "_expected_ev", None), "net_ev_usd", None),
+                        expected_net_ev_pct=getattr(
+                            getattr(opp, "_expected_ev", None), "net_ev_pct", None),
+                        # The market data mode, kept for context. The
+                        # paper/live split reads execution_mode, above.
                         data_mode=str(data_mode_for_calib),
                         # What the trade actually cost. Recorded so the
                         # qualification gate can MEASURE fees, slippage and

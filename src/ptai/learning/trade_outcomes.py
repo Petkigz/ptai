@@ -41,6 +41,37 @@ class TradeOutcome:
     slippage_bps: Optional[float] = None
     execution_quality: Optional[float] = None
     data_mode: str = ""
+    # PAPER or LIVE - what happened to the money. `data_mode` describes the
+    # market data and was doing this job, so a simulated trade against live
+    # prices was counted as a live outcome in every statistic that split on it.
+    execution_mode: str = ""
+    # The expected net EV that was computed BEFORE the trade was taken, in
+    # dollars and as a fraction of the stake.
+    #
+    # Qualification's `expected_value` was the average of `edge` - the recorded
+    # EFFECTIVE EDGE - which is a probability-scale number and not an expected
+    # monetary value at all. A venue could pass "EV >= 1%" on a mean edge of 3c
+    # per share while every trade lost money after fees. None means the trade
+    # predates this measurement and must not be averaged in as if it were zero.
+    expected_net_ev: Optional[float] = None
+    expected_net_ev_pct: Optional[float] = None
+
+
+def _mode_from(value) -> str:
+    """
+    PAPER or LIVE, or "" when the caller did not say.
+
+    Unknown is left unknown rather than assumed: `qualification_stats_from_outcomes`
+    treats an unlabelled outcome as neither live nor paper, and that is the
+    honest answer. Assuming LIVE would let a simulation vote in the live
+    statistics; assuming PAPER would hide a real trade.
+    """
+    text = str(value or "").strip().lower()
+    if text in ("paper", "simulated", "sim", "dry_run", "shadow"):
+        return "paper"
+    if text in ("live", "real", "executed"):
+        return "live"
+    return ""
 
 
 class TradeOutcomeTracker:
@@ -137,8 +168,9 @@ class TradeOutcomeTracker:
                     "venue_id, strategy, category, forecast_prob, market_price, "
                     "edge, side, amount_usd, actual_outcome, pnl, resolved_at, "
                     "brier_score, was_correct, recorded_at, fees_usd, "
-                    "slippage_bps, execution_quality, data_mode) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "slippage_bps, execution_quality, data_mode, "
+                    "execution_mode, expected_net_ev, expected_net_ev_pct) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (outcome.trade_id, outcome.market_id, outcome.venue_id,
                      outcome.strategy, outcome.category, outcome.forecast_prob,
                      outcome.market_price, outcome.edge, outcome.side,
@@ -147,7 +179,9 @@ class TradeOutcomeTracker:
                      outcome.brier_score, int(outcome.was_correct),
                      datetime.now(timezone.utc).isoformat(),
                      outcome.fees_usd, outcome.slippage_bps,
-                     outcome.execution_quality, outcome.data_mode or None))
+                     outcome.execution_quality, outcome.data_mode or None,
+                     outcome.execution_mode or None,
+                     outcome.expected_net_ev, outcome.expected_net_ev_pct))
             self.storage.conn.commit()
             return True
         except Exception as e:
@@ -160,7 +194,9 @@ class TradeOutcomeTracker:
     def record_trade(self, trade_id: str = None, market_id: str = "", venue_id: str = "",
                      strategy: str = "", category: str = "", forecast_prob: float = None,
                      market_price: float = None, edge: float = 0.0, side: str = "",
-                     amount_usd: float = 0.0, **extra):
+                     amount_usd: float = 0.0, execution_mode: str = "",
+                     expected_net_ev: float = None,
+                     expected_net_ev_pct: float = None, **extra):
         """
         Record an opened trade.
 
@@ -219,6 +255,13 @@ class TradeOutcomeTracker:
             slippage_bps=_optional_float(extra.get("slippage_bps")),
             execution_quality=_optional_float(extra.get("execution_quality")),
             data_mode=str(extra.get("data_mode") or ""),
+            execution_mode=_mode_from(execution_mode or extra.get("execution_mode")),
+            expected_net_ev=_optional_float(
+                expected_net_ev if expected_net_ev is not None
+                else extra.get("expected_net_ev")),
+            expected_net_ev_pct=_optional_float(
+                expected_net_ev_pct if expected_net_ev_pct is not None
+                else extra.get("expected_net_ev_pct")),
         )
         self.outcomes.append(outcome)
         self._persist(outcome)
@@ -382,6 +425,11 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "execution_quality_avg": 0.0,
         "costs_measured": 0, "slippage_measured": 0,
         "modes": [], "live_trades": 0, "paper_trades": 0,
+        "unclassified_trades": 0,
+        # None, not 0.0: nothing was ever predicted, which is not the same as
+        # having predicted no profit. The gate fails on None.
+        "expected_value": None, "expected_value_usd": None,
+        "expected_value_samples": 0, "expected_value_coverage": 0.0,
         "source": "no recorded outcomes",
     }
     if storage is None:
@@ -391,7 +439,8 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
             """
             SELECT forecast_prob, edge, actual_outcome, pnl, brier_score,
                    was_correct, amount_usd, fees_usd, slippage_bps,
-                   execution_quality, data_mode
+                   execution_quality, data_mode, execution_mode,
+                   expected_net_ev, expected_net_ev_pct
             FROM trade_outcomes
             WHERE venue_id = ? AND actual_outcome IS NOT NULL
             ORDER BY COALESCE(resolved_at, recorded_at)
@@ -457,13 +506,44 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
                       if r["execution_quality"] is not None]
     modes = [str(r["data_mode"] or "") for r in rows]
 
-    # Realised P&L split by execution mode. Qualification is supposed to weigh
-    # paper and live separately; with no mode recorded they were one pool, so a
-    # paper result could carry a venue toward live capital.
-    live_rows = [r for r in rows if str(r["data_mode"] or "").lower() in ("live", "real")]
-    paper_rows = [r for r in rows if str(r["data_mode"] or "").lower() not in ("live", "real")]
+    # Realised P&L split by EXECUTION mode, which is what this split is about.
+    #
+    # It was computed from `data_mode`, which describes the market data. An
+    # exploration trade is executed on paper against live prices, so it recorded
+    # data_mode='live' and its simulated P&L was counted as live profit - the
+    # exact outcome the split exists to prevent. `execution_mode` is now written
+    # by the execution path and this reads it.
+    #
+    # An outcome with NEITHER label is not counted as live: unknown is not a
+    # promotion to live, and it is not quietly filed as paper either. The counts
+    # are reported so the gap is visible.
+    live_rows = [r for r in rows
+                 if str(r["execution_mode"] or "").lower() in ("live", "real")]
+    paper_rows = [r for r in rows
+                  if str(r["execution_mode"] or "").lower() in
+                  ("paper", "simulated", "sim", "dry_run", "shadow")]
+    unclassified_rows = [r for r in rows
+                         if r not in live_rows and r not in paper_rows]
     profit_live = sum(_f(r, "pnl") for r in live_rows)
     profit_paper = sum(_f(r, "pnl") for r in paper_rows)
+
+    # The expected net EV that was recorded WHEN THE TRADE WAS TAKEN.
+    #
+    # The qualification gate's `expected_value` was `avg_edge` - the mean of the
+    # recorded effective edges, a probability-scale number - while the
+    # requirement it is compared against is written as "EV >1% per trade". Mean
+    # edge and expected monetary value are different quantities, and a venue
+    # could clear the EV bar on edge alone while losing money to fees. This is
+    # the real figure, and the coverage is reported with it so a mean over three
+    # recorded trades cannot be read as a mean over all of them.
+    ev_values = [float(r["expected_net_ev"]) for r in rows
+                 if r["expected_net_ev"] is not None]
+    ev_pct_values = [float(r["expected_net_ev_pct"]) for r in rows
+                     if r["expected_net_ev_pct"] is not None]
+    expected_value = (sum(ev_pct_values) / len(ev_pct_values)
+                      if ev_pct_values else None)
+    expected_value_usd = (sum(ev_values) / len(ev_values)
+                          if ev_values else None)
 
     # Slippage in USD: basis points of the notional actually traded.
     slippage_usd = sum(
@@ -527,5 +607,16 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "modes": sorted(set(m for m in modes if m)),
         "live_trades": len(live_rows),
         "paper_trades": len(paper_rows),
+        # Reported, not hidden: an outcome with no execution mode is in neither
+        # split, and a silent difference between these three numbers and the
+        # sample size is how it went unnoticed before.
+        "unclassified_trades": len(unclassified_rows),
+        # The recorded expected net EV at entry, meant over the trades that
+        # actually have one. None - not 0.0 - when none does: "never measured"
+        # must not read as "measurably zero".
+        "expected_value": expected_value,
+        "expected_value_usd": expected_value_usd,
+        "expected_value_samples": len(ev_pct_values),
+        "expected_value_coverage": (len(ev_pct_values) / n) if n else 0.0,
         "source": f"{n} recorded outcomes",
     }

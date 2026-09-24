@@ -215,6 +215,62 @@ def _as_bytes32(value: str) -> bytes:
 # the redeemer
 # ----------------------------------------------------------------------
 
+def read_venue_positions(session, user: str, redeemable_only: bool = False,
+                         limit: int = 500) -> tuple:
+    """
+    The venue's OWN position list for a wallet - the authoritative account state.
+
+    Kept next to the redemption fetch because it is the same endpoint, the same
+    backoff and the same parsing; the only difference is whether the venue is
+    asked to filter to redeemable positions.
+
+    This matters beyond redemption: PTAI's SQLite is its BOOKKEEPING. A position
+    that exists at the venue and not in the local database - placed by hand, or
+    filled while the process was down - is exposure the risk system cannot see,
+    and "the venue says you hold this" is the only thing that can reveal it.
+
+    Returns (positions, available, reason). `available=False` means the venue
+    could not be asked, which is NOT the same as "no positions".
+    """
+    if not user:
+        return [], False, "no wallet address, so no position list can be requested"
+
+    last_error = ""
+    for base in (DATA_API_V2, DATA_API):
+        for attempt in range(3):
+            try:
+                params = {"user": user, "sizeThreshold": 0,
+                          "limit": min(500, limit)}
+                if redeemable_only:
+                    params["redeemable"] = "true"
+                response = session.get(f"{base}/positions", params=params,
+                                       timeout=15)
+                if response.status_code == 429:
+                    wait = 1.5 * (attempt + 1)
+                    logger.warning(
+                        f"positions API rate limited; backing off {wait}s")
+                    time.sleep(wait)
+                    continue
+                if response.status_code >= 400:
+                    last_error = f"HTTP {response.status_code} from {base}"
+                    break
+                payload = response.json()
+                rows = payload.get("data") if isinstance(payload, dict) else payload
+                if rows is None:
+                    rows = []
+                if not isinstance(rows, list):
+                    last_error = (f"unexpected payload shape from {base}: "
+                                  f"{type(rows).__name__}")
+                    break
+                logger.info(f"Venue positions: {len(rows)} row(s) from {base}")
+                return rows, True, ""
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                time.sleep(0.5 * (attempt + 1))
+    logger.warning(f"Could not read venue positions: {last_error}")
+    return [], False, last_error
+
+
 class Redeemer:
     """
     Read claimable positions from the venue and claim them.

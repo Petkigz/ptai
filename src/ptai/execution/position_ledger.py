@@ -108,7 +108,8 @@ class PositionLedgerBuilder:
         self.storage = storage
         self._bankroll_provider = bankroll_provider
 
-    def build(self, price_lookup=None) -> PositionLedger:
+    def build(self, price_lookup=None, venue_positions=None,
+              venue_state_complete=None) -> PositionLedger:
         """
         Compute the ledger.
 
@@ -116,6 +117,17 @@ class PositionLedgerBuilder:
         market. Without it, open positions are carried at cost and
         unrealised_pnl is reported as 0 with a warning, because an unknown mark
         must not be presented as a profit or a loss.
+
+        `venue_positions` are positions the VENUE reports that our own records do
+        not contain - placed by hand, or filled while the process was down. They
+        are real capital committed, so they are reserved here; without them the
+        ledger could offer free cash that is already spent.
+
+        `venue_state_complete` is the venue read's own verdict. False or None
+        means the account could not be fully read, and reservations are then
+        UNKNOWN - the same fail-closed treatment as an unreadable working order,
+        because "I could not ask" and "there is nothing there" are different
+        answers and only one of them is safe to trade on.
         """
         ledger = PositionLedger()
 
@@ -139,12 +151,48 @@ class PositionLedgerBuilder:
             open_trades = []
 
         try:
+            # LIVE settlements only. Paper P&L is real data about the strategy
+            # and not real money; summing both here put simulated profit into
+            # the equity and drawdown the operator is shown.
             realised_row = self.storage.conn.execute(
-                "SELECT COALESCE(SUM(pnl), 0) AS total FROM trades WHERE resolved = 1"
+                "SELECT COALESCE(SUM(pnl), 0) AS total FROM trades "
+                "WHERE resolved = 1 AND COALESCE(execution_mode,'live')='live'"
             ).fetchone()
             ledger.realised_pnl = float(realised_row["total"] or 0.0) if realised_row else 0.0
         except Exception as e:
             ledger.warnings.append(f"could not read realised P&L: {e}")
+
+        # Capital committed to positions the venue knows about and we do not.
+        external_cost = 0.0
+        external_count = 0
+        for position in (venue_positions or []):
+            try:
+                amount = float(position.get("amount_usd") or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if amount <= 0:
+                # A venue position with no valuation is still exposure. Count it
+                # as unknown rather than as nothing.
+                ledger.reservations_unknown = True
+                ledger.warnings.append(
+                    "venue position without a value: exposure cannot be sized")
+                continue
+            external_cost += amount
+            external_count += 1
+
+        if external_count:
+            ledger.open_position_cost += external_cost
+            ledger.live_position_count += external_count
+            ledger.warnings.append(
+                f"{external_count} venue-only position(s) worth "
+                f"${external_cost:.2f} reserved: the venue reports exposure that "
+                f"is not in the local trade log")
+
+        if venue_state_complete is False:
+            ledger.reservations_unknown = True
+            ledger.warnings.append(
+                "venue account state could not be read: working orders and "
+                "positions may exist that are not in this ledger")
 
         marked = 0
         unmarked = 0

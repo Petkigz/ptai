@@ -14,7 +14,7 @@ import re
 import json
 import random
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from loguru import logger
 
@@ -37,6 +37,61 @@ class FairValueResult:
     side: str = "YES"  # YES or NO
     raw: Dict = None
     llm_provider: str = "heuristic"
+
+@dataclass
+class _SentimentView:
+    """
+    The fields `_build_prompt` reads, from whatever shape the caller had.
+
+    Missing fields get honest neutral defaults rather than fabricated ones: a
+    sentiment dict with a score and nothing else must not invent a tweet count
+    or a confidence that makes the sentiment look corroborated.
+    """
+    score: float = 0.0
+    bullish_pct: float = 0.0
+    bearish_pct: float = 0.0
+    neutral_pct: float = 0.0
+    summary: str = ""
+    key_phrases: List[str] = field(default_factory=list)
+    tweet_count: int = 0
+    confidence: float = 0.0
+
+
+def _as_sentiment(sentiment):
+    """
+    Accept either the structured object or the dict V3 puts in the context.
+
+    One value, two shapes: `EnsembleForecaster` passes `context["sentiment"]`,
+    which V3 builds as a dict, while `_build_prompt` reads attributes. Converting
+    at the boundary is the fix; changing one caller would have left the next one
+    free to reintroduce it.
+    """
+    if sentiment is None:
+        return None
+    if isinstance(sentiment, dict):
+        if not sentiment:
+            return None
+        phrases = sentiment.get("key_phrases") or []
+        if isinstance(phrases, str):
+            phrases = [phrases]
+        def _num(key, default=0.0):
+            try:
+                return float(sentiment.get(key, default) or default)
+            except (TypeError, ValueError):
+                return default
+        return _SentimentView(
+            score=_num("score"),
+            bullish_pct=_num("bullish_pct"),
+            bearish_pct=_num("bearish_pct"),
+            neutral_pct=_num("neutral_pct"),
+            summary=str(sentiment.get("summary") or
+                       sentiment.get("reasoning") or ""),
+            key_phrases=[str(p) for p in phrases][:10],
+            tweet_count=int(_num("tweet_count")),
+            confidence=_num("confidence", _num("credibility")),
+        )
+    return sentiment
+
 
 class Brain:
     def __init__(self, llm_config=None, llm_router=None):
@@ -83,6 +138,13 @@ class Brain:
 
     def _build_prompt(self, market: Market, sentiment: Optional[SentimentResult], research_text: str = "") -> tuple:
         """Build LLM prompt for fair value estimation, returns (system, user)"""
+        # V3 hands the ensemble a DICT; this function expects an object with
+        # attributes. Both were true at the same time, so on the real V3 path the
+        # LLM branch raised AttributeError('dict' object has no attribute
+        # 'score') before it ever reached the provider - and the caller's
+        # `except` logged it as "LLM forecast failed", which is why the component
+        # looked wired and produced nothing.
+        sentiment = _as_sentiment(sentiment)
         sentiment_block = ""
         if sentiment:
             sentiment_block = f"""
@@ -212,7 +274,17 @@ Rules: fair 0.01-0.99, side YES if fair>market else NO, calibrated, if unsure fa
         )
 
     def estimate_fair_value(self, market: Market, sentiment: Optional[SentimentResult] = None, research_text: str = "") -> FairValueResult:
-        """Main entry - estimate fair value"""
+        """
+        Main entry - estimate fair value.
+
+        `sentiment` may be the structured object or the dict V3 puts in the
+        context. It is normalised HERE, once, because every consumer below reads
+        attributes: `_build_prompt` formats them and `_fallback_heuristic` reads
+        `sentiment.confidence`. Normalising inside `_build_prompt` alone fixed
+        the prompt and then failed on the next reader, which is the same
+        one-shape-assumption bug moved one step along.
+        """
+        sentiment = _as_sentiment(sentiment)
         system_prompt, user_prompt = self._build_prompt(market, sentiment, research_text)
 
         llm_result = self._call_llm(system_prompt, user_prompt)

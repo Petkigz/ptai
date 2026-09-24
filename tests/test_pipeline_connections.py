@@ -386,16 +386,30 @@ class TestWorkingOrdersReserveCash:
 # ----------------------------------------------------------------------
 
 def _record_costed_outcomes(storage, tracker, n=150, with_costs=True):
+    """
+    A paper run against LIVE market data - the realistic paper simulation.
+
+    The two labels say two different things and both are true here:
+    `data_mode="live"` (real books and prices from the venue) and
+    `execution_mode="paper"` (no real money moved). The fixture used to record
+    only `data_mode="live_paper"`, which the old paper/live split read as paper
+    purely because that string is not equal to "live" - and which would have
+    been read as LIVE by any code that checked `data_mode == "live"`. Writing
+    both makes the split test what it claims to test.
+    """
     for i in range(n):
         won = (i % 10) < 8
         tid = storage.log_trade({
             "market_id": f"C{i}", "venue_id": "polymarket", "side": "YES",
             "position_size_usd": 3.0, "market_price": 0.5, "fair_value": 0.75,
-            "edge": 0.15, "confidence": 0.7, "strategy": "value"})
+            "edge": 0.15, "confidence": 0.7, "strategy": "value",
+            "execution_mode": "paper", "status": "paper",
+            "yes_price_at_entry": 0.5, "token_price_at_entry": 0.5})
         pnl = 1.2 if won else -1.8
         storage.resolve_trade(tid, outcome=1.0 if won else 0.0, pnl=pnl)
         kwargs = {"fees_usd": 0.06, "slippage_bps": 10.0,
-                  "execution_quality": 0.98, "data_mode": "live_paper"} \
+                  "execution_quality": 0.98, "data_mode": "live",
+                  "execution_mode": "paper"} \
             if with_costs else {}
         tracker.record_trade(
             trade_id=str(tid), market_id=f"C{i}", venue_id="polymarket",
@@ -439,8 +453,12 @@ class TestQualificationMetricsAreMeasured:
         tracker = TradeOutcomeTracker(storage=storage)
         _record_costed_outcomes(storage, tracker, n=20)
         stats = qualification_stats_from_outcomes(storage, "polymarket")
-        assert stats["live_trades"] == 0
+        assert stats["live_trades"] == 0, (
+            "these ran on live DATA and moved no money; live data is not live "
+            "execution"
+        )
         assert stats["paper_trades"] == 20
+        assert stats["unclassified_trades"] == 0
         assert stats["profit_live"] == 0.0, (
             "nothing here was executed live, so live profit is zero"
         )

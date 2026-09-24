@@ -4,6 +4,7 @@ FIXED V7: Real orderbook intelligence + Real portfolio + No dangerous fallbacks
 """
 import asyncio
 import json
+import time
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
@@ -11,6 +12,18 @@ from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportuni
 from ..markets.base import Market, MarketSource, DataMode
 from ..markets.polymarket import PolymarketClient
 from ..markets.scanner import MarketScanner
+
+
+_DATA_API_SESSION = None
+
+
+def _data_api_session():
+    """One pooled HTTP session for the venue's public data API."""
+    global _DATA_API_SESSION
+    if _DATA_API_SESSION is None:
+        import requests
+        _DATA_API_SESSION = requests.Session()
+    return _DATA_API_SESSION
 
 
 class PolymarketAdapter(MarketAdapter):
@@ -27,6 +40,8 @@ class PolymarketAdapter(MarketAdapter):
         # debug log, leaving its registry None. Every PolymarketAdapter
         # construction burned a near-limit stack for nothing.
         self._scanner = None
+        # (read_at, payload). See PORTFOLIO_CACHE_SECONDS.
+        self._portfolio_cache = None
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
@@ -344,7 +359,15 @@ class PolymarketAdapter(MarketAdapter):
                 "warning": "Error fallback - not trustworthy"
             }
 
-    async def get_portfolio(self) -> Dict[str, Any]:
+    # The account state is read once per cycle and used by both the ledger (to
+    # reserve real committed capital) and the readiness ladder. A cache keeps
+    # that one read from becoming two network round trips, and keeps the two
+    # consumers looking at the SAME snapshot - two independent reads could
+    # disagree, and then the ledger would size against a different account than
+    # the one the ladder approved.
+    PORTFOLIO_CACHE_SECONDS = 20.0
+
+    async def get_portfolio(self, use_cache: bool = True) -> Dict[str, Any]:
         """
         Real portfolio synchronization - FIXED V7: Truly real, not placeholder
         User correctly identified: portfolio implementation still essentially placeholder returning balance:0 positions:[] orders:[]
@@ -353,6 +376,11 @@ class PolymarketAdapter(MarketAdapter):
         
         Now: tries multiple sources, reports what is real vs placeholder, never pretend placeholder is real
         """
+        if use_cache and self._portfolio_cache is not None:
+            age = time.time() - self._portfolio_cache[0]
+            if age < self.PORTFOLIO_CACHE_SECONDS:
+                return self._portfolio_cache[1]
+
         portfolio_sources = []
         errors = []
         # Set only if a venue-side source produced a number. Everything else in
@@ -452,6 +480,77 @@ class PolymarketAdapter(MarketAdapter):
                 except Exception as e:
                     errors.append(f"Venue balance read failed: {type(e).__name__}: {e}")
             
+            # The venue's OWN positions and working orders.
+            #
+            # The balance was being venue-verified while the positions, orders
+            # and exposure beside it were read from PTAI's SQLite. So the agent
+            # could know Polymarket held $X and have no idea that it also held
+            # three positions it had not placed - a manual trade, or a fill that
+            # arrived while the process was down. Exposure the risk system cannot
+            # see is the exposure that ends accounts.
+            venue_positions_available = False
+            venue_positions_reason = "not attempted: no funder address"
+            venue_only_positions = []
+            if self.funder:
+                try:
+                    from ..execution.redemption import read_venue_positions
+                    rows, available, reason = read_venue_positions(
+                        _data_api_session(), self.funder, redeemable_only=False)
+                    venue_positions_available = available
+                    venue_positions_reason = reason
+                    if available:
+                        known = {(str(p.get("market_id") or ""),
+                                  str(p.get("side") or "").upper())
+                                 for p in positions}
+                        known_tokens = {str(p.get("token_id") or "")
+                                        for p in positions}
+                        for row in rows:
+                            asset = str(row.get("asset") or row.get("tokenId") or "")
+                            outcome = str(row.get("outcome") or "").upper()
+                            size = row.get("size")
+                            condition = str(row.get("conditionId") or "")
+                            try:
+                                size = float(size or 0.0)
+                            except (TypeError, ValueError):
+                                size = 0.0
+                            if size <= 0:
+                                continue
+                            if (condition, outcome) in known or (asset and asset in known_tokens):
+                                continue
+                            venue_only_positions.append({
+                                "market_id": condition or asset,
+                                "token_id": asset,
+                                "side": outcome or "UNKNOWN",
+                                "size": size,
+                                "amount_usd": row.get("currentValue") or 0.0,
+                                "price": row.get("curPrice") or row.get("avgPrice") or 0.0,
+                                "title": row.get("title") or "",
+                                "source": "venue_positions",
+                                "known_locally": False,
+                            })
+                        portfolio_sources.append("venue_positions")
+                except Exception as e:
+                    venue_positions_reason = f"{type(e).__name__}: {e}"
+                    logger.warning(f"Venue positions read failed: {e}")
+
+            # Working orders AS THE VENUE SEES THEM, not as the local DB believes.
+            venue_orders_available = False
+            venue_orders_reason = "not attempted: no credentials"
+            venue_open_orders = []
+            if self.private_key and self.funder:
+                try:
+                    executor = self._get_executor()
+                    if executor is not None:
+                        fetched = executor.get_open_orders()
+                        venue_orders_available = bool(fetched.get("available"))
+                        venue_orders_reason = fetched.get("reason", "")
+                        venue_open_orders = fetched.get("orders") or []
+                        if venue_orders_available:
+                            portfolio_sources.append("clob_open_orders")
+                except Exception as e:
+                    venue_orders_reason = f"{type(e).__name__}: {e}"
+                    logger.warning(f"Venue open-order read failed: {e}")
+
             # When the venue answered, ITS figure is the balance - the local
             # number is our estimate of it, and where they disagree the venue is
             # right.
@@ -473,15 +572,20 @@ class PolymarketAdapter(MarketAdapter):
                 "exposure": {
                     "total_usd": total_exposure_usd,
                     "total_pct": exposure_pct_calc,
-                    "open_positions": len(positions),
+                    "open_positions": len(positions) + len(venue_only_positions),
                     "by_venue": {"polymarket": total_exposure_usd},
                     "by_category": {}
                 },
-                "positions": positions,
-                "positions_count": len(positions),
+                # The union: what we think we hold, plus what the venue says we
+                # hold that we did not know about. They are marked rather than
+                # merged, because one of them is PTAI's bookkeeping and the other
+                # is the account.
+                "positions": positions + venue_only_positions,
+                "positions_count": len(positions) + len(venue_only_positions),
                 "orders": open_orders,
                 "open_orders": open_orders,
                 "open_orders_count": len(open_orders),
+                "venue_open_orders": venue_open_orders,
                 "fills": fills[:20],
                 "fills_count": len(fills),
                 "total_trades": total_trades,
@@ -501,6 +605,23 @@ class PolymarketAdapter(MarketAdapter):
                            else "+".join(portfolio_sources)),
                 "portfolio_sources": "+".join(portfolio_sources),
                 "contains_local_state": True,
+                # What is venue-authoritative and what is only our bookkeeping.
+                # The balance has been venue-confirmed for a while; the positions
+                # and orders beside it had not been, and the difference is the
+                # whole question of whether the risk system is looking at the
+                # real account.
+                "venue_positions_available": venue_positions_available,
+                "venue_positions_reason": venue_positions_reason,
+                "venue_only_positions": venue_only_positions,
+                "venue_only_positions_count": len(venue_only_positions),
+                "venue_orders_available": venue_orders_available,
+                "venue_orders_reason": venue_orders_reason,
+                "venue_open_orders_count": len(venue_open_orders),
+                # True when something about the account could not be read, so a
+                # consumer cannot mistake an unreadable account for a flat one.
+                "account_state_incomplete": not (
+                    venue_positions_available and
+                    (venue_orders_available or not self.private_key)),
                 "available": _venue_side_balance is not None,
                 # NOT is_real: True unless the venue itself answered. Every number in this branch comes from the
                 # local database - PTAI's own bookkeeping - and the on-chain read
@@ -532,6 +653,7 @@ class PolymarketAdapter(MarketAdapter):
                 "warnings": errors if errors else [],
                 "critical_blocker_fixed": "Previously placeholder balance:0 positions:[] orders:[] - now real storage sync"
             }
+            self._portfolio_cache = (time.time(), portfolio)
             
             # Said plainly. This line used to read "Portfolio REAL", which is
             # how a local database read came to look like a verified venue

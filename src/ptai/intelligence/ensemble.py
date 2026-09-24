@@ -267,8 +267,19 @@ class EnsembleForecaster:
                 # endpoint, model and timeout than the rest of the intelligence
                 # stack. Hand it the router already in use.
                 brain = Brain(llm_router=self.llm_router)
+                # The research is passed through. V3 goes to the trouble of
+                # fetching news, X sentiment and web research, and the LLM call
+                # was dropping the web research on the floor - so the component
+                # with the largest weight reasoned from the market question and
+                # the sentiment alone.
+                #
+                # `sentiment` is handed over as V3 built it; Brain accepts the
+                # dict or the structured object.
                 llm_res = brain.estimate_fair_value(
-                    market=market, sentiment=context.get("sentiment"))
+                    market=market,
+                    sentiment=context.get("sentiment"),
+                    research_text=context.get("research") or "",
+                )
                 forecasts.append(self.add_llm_forecast(market, {
                     "fair_value": llm_res.fair_value,
                     "confidence": llm_res.confidence,
