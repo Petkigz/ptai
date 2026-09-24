@@ -619,6 +619,18 @@ class TradingAgentV3:
                 orderbook = await adapter.get_orderbook(market)
                 context["orderbook"] = orderbook
                 context["orderbook_venue"] = adapter.venue_id
+                # ALSO attached to the market, because the expected-EV stage
+                # reads `opp.market.raw["orderbook"]` and nothing ever put it
+                # there. The result was two different cost estimates for the same
+                # trade: EdgeCalculator priced the spread from the real book,
+                # then ExpectedNetEVEngine - handed {} - fell back to a default
+                # 0.02 spread, so the two stages disagreed about the trade's own
+                # costs and the later one decided.
+                try:
+                    if isinstance(getattr(market, "raw", None), dict):
+                        market.raw["orderbook"] = orderbook
+                except Exception as e:
+                    logger.debug(f"Could not attach the orderbook to {market.id}: {e}")
                 # Check if orderbook is real
                 if not orderbook.get("is_real", False):
                     logger.warning(f"Orderbook for {market.id} is ESTIMATION not real CLOB - edge may not be executable")
@@ -1352,12 +1364,34 @@ class TradingAgentV3:
             logger.info(f"Core Objective PASS: {opp.market.id} @ {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} score {opp.score:.3f} amount ${proposed_amount:.2f} netEV ${expected_ev.net_ev_usd:.2f} - ALL independently enforced rules PASSED (consistent sizing)")
             final_trades.append(opp)
         
-        # V10 FIX #8: Exploration lane - shadow/paper only, no live capital, for learning
+        # V10 FIX #8: Exploration lane - shadow/paper only, no live capital, for
+        # learning.
+        #
+        # These candidates used to be collected here, marked, appended to a list,
+        # and then COUNTED IN A LOG LINE. Nothing executed them. The consequence
+        # was a deadlock on every fresh installation:
+        #
+        #     no qualified venues -> pick an exploration candidate
+        #     -> do not execute it -> zero trade outcomes
+        #     -> qualification stays at zero -> no qualified venues -> repeat
+        #
+        # The agent could never bootstrap its own qualification evidence from
+        # zero, so the "100 paper trades -> qualified -> live" lifecycle was
+        # unreachable by construction. They now go through the SAME execution
+        # path as everything else, forced to paper, so they produce real
+        # simulated fills, real positions and real learning records.
         for opp in exploration_candidates:
             opp._proposed_amount = 1.0  # minimal shadow
             opp._is_exploration = True
             exploration_trades.append(opp)
             logger.info(f"Exploration SHADOW: {opp.market.id} @ {opp.venue_id} score {opp.score:.3f} - shadow/paper only, NO live capital, for discovering new edges")
+
+        # The exploration lane is downstream of qualification, so on a fresh
+        # install it is the ONLY source of evidence. Route it into the execution
+        # loop, after the qualified trades so it can never displace a real one.
+        for opp in exploration_trades:
+            if opp not in final_trades:
+                final_trades.append(opp)
         
         # Execution - V10 FIX #1: ONE canonical execution path via MultiVenueExecutor
         # Architecture: V3 → ExecutionGuard → MultiVenueExecutor → Exact venue adapter → place_order()
@@ -1479,11 +1513,14 @@ class TradingAgentV3:
                 
                 # V10 FIX #1: ONE canonical path: MultiVenueExecutor.execute_single()
                 # Executor has: MOCK protection, exact routing ABORT, rate limits, min order checks, fee calc, gas
-                exec_result = await self.multi_venue_executor.execute_single(
-                    opportunity=opp,
-                    max_spend_usd=amount_usd,
-                    max_price=opp.market_price + 0.02
-                )
+                #
+                # The price cap is on the side being bought. It used to be
+                # market_price + 0.02 - the YES price - which for a NO order caps
+                # the wrong token and either rejects a valid order or lets it
+                # through at a price the NO token never trades at.
+                exec_result = await self._execute_with_side_aware_cap(
+                    opp=opp, amount_usd=amount_usd,
+                    exploration=bool(getattr(opp, "_is_exploration", False)))
                 
                 execution_results.append({
                     "market_id": opp.market.id,
@@ -1872,6 +1909,55 @@ class TradingAgentV3:
         logger.info(f"V3 Report: {scan_result.reasoning}")
         
         return result
+
+    async def _execute_with_side_aware_cap(self, opp, amount_usd: float,
+                                           exploration: bool = False):
+        """
+        Send the order with a price cap on the side actually being bought, and
+        with real money forbidden for exploration.
+
+        Two corrections in one place, because both are properties of the call:
+
+        1. THE CAP. `opp.market_price` is the YES price. A NO order buys the NO
+           token, which trades near 1 - yes, so a cap of yes + 0.02 is a cap on a
+           price that token never reaches - the order is rejected as
+           non-marketable, or worse, accepted at a nonsense limit. The cap is
+           derived from the side, using the opportunity's own price for that side
+           when it has one.
+
+        2. EXPLORATION IS PAPER. The adapter's dry_run flag is the last gate
+           before real money, so it is set for the duration of this call and
+           restored in a finally. Exploration exists to earn qualification, and
+           qualification is earned in paper - an exploration trade that could
+           touch real capital would be live trading at an unqualified venue,
+           which is the one thing the qualification gate exists to prevent.
+        """
+        if str(opp.side).upper() == "NO":
+            yes_price = float(opp.market_price)
+            cap = max(0.01, min(0.99, 1.0 - yes_price + 0.02))
+        else:
+            cap = float(opp.market_price) + 0.02
+
+        adapter = None
+        saved_dry_run = None
+        if exploration:
+            adapter = self.venue_registry.get_adapter_for_market(opp.market)
+            if adapter is not None:
+                saved_dry_run = adapter.dry_run
+                adapter.dry_run = True
+                logger.info(
+                    f"Exploration is PAPER-ONLY: {opp.market.id} @ {opp.venue_id} "
+                    f"executed with the adapter forced to dry_run for this call "
+                    f"so it can never touch live capital")
+        try:
+            return await self.multi_venue_executor.execute_single(
+                opportunity=opp,
+                max_spend_usd=amount_usd,
+                max_price=cap,
+            )
+        finally:
+            if adapter is not None and saved_dry_run is not None:
+                adapter.dry_run = saved_dry_run
 
     @staticmethod
     def _execution_quality(exec_result) -> Optional[float]:

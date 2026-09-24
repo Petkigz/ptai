@@ -654,6 +654,57 @@ class TestFullCycle:
         finally:
             agent.storage.close()
 
+    def test_a_fresh_install_can_bootstrap_its_own_qualification_evidence(
+            self, tmp_path, monkeypatch):
+        """
+        The exploration lane must EXECUTE, or qualification can never start.
+
+        With no qualified venues, exploration is the only possible source of
+        evidence. The candidates used to be selected, marked, appended to a list
+        and then counted in a log line - never executed. So:
+
+            no qualified venues -> pick an exploration candidate
+            -> do not execute it -> zero outcomes
+            -> qualification stays zero -> repeat
+
+        Every component worked and the loop could not close. This runs the real
+        cycle in that state and requires a position and a learning record.
+        """
+        agent, adapter = build_agent(tmp_path, dry_run=True)
+        # The venue simulates its fill against a real book, which is what makes
+        # a paper trade evidence. A stub that refuses produces no paper evidence,
+        # and refusing is the correct outcome for it.
+        adapter.place_order = _simulating_place_order(adapter)
+        _inject_opportunity(agent, adapter._market(), monkeypatch,
+                            edge=0.15)
+
+        async def nothing_qualified(self, target_per_venue=20, **kwargs):
+            return _report(qualified=[])
+        monkeypatch.setattr(type(agent.capability_engine),
+                            "evaluate_all_venues", nothing_qualified,
+                            raising=True)
+        agent._last_qualified_venue_ids = []
+
+        try:
+            r = _cycle(agent)
+            assert r["core_objective_execution"]["step1_qualified_venues"] == []
+            executed = r.get("execution", [])
+            assert executed, (
+                "with nothing qualified, the exploration lane produced no "
+                "execution at all - the bootstrap deadlock is back"
+            )
+            # And it must be PAPER: the adapter is dry_run, and exploration must
+            # never touch live capital regardless.
+            for item in executed:
+                assert item.get("position_recorded") is True, (
+                    f"exploration ran but recorded no position: {item}"
+                )
+            trades = agent.storage.conn.execute(
+                "SELECT COUNT(*) FROM trades").fetchone()[0]
+            assert trades >= 1, "no position row from the exploration trade"
+        finally:
+            agent.storage.close()
+
     def test_paper_positions_do_not_consume_live_capital(self, tmp_path, monkeypatch):
         """
         Paper trading is how a venue earns qualification. It must build the

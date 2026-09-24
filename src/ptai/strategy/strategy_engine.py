@@ -67,6 +67,36 @@ class MultiVenueScanResult:
     best_opportunity: Optional[VenueOpportunity] = None
 
 
+def _execution_quality_from_book(orderbook, market) -> float:
+    """
+    How well an order is likely to execute, from the book in front of it.
+
+    A tight spread on a deep book is a 1.0; a wide spread or thin depth is worse.
+    When there is no book the value is 0.0, not a confident-looking default -
+    an unmeasured execution is not a good one, and the same rule already applies
+    to spreads and balances elsewhere in this codebase.
+    """
+    if not isinstance(orderbook, dict) or not orderbook.get("is_real"):
+        return 0.0
+    spread = orderbook.get("spread")
+    depth = orderbook.get("depth")
+    if spread is None and depth is None:
+        return 0.0
+    score = 1.0
+    try:
+        if spread is not None:
+            # 1c is excellent; 10c is bad.
+            score = min(score, max(0.0, 1.0 - (float(spread) - 0.01) / 0.09))
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        if depth is not None and float(market.liquidity or 0) >= 0:
+            score = min(score, max(0.0, min(1.0, float(depth) / 5000.0)))
+    except (TypeError, ValueError):
+        pass
+    return round(score, 3)
+
+
 class StrategyEngineV3:
     """
     V3 Strategy Engine: venue × market × strategy
@@ -147,7 +177,14 @@ class StrategyEngineV3:
                     confidence=fv_result.confidence,
                     uncertainty=fv_result.uncertainty,
                     liquidity_score=min(1.0, market.liquidity / 10000),
-                    execution_quality=0.8,
+                    # Measured from the book when there is one. This was the
+                    # literal 0.8 for every mispricing opportunity, so a market
+                    # with a wide spread and no depth scored the same as a deep
+                    # one - and execution_quality feeds the opportunity score, the
+                    # EV penalty and the ranking, so the ranking was partly made
+                    # of a constant.
+                    execution_quality=_execution_quality_from_book(
+                        context.get("orderbook"), market),
                     category=context.get("category", "mispricing"),
                     sources=fv_result.forecast_result.sources if fv_result.forecast_result else ["fair_value"],
                     reasoning=fv_result.reasoning,

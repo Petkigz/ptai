@@ -315,16 +315,26 @@ class VenueStrategyQualificationEngine:
             sample_size = qual_result.total_paper_trades
             avg_edge = qual_result.avg_edge
         
-        # Historical edge criteria: profitable after fees, Brier <0.25, profit factor >1.1, sample >=100
-        if sample_size >= 100:
-            historical_edge = (
-                net_pnl > 0 and
-                brier <= 0.25 and
-                profit_factor >= 1.1 and
-                win_rate >= 0.55
-            )
+        # Historical edge.
+        #
+        # This used to be a SECOND, weaker qualification test written here: a
+        # sample floor plus four conditions. The gates below only require
+        # historical_edge and trading_available for is_qualified, so a venue could
+        # reach qualified_venue_ids while failing log loss, calibration (ECE),
+        # forecast skill, expected value, average edge, drawdown and execution
+        # quality - every criterion its own qualification engine checks.
+        #
+        # Two tests for the same decision, where one is weaker, means the weaker
+        # one decides. The engine that actually evaluates all fifteen criteria now
+        # decides, and this defers to it.
+        eng_result = self.qualification_engine.qualifications.get(venue_id)
+        if eng_result is not None:
+            historical_edge = bool(eng_result.is_qualified)
         elif sample_size >= 20:
-            # Some data but not enough
+            # No evaluation on record. The venue has data, so the honest answer is
+            # "not yet judged" rather than a local re-derivation - the refresh in
+            # V3 evaluates every registered venue each cycle, so this state should
+            # not persist.
             historical_edge = False
         else:
             historical_edge = False

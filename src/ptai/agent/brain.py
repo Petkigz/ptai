@@ -39,10 +39,27 @@ class FairValueResult:
     llm_provider: str = "heuristic"
 
 class Brain:
-    def __init__(self, llm_config=None):
+    def __init__(self, llm_config=None, llm_router=None):
         self.settings = get_settings()
         self.llm_config = llm_config or self.settings.to_llm_config()
+        # Reuse the caller's router when one is given. Building a second one from
+        # settings meant the fallback forecast could run against a different
+        # provider, endpoint, model and timeout than the intelligence stack that
+        # asked for it.
+        self.llm_router = llm_router
         # Initialize LLM Router (supports LM Studio, Ollama, etc)
+        if self.llm_router is not None:
+            # Supplied by the caller: use it as-is rather than building a second
+            # one from settings, which is how two parts of the system ended up
+            # talking to different providers.
+            # Never assume the supplied object's shape: it only has to be a
+            # router, and logging must not be able to break construction.
+            try:
+                name = self.llm_router.get_provider_name()
+            except Exception:
+                name = type(self.llm_router).__name__
+            logger.info(f"Brain reusing the supplied LLM router ({name})")
+            return
         try:
             from ..llm.provider import LLMRouter
             model_name_lower = (self.llm_config.model + " " + getattr(self.settings, 'ollama_model', '') + " " + getattr(self.settings, 'lm_studio_model', '')).lower()
@@ -132,27 +149,51 @@ Rules: fair 0.01-0.99, side YES if fair>market else NO, calibrated, if unsure fa
             return None
 
     def _fallback_heuristic(self, market: Market, sentiment: Optional[SentimentResult]) -> FairValueResult:
-        """Fallback if LLM fails - uses sentiment + base rate + mock edge for demo"""
+        """
+        What to say about a market when the LLM did not answer.
+
+        This used to invent a fair value from `random.uniform`. That number was
+        then labelled `llm_reasoning`, given the largest weight in the ensemble
+        (0.30), and handed a confidence that INCREASED with the size of the random
+        edge - so noise was not merely admitted, it was rewarded. On a machine
+        with no local model, as the startup log reports, the single largest
+        component of every forecast was a random draw, and the resulting trades
+        were recorded as evidence that the venue and the strategy worked.
+
+        The honest answer to "no model answered" is that the agent has no opinion.
+        Fair value is the market's own price, the edge is zero, and it does not
+        trade. That costs nothing and it does not manufacture learning data from
+        nothing.
+
+        Sentiment is kept, because it IS evidence: when a real sentiment result
+        exists, the estimate moves with it and the confidence reflects the
+        sentiment's own confidence.
+        """
         market_price = market.yes_price
 
         if sentiment and sentiment.confidence > 0.3:
             sentiment_adjustment = sentiment.score * 0.15 * sentiment.confidence
             fair_value = market_price + sentiment_adjustment
+            confidence = 0.4 + sentiment.confidence * 0.3
+            source = "sentiment only (no LLM)"
         else:
-            if market_price < 0.2:
-                fair_value = market_price + random.uniform(0.02, 0.12)
-            elif market_price > 0.8:
-                fair_value = market_price - random.uniform(0.02, 0.12)
-            else:
-                fair_value = market_price + random.uniform(-0.12, 0.12)
+            # No LLM and no sentiment: no basis for an opinion. Saying so is the
+            # correct output, not a guess in its place.
+            fair_value = market_price
+            confidence = 0.0
+            source = "no model and no sentiment"
 
         fair_value = max(0.05, min(0.95, fair_value))
         edge = fair_value - market_price
-        confidence = 0.6 + min(0.3, abs(edge)) if not sentiment else 0.4 + sentiment.confidence * 0.3
 
-        should_trade = abs(edge) >= self.settings.min_edge_pct and confidence >= 0.55
+        should_trade = (confidence > 0
+                        and abs(edge) >= self.settings.min_edge_pct
+                        and confidence >= 0.55)
         side = "YES" if edge > 0 else "NO"
-        reasoning = f"Fallback heuristic (no LLM): market {market_price:.1%}, sentiment {sentiment.score if sentiment else 0:.2f} -> fair {fair_value:.1%}, edge {edge:.1%}. Base rate: extreme prices revert."
+        reasoning = (f"{source}: market {market_price:.1%}, sentiment "
+                     f"{sentiment.score if sentiment else 0:.2f} -> fair "
+                     f"{fair_value:.1%}, edge {edge:.1%}. No LLM opinion was "
+                     f"produced, so this is not an LLM forecast.")
 
         return FairValueResult(
             market_id=market.id,

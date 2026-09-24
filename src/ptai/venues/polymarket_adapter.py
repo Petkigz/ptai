@@ -693,7 +693,17 @@ class PolymarketAdapter(MarketAdapter):
                 token_id=token_id,
                 price=signed_price,
                 size=size,
-                side="BUY" if str(opportunity.side).upper() in ("YES", "BUY") else "SELL",
+                # ALWAYS a BUY. `_resolve_token_id` has already selected the
+                # token for the side being taken, so buying it IS taking the
+                # position - including a NO position, which is bought as the NO
+                # token. This said
+                #     "BUY" if side in ("YES","BUY") else "SELL"
+                # which selected the NO token and then SELL it: an order in the
+                # wrong direction on the right token. On a binary market that is
+                # either rejected or fills as the opposite of the intended trade,
+                # and it is the kind of error that only appears with real money
+                # because a paper fill of either direction looks plausible.
+                side="BUY",
                 order_type="GTC",
                 dry_run=False,  # real submission: gated by can_place_real_orders above
                 mechanics=mechanics,
@@ -742,7 +752,9 @@ class PolymarketAdapter(MarketAdapter):
                     "reason": "no token id, so there is no book to simulate against"}
 
         mechanics = self.get_mechanics(opportunity, token_id=token_id)
-        side = "BUY" if str(opportunity.side).upper() in ("YES", "BUY") else "SELL"
+        # A paper fill must walk the book in the same direction the live order
+        # would, or the simulation measures a trade that will never be placed.
+        side = "BUY"
         limit = mechanics.round_price(float(max_price), side)
 
         book = None

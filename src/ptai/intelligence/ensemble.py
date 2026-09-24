@@ -73,18 +73,44 @@ class EnsembleForecaster:
             "news": 0.20,
             "x_sentiment": 0.15,
             "market_microstructure": 0.20,
-            "llm_reasoning": 0.30
+            "llm_reasoning": 0.30,
+            # A non-LLM heuristic answer. Same floor as any unlisted model, so it
+            # cannot outvote the models that actually ran.
+            "heuristic_reasoning": 0.10,
         }
 
+    # The weight this component gets when the LLM DID NOT answer. Deliberately
+    # the floor weight used for unrecognised models, not the 0.30 of
+    # llm_reasoning: a heuristic that is not an LLM must not be weighted like one.
+    HEURISTIC_MODEL_WEIGHT_NAME = "heuristic_reasoning"
+
     def add_llm_forecast(self, market: Market, llm_result: Dict) -> ModelForecast:
-        """Convert LLM Brain result to ModelForecast"""
+        """
+        Convert a Brain result to a ModelForecast.
+
+        The provider tag is carried through. It used to be dropped here: Brain
+        labels a non-LLM answer llm_provider="heuristic", and this method named
+        every result "llm_reasoning" regardless - so a rule of thumb arrived in
+        the ensemble wearing the LLM's name and the LLM's 0.30 weight, the largest
+        of any component.
+        """
         try:
             fair = llm_result.get("fair_value", 0.5) if isinstance(llm_result, dict) else getattr(llm_result, "fair_value", 0.5)
             conf = llm_result.get("confidence", 0.6) if isinstance(llm_result, dict) else getattr(llm_result, "confidence", 0.6)
             reasoning = llm_result.get("reasoning", "") if isinstance(llm_result, dict) else getattr(llm_result, "reasoning", "")
-            
+            provider = (llm_result.get("llm_provider", "") if isinstance(llm_result, dict)
+                        else getattr(llm_result, "llm_provider", "")) or ""
+            # Anything that is not a real model answer is named for what it is,
+            # and falls to the default weight rather than the LLM's.
+            model_name = (self.HEURISTIC_MODEL_WEIGHT_NAME
+                          if str(provider).lower() in ("heuristic", "fallback", "")
+                          else "llm_reasoning")
+            if model_name == self.HEURISTIC_MODEL_WEIGHT_NAME:
+                conf = min(float(conf), 0.4)
+                reasoning = f"[NOT AN LLM ANSWER - provider={provider or 'none'}] {reasoning}"
+
             return ModelForecast(
-                model_name="llm_reasoning",
+                model_name=model_name,
                 probability=float(fair),
                 confidence=float(conf),
                 uncertainty=1.0 - float(conf),
@@ -235,9 +261,22 @@ class EnsembleForecaster:
             # Try to get LLM forecast via Brain
             try:
                 from ..agent.brain import Brain
-                brain = Brain()
-                llm_res = brain.estimate_fair_value(market=market, sentiment=context.get("sentiment"))
-                forecasts.append(self.add_llm_forecast(market, {"fair_value": llm_res.fair_value, "confidence": llm_res.confidence, "reasoning": llm_res.reasoning}))
+                # `Brain()` built its OWN router from settings, which could
+                # differ from the one this ensemble was constructed with - so the
+                # fallback forecast could run against a different provider,
+                # endpoint, model and timeout than the rest of the intelligence
+                # stack. Hand it the router already in use.
+                brain = Brain(llm_router=self.llm_router)
+                llm_res = brain.estimate_fair_value(
+                    market=market, sentiment=context.get("sentiment"))
+                forecasts.append(self.add_llm_forecast(market, {
+                    "fair_value": llm_res.fair_value,
+                    "confidence": llm_res.confidence,
+                    "reasoning": llm_res.reasoning,
+                    # Carried through, or the ensemble cannot tell an LLM answer
+                    # from a heuristic one.
+                    "llm_provider": getattr(llm_res, "llm_provider", ""),
+                }))
             except Exception as e:
                 logger.warning(f"LLM forecast failed: {e}")
 
