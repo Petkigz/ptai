@@ -116,7 +116,8 @@ class CapabilityStatus(str, Enum):
     QUALIFIED = "qualified"
     DATA_ONLY = "data_only"  # Can discover but not trade
     ILLIQUID = "illiquid"
-    RESTRICTED = "restricted"
+    RESTRICTED = "restricted"        # a legal/regulatory determination says no
+    UNDETERMINED = "undetermined"    # legality was never researched - not a "no"
     NO_EDGE = "no_edge"
     EXPERIMENTAL = "experimental"
     UNTESTED = "untested"
@@ -180,6 +181,11 @@ class QualificationEngineReport:
     recommended_venues: List[str]
     execution_time: float
     reasoning: str
+    # Kept separate from restricted_venues: an unresearched jurisdiction is an
+    # open question, and collapsing it into "restricted" asserts a legal
+    # prohibition nobody established. Defaulted so existing constructors and
+    # serialised reports keep working.
+    undetermined_venues: int = 0
 
 class VenueStrategyQualificationEngine:
     """
@@ -359,7 +365,18 @@ class VenueStrategyQualificationEngine:
         score += 0.1 if execution_tested else 0
         
         # Determine status
-        if not legal_eligible:
+        if eligibility == EligibilityStatus.RESTRICTED:
+            # An explicit legal determination. Only this is "restricted".
+            status = CapabilityStatus.RESTRICTED
+            is_qualified = False
+        elif eligibility == EligibilityStatus.UNKNOWN:
+            # Nobody has established whether this venue is legal here. That is
+            # an unverified open question, not a prohibition - reporting it as
+            # "restricted" told the operator a venue was illegal when the truth
+            # was "we have not checked", and buried the research work item.
+            status = CapabilityStatus.UNDETERMINED
+            is_qualified = False
+        elif not legal_eligible:
             status = CapabilityStatus.RESTRICTED
             is_qualified = False
         elif not data_quality >= 0.5:
@@ -557,6 +574,7 @@ class VenueStrategyQualificationEngine:
         data_only = [r for r in venue_reports if r.status == CapabilityStatus.DATA_ONLY]
         restricted = [r for r in venue_reports if r.status == CapabilityStatus.RESTRICTED]
         untested = [r for r in venue_reports if r.status == CapabilityStatus.UNTESTED]
+        undetermined = [r for r in venue_reports if r.status == CapabilityStatus.UNDETERMINED]
         
         qualified_ids = [r.venue_id for r in qualified]
         recommended = sorted(qualified, key=lambda x: x.qualification_score, reverse=True)
@@ -569,7 +587,12 @@ class VenueStrategyQualificationEngine:
             f"Total {len(venue_reports)} venues evaluated, "
             f"Qualified {len(qualified)}: {qualified_ids}, "
             f"Data-only {len(data_only)}, "
-            f"Restricted {len(restricted)}, "
+            f"Restricted {len(restricted)}"
+            f"{(' (' + ', '.join(r.venue_id for r in restricted) + ')') if restricted else ''}, "
+            f"Undetermined {len(undetermined)}"
+            f"{(' (' + ', '.join(r.venue_id for r in undetermined) + ')') if undetermined else ''}"
+            f" - legality not yet researched for these, so they are blocked on "
+            f"research, not on law, "
             f"Untested {len(untested)}, "
             f"Recommended {recommended_ids} | "
             f"PTAI now has broad multi-venue framework, but each venue/strategy combination still needs capability validation and testing | "
@@ -583,6 +606,7 @@ class VenueStrategyQualificationEngine:
             data_only_venues=len(data_only),
             restricted_venues=len(restricted),
             untested_venues=len(untested),
+            undetermined_venues=len(undetermined),
             venue_reports=venue_reports,
             strategy_reports=list(self.strategy_reports.values()),
             qualified_venue_ids=qualified_ids,

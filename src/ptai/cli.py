@@ -15,7 +15,8 @@ from rich.table import Table
 from loguru import logger
 
 from .config import get_settings
-from .agent.loop import TradingAgent
+from .agent.loop import TradingAgent  # legacy; retained for `ptai premium` and history
+from .agent.v3_loop import TradingAgentV3
 from .storage.db import Storage
 from .markets.scanner import MarketScanner
 from .risk import KellyCalculator
@@ -168,6 +169,77 @@ def scan(
     console.print(table)
     console.print(f"Stats: {scanner.quick_stats(markets)}")
 
+# ---------------------------------------------------------------------------
+# V3 runtime helpers
+# ---------------------------------------------------------------------------
+
+def _seed_bankroll(amount: float) -> None:
+    """
+    Persist the bankroll before constructing V3.
+
+    TradingAgentV3 sizes everything - Kelly, the 6% cap, exposure limits,
+    drawdown - from `storage.get_performance_summary()["bankroll"]`, not from a
+    constructor argument. Without this the CLI's --bankroll flag would be
+    ignored and the agent would size against whatever was last stored.
+    """
+    try:
+        from .storage.db import Storage
+        storage = Storage()
+        storage.set_bankroll(float(amount))
+        storage.close()
+        logger.debug(f"Seeded bankroll ${amount}")
+    except Exception as e:
+        logger.warning(f"Could not seed bankroll ${amount}: {type(e).__name__}: {e}")
+
+
+def _print_cycle_result(result: dict) -> None:
+    """
+    Print a cycle summary rather than the raw dict.
+
+    A V3 result is large (per-venue reports, alpha output, betting card,
+    execution detail); dumping it to the terminal buries the one line the
+    operator needs.
+    """
+    status = result.get("status", "unknown")
+    if status == "blocked":
+        console.print(f"[red]Cycle blocked:[/red] {result.get('reason')}")
+        return
+
+    disc = result.get("discovery", {}) or {}
+    opps = result.get("opportunities", {}) or {}
+    execs = result.get("execution", []) or []
+
+    table = Table(title=f"V3 Cycle: {status}")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Markets scanned", str(disc.get("total_scanned", 0)))
+    table.add_row("Venues reporting", str(len(disc.get("per_venue", {}) or {})))
+    table.add_row("Candidates", str(opps.get("total_candidates", 0)))
+    table.add_row("Tradeable after costs", str(opps.get("total_tradeable", 0)))
+    table.add_row("Executed", str(len(execs)))
+    table.add_row("DO NOTHING", "yes" if result.get("do_nothing_success") else "no")
+    table.add_row("Time", f"{result.get('execution_time', 0):.1f}s")
+    console.print(table)
+
+    best = opps.get("best") or {}
+    if best.get("question") and best.get("question") != "DO NOTHING":
+        console.print(
+            f"[green]Best:[/green] {best.get('venue')} / {best.get('strategy')} "
+            f"- edge {best.get('edge', 0):.3f} score {best.get('score', 0):.3f}")
+        if best.get("reasoning"):
+            console.print(f"[dim]{best['reasoning'][:200]}[/dim]")
+    else:
+        console.print("[dim]No opportunity cleared the gates. DO NOTHING is a "
+                      "successful outcome, not a failure.[/dim]")
+
+    betting = result.get("betting") or {}
+    if betting.get("events"):
+        console.print(
+            f"[dim]Betting: {betting.get('events')} fixtures, "
+            f"{betting.get('markets_scanned_by_type', {})} markets, "
+            f"mode {betting.get('data_mode')}[/dim]")
+
+
 @app.command()
 def run(
     bankroll: Optional[float] = typer.Option(None, "--bankroll", "-b", help="Bankroll override"),
@@ -176,6 +248,9 @@ def run(
     dry_run: bool = typer.Option(True, "--dry-run/--live", help="Dry run"),
     headless: bool = typer.Option(False, "--headless", help="Browser headless"),
     llm: str = typer.Option("auto", "--llm", help="LLM provider: auto, lm_studio, ollama"),
+    country: str = typer.Option(
+        "UG", "--country",
+        help="Jurisdiction used for venue eligibility (e.g. UG, GB, US)"),
 ):
     """
     Run autonomous agent
@@ -195,20 +270,31 @@ def run(
         f"[bold]Bankroll: ${bankroll or settings.bankroll}\n"
         f"Interval: {interval}min\n"
         f"Dry Run: {dry_run}\n"
+        f"Country: {country}\n"
         f"Headless: {headless}\n"
         f"LLM: {llm} (LM Studio {settings.lm_studio_host} / Ollama {settings.ollama_host})\n"
         f"Goal: Earn ${settings.daily_cost_to_cover}/day or shutdown[/bold]",
         title="PTAI Autonomous Agent"
     ))
 
-    agent = TradingAgent(bankroll=bankroll, dry_run=dry_run)
+    # V3 is the canonical pipeline (qualification -> multi-venue discovery ->
+    # multi-strategy evaluation -> expected net EV -> Kelly -> exposure ->
+    # ExecutionGuard -> MultiVenueExecutor -> exact adapter). This command used
+    # to launch the legacy agent/loop.py TradingAgent, so every V3 improvement
+    # sat beside the runtime instead of underneath it.
+    _seed_bankroll(bankroll or settings.bankroll)
+
+    agent = TradingAgentV3(country_code=country, dry_run=dry_run)
 
     async def _run():
         if once:
             result = await agent.run_cycle()
-            console.print(f"Cycle result: {result}")
+            _print_cycle_result(result)
         else:
-            await agent.run_autonomous(interval_minutes=interval)
+            console.print(
+                "[dim]V3 runs the qualification pipeline each cycle. "
+                "Ctrl-C to stop.[/dim]")
+            await agent.run_continuous(interval_minutes=interval)
 
     try:
         asyncio.run(_run())
@@ -339,6 +425,9 @@ def pay_for_yourself(
     daily_cost: float = typer.Option(5.0, "--daily-cost", help="Daily cost to cover"),
     interval: int = typer.Option(10, "--interval", help="Scan interval minutes"),
     llm: str = typer.Option("auto", "--llm", help="LLM provider: auto, lm_studio, ollama"),
+    country: str = typer.Option(
+        "UG", "--country",
+        help="Jurisdiction used for venue eligibility (e.g. UG, GB, US)"),
 ):
     """
     The self-preservation command: "here is 50 dollars earn enough to pay for yourself or shut down"
@@ -351,6 +440,7 @@ def pay_for_yourself(
         f"Daily cost: ${daily_cost}\n"
         f"Bankroll: ${bankroll}\n"
         f"Interval: {interval}min\n"
+        f"Country: {country}\n"
         f"LLM: {llm} (LM Studio at http://localhost:1234)\n"
         f"Strategy: Scan 500-1000 markets, X sentiment, fair value, mispricing >8%, Kelly max 6%[/bold green]",
         title="PTAI Self-Preservation Mode - LM Studio Ready"
@@ -365,10 +455,19 @@ def pay_for_yourself(
     settings = get_settings()
     settings.llm_provider = llm
 
-    agent = TradingAgent(bankroll=bankroll, dry_run=settings.dry_run)
+    # The self-preservation command is the one the user actually runs, and it
+    # was launching the legacy loop. It now runs V3, which is the pipeline that
+    # carries expected net EV, the execution guard and exact venue routing.
+    agent = TradingAgentV3(country_code=country, dry_run=settings.dry_run)
+
+    console.print(
+        f"[dim]Data mode {agent.data_mode.value} "
+        f"(dry_run={agent.dry_run}). Real orders require dry_run=False AND a "
+        f"verified account; until the account probe can place and cancel a test "
+        f"order, live capital stays disabled.[/dim]")
 
     async def _run():
-        await agent.run_autonomous(interval_minutes=interval)
+        await agent.run_continuous(interval_minutes=interval)
 
     try:
         asyncio.run(_run())

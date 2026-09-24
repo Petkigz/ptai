@@ -133,9 +133,19 @@ class TradingAgentV3:
     PTAI V3 - genuinely multi-venue, multi-strategy
     Mission: Find best legitimate opportunity across all venues and strategies
     """
-    def __init__(self, country_code: str = "UG"):
+    def __init__(self, country_code: str = "UG", dry_run: bool = True):
+        """
+        dry_run controls whether real capital can move, and it defaults True.
+
+        V3 had no dry_run concept at all: the CLI's --dry-run flag (which
+        defaults to settings.dry_run) had nowhere to go when the CLI was pointed
+        at V3, and the betting scan hardcoded DataMode.LIVE_SHADOW. This
+        restores the safety default so wiring the CLI to V3 cannot accidentally
+        arm live trading - a caller has to ask for live explicitly.
+        """
         self.settings = get_settings()
         self.country_code = country_code
+        self.dry_run = bool(dry_run)
         
         # Storage
         self.storage = Storage(db_path="./data/ptai.db")
@@ -339,6 +349,11 @@ class TradingAgentV3:
         self.multi_venue_executor = MultiVenueExecutor(registry=self.venue_registry, bankroll=bankroll)
         self.account_health_engine = AccountHealthEngine(venue_registry=self.venue_registry)
         self.expected_ev_engine = ExpectedNetEVEngine()
+
+        # The one place dry_run becomes a data mode. LIVE_PAPER (not SHADOW) when
+        # dry: paper trading still qualifies venues and exercises the full
+        # prediction and risk path, it just cannot settle real money.
+        self.data_mode = DataMode.LIVE_PAPER if self.dry_run else DataMode.LIVE
         
         # Learning
         self.trade_outcome_tracker = TradeOutcomeTracker(storage=self.storage)
@@ -348,6 +363,10 @@ class TradingAgentV3:
         self.mission = "Find best legitimate opportunity across all venues and strategies. Trade only when evidence, calibration, liquidity, risk agree. DO NOTHING is successful."
         
         logger.info(f"PTAI V3 initialized: {self.mission} | Country {country_code} | Bankroll ${bankroll} | Venues {list(self.venue_registry.adapters.keys())}")
+        logger.info(
+            f"V3 data mode: {self.data_mode.value} (dry_run={self.dry_run}) - "
+            + ("no real orders can be placed" if self.dry_run
+               else "LIVE: real orders possible if account health passes"))
 
     async def check_system_health(self) -> Dict[str, Any]:
         health = {
@@ -685,7 +704,27 @@ class TradingAgentV3:
                                 f"{len(markets_by_venue)} venues. No venue returned markets - "
                                 "check credentials and eligibility before assuming a quiet market."),
                 },
-                "opportunities": {"total": 0, "selected": 0, "trades": [], "reasoning": "DO NOTHING"},
+                # Key-for-key identical to the success path. run_continuous reads
+                # result['opportunities']['final_selected'] every cycle, and
+                # do_nothing_success is read by the loop and the dashboard - both
+                # KeyErrored on this path, so a fresh deployment with no venue
+                # credentials spun on errors forever instead of idling.
+                "opportunities": {
+                    "total_candidates": 0,
+                    "total_tradeable": 0,
+                    "final_selected": 0,
+                    "best": {
+                        "venue": None, "strategy": None,
+                        "question": "DO NOTHING",
+                        "edge": 0, "score": 0, "side": None,
+                        "reasoning": "No markets discovered - nothing to evaluate",
+                    },
+                },
+                "alpha": {},
+                "betting": {"ok": False, "events": 0, "data_mode": "none",
+                            "blockers": ["no markets discovered"]},
+                "execution": [],
+                "do_nothing_success": True,
                 "reasoning": ("No markets discovered from any venue, so no opportunities were "
                               "evaluated. This is not a signal to hold: a venue that fails to "
                               "return markets is unavailable, not quiet."),
@@ -708,7 +747,10 @@ class TradingAgentV3:
         try:
             betting_results = await self.betting_engine.run_cycle(
                 leagues=("nba", "epl"),
-                data_mode=DataMode.LIVE_SHADOW,
+                data_mode=self.data_mode,
+                # Real capital needs a verified account. Until the account-health
+                # probe can actually place and cancel an order this stays False,
+                # so a live data mode cannot by itself deploy money.
                 account_health_ok=False,
             )
             logger.info(
@@ -1132,7 +1174,10 @@ class TradingAgentV3:
             "do_nothing_success": len(final_trades) == 0
         }
         
-        logger.info(f"=== PTAI V3 Cycle Complete in {elapsed:.1f}s: {result['opportunities']['final_selected']} trades, DO NOTHING success: {result['do_nothing_success']} ===")
+        # .get() throughout: a cycle that returns an unexpected shape must not
+        # be able to kill the loop. A long run has to survive its own reporting.
+        _n_trades = (result.get("opportunities") or {}).get("final_selected", 0)
+        logger.info(f"=== PTAI V3 Cycle Complete in {elapsed:.1f}s: {_n_trades} trades, DO NOTHING success: {result.get('do_nothing_success', True)} ===")
         logger.info(f"V3 Report: {scan_result.reasoning}")
         
         return result
@@ -1148,7 +1193,9 @@ class TradingAgentV3:
                     continue
                 
                 result = await self.run_cycle()
-                logger.info(f"V3 cycle result: {result['status']} {result['opportunities']['final_selected']} trades")
+                logger.info(
+                    f"V3 cycle result: {result.get('status', 'unknown')} "
+                    f"{(result.get('opportunities') or {}).get('final_selected', 0)} trades")
                 
                 # Sleep
                 await asyncio.sleep(interval_minutes * 60)
