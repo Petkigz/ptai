@@ -1321,12 +1321,20 @@ async def api_v3_venues():
         from .venues.manifold_adapter import ManifoldAdapter
         from .venues.crypto_adapter import CryptoAdapter
         from .venues.stock_adapter import StockAdapter
+        from .venues.predictit_adapter import PredictItAdapter
+        from .venues.betfair_exchange import BetfairExchangeAdapter
         registry = VenueRegistry(country_code="UG")
         registry.register(PolymarketAdapter())
         registry.register(KalshiAdapter())
         registry.register(ManifoldAdapter())
+        registry.register(PredictItAdapter())
         registry.register(CryptoAdapter(exchange="binance"))
-        registry.register(StockAdapter(broker="mock"))
+        # There is no mock broker any more; StockAdapter declares itself
+        # unimplemented rather than returning invented quotes.
+        registry.register(StockAdapter(broker="none"))
+        # The real Betfair exchange adapter - the feed that carries goals,
+        # corners, cards and player props.
+        registry.register(BetfairExchangeAdapter())
         eligibility = registry.check_all_eligibility()
         return {
             "venues": list(registry.adapters.keys()),

@@ -23,6 +23,7 @@ class KalshiAdapter(MarketAdapter):
         self.member_id = member_id
         self.base_url = KALSHI_API
         self.session = requests.Session()
+        self.last_error: str = ""
         self.session.headers.update({
             "User-Agent": "PTAI/1.0 Local Trading Agent",
             "Accept": "application/json"
@@ -134,71 +135,14 @@ class KalshiAdapter(MarketAdapter):
         except Exception as e:
             logger.warning(f"Kalshi API failed (expected in offline): {e}")
 
-        # Mock fallback - generate realistic Kalshi-style markets for testing V3 multi-venue
-        # In production, this would be replaced by real API data
-        import random
-        mock_titles = [
-            "Will CPI exceed 3.5% in {month}?",
-            "Will Fed raise rates in {month}?",
-            "Will unemployment be below 4% in {month}?",
-            "Will S&P 500 close above {level} on {date}?",
-            "Will {candidate} win {state}?",
-            "Will {team} win {event}?",
-            "Will temperature exceed {temp}F in {city}?",
-            "Will {company} earnings beat estimates?",
-        ]
-        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
-        for i in range(min(target_count, 200)):
-            title_template = random.choice(mock_titles)
-            title = title_template.format(
-                month=random.choice(months),
-                level=random.randint(4000, 5000),
-                date=f"2026-{random.randint(1,12):02d}-{random.randint(1,28):02d}",
-                candidate=random.choice(["Candidate A", "Candidate B"]),
-                state=random.choice(["CA", "TX", "NY", "FL"]),
-                team=random.choice(["Team A", "Team B"]),
-                event=random.choice(["Championship", "Finals"]),
-                temp=random.randint(70, 100),
-                city=random.choice(["NYC", "LA", "Chicago"]),
-                company=random.choice(["AAPL", "GOOGL", "MSFT"])
-            )
-            price = random.uniform(0.15, 0.85)
-            vol = random.uniform(5000, 100000)
-            liq = random.uniform(1000, 50000)
-            m = Market(
-                id=f"KALSHI-MOCK-{i:04d}",
-                source=MarketSource.KALSHI,
-                question=title,
-                description=f"Kalshi mock market {i} for V3 multi-venue testing - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
-                outcomes=["YES", "NO"],
-                outcome_prices=[price, 1-price],
-                tokens=[
-                    Token(token_id=f"KALSHI-MOCK-{i}_YES", outcome="YES", price=price),
-                    Token(token_id=f"KALSHI-MOCK-{i}_NO", outcome="NO", price=1-price)
-                ],
-                volume=vol,
-                volume_24h=vol*0.4,
-                liquidity=liq,
-                active=True,
-                closed=False,
-                slug=f"kalshi-mock-{i}",
-                event_slug=f"kalshi-event-{i//5}",
-                market_type="binary",
-                raw={"mock": True, "venue": "kalshi", "venue_id": "kalshi", "adapter_venue_id": "kalshi", "discovery_source": "KalshiAdapter.mock", "data_mode": "mock", "data_source": "kalshi_mock_fallback", "is_mock": True, "safety": "MOCK_DATA - must be impossible to reach live execution"},
-                venue_id="kalshi",
-                venue_type="prediction",
-                data_mode=DataMode.MOCK,
-                data_source="kalshi_mock_fallback",
-                is_mock=True
-            )
-            markets.append(m)
-        
-        # Apply filters
-        min_vol = filters.get("min_volume", 1000)
-        min_liq = filters.get("min_liquidity", 100)
-        filtered = [m for m in markets if m.volume_24h >= min_vol and m.liquidity >= min_liq]
-        logger.info(f"Kalshi mock discovery: {len(markets)} -> {len(filtered)} after filters")
-        return filtered[:target_count]
+        # No mock fallback. This generated up to `target_count` Kalshi-style
+        # questions with random prices whenever the API was unreachable, so an
+        # outage produced markets indistinguishable from real ones. Returning
+        # nothing with a stated reason is the only honest outcome.
+        self.last_error = ("Kalshi API unreachable; no markets returned. "
+                           "Refusing to fabricate markets on a network failure.")
+        logger.warning(f"Kalshi discovery returned no markets: {self.last_error}")
+        return []
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         # V9 FIX #1 & #3: Real orderbook with is_real flag

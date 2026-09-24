@@ -20,6 +20,7 @@ class ManifoldAdapter(MarketAdapter):
         super().__init__(venue_id="manifold", venue_type=VenueType.PREDICTION)
         self.api_key = api_key
         self.base_url = MANIFOLD_API
+        self.last_error: str = ""
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "PTAI/1.0 Local Trading Agent",
@@ -121,67 +122,15 @@ class ManifoldAdapter(MarketAdapter):
         except Exception as e:
             logger.warning(f"Manifold API failed (expected offline): {e}")
 
-        # Mock fallback for V3 multi-venue testing
-        import random
-        mock_questions = [
-            "Will {company} release {product} in 2026?",
-            "Will AI achieve {milestone} by {date}?",
-            "Will {country} have {event} in {year}?",
-            "Will {person} do {action} in {month}?",
-            "Will {tech} be adopted by {percent}% by {year}?",
-        ]
-        for i in range(min(target_count, 150)):
-            q_template = random.choice(mock_questions)
-            question = q_template.format(
-                company=random.choice(["OpenAI", "Google", "Meta", "Apple"]),
-                product=random.choice(["AGI", "new model", "AR glasses"]),
-                milestone=random.choice(["human-level coding", "100% on MMLU", "self-improvement"]),
-                date=f"2026-{random.randint(1,12):02d}",
-                country=random.choice(["USA", "China", "UK"]),
-                event=random.choice(["recession", "election", "new law"]),
-                year=random.randint(2026, 2028),
-                person=random.choice(["Elon", "Sam Altman", "Satoshi"]),
-                action=random.choice(["tweet about crypto", "launch rocket", "release paper"]),
-                month=random.choice(["Jan", "Feb", "Mar", "Apr"]),
-                tech=random.choice(["AI agents", "quantum", "VR"]),
-                percent=random.randint(10, 90)
-            )
-            price = random.uniform(0.1, 0.9)
-            vol = random.uniform(1000, 50000)
-            liq = random.uniform(500, 20000)
-            m = Market(
-                id=f"MANIFOLD-MOCK-{i:04d}",
-                source=MarketSource.PREDICTIT,
-                question=question,
-                description=f"Manifold mock market {i} - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
-                outcomes=["YES", "NO"],
-                outcome_prices=[price, 1-price],
-                tokens=[
-                    Token(token_id=f"MANIFOLD-MOCK-{i}_YES", outcome="YES", price=price),
-                    Token(token_id=f"MANIFOLD-MOCK-{i}_NO", outcome="NO", price=1-price)
-                ],
-                volume=vol,
-                volume_24h=vol*0.3,
-                liquidity=liq,
-                active=True,
-                closed=False,
-                slug=f"manifold-mock-{i}",
-                event_slug=f"manifold-event-{i//5}",
-                market_type="binary",
-                raw={"mock": True, "venue": "manifold", "data_mode": "mock", "data_source": "manifold_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
-                venue_id="manifold",
-                venue_type="prediction",
-                data_mode=DataMode.MOCK,
-                data_source="manifold_mock_fallback",
-                is_mock=True
-            )
-            markets.append(m)
-        
-        min_vol = filters.get("min_volume", 500)
-        min_liq = filters.get("min_liquidity", 100)
-        filtered = [m for m in markets if m.volume_24h >= min_vol and m.liquidity >= min_liq]
-        logger.info(f"Manifold mock discovery: {len(markets)} -> {len(filtered)}")
-        return filtered[:target_count]
+        # No mock fallback. This used to fabricate up to 150 Manifold questions
+        # from templates with random prices on ANY failure - so a network
+        # outage, which is the common case, silently became invented markets
+        # flowing into the scanner. An empty result with a stated reason is the
+        # only honest outcome.
+        self.last_error = ("Manifold API unreachable; no markets returned. "
+                           "Refusing to fabricate markets on a network failure.")
+        logger.warning(f"Manifold discovery returned no markets: {self.last_error}")
+        return []
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         # Manifold uses AMM, not orderbook - simulate spread based on liquidity

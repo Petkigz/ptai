@@ -350,16 +350,26 @@ class StrategyEngineV3:
         
         strategy_summary = ", ".join([f"{k}: {v}" for k, v in strategy_breakdown.items()])
         
+        # The None guard must cover every field, not just the first. This
+        # previously read `best_opp.side if best_opp else ''` and then
+        # dereferenced best_opp.effective_edge unconditionally, so the log line
+        # raised AttributeError exactly when there was nothing to trade -
+        # turning "no opportunities found" into a 500 on the endpoint.
+        if best_opp is not None:
+            _strategy = best_opp.raw.get("strategy") if hasattr(best_opp, "raw") else "unknown"
+            best_line = (f"Best opportunity: {best_opp.venue_id} {best_opp.side} "
+                         f"edge {best_opp.effective_edge:.3f} score {best_opp.score:.3f} "
+                         f"strategy {_strategy} | {best_opp.market.question[:80]}")
+        else:
+            best_line = "Best opportunity: none - nothing cleared the gates | DO NOTHING"
+
         reasoning = (
             f"I scanned {total_scanned} opportunities across {len(markets_by_venue)} venues.\n"
             f"{venue_summary}\n"
             f"Strategies evaluated: {strategy_summary}\n"
             f"Arbitrage candidates: {len([a for a in arbitrage_opps if a.should_trade])} tradeable out of {len(arbitrage_opps)}\n"
             f"After fees/liquidity/uncertainty/risk: {len(tradeable)} actually tradeable opportunities\n"
-            f"Best opportunity: {best_opp.venue_id if best_opp else 'None'} "
-            f"{best_opp.side if best_opp else ''} edge {best_opp.effective_edge:.3f} score {best_opp.score:.3f} "
-            f"strategy {best_opp.raw.get('strategy') if best_opp and hasattr(best_opp, 'raw') else 'unknown'} | "
-            f"{best_opp.market.question[:80] if best_opp else 'DO NOTHING'}\n"
+            f"{best_line}\n"
             f"Final selected {len(final_selected)} trades (max {max_final_trades}) | Time {elapsed:.1f}s"
         )
         

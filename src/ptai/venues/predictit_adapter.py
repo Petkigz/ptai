@@ -14,6 +14,7 @@ from ..markets.base import Market, MarketSource, Token, DataMode
 class PredictItAdapter(MarketAdapter):
     def __init__(self):
         super().__init__(venue_id="predictit", venue_type=VenueType.PREDICTION)
+        self.last_error: str = ""
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=False,
@@ -41,8 +42,9 @@ class PredictItAdapter(MarketAdapter):
         try:
             resp = requests.get(self.api_url, timeout=10, headers={"User-Agent": "PTAI/1.0"})
             if resp.status_code != 200:
-                logger.warning(f"PredictIt API {resp.status_code}, using mock")
-                return self._mock_markets(target_count)
+                self.last_error = f"PredictIt API returned HTTP {resp.status_code}"
+                logger.warning(f"PredictIt: {self.last_error}; no markets returned")
+                return []
             data = resp.json()
             markets = []
             for m in data.get("markets", [])[:target_count]:
@@ -83,44 +85,14 @@ class PredictItAdapter(MarketAdapter):
                     logger.debug(f"PredictIt parse fail: {e}")
                     continue
             if not markets:
-                return self._mock_markets(target_count)
+                self.last_error = "PredictIt returned no parseable markets"
+                return []
             logger.info(f"PredictIt discovered {len(markets)} markets")
             return markets[:target_count]
         except Exception as e:
-            logger.error(f"PredictIt discovery failed: {e}, using mock")
-            return self._mock_markets(target_count)
-
-    def _mock_markets(self, count: int) -> List[Market]:
-        mock_qs = [
-            "Will Trump win 2024 election?",
-            "Will Biden be Democratic nominee?",
-            "Will Republican win Senate?",
-            "Will Democratic win House?",
-        ]
-        markets = []
-        for i, q in enumerate(mock_qs[:count]):
-            price = 0.5 + (i * 0.05)
-            markets.append(Market(
-                id=f"predictit-MOCK-{i}",
-                source=MarketSource.POLYMARKET,
-                question=q + " - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
-                outcomes=["YES", "NO"],
-                outcome_prices=[price, 1-price],
-                tokens=[Token(token_id=f"pit-{i}", outcome="YES", price=price)],
-                volume=5000,
-                volume_24h=1000,
-                liquidity=2000,
-                active=True,
-                closed=False,
-                event_slug=f"predictit-mock-{i}",
-                raw={"venue": "predictit", "mock": True, "category": "politics", "data_mode": "mock", "data_source": "predictit_mock_fallback", "is_mock": True, "safety": "MOCK_DATA MUST NEVER REACH LIVE EXECUTION"},
-                venue_id="predictit",
-                venue_type="prediction",
-                data_mode=DataMode.MOCK,
-                data_source="predictit_mock_fallback",
-                is_mock=True
-            ))
-        return markets
+            self.last_error = f"{type(e).__name__}: {e}"
+            logger.error(f"PredictIt discovery failed: {self.last_error}; no markets returned")
+            return []
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         return {"spread": 0.05, "bid": market.best_price-0.02, "ask": market.best_price+0.02, "depth": market.liquidity, "source": "predictit_mock"}

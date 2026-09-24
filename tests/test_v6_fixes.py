@@ -256,13 +256,28 @@ def test_market_scanner_uses_registry():
     assert hasattr(scanner, 'scan_multi_venue')
 
 def test_kalshi_not_stub():
+    """
+    Kalshi must not be a stub - but "not a stub" means it talks to the real
+    API, not that it always returns something.
+
+    This asserted `len(markets) > 0`, which passed because the client had three
+    separate mock-fallback paths that invented markets in every failure mode.
+    The honest assertion is that the client delegates to the adapter and returns
+    real markets or none, with nothing fabricated in between.
+    """
     from src.ptai.markets.kalshi import KalshiClient
     client = KalshiClient(enabled=True)
+    assert client.adapter is not None, "should delegate to the real KalshiAdapter"
+
     markets = client.scan_markets(target_count=10)
-    # Should not be empty stub
-    assert len(markets) > 0
-    assert markets[0].id is not None
-    assert markets[0].question != ""
+    for m in markets:
+        assert m.id is not None
+        assert m.question != ""
+        assert not m.is_mock, "KalshiClient returned a fabricated market"
+        assert "MOCK" not in str(m.id).upper()
+
+    # disabled client returns nothing rather than inventing
+    assert KalshiClient(enabled=False).scan_markets(target_count=10) == []
 
 def test_market_normalizer_robust_19_venues():
     normalizer = MarketNormalizer()

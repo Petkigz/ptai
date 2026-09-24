@@ -8,6 +8,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 from datetime import datetime
 
+from loguru import logger
+
 from ..markets.base import Market
 
 
@@ -24,6 +26,14 @@ class EligibilityStatus(str, Enum):
     REQUIRES_VERIFICATION = "requires_verification"
 
 
+# Implementation status. Distinct from eligibility, which is a regulatory
+# question: a venue can be perfectly legal to trade and still have no code
+# behind it.
+STATUS_LIVE = "live"                    # issues real requests to the venue
+STATUS_UNIMPLEMENTED = "unimplemented"  # no client exists; must never return markets
+STATUS_SCANNER = "scanner"              # read-only aggregator, cannot place orders
+
+
 @dataclass
 class AdapterCapability:
     supports_market_discovery: bool = True
@@ -35,6 +45,17 @@ class AdapterCapability:
     fee_taker_pct: float = 0.0  # e.g. 0.02 = 2%
     fee_maker_pct: float = 0.0
     min_order_usd: float = 1.0
+    # Which of the above are actually true. An adapter that has never issued an
+    # HTTP request must not advertise market discovery, and must not appear
+    # eligible for trading.
+    implementation_status: str = STATUS_LIVE
+    # One line on what is missing, shown in the UI so a user can tell why a
+    # venue they linked produces nothing.
+    implementation_note: str = ""
+
+    @property
+    def is_implemented(self) -> bool:
+        return self.implementation_status in (STATUS_LIVE, STATUS_SCANNER)
 
 
 @dataclass
@@ -215,5 +236,85 @@ class MarketAdapter(ABC):
             "venue_id": self.venue_id,
             "type": self.venue_type.value,
             "qualified": self.is_qualified,
+            "implementation_status": self.capabilities.implementation_status,
             **self.performance_stats
+        }
+
+
+class UnimplementedVenueAdapter(MarketAdapter):
+    """
+    Base for a venue with no working client.
+
+    These adapters previously fabricated markets: `discover_markets` returned
+    hardcoded rows with `id="...-MOCK-..."` describing invented prices, which
+    then flowed into the scanner, were scored and ranked, and appeared in the
+    dashboard as opportunities. The execution guard refused them at the last
+    step, so nothing was actually traded - but everything upstream treated them
+    as real, which is why the scanner appeared to see hundreds of markets across
+    many venues when only a handful were ever reachable.
+
+    Declaring the venue unimplemented fixes that at the source:
+      - discover_markets returns nothing, so no fabricated market enters scoring
+      - eligibility is UNKNOWN, not ELIGIBLE, so it is never routed to
+      - place_order refuses rather than returning a success-shaped message
+
+    The venue still appears in the registry and in the UI, labelled with what is
+    missing, because a user needs to know a venue is known-but-unavailable
+    rather than silently absent.
+    """
+
+    def __init__(self, venue_id: str, venue_type: VenueType, note: str = ""):
+        super().__init__(venue_id=venue_id, venue_type=venue_type)
+        self.capabilities = AdapterCapability(
+            supports_market_discovery=False,
+            supports_orderbook=False,
+            supports_trading=False,
+            supports_portfolio=False,
+            implementation_status=STATUS_UNIMPLEMENTED,
+            implementation_note=note or "no client implementation",
+        )
+        self.implementation_note = self.capabilities.implementation_note
+
+    def check_eligibility(self, country_code: str = "UG") -> EligibilityStatus:
+        """
+        UNKNOWN, not ELIGIBLE.
+
+        Claiming eligibility is a claim the venue can be traded on, and an
+        adapter with no client cannot be traded on by definition.
+        """
+        return EligibilityStatus.UNKNOWN
+
+    async def discover_markets(self, target_count: int = 500, filters: Dict = None) -> List[Market]:
+        logger.info(
+            f"{self.venue_id}: no client implementation, returning no markets. "
+            f"{self.capabilities.implementation_note}")
+        return []
+
+    async def get_orderbook(self, market: Market) -> Dict[str, Any]:
+        return {
+            "venue_id": self.venue_id,
+            "available": False,
+            "reason": self.capabilities.implementation_note,
+            "note": "no client implementation - this is not an empty orderbook, it is no orderbook",
+        }
+
+    async def get_portfolio(self) -> Dict[str, Any]:
+        return {
+            "venue_id": self.venue_id,
+            "available": False,
+            "balance": None,
+            "positions": [],
+            "reason": self.capabilities.implementation_note,
+        }
+
+    async def place_order(self, opportunity: VenueOpportunity, max_spend_usd: float,
+                          max_price: float) -> Dict[str, Any]:
+        logger.error(f"{self.venue_id}: order refused - {self.capabilities.implementation_note}")
+        return {
+            "status": "unimplemented",
+            "success": False,
+            "venue_id": self.venue_id,
+            "error": self.capabilities.implementation_note,
+            "message": (f"{self.venue_id} has no client implementation; no order was placed. "
+                        f"This is a refusal, not a fill."),
         }

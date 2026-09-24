@@ -18,6 +18,8 @@ class CryptoAdapter(MarketAdapter):
     """
     def __init__(self, exchange: str = "binance", api_key: str = None, api_secret: str = None):
         super().__init__(venue_id=f"crypto_{exchange}", venue_type=VenueType.FINANCIAL)
+
+        self.last_error: str = ""
         self.exchange = exchange
         self.api_key = api_key
         self.api_secret = api_secret
@@ -101,48 +103,13 @@ class CryptoAdapter(MarketAdapter):
         except Exception as e:
             logger.warning(f"Crypto {self.exchange} API failed (expected offline): {e}")
 
-        # Mock fallback for V3 testing
-        import random
-        crypto_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-                         "MATICUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT", "ETCUSDT", "XLMUSDT", "ALGOUSDT", "VETUSDT", "FILUSDT", "TRXUSDT"]
-        for i, symbol in enumerate(crypto_symbols[:min(target_count, 50)]):
-            price = random.uniform(0.1, 50000)
-            vol = random.uniform(1000000, 100000000)
-            change = random.uniform(-10, 10)
-            prob_up = 0.5 + change / 100.0 * 0.5
-            prob_up = max(0.1, min(0.9, prob_up))
-            m = Market(
-                id=f"CRYPTO-MOCK-{symbol}",
-                source=MarketSource.PREDICTIT,
-                question=f"Will {symbol} close higher in 24h? (Crypto {self.exchange}) - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
-                description=f"Mock crypto {symbol} last ${price:.2f} change {change:.1f}% - MOCK",
-                outcomes=["YES", "NO"],
-                outcome_prices=[prob_up, 1-prob_up],
-                tokens=[
-                    Token(token_id=f"CRYPTO-MOCK-{symbol}_UP", outcome="YES", price=prob_up),
-                    Token(token_id=f"CRYPTO-MOCK-{symbol}_DOWN", outcome="NO", price=1-prob_up)
-                ],
-                volume=vol,
-                volume_24h=vol,
-                liquidity=vol*0.1,
-                active=True,
-                closed=False,
-                slug=symbol.lower(),
-                event_slug=f"crypto-{self.exchange}",
-                market_type="binary",
-                raw={"mock": True, "venue": f"crypto_{self.exchange}", "symbol": symbol, "data_mode": "mock", "data_source": "crypto_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
-                venue_id=f"crypto_{self.exchange}",
-                venue_type="financial",
-                data_mode=DataMode.MOCK,
-                data_source="crypto_mock_fallback",
-                is_mock=True
-            )
-            markets.append(m)
-        
-        min_vol = filters.get("min_volume", 10000)
-        filtered = [m for m in markets if m.volume_24h >= min_vol]
-        logger.info(f"Crypto {self.exchange} mock discovery: {len(markets)} -> {len(filtered)}")
-        return filtered[:target_count]
+        # No mock fallback. This fabricated markets for every symbol in the
+        # pair list whenever the exchange was unreachable, so a network failure
+        # became invented prices.
+        self.last_error = (f"{self.exchange} unreachable; no markets returned. "
+                           f"Refusing to fabricate markets on a network failure.")
+        logger.warning(f"Crypto {self.exchange} discovery returned no markets: {self.last_error}")
+        return []
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         # For crypto, fetch real orderbook if possible

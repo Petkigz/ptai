@@ -17,7 +17,13 @@ class PolymarketAdapter(MarketAdapter):
         self.private_key = private_key
         self.funder = funder
         self.client = PolymarketClient()
-        self.scanner = MarketScanner()
+        # Constructed lazily. MarketScanner.__init__ builds a VenueRegistry that
+        # registers a PolymarketAdapter, so building it here recursed:
+        #   MarketScanner -> VenueRegistry -> PolymarketAdapter -> MarketScanner
+        # until RecursionError, which MarketScanner caught and downgraded to a
+        # debug log, leaving its registry None. Every PolymarketAdapter
+        # construction burned a near-limit stack for nothing.
+        self._scanner = None
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
@@ -39,38 +45,83 @@ class PolymarketAdapter(MarketAdapter):
             return EligibilityStatus.REQUIRES_VERIFICATION
         return EligibilityStatus.ELIGIBLE
 
+    @property
+    def scanner(self) -> "MarketScanner":
+        """Lazily built - see the note in __init__ on the recursion this avoids."""
+        if self._scanner is None:
+            self._scanner = MarketScanner()
+        return self._scanner
+
+    # Anything matching this did not come from the Gamma API and must not be
+    # relabelled as if it did.
+    @staticmethod
+    def _looks_fabricated(m: Market) -> bool:
+        return bool(
+            getattr(m, "is_mock", False)
+            or str(getattr(m, "data_mode", "")).lower().endswith("mock")
+            or str(getattr(m, "venue_id", "")).lower() == "mock"
+            or (m.raw or {}).get("mock") is True
+            or "MOCK" in str(getattr(m, "id", "")).upper()
+        )
+
     async def discover_markets(self, target_count: int = 500, filters: Dict = None) -> List[Market]:
+        """
+        Real Polymarket markets only.
+
+        This method used to stamp `data_mode=LIVE`, `is_mock=False` and
+        `"safety": "LIVE_DATA - executable"` onto EVERY market the scanner
+        returned - including the mock fallback markets the scanner generates
+        when discovery fails. Since the scanner's default is allow_mock=True,
+        a network failure produced fabricated markets that this adapter then
+        relabelled as live Gamma API data, defeating the execution guard that
+        checks exactly those two fields.
+
+        Provenance is now asserted only for markets that actually come back
+        from a live call, and anything fabricated is dropped rather than
+        relabelled.
+        """
         filters = filters or {}
         try:
-            # Use scanner but ensure venue_id immutable
-            markets = self.scanner.scan(target_count=target_count, order_by="volume_24hr", use_registry=False)
-            min_vol = filters.get("min_volume", 1000)
-            min_liq = filters.get("min_liquidity", 100)
-            filtered = [m for m in markets if m.volume_24h >= min_vol and m.liquidity >= min_liq]
-            # Ensure venue_id immutable + V9 FIX #1 explicit LIVE data_mode
-            for m in filtered:
-                m.venue_id = "polymarket"
-                m.venue_type = "prediction"
-                # V9 FIX #1: Explicit LIVE data separation - real Polymarket Gamma API
-                m.data_mode = DataMode.LIVE
-                m.data_source = "gamma_api"
-                m.is_mock = False
-                m.raw["venue_id"] = "polymarket"
-                m.raw["adapter_venue_id"] = self.venue_id
-                m.raw["discovery_source"] = "PolymarketAdapter.discover_markets"
-                m.raw["data_mode"] = "live"
-                m.raw["data_source"] = "gamma_api"
-                m.raw["is_mock"] = False
-                m.raw["safety"] = "LIVE_DATA - executable"
-            return filtered[:target_count]
+            # allow_mock=False: the scanner must not generate fabricated markets
+            # for an adapter whose whole job is reporting real ones.
+            markets = self.scanner.scan(target_count=target_count, order_by="volume_24hr",
+                                        use_registry=False, allow_mock=False)
         except Exception as e:
-            logger.error(f"Polymarket discovery failed: {e}")
+            logger.error(f"Polymarket discovery failed: {type(e).__name__}: {e}")
             return []
 
+        fabricated = [m for m in markets if self._looks_fabricated(m)]
+        if fabricated:
+            logger.warning(
+                f"Polymarket: dropped {len(fabricated)} fabricated market(s) rather than "
+                f"relabelling them as live, e.g. {fabricated[0].id}")
+        markets = [m for m in markets if not self._looks_fabricated(m)]
+
+        min_vol = filters.get("min_volume", 1000)
+        min_liq = filters.get("min_liquidity", 100)
+        filtered = [m for m in markets if m.volume_24h >= min_vol and m.liquidity >= min_liq]
+
+        for m in filtered:
+            m.venue_id = "polymarket"
+            m.venue_type = "prediction"
+            m.data_mode = DataMode.LIVE
+            m.data_source = "gamma_api"
+            m.is_mock = False
+            m.raw["venue_id"] = "polymarket"
+            m.raw["adapter_venue_id"] = self.venue_id
+            m.raw["discovery_source"] = "PolymarketAdapter.discover_markets"
+            m.raw["data_mode"] = "live"
+            m.raw["data_source"] = "gamma_api"
+            m.raw["is_mock"] = False
+            m.raw["safety"] = "LIVE_DATA - executable"
+        return filtered[:target_count]
+
     def discover_markets_sync(self, target_count: int = 500) -> List[Market]:
-        """Synchronous version for scanner compatibility"""
+        """Synchronous version for scanner compatibility. Same no-laundering rule."""
         try:
-            markets = self.scanner.scan(target_count=target_count, order_by="volume_24hr", use_registry=False)
+            markets = self.scanner.scan(target_count=target_count, order_by="volume_24hr",
+                                        use_registry=False, allow_mock=False)
+            markets = [m for m in markets if not self._looks_fabricated(m)]
             for m in markets:
                 m.venue_id = "polymarket"
                 m.venue_type = "prediction"

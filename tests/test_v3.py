@@ -50,7 +50,12 @@ class TestV3Venues:
         assert "kalshi" in registry.adapters
         assert "manifold" in registry.adapters
         assert "crypto_binance" in registry.adapters
-        assert "stock_mock" in registry.adapters
+        # There is no mock broker any more. StockAdapter now declares itself
+        # unimplemented rather than returning invented quotes, so the venue_id
+        # reflects the real broker name instead of the literal string "mock".
+        assert "stock_none" in registry.adapters
+        stock = registry.adapters["stock_none"]
+        assert stock.capabilities.implementation_status == "unimplemented"
 
     def test_kalshi_eligibility_ug_restricted(self):
         adapter = KalshiAdapter()
@@ -78,12 +83,31 @@ class TestV3Venues:
         assert adapter.check_eligibility("US") == EligibilityStatus.RESTRICTED
 
     @pytest.mark.asyncio
-    async def test_all_venues_discover(self):
-        venues = [PolymarketAdapter(), KalshiAdapter(), ManifoldAdapter(), CryptoAdapter(), StockAdapter()]
+    async def test_no_venue_fabricates_markets(self):
+        """
+        This previously asserted every venue discovered markets.
+
+        That could only pass because adapters returned hardcoded rows on
+        failure, so it locked the fabrication in as a requirement. Offline -the
+        normal state in a sandbox and a real failure mode in production - a
+        venue must return nothing and say why.
+        """
+        venues = [PolymarketAdapter(), KalshiAdapter(), ManifoldAdapter(),
+                  CryptoAdapter(), StockAdapter()]
         for adapter in venues:
             markets = await adapter.discover_markets(target_count=20)
-            assert len(markets) > 0, f"{adapter.venue_id} should discover markets"
             assert len(markets) <= 20
+            for m in markets:
+                assert not m.is_mock, f"{adapter.venue_id} returned a mock market"
+                assert "MOCK" not in str(m.id).upper(), \
+                    f"{adapter.venue_id} returned fabricated id {m.id}"
+                assert "MOCK" not in (m.question or "").upper()
+
+    @pytest.mark.asyncio
+    async def test_unimplemented_venue_returns_nothing(self):
+        adapter = StockAdapter()
+        assert await adapter.discover_markets(target_count=20) == []
+        assert adapter.check_eligibility("UG") != EligibilityStatus.ELIGIBLE
 
     def test_venue_capabilities(self):
         poly = PolymarketAdapter()
@@ -285,8 +309,21 @@ class TestV3Endpoints:
         data = res.json()
         assert "total_scanned" in data
         assert "per_venue" in data
-        assert data["total_scanned"] > 0
         assert "I scanned" in data["message"]
+        # The count is no longer asserted > 0. It only ever was because
+        # adapters fabricated markets on failure; with the network blocked here
+        # the honest answer is zero, and the endpoint must report that cleanly
+        # rather than erroring.
+        assert data["total_scanned"] >= 0
+
+    def test_discovery_endpoint_is_clean_when_offline(self):
+        """Zero markets must be a normal result, not an exception."""
+        from fastapi.testclient import TestClient
+        from src.ptai.dashboard import app
+        client = TestClient(app)
+        data = client.get("/api/v3/discovery?target_per_venue=10").json()
+        assert "error" not in data, data.get("error")
+        assert isinstance(data.get("per_venue"), dict)
 
     def test_v3_opportunities_endpoint(self):
         from fastapi.testclient import TestClient
@@ -320,7 +357,10 @@ class TestV3Endpoints:
         assert res.status_code == 200
         data = res.json()
         assert "status" in data
-        assert data["status"] == "completed"
+        # "completed" required markets to exist, which required fabrication.
+        # A cycle with no markets is a legitimate completed outcome; the
+        # endpoint reports it as "no_markets" rather than pretending to trade.
+        assert data["status"] in ("completed", "no_markets")
         assert "discovery" in data
         assert "opportunities" in data
         assert "reasoning" in data

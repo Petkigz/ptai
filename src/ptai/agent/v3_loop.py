@@ -48,6 +48,8 @@ from typing import Dict, List, Optional, Any
 import asyncio
 import time
 from datetime import datetime, timezone
+import os
+
 from loguru import logger
 from pathlib import Path
 
@@ -71,7 +73,8 @@ from ..venues.whitebit_adapter import WhiteBITAdapter
 from ..venues.afx_adapter import AFXAdapter
 from ..venues.grvt_adapter import GRVTAdapter
 from ..venues.pionex_adapter import PionexAdapter
-from ..venues.betfair_adapter import BetfairAdapter, BetdaqAdapter, BetConnectAdapter
+from ..venues.betfair_adapter import BetdaqAdapter, BetConnectAdapter
+from ..venues.betfair_exchange import BetfairExchangeAdapter
 from ..betting.engine import BettingEngine
 from ..betting.market_types import catalogue_report as betting_catalogue_report
 from ..venues.ccxt_adapter import CCXTUnifiedAdapter
@@ -272,8 +275,18 @@ class TradingAgentV3:
         stock_adapter = StockAdapter(broker="mock")
         self.venue_registry.register(stock_adapter)
 
-        # Betfair - world's largest betting exchange flumine framework Betfair Betdaq Betconnect lay betting
-        betfair_adapter = BetfairAdapter(use_flumine=True)
+        # Betfair - world's largest betting exchange. This is the REAL adapter
+        # from betfair_exchange.py, not the legacy stub that returned invented
+        # football questions. It is the feed that carries goals, corners, cards
+        # and player props, so the derivative market models have something to
+        # price against. Without credentials it returns no markets and says so.
+        betfair_adapter = BetfairExchangeAdapter(
+            username=os.getenv("BETFAIR_USERNAME", ""),
+            password=os.getenv("BETFAIR_PASSWORD", ""),
+            app_key=os.getenv("BETFAIR_APP_KEY", ""),
+            sports=("football",),
+            include_player_markets=False,
+        )
         self.venue_registry.register(betfair_adapter)
         betdaq_adapter = BetdaqAdapter()
         self.venue_registry.register(betdaq_adapter)
@@ -652,6 +665,11 @@ class TradingAgentV3:
         total_markets = sum(len(m) for m in markets_by_venue.values())
         
         if total_markets == 0:
+            # Same shape as the full result. The no-markets path used to return
+            # a different set of keys, so a UI had to special-case it to render
+            # "nothing to trade" - and the honest empty case is the common one
+            # whenever a venue is down or unconfigured.
+            empty_venues = {vid: 0 for vid in markets_by_venue} or {}
             return {
                 "status": "no_markets",
                 "reason": "No markets discovered from any venue",
@@ -659,7 +677,18 @@ class TradingAgentV3:
                 "eligibility": {k: v.value for k, v in eligibility.items()},
                 "qualification": qualification_report.reasoning if qualification_report else "No qualification",
                 "execution_time": time.time() - start,
-                "mission": self.mission
+                "mission": self.mission,
+                "discovery": {
+                    "total_scanned": 0,
+                    "per_venue": empty_venues,
+                    "message": ("I scanned 0 markets across "
+                                f"{len(markets_by_venue)} venues. No venue returned markets - "
+                                "check credentials and eligibility before assuming a quiet market."),
+                },
+                "opportunities": {"total": 0, "selected": 0, "trades": [], "reasoning": "DO NOTHING"},
+                "reasoning": ("No markets discovered from any venue, so no opportunities were "
+                              "evaluated. This is not a signal to hold: a venue that fails to "
+                              "return markets is unavailable, not quiet."),
             }
         
         # Alpha scan - all additional alpha ideas (Top 5 + queue)

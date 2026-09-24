@@ -1,6 +1,16 @@
 
 """
-Tests for v5 expansion beyond Polymarket - 18 venues
+Tests for the multi-venue expansion.
+
+These tests used to assert that eighteen venues discovered markets. Most of
+those venues had no client at all - they returned hardcoded rows - so the tests
+were asserting the fabrication. `test_veynor_intelligence` checked that a
+whale-trade list contained the word "whale"; `test_openpx_sub_ms` checked that a
+fabricated orderbook reported "sub-millisecond" latency.
+
+The expansion is still real: eighteen venues are registered and reachable
+through one interface. What is now tested is which of them actually work, and
+that the ones which do not say so instead of inventing markets.
 """
 import pytest
 from src.ptai.venues.registry import VenueRegistry
@@ -67,36 +77,57 @@ async def test_all_venues_register():
     assert len(registry.adapters) == 19
     assert "polymarket" in registry.adapters
     assert "kalshi" in registry.adapters
-    assert "betfair" in registry.adapters
     assert "whitebit" in registry.adapters
     assert "afx_dex" in registry.adapters
     assert "ccxt_unified" in registry.adapters
     assert "veynor" in registry.adapters
     assert "openpx" in registry.adapters
+    # The legacy Betfair stub no longer claims venue_id "betfair" - that
+    # belongs to the real exchange adapter, and registering the stub under that
+    # id shadowed it.
+    assert "betfair_legacy_stub" in registry.adapters
+    assert "betfair" not in registry.adapters
 
 @pytest.mark.asyncio
-async def test_venue_discovery():
+async def test_venue_discovery_returns_no_fabricated_markets():
+    """
+    Every adapter is called and checked for fabrication.
+
+    This previously asserted `len(markets) > 0` for all fifteen, which could
+    only pass because fourteen of them returned invented rows. With the network
+    blocked the honest count is zero, and the assertion that matters is that
+    nothing fabricated comes back.
+    """
     adapters = [
-        PolymarketAdapter(),
-        KalshiAdapter(),
-        ManifoldAdapter(),
-        PredictItAdapter(),
-        SimmerAdapter(),
-        CymeticaAdapter(),
-        WhiteBITAdapter(),
-        AFXAdapter(),
-        GRVTAdapter(),
-        PionexAdapter(),
-        BetfairAdapter(),
-        CCXTUnifiedAdapter(),
-        VeynorAdapter(),
-        OpenPXAdapter(),
-        ApifyAdapter(),
+        PolymarketAdapter(), KalshiAdapter(), ManifoldAdapter(),
+        PredictItAdapter(), SimmerAdapter(), CymeticaAdapter(), WhiteBITAdapter(),
+        AFXAdapter(), GRVTAdapter(), PionexAdapter(), BetfairAdapter(),
+        CCXTUnifiedAdapter(), VeynorAdapter(), OpenPXAdapter(), ApifyAdapter(),
     ]
     for adapter in adapters:
         markets = await adapter.discover_markets(target_count=5)
-        assert len(markets) > 0, f"{adapter.venue_id} discovery failed"
-        assert markets[0].best_price > 0
+        for m in markets:
+            assert not m.is_mock, f"{adapter.venue_id} returned a mock market"
+            assert "MOCK" not in str(m.id).upper(), \
+                f"{adapter.venue_id} returned fabricated id {m.id}"
+            assert "MOCK" not in (m.question or "").upper(), \
+                f"{adapter.venue_id} fabricated a question"
+
+
+@pytest.mark.asyncio
+async def test_unimplemented_venues_declare_themselves():
+    """A venue with no client must say so rather than returning markets."""
+    from src.ptai.venues.adapter import STATUS_UNIMPLEMENTED
+    for adapter in [SimmerAdapter(), CymeticaAdapter(), AFXAdapter(), GRVTAdapter(),
+                    PionexAdapter(), CCXTUnifiedAdapter(), VeynorAdapter(),
+                    OpenPXAdapter(), BetdaqAdapter(), BetConnectAdapter()]:
+        assert adapter.capabilities.implementation_status == STATUS_UNIMPLEMENTED, \
+            adapter.venue_id
+        assert adapter.capabilities.supports_market_discovery is False, adapter.venue_id
+        assert await adapter.discover_markets() == [], adapter.venue_id
+        # UNKNOWN, not ELIGIBLE: an adapter with no client cannot be traded on.
+        assert adapter.check_eligibility("UG").value == "unknown", adapter.venue_id
+
 
 def test_eligibility_ug():
     adapters = [
@@ -185,22 +216,32 @@ def test_multi_venue_risk_settlement():
     assert len(risks) == 2
     assert any("risk" in r.lower() for r in risks)
 
-def test_ccxt_unified():
-    adapter = CCXTUnifiedAdapter(venues=["polymarket", "kalshi", "binance"])
-    assert adapter.ccxt_available or not adapter.ccxt_available  # either
-    ticker = adapter.get_unified_ticker("Fed cut June")
-    assert "polymarket" in ticker
-    assert "kalshi" in ticker
-    assert "spread" in ticker
+def test_ccxt_unified_is_declared_unimplemented():
+    """
+    This asserted `get_unified_ticker` returned cross-venue prices.
 
-def test_veynor_intelligence():
+    ccxt is not installed and the method no longer exists - it returned invented
+    tickers. Polymarket and Kalshi have real adapters, so this layer is
+    redundant rather than merely unbuilt.
+    """
+    adapter = CCXTUnifiedAdapter(venues=["polymarket", "kalshi", "binance"])
+    assert adapter.venue_id == "ccxt_unified"
+    assert adapter.capabilities.implementation_status == "unimplemented"
+    assert adapter.capabilities.supports_market_discovery is False
+
+
+def test_veynor_is_declared_unimplemented():
+    """
+    This asserted a whale-trade list contained the word "whale".
+
+    There is no Veynor client. Whale signals now come from
+    markets/whale_tracker.py, which reads public Polymarket activity.
+    """
     adapter = VeynorAdapter()
-    whales = adapter.get_whale_trades(limit=2)
-    assert len(whales) >= 1
-    assert "whale" in whales[0]
-    arbs = adapter.get_arb_opportunities()
-    assert len(arbs) >= 1
-    assert "spread" in arbs[0]
+    assert adapter.venue_id == "veynor"
+    assert adapter.capabilities.implementation_status == "unimplemented"
+    assert not hasattr(adapter, "get_whale_trades")
+
 
 def test_whitebit_low_minimum():
     adapter = WhiteBITAdapter()
@@ -210,29 +251,76 @@ def test_whitebit_low_minimum():
     status_ug = adapter.check_eligibility("UG")
     assert status_ug.value in ["eligible", "requires_verification", "restricted"]
 
-def test_afx_dex_wallet_signed():
+def test_afx_dex_is_declared_unimplemented():
+    """
+    This asserted `min_deposit == 10.0` and a 0.05% fee.
+
+    Neither was real - there is no wallet-signed request client, no EIP-712
+    signing and no deposit flow. The constants described a venue, not code.
+    """
     adapter = AFXAdapter(wallet_address="0x1234", private_key="0xabc")
-    assert adapter.min_deposit == 10.0
-    assert adapter.min_withdrawal == 2.0
-    assert adapter.capabilities.fee_taker_pct == 0.0005
-    status = adapter.check_eligibility("UG")
-    assert status.value == "eligible"  # DEX worldwide
+    assert adapter.venue_id == "afx_dex"
+    assert adapter.capabilities.implementation_status == "unimplemented"
+    assert not hasattr(adapter, "min_deposit")
 
-def test_betfair_lay_betting():
-    adapter = BetfairAdapter()
-    assert adapter.capabilities.fee_taker_pct == 0.05
-    # Lay available opens arb and market-making not possible on traditional sportsbooks
-    # Check mock market has lay
-    import asyncio
-    markets = asyncio.run(adapter.discover_markets(target_count=2))
-    assert len(markets) > 0
-    assert markets[0].raw.get("lay_available") == True
 
-def test_openpx_sub_ms():
+def test_betfair_lay_is_tested_against_the_real_adapter():
+    """
+    Lay betting is real, but not on this stub.
+
+    The legacy adapter asserted a 5% fee and returned invented markets carrying
+    `lay_available: True`. Lay support lives in the exchange adapter, which
+    carries both sides of the ladder from real Betfair data.
+    """
+    legacy = BetfairAdapter()
+    assert legacy.capabilities.implementation_status == "unimplemented"
+    assert legacy.venue_id != "betfair", \
+        "the stub must not share the venue_id of the working adapter"
+
+    from src.ptai.venues.betfair_exchange import BetfairExchangeAdapter, BetfairClient
+    real = BetfairExchangeAdapter()
+    assert real.venue_id == "betfair"
+    assert real.capabilities.implementation_status == "live"
+    # Betfair commission is charged on net winnings, not as a taker fee.
+    assert real.capabilities.supports_orderbook is True
+    assert real.capabilities.supports_trading is False, \
+        "order placement is deliberately not implemented"
+
+
+def test_openpx_is_declared_unimplemented():
+    """
+    This asserted a fabricated orderbook reported "sub-millisecond" latency.
+
+    No Rust binding exists, and a latency figure for a client that was never
+    written is not a capability.
+    """
     adapter = OpenPXAdapter()
     assert adapter.venue_id == "openpx"
+    assert adapter.capabilities.implementation_status == "unimplemented"
+
     import asyncio
     ob = asyncio.run(adapter.get_orderbook(make_market()))
-    assert ob["latency"] == "sub-millisecond"
-    assert "polymarket" in ob["venues"]
-    assert "kalshi" in ob["venues"]
+    assert ob["available"] is False
+    assert "reason" in ob
+    assert "latency" not in ob
+
+
+def test_registry_capability_report_separates_live_from_declared():
+    """The UI needs to distinguish reachable venues from merely-registered ones."""
+    registry = VenueRegistry(country_code="UG")
+    registry.register(PolymarketAdapter())
+    registry.register(SimmerAdapter())
+    from src.ptai.venues.betfair_exchange import BetfairExchangeAdapter
+    registry.register(BetfairExchangeAdapter())
+
+    report = registry.capability_report()
+    assert report["total_registered"] == 3
+    assert "polymarket" in report["live"]
+    assert "betfair" in report["live"]
+    assert "simmer" in report["unimplemented"]
+    assert "simmer" not in report["live"]
+    assert report["tradeable"] == [], "nothing here places orders"
+    # every venue reports what is missing
+    for v in report["venues"]:
+        if v["implementation_status"] == "unimplemented":
+            assert v["note"], v["venue_id"]

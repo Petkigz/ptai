@@ -18,6 +18,8 @@ from ..markets.base import Market, MarketSource, Token, DataMode
 class WhiteBITAdapter(MarketAdapter):
     def __init__(self, api_key: str = None, api_secret: str = None):
         super().__init__(venue_id="whitebit", venue_type=VenueType.FINANCIAL)
+
+        self.last_error: str = ""
         self.api_key = api_key
         self.api_secret = api_secret
         self.capabilities = AdapterCapability(
@@ -89,32 +91,12 @@ class WhiteBITAdapter(MarketAdapter):
         except Exception as e:
             logger.debug(f"WhiteBIT public API failed: {e}")
 
-        # Mock fallback
-        symbols = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "BNB_USDT", "XRP_USDT", "ADA_USDT", "DOGE_USDT"]
-        markets = []
-        for i, sym in enumerate(symbols[:target_count]):
-            prob = 0.5 + (i*0.02 - 0.06)
-            markets.append(Market(
-                id=f"whitebit-MOCK-{sym}",
-                source=MarketSource.POLYMARKET,
-                question=f"Will {sym} close higher? (WhiteBIT margin/futures) - MOCK_DATA MUST NEVER REACH LIVE EXECUTION",
-                outcomes=["YES", "NO"],
-                outcome_prices=[prob, 1-prob],
-                tokens=[Token(token_id=sym, outcome="YES", price=prob)],
-                volume=100000,
-                volume_24h=50000,
-                liquidity=20000,
-                active=True,
-                closed=False,
-                event_slug=sym,
-                raw={"venue": "whitebit", "symbol": sym, "type": "futures" if "PERP" in sym else "spot", "category": "crypto", "leverage": "10x margin 100x futures", "data_mode": "mock", "data_source": "whitebit_mock_fallback", "is_mock": True, "safety": "MOCK_DATA must be impossible to reach live execution"},
-                venue_id="whitebit",
-                venue_type="financial",
-                data_mode=DataMode.MOCK,
-                data_source="whitebit_mock_fallback",
-                is_mock=True
-            ))
-        logger.info(f"WhiteBIT mock discovered {len(markets)} markets")
+        # No mock fallback - the line below used to follow a fabricated-market
+        # block. A network failure now returns nothing and says so.
+        self.last_error = ("WhiteBIT API unreachable; no markets returned. "
+                           "Refusing to fabricate markets on a network failure.")
+        logger.warning(f"WhiteBIT discovery returned no markets: {self.last_error}")
+        return []
         return markets
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:

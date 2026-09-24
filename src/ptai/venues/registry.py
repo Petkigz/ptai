@@ -2,7 +2,7 @@
 Venue Registry - manages all adapters, learns which venues work
 FIXED V7: Exact routing, no fallback to first eligible - hard safety
 """
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity
@@ -134,6 +134,67 @@ class VenueRegistry:
             return adapter
         logger.error(f"Adapter for venue_id {venue_id} not found in {list(self.adapters.keys())} - ABORT TRADE, never fallback")
         return None
+
+    def capability_report(self) -> Dict[str, Any]:
+        """
+        What each registered venue can actually do.
+
+        The distinction that matters to a user is not eligibility but whether
+        code exists behind the venue. Thirteen adapters once advertised market
+        discovery and returned invented markets, so adding a venue to the
+        registry looked like adding coverage. This separates the two questions:
+        which venues are reachable, and which are only known about.
+
+        Driven by AdapterCapability.implementation_status, so it cannot drift
+        from what the adapter actually does.
+        """
+        from .adapter import STATUS_LIVE, STATUS_SCANNER, STATUS_UNIMPLEMENTED
+
+        venues = []
+        for venue_id, adapter in sorted(self.adapters.items()):
+            caps = adapter.capabilities
+            status = getattr(caps, "implementation_status", STATUS_LIVE)
+            note = getattr(caps, "implementation_note", "")
+            try:
+                eligibility = adapter.check_eligibility(self.country_code).value
+            except Exception as e:
+                eligibility = f"error: {type(e).__name__}"
+            venues.append({
+                "venue_id": venue_id,
+                "venue_type": adapter.venue_type.value,
+                "implementation_status": status,
+                "implemented": getattr(caps, "is_implemented", status == STATUS_LIVE),
+                "returns_real_data": status == STATUS_LIVE,
+                "can_trade": status == STATUS_LIVE and caps.supports_trading,
+                "eligibility": eligibility,
+                "note": note,
+                "supports": {
+                    "market_discovery": caps.supports_market_discovery,
+                    "orderbook": caps.supports_orderbook,
+                    "trading": caps.supports_trading,
+                    "portfolio": caps.supports_portfolio,
+                },
+            })
+
+        by_status: Dict[str, int] = {}
+        for v in venues:
+            by_status[v["implementation_status"]] = by_status.get(v["implementation_status"], 0) + 1
+
+        return {
+            "country_code": self.country_code,
+            "total_registered": len(venues),
+            "by_status": by_status,
+            "live": [v["venue_id"] for v in venues if v["returns_real_data"]],
+            "tradeable": [v["venue_id"] for v in venues if v["can_trade"]],
+            "unimplemented": [v["venue_id"] for v in venues
+                              if v["implementation_status"] == STATUS_UNIMPLEMENTED],
+            "scanners": [v["venue_id"] for v in venues
+                         if v["implementation_status"] == STATUS_SCANNER],
+            "venues": venues,
+            "how_to_read": ("implements/returns_real_data reflect whether a client exists, "
+                            "not whether the venue is legal in your jurisdiction. "
+                            "'unimplemented' venues return no markets by design."),
+        }
 
     def rank_opportunities(self, opportunities: List[VenueOpportunity]) -> List[VenueOpportunity]:
         """

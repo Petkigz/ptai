@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from loguru import logger
 
 from ..markets.base import DataMode, Market, MarketSource, Token
+from .adapter import (AdapterCapability, EligibilityStatus, MarketAdapter,
+                      STATUS_LIVE, VenueOpportunity, VenueType)
 
 
 # ---------------------------------------------------------------------------
@@ -491,3 +493,227 @@ def fetch_full_card(client: BetfairClient, event_type_id: str,
     logger.info(f"[betfair] full card: {sum(len(v) for v in grouped.values())} bookable "
                 f"markets across {len(grouped)} catalogue keys")
     return grouped
+
+
+# ---------------------------------------------------------------------------
+# MarketAdapter implementation - the wiring that was missing
+# ---------------------------------------------------------------------------
+
+# Betfair sport ids. Football is 1; the rest are here so one call can pull a
+# whole card for the sports the pricing models cover.
+# Countries Betfair does not accept customers from. Not exhaustive - Betfair
+# maintains the authoritative list and it changes; this is a conservative
+# starting set so a restricted jurisdiction is not reported as eligible.
+BETFAIR_RESTRICTED_COUNTRIES = frozenset({
+    "US", "FR", "DE", "ES", "IT", "PT", "BE", "NL", "TR", "SG", "HK",
+    "JP", "KR", "CN", "TW", "AU", "NZ", "ZA", "TW",
+})
+
+BETFAIR_EVENT_TYPE_IDS = {
+    "football": "1", "tennis": "2", "golf": "3", "cricket": "4",
+    "basketball": "7524", "ice_hockey": "7522", "american_football": "6423",
+    "baseball": "7511", "rugby_union": "5", "rugby_league": "1477",
+}
+
+
+class BetfairExchangeAdapter(MarketAdapter):
+    """
+    The real Betfair adapter, as a MarketAdapter.
+
+    The exchange client, the market-type mapping and the full-card fetch all
+    existed in this module, but nothing in the trading path used them: the
+    registry was given `venues/betfair_adapter.BetfairAdapter`, a stub that
+    returned invented football questions. So the one feed that actually carries
+    goals, corners, cards and player props - the derivative markets the pricing
+    models were written for - was never connected to anything.
+
+    This class connects it. `discover_markets` fans out across the requested
+    sports, fetches every market type in the catalogue, and returns only
+    bookable ones.
+
+    Credentials are required. Without them it returns no markets and records
+    why, because a fabricated exchange price would be priced by the arbitrage
+    module as a real lay opportunity.
+    """
+
+    def __init__(self, username: str = "", password: str = "", app_key: str = "",
+                 cert_files: Optional[Tuple[str, str]] = None,
+                 sports: Sequence[str] = ("football",),
+                 include_player_markets: bool = False,
+                 hours_ahead: int = 48,
+                 max_results_per_sport: int = 200,
+                 client: Optional["BetfairClient"] = None):
+        super().__init__(venue_id="betfair", venue_type=VenueType.OTHER)
+        self.sports = list(sports)
+        self.include_player_markets = include_player_markets
+        self.hours_ahead = hours_ahead
+        self.max_results_per_sport = max_results_per_sport
+        self.client = client or BetfairClient(username, password, app_key, cert_files)
+        self.capabilities = AdapterCapability(
+            supports_market_discovery=True,
+            supports_orderbook=True,
+            # Order placement is not implemented - see place_order.
+            supports_trading=False,
+            supports_portfolio=True,
+            supports_history=False,
+            fee_taker_pct=0.02,   # Betfair charges commission on net winnings
+            fee_maker_pct=0.0,
+            min_order_usd=2.0,
+            implementation_status=STATUS_LIVE,
+            implementation_note="",
+        )
+        self._card: Dict[str, List[BetfairMarket]] = {}
+        self.last_error: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return self.client.configured
+
+    def check_eligibility(self, country_code: str = "UG") -> EligibilityStatus:
+        """
+        Betfair does not accept customers from every jurisdiction, and the
+        country must be one the exchange actually serves.
+        """
+        if country_code.upper() in BETFAIR_RESTRICTED_COUNTRIES:
+            return EligibilityStatus.RESTRICTED
+        if not self.configured:
+            return EligibilityStatus.REQUIRES_VERIFICATION
+        return EligibilityStatus.ELIGIBLE
+
+    async def discover_markets(self, target_count: int = 500, filters: Dict = None) -> List[Market]:
+        self.last_error = ""
+        if not self.configured:
+            self.last_error = ("Betfair credentials not configured (username, password, "
+                               "app_key). No markets returned - refusing to invent them.")
+            logger.info(f"[betfair] {self.last_error}")
+            return []
+
+        if not self.client.login():
+            self.last_error = f"login failed: {self.client.last_error}"
+            logger.warning(f"[betfair] {self.last_error}")
+            return []
+
+        markets: List[Market] = []
+        self._card = {}
+        sports = (filters or {}).get("sports", self.sports)
+        for sport in sports:
+            event_type_id = BETFAIR_EVENT_TYPE_IDS.get(str(sport).lower())
+            if not event_type_id:
+                logger.warning(f"[betfair] unknown sport {sport!r}; known: "
+                               f"{sorted(BETFAIR_EVENT_TYPE_IDS)}")
+                continue
+            try:
+                card = fetch_full_card(
+                    self.client, event_type_id,
+                    include_player_markets=self.include_player_markets,
+                    max_results=self.max_results_per_sport,
+                    hours_ahead=self.hours_ahead)
+            except Exception as e:
+                self.last_error = f"{sport}: {type(e).__name__}: {e}"
+                logger.warning(f"[betfair] {self.last_error}")
+                continue
+
+            for catalogue_key, group in card.items():
+                self._card.setdefault(catalogue_key, []).extend(group)
+                for mf in group:
+                    try:
+                        built = self.client.to_market(mf, data_mode=DataMode.LIVE)
+                    except Exception as e:
+                        logger.debug(f"[betfair] to_market failed for {mf.market_id}: {e}")
+                        continue
+                    if built is not None:
+                        markets.append(built)
+            logger.info(f"[betfair] {sport}: {sum(len(v) for v in card.values())} bookable markets "
+                        f"across {len(card)} catalogue keys")
+
+        if not markets:
+            self.last_error = self.last_error or "no bookable markets in the requested window"
+        return markets[:target_count]
+
+    async def get_orderbook(self, market: Market) -> Dict[str, Any]:
+        """
+        Real exchange depth for one market.
+
+        Returns the back and lay ladders as the venue reports them, not a
+        derived spread: on an exchange the lay price is a genuine tradable
+        price rather than the inverse of the back.
+        """
+        market_id = market.raw.get("market_id") or market.slug
+        if not market_id:
+            return {"available": False, "reason": "no betfair market_id on this market"}
+        if not self.configured:
+            return {"available": False, "reason": "Betfair credentials not configured"}
+        if not self.client.login():
+            return {"available": False, "reason": self.client.last_error}
+
+        try:
+            books = self.client.market_books([market_id])
+        except Exception as e:
+            return {"available": False, "reason": f"{type(e).__name__}: {e}"}
+
+        book = books.get(market_id)
+        if book is None:
+            return {"available": False, "reason": "market book not returned by the exchange"}
+
+        runners, total_matched = BetfairClient.parse_runners(book)
+        return {
+            "available": True,
+            "market_id": market_id,
+            "back": [{"price": r.back_price, "size": r.back_size} for r in runners if r.back_price],
+            "lay": [{"price": r.lay_price, "size": r.lay_size} for r in runners if r.lay_price],
+            "total_matched": total_matched,
+            "in_play": getattr(book, "inplay", False),
+            "source": "betfair_exchange_live",
+        }
+
+    async def get_portfolio(self) -> Dict[str, Any]:
+        if not self.configured or not self.client.login():
+            return {"available": False, "balance": None, "positions": [],
+                    "reason": self.client.last_error or "not configured"}
+        try:
+            account = self.client._client.account
+            funds = account.get_account_funds()
+            return {
+                "available": True,
+                "balance": float(getattr(funds, "available_to_bet_balance", 0.0) or 0.0),
+                "currency": getattr(funds, "currency", ""),
+                "positions": [],
+                "source": "betfair_account_api",
+            }
+        except Exception as e:
+            return {"available": False, "balance": None, "positions": [],
+                    "reason": f"{type(e).__name__}: {e}"}
+
+    async def place_order(self, opportunity: VenueOpportunity, max_spend_usd: float,
+                          max_price: float) -> Dict[str, Any]:
+        """
+        Refused, deliberately.
+
+        Placing a real Betfair order needs the back/lay side, the price, the
+        size, persistence type and a liability check against the wallet. None
+        of that is built, and an order path that half-exists is more dangerous
+        than one that does not: it would place bets the risk layer never sized.
+        """
+        logger.error("[betfair] place_order refused - order placement is not implemented")
+        return {
+            "status": "unimplemented",
+            "success": False,
+            "venue_id": "betfair",
+            "error": "Betfair order placement is not implemented. Market data and real "
+                     "exchange prices are available; execution is not.",
+            "message": "Refusal, not a fill. No order was placed.",
+        }
+
+    def full_card(self) -> Dict[str, List[BetfairMarket]]:
+        """The last fetched card, grouped by catalogue key."""
+        return self._card
+
+    def catalogue_coverage(self) -> Dict[str, Any]:
+        """Which market types the last fetch actually returned."""
+        return {
+            "catalogue_keys": sorted(self._card.keys()),
+            "market_counts": {k: len(v) for k, v in sorted(self._card.items())},
+            "total": sum(len(v) for v in self._card.values()),
+            "mapped_types": len(BETFAIR_MARKET_MAP),
+            "unknown_types_seen": dict(self.client.unknown_market_types),
+        }
