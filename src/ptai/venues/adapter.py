@@ -11,6 +11,7 @@ from datetime import datetime
 from loguru import logger
 
 from ..markets.base import Market
+from ..markets.orderbook import read_spread
 
 
 class VenueType(str, Enum):
@@ -206,7 +207,7 @@ class MarketAdapter(ABC):
         ask = orderbook.get("ask", 1)
         if bid and ask:
             return abs(ask - bid)
-        return orderbook.get("spread", 0.01)
+        return read_spread(orderbook, 0.01)[0]
 
     @abstractmethod
     async def place_order(self, opportunity: VenueOpportunity, max_spend_usd: float, max_price: float) -> Dict[str, Any]:

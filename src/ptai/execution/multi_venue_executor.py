@@ -10,6 +10,7 @@ import asyncio
 
 from ..venues.registry import VenueRegistry
 from ..venues.adapter import VenueOpportunity
+from ..markets.orderbook import read_spread
 
 @dataclass
 class ExecutionResult:
@@ -218,7 +219,11 @@ class MultiVenueExecutor:
                 ob_a = await adapter_a.get_orderbook(arb.market_a)
                 ob_b = await adapter_b.get_orderbook(arb.market_b)
                 
-                if ob_a.get("spread", 0.02) > 0.08 or ob_b.get("spread", 0.08) > 0.08:
+                # An unmeasured spread must not pass the arb gate on a default.
+                # read_spread reports provenance; treat unknown as too wide.
+                spread_a, real_a = read_spread(ob_a, 0.02)
+                spread_b, real_b = read_spread(ob_b, 0.08)
+                if not real_a or not real_b or spread_a > 0.08 or spread_b > 0.08:
                     logger.warning(f"Arb VERIFY_BOOKS FAIL: spread too wide A {ob_a.get('spread')} B {ob_b.get('spread')} - abort")
                     return [
                         ExecutionResult(venue_id=venue_a, market_id=arb.market_a.id, status="aborted", amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0, reasoning="VERIFY_BOOKS FAIL spread too wide"),

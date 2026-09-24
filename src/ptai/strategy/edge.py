@@ -26,6 +26,7 @@ from loguru import logger
 
 from ..markets.base import Market
 from ..venues.adapter import VenueOpportunity
+from ..markets.orderbook import read_spread
 
 
 @dataclass
@@ -84,7 +85,7 @@ class EdgeCalculator:
             gas_pct = 0.016  # $0.05 / $3 = 1.6%
 
         # Spread from orderbook
-        spread = orderbook.get("spread", 0.02)
+        spread, _spread_is_real = read_spread(orderbook, 0.02)
         # If market has low liquidity, spread wider
         if market.liquidity < 1000:
             spread = max(spread, 0.04)

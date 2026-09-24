@@ -21,7 +21,8 @@ These tests pin the distinction.
 import pytest
 
 from src.ptai.markets.base import Market, MarketSource
-from src.ptai.markets.orderbook import OrderbookAnalyzer, OrderbookSnapshot
+from src.ptai.markets.orderbook import (OrderbookAnalyzer, OrderbookSnapshot,
+                                        read_spread)
 
 
 def make_market(price=0.5, liquidity=10000.0, volume=20000.0):
@@ -198,3 +199,112 @@ class TestConsumersCanDistinguish:
         assert book2.has_book is True
         assert book2.spread == pytest.approx(0.06)
         assert book2.source == "orderbook"
+
+
+# ---------------------------------------------------------------------------
+# read_spread: the shared reader
+# ---------------------------------------------------------------------------
+
+class TestReadSpread:
+    """
+    `orderbook.get("spread", default)` returns None when the key EXISTS with a
+    None value, so a caller reporting "no spread measured" crashed every
+    consumer using the default-argument idiom. Conversely the idiom silently
+    substitutes a default when the key is missing, which is how a fabricated 2%
+    spread travelled through the risk stack.
+    """
+
+    def test_measured_spread_is_reported_as_real(self):
+        spread, is_real = read_spread({"spread": 0.031, "is_real": True})
+        assert spread == pytest.approx(0.031)
+        assert is_real is True
+
+    def test_explicit_none_falls_back_and_is_not_real(self):
+        spread, is_real = read_spread({"spread": None, "is_real": False})
+        assert spread == pytest.approx(0.02)
+        assert is_real is False
+
+    def test_missing_key_falls_back_and_is_not_real(self):
+        spread, is_real = read_spread({})
+        assert spread == pytest.approx(0.02)
+        assert is_real is False
+
+    def test_none_orderbook_is_handled(self):
+        assert read_spread(None) == (0.02, False)
+
+    def test_assumed_marker_overrides_the_number(self):
+        """A book that says it is assumed is not trusted even if it has a value."""
+        spread, is_real = read_spread({"spread": 0.05, "spread_source": "assumed_default"})
+        assert is_real is False
+
+    def test_zero_spread_is_preserved_not_defaulted(self):
+        """A genuinely tight book has a small spread; don't mistake it for absent."""
+        spread, is_real = read_spread({"spread": 0.0, "is_real": True})
+        assert spread == 0.0
+        assert is_real is True
+
+    def test_garbage_is_rejected(self):
+        assert read_spread({"spread": "wide"}) == (0.02, False)
+
+    def test_negative_spread_is_rejected(self):
+        assert read_spread({"spread": -0.5}) == (0.02, False)
+
+    def test_custom_default_respected(self):
+        assert read_spread({}, 0.01)[0] == pytest.approx(0.01)
+
+
+class TestUnknownSpreadRaisesUncertainty:
+    """
+    An unknown spread is worse than a wide one: the cost of getting in or out
+    cannot be bounded. It must raise uncertainty, not quietly become 2%.
+    """
+
+    def _uncertainty(self, context):
+        from src.ptai.intelligence.uncertainty import UncertaintyEngine
+        return UncertaintyEngine().calculate_uncertainty([], context=context)
+
+    def test_unknown_spread_is_not_treated_as_tight(self):
+        unknown = self._uncertainty({"spread": None, "is_real": False})
+        tight = self._uncertainty({"spread": 0.01, "is_real": True})
+        assert unknown > tight
+
+    def test_unknown_is_at_least_as_bad_as_the_widest_measured(self):
+        unknown = self._uncertainty({"spread": None, "is_real": False})
+        widest = self._uncertainty({"spread": 0.10, "is_real": True})
+        assert unknown >= widest
+
+    def test_an_assumed_book_is_not_treated_as_measured(self):
+        assumed = self._uncertainty({"spread": 0.01, "spread_source": "assumed_default"})
+        measured = self._uncertainty({"spread": 0.01, "is_real": True})
+        assert assumed > measured
+
+
+class TestNoSilentSpreadDefaultsRemain:
+    def test_no_consumer_uses_the_get_default_idiom(self):
+        """
+        A bare `.get("spread", default)` cannot distinguish absent from None and
+        silently substitutes a number. All consumers must go through read_spread.
+        """
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parents[1] / "src" / "ptai"
+        # Only a NUMERIC LITERAL default silently substitutes a measurement.
+        # A fallback to None, or to another expression, is legitimate plumbing.
+        pattern = re.compile(r'\.get\(\s*"spread"\s*,\s*[0-9]')
+        allowed = {
+            # The analyzer reads the raw dict itself and labels provenance.
+            "markets/orderbook.py",
+            # Reads a betting line handicap, not an orderbook spread.
+            "betting/in_play.py",
+        }
+        offenders = []
+        for path in root.rglob("*.py"):
+            rel = str(path.relative_to(root))
+            if rel in allowed:
+                continue
+            for i, line in enumerate(path.read_text().splitlines(), 1):
+                if pattern.search(line) and not line.strip().startswith("#"):
+                    offenders.append(f"{rel}:{i}")
+        assert offenders == [], (
+            "these still silently default a spread; use read_spread: " + ", ".join(offenders))

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 from ..venues.adapter import VenueOpportunity
+from ..markets.orderbook import read_spread
 
 @dataclass
 class ExpectedEVResult:
@@ -90,7 +91,10 @@ class ExpectedNetEVEngine:
         fees_usd = amount_usd * fee_pct
         
         # Spread - from orderbook or opportunity
-        spread_pct = opportunity.spread_pct or orderbook.get("spread", 0.02) or 0.02
+        # read_spread handles an explicit None and reports whether the value
+        # was actually measured, rather than defaulting silently.
+        _measured_spread, _spread_is_real = read_spread(orderbook, 0.02)
+        spread_pct = opportunity.spread_pct or _measured_spread
         spread_usd = amount_usd * spread_pct * 0.5  # half spread cost (buy at ask)
         
         # Slippage - from opportunity or orderbook depth

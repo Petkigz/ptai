@@ -14,6 +14,7 @@ import math
 
 from ..markets.base import Market
 from .correlation import CorrelationEngine, CorrelationGroup
+from ..markets.orderbook import read_spread
 
 
 @dataclass
@@ -327,7 +328,7 @@ class CorrelationAwareRiskManager:
             return True, f"Liquidity stop: liquidity thinned {entry_liq} -> {current_liq} <30% entry, exit"
         
         # Check slippage
-        current_spread = current_orderbook.get("spread", 0.02)
+        current_spread, _ = read_spread(current_orderbook, 0.02)
         if current_spread > 0.05:
             return True, f"Liquidity stop: spread {current_spread*100:.1f}% >5%, slippage exceeds edge, exit"
         

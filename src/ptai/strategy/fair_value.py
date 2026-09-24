@@ -33,11 +33,17 @@ class FairValueEngine:
     Fair Value Engine - most important part.
     Uses ensemble, calibration, uncertainty, contradiction, resolution analysis.
     """
-    def __init__(self, llm_router=None, calibration_engine=None, uncertainty_engine=None):
+    def __init__(self, llm_router=None, calibration_engine=None, uncertainty_engine=None,
+                 web_researcher=None):
         self.llm_router = llm_router
         self.calibration_engine = calibration_engine or CalibrationEngine()
         self.uncertainty_engine = uncertainty_engine or UncertaintyEngine()
-        self.contradiction_engine = ContradictionEngine(llm_router=llm_router)
+        # Without a researcher the contradiction engine can only read the
+        # market definition. That used to be papered over by keyword-matching
+        # the question for words like "will", which produced 0.6-strength
+        # evidence on nearly every market.
+        self.contradiction_engine = ContradictionEngine(
+            llm_router=llm_router, web_researcher=web_researcher)
         self.resolution_analyzer = ResolutionAnalyzer(llm_router=llm_router)
         self.ensemble_forecaster = EnsembleForecaster(
             calibration_engine=self.calibration_engine,
@@ -64,12 +70,15 @@ class FairValueEngine:
                 resolution_analysis=resolution_analysis
             )
 
-        # Step 2: Contradiction analysis - bull vs bear
+        # Step 2: Contradiction analysis - bull vs bear.
+        # Prefer the research result the caller already fetched, so the two
+        # researchers read the retrieved sources rather than re-running search.
         contradiction_report = self.contradiction_engine.synthesize(
             market=market,
             research_text=context.get("research", ""),
             news=context.get("news", ""),
-            tweets=context.get("tweets", [])
+            tweets=context.get("tweets", []),
+            research_result=context.get("research_result"),
         )
 
         # Step 3: Ensemble forecasting
@@ -77,12 +86,26 @@ class FairValueEngine:
         context["bull_strength"] = sum(e.strength for e in contradiction_report.supporting_yes)
         context["bear_strength"] = sum(e.strength for e in contradiction_report.supporting_no)
         context["resolution_risks"] = resolution_analysis.risks
-        context["spread"] = context.get("orderbook", {}).get("spread", 0.02)
+        # Do not invent a spread. If the orderbook context did not come back
+        # with one, `spread` stays None and downstream can see it is unknown
+        # rather than pricing a made-up 2%.
+        _ob = context.get("orderbook") or {}
+        context["spread"] = _ob.get("spread")
+        context["spread_is_real"] = bool(_ob.get("is_real", False))
+        if context["spread"] is None:
+            logger.debug(f"FairValue {market.id}: no measured spread available")
 
         forecast_result = self.ensemble_forecaster.forecast_market(market, context=context)
 
-        # Adjust confidence by contradiction
-        adjusted_confidence = max(0.1, forecast_result.confidence + contradiction_report.confidence_adjustment)
+        # Adjust confidence by contradiction. The adjustment is applied only
+        # when the report is backed by retrieved sources; for an unresearched
+        # report there is nothing to contradict with, and applying a fixed
+        # penalty every time would be a constant masquerading as analysis.
+        if contradiction_report.researched:
+            adjusted_confidence = max(
+                0.1, forecast_result.confidence + contradiction_report.confidence_adjustment)
+        else:
+            adjusted_confidence = forecast_result.confidence
         forecast_result.confidence = adjusted_confidence
 
         # Step 4: Effective edge calculation

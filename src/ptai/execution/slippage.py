@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from loguru import logger
 import math
 import time
+from ..markets.orderbook import read_spread
 
 
 @dataclass
@@ -76,7 +77,9 @@ class SlippageModel:
         # Parse orderbook
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
-        spread = orderbook.get("spread", 0.02)
+        # read_spread treats an explicit None as absent, so a caller that
+        # honestly reports "no spread measured" is handled rather than crashing.
+        spread, _spread_is_real = read_spread(orderbook, 0.02)
         depth = orderbook.get("depth", 10000)
         
         # If no detailed bids/asks, use simple model: slippage = amount / liquidity * 0.3
@@ -206,7 +209,7 @@ class OrderBookImbalance:
             # Use simple mock
             bid_depth = orderbook.get("bid_size", orderbook.get("depth", 10000) * 0.5)
             ask_depth = orderbook.get("ask_size", orderbook.get("depth", 10000) * 0.5)
-            spread = orderbook.get("spread", 0.02)
+            spread, _ = read_spread(orderbook, 0.02)
             mid = orderbook.get("mid_price", 0.5)
         else:
             # Calculate spread and mid

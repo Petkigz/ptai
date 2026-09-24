@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 import random
 from loguru import logger
+from ..markets.orderbook import read_spread
 
 @dataclass
 class BacktestResult:
@@ -122,10 +123,15 @@ class BacktestEngine:
             if market["confidence"] < 0.6:
                 continue
             
-            # V10 FIX #6: Real orderbook data if available, else estimate
-            bid = market.get("bid", market["market_price"] - market.get("spread", 0.02)/2)
-            ask = market.get("ask", market["market_price"] + market.get("spread", 0.02)/2)
-            spread = market.get("spread", ask - bid) if "spread" in market else (ask - bid)
+            # V10 FIX #6: Real orderbook data if available, else estimate.
+            # read_spread distinguishes a measured spread from an assumed one;
+            # historical rows carry cost_fields_assumed to say which.
+            spread, spread_is_real = read_spread(market, 0.02)
+            bid = market.get("bid")
+            ask = market.get("ask")
+            if bid is None or ask is None:
+                bid = market["market_price"] - spread / 2
+                ask = market["market_price"] + spread / 2
             depth = market.get("depth", market.get("liquidity", 5000))
             fee_pct = market.get("fee_pct", 0.02)
             

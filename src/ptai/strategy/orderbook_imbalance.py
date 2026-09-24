@@ -5,6 +5,7 @@ If bid side stacked, wait or buy into weakness
 from typing import Dict, Any, List, Tuple
 from dataclasses import dataclass
 from loguru import logger
+from ..markets.orderbook import read_spread
 
 
 @dataclass
@@ -39,7 +40,7 @@ class OrderBookImbalanceEngine:
 
         bid_depth = orderbook.get("bid_size", orderbook.get("bid_depth", 5000))
         ask_depth = orderbook.get("ask_size", orderbook.get("ask_depth", 5000))
-        spread = orderbook.get("spread", 0.02)
+        spread, _spread_is_real = read_spread(orderbook, 0.02)
         
         total = bid_depth + ask_depth
         imbalance = (bid_depth - ask_depth) / total if total > 0 else 0
@@ -93,7 +94,7 @@ class OrderBookImbalanceEngine:
             imbalance = depth_signal.get("imbalance", 0)
             bid_depth = depth_signal.get("bid_depth", 0)
             ask_depth = depth_signal.get("ask_depth", 0)
-            spread = depth_signal.get("spread", 0.02)
+            spread, _ = read_spread(depth_signal, 0.02)
             signal_obj = self.analyze(orderbook=depth_signal)
         else:
             signal_obj = depth_signal

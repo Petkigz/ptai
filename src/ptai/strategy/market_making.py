@@ -8,6 +8,7 @@ from loguru import logger
 
 from ..markets.base import Market
 from ..venues.adapter import VenueOpportunity, VenueType
+from ..markets.orderbook import read_spread
 
 
 @dataclass
@@ -36,7 +37,7 @@ class MarketMakingEngine:
 
     def evaluate(self, market: Market, orderbook: Dict = None) -> MarketMakingSignal:
         orderbook = orderbook or {}
-        spread = orderbook.get("spread", 0.02)
+        spread, _spread_is_real = read_spread(orderbook, 0.02)
         spread_pct = orderbook.get("spread_pct", spread)
         depth = orderbook.get("depth", market.liquidity)
         volatility = orderbook.get("volatility", 0.02)  # default low vol

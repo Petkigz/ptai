@@ -165,3 +165,32 @@ class OrderbookAnalyzer:
         if abs(snapshot.price_velocity) > 0.2:
             risks.append(f"High velocity {snapshot.price_velocity:.3f} - rapid move")
         return risks
+
+def read_spread(orderbook: Optional[Dict] = None, default: float = 0.02) -> tuple:
+    """
+    Read a spread from an orderbook dict, distinguishing absent from measured.
+
+    `orderbook.get("spread", default)` returns None when the key EXISTS with a
+    None value, so a caller that honestly reports "no spread measured" breaks
+    every consumer that used the default-argument idiom. Conversely the idiom
+    silently substitutes a default when the key is merely missing, which is how
+    a fabricated 2% spread travelled through the risk stack unnoticed.
+
+    Returns (spread, is_real) where is_real is True only when the dict carried a
+    usable spread AND did not declare itself assumed.
+    """
+    book = orderbook or {}
+    raw = book.get("spread")
+    if raw is None:
+        return float(default), False
+    try:
+        spread = float(raw)
+    except (TypeError, ValueError):
+        return float(default), False
+    if spread < 0:
+        return float(default), False
+    # An explicit provenance marker wins: a book that says is_real False is not
+    # measured, whatever number it carries.
+    if book.get("is_real") is False or book.get("spread_source") == "assumed_default":
+        return spread, False
+    return spread, True

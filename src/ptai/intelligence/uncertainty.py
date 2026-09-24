@@ -5,6 +5,7 @@ Market 60%, Model 71% (+11% edge) but uncertainty ±8% -> conservative 63% -> on
 from typing import Dict, List, Tuple
 import math
 from loguru import logger
+from ..markets.orderbook import read_spread
 
 
 class UncertaintyEngine:
@@ -51,9 +52,14 @@ class UncertaintyEngine:
         elif source_count < 5:
             uncertainties.append(0.05)
 
-        # Wide spread
-        spread = context.get("spread", 0.02)
-        uncertainties.append(min(0.2, spread * 2))
+        # Wide spread. An UNKNOWN spread is worse than a wide one: we cannot
+        # bound the cost of getting in or out, so it must raise uncertainty
+        # rather than quietly become a 2% default. This feeds position sizing.
+        spread, spread_is_real = read_spread(context, 0.02)
+        if spread_is_real:
+            uncertainties.append(min(0.2, spread * 2))
+        else:
+            uncertainties.append(0.2)
 
         # Conflicting evidence (bull and bear both strong)
         bull_strength = context.get("bull_strength", 0)

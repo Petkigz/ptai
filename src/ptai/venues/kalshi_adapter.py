@@ -151,23 +151,49 @@ class KalshiAdapter(MarketAdapter):
             if resp.status_code == 200:
                 data = resp.json()
                 ob = data.get("orderbook", {})
-                yes_ob = ob.get("yes", {})
-                bid = yes_ob.get("bid", market.yes_price - 0.01) if isinstance(yes_ob, dict) else market.yes_price - 0.01
-                ask = yes_ob.get("ask", market.yes_price + 0.01) if isinstance(yes_ob, dict) else market.yes_price + 0.01
+                yes_ob = ob.get("yes", {}) if isinstance(ob, dict) else {}
+                yes_ob = yes_ob if isinstance(yes_ob, dict) else {}
+
+                # A 200 response is not the same as a usable book. This used to
+                # default bid/ask from the market price and the spread to 0.02,
+                # then report is_real=True and executable=True - so an empty
+                # orderbook was handed downstream as a real, executable one.
+                real_bid = yes_ob.get("bid")
+                real_ask = yes_ob.get("ask")
+                raw_spread = yes_ob.get("spread", ob.get("spread") if isinstance(ob, dict) else None)
+
+                has_sides = real_bid is not None and real_ask is not None
+                if has_sides:
+                    bid, ask = real_bid, real_ask
+                    spread = raw_spread if raw_spread is not None else (ask - bid)
+                    depth = yes_ob.get("depth", market.liquidity)
+                    is_real = True
+                else:
+                    # Report the shape, but declare it unusable.
+                    bid = market.yes_price - 0.01
+                    ask = market.yes_price + 0.01
+                    spread = 0.02
+                    depth = market.liquidity
+                    is_real = False
+                    logger.debug(
+                        f"Kalshi {market.id}: API returned 200 but no bid/ask "
+                        f"ladder - reporting placeholder spread, is_real=False")
+
                 return {
                     "market_id": market.id,
                     "venue_id": "kalshi",
                     "bid": bid,
                     "ask": ask,
-                    "spread": ob.get("spread", 0.02) if isinstance(ob, dict) else 0.02,
-                    "spread_pct": ob.get("spread", 0.02) if isinstance(ob, dict) else 0.02,
-                    "depth": market.liquidity,
+                    "spread": spread,
+                    "spread_pct": spread,
+                    "depth": depth,
                     "liquidity": market.liquidity,
-                    "source": "kalshi_api_real",
-                    "is_real": True,
+                    "source": "kalshi_api_real" if is_real else "kalshi_api_no_ladder",
+                    "is_real": is_real,
                     "is_mock": False,
-                    "executable": True,
-                    "data_mode": "live"
+                    "executable": is_real,
+                    "data_mode": "live",
+                    "assumed_fields": [] if is_real else ["bid", "ask", "spread"],
                 }
         except Exception as e:
             logger.debug(f"Kalshi orderbook fetch failed for {market.id}: {e}")

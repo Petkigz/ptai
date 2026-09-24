@@ -8,6 +8,7 @@ import math
 from loguru import logger
 
 from ..markets.base import Market
+from ..markets.orderbook import read_spread
 
 
 @dataclass
@@ -207,7 +208,9 @@ class MarketMicrostructureModel:
         recent_trades = recent_trades or []
 
         # Analyze spread - wide spread = uncertainty
-        spread = orderbook.get("spread", 0.03)
+        # A missing spread means the book was not read. Use a conservative
+        # default so the model still runs, but do not pretend it was measured.
+        spread, _spread_is_real = read_spread(orderbook, 0.03)
         spread_uncertainty = min(0.3, spread * 2)  # wide spread -> higher uncertainty
 
         # Analyze volume - high volume = more efficient, price more trustworthy
