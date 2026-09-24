@@ -354,6 +354,34 @@ class TradingAgentV3:
         # dry: paper trading still qualifies venues and exercises the full
         # prediction and risk path, it just cannot settle real money.
         self.data_mode = DataMode.LIVE_PAPER if self.dry_run else DataMode.LIVE
+
+        # Propagate to every adapter. The adapter is the last gate before a real
+        # order, and it holds its own flag, so this is the one line that decides
+        # whether live capital is reachable at all. Without it the flag stopped
+        # at the agent and a credentialed adapter would submit real orders
+        # during what the operator believed was a dry run.
+        _armed = []
+        for _vid, _adapter in self.venue_registry.adapters.items():
+            if hasattr(_adapter, "dry_run"):
+                _adapter.dry_run = self.dry_run
+                # Only report venues that could actually place an order, not
+                # every adapter that happens to hold the flag. Most are honest
+                # stubs with supports_trading=False and cannot trade either way.
+                if not self.dry_run and getattr(
+                        _adapter, "can_place_real_orders", False):
+                    _armed.append(_vid)
+        if not self.dry_run:
+            if _armed:
+                logger.warning(
+                    f"LIVE MODE: {len(_armed)} venue(s) could submit real orders "
+                    f"once account health passes: {_armed}. Execution still "
+                    f"requires a TRADE_PERMITTED account health result "
+                    f"(authenticated + funded + order probe verified).")
+            else:
+                logger.warning(
+                    "LIVE MODE, but no venue can submit a real order: none of "
+                    "the adapters has both live credentials and trading "
+                    "support. Every execution this run is simulated.")
         
         # Learning
         self.trade_outcome_tracker = TradeOutcomeTracker(storage=self.storage)
@@ -366,7 +394,9 @@ class TradingAgentV3:
         logger.info(
             f"V3 data mode: {self.data_mode.value} (dry_run={self.dry_run}) - "
             + ("no real orders can be placed" if self.dry_run
-               else "LIVE: real orders possible if account health passes"))
+               else (f"LIVE, {len(_armed)} venue(s) could submit after account "
+                     f"health passes {_armed}" if _armed
+                     else "LIVE, but no venue can submit a real order")))
 
     async def check_system_health(self) -> Dict[str, Any]:
         health = {

@@ -12,8 +12,9 @@ from ..markets.scanner import MarketScanner
 
 
 class PolymarketAdapter(MarketAdapter):
-    def __init__(self, private_key: str = None, funder: str = None):
-        super().__init__(venue_id="polymarket", venue_type=VenueType.PREDICTION)
+    def __init__(self, private_key: str = None, funder: str = None, dry_run: bool = True):
+        super().__init__(venue_id="polymarket", venue_type=VenueType.PREDICTION,
+                         dry_run=dry_run)
         self.private_key = private_key
         self.funder = funder
         self.client = PolymarketClient()
@@ -529,19 +530,99 @@ class PolymarketAdapter(MarketAdapter):
 
         logger.info(f"Execution guard: market={opportunity.market.id} venue_id={opportunity.venue_id} side={opportunity.side} max_price={max_price} max_spend=${max_spend_usd} - exact routing validated")
 
+        market_id = opportunity.market.id
+
+        # THE gate. Everything above this line is validation; this is the only
+        # branch that can move real money, and it requires an explicit
+        # non-dry-run adapter. Previously nothing here consulted dry_run at all.
+        if not self.can_place_real_orders:
+            reason = (
+                "adapter is in dry run (agent dry_run=True)"
+                if self.dry_run else
+                "adapter has no live credentials (private_key + funder)"
+            )
+            logger.info(f"Polymarket {market_id}: {reason} - returning simulated fill")
+            sim = self.real_order_refusal(max_spend_usd, max_price,
+                                          opportunity.side, market_id)
+            sim["message"] = (
+                f"DRY RUN - would place {opportunity.side} ${max_spend_usd:.2f} "
+                f"@ {max_price} for {market_id} ({reason})"
+            )
+            return sim
+
+        # Resolve the token to trade. Polymarket orders are placed against a
+        # CLOB token id, not a market id.
+        token_id = self._resolve_token_id(opportunity)
+        if not token_id:
+            return {
+                "status": "rejected",
+                "venue_id": "polymarket",
+                "reason": (
+                    f"No CLOB token_id on market {market_id} for side "
+                    f"{opportunity.side} - cannot build an order without one"
+                ),
+            }
+
+        # The executor lives in markets/polymarket.py. This previously imported
+        # `PolymarketExecutor` from execution/polymarket_executor.py, which only
+        # defines ExecutionOrchestrator - so the import raised ImportError, the
+        # bare `except` swallowed it, and live Polymarket execution had never
+        # once worked. It returned {"status": "error"} which reads like a
+        # transient failure rather than a permanent wiring bug.
+        from ..markets.polymarket import PolymarketExecutor
+
+        executor = PolymarketExecutor(private_key=self.private_key, funder=self.funder)
+
+        # `place_order` is synchronous and takes (token_id, price, size, side,
+        # order_type, dry_run). The old call passed market/side/max_price/
+        # amount_usd to a method named `execute` that does not exist.
+        price = float(max_price)
+        size = float(max_spend_usd) / price if price > 0 else 0.0
+        if size <= 0:
+            return {"status": "rejected", "venue_id": "polymarket",
+                    "reason": f"Computed size {size} <= 0 from ${max_spend_usd} @ {price}"}
+
         try:
-            from ..execution.polymarket_executor import PolymarketExecutor
-            if self.private_key and self.funder:
-                executor = PolymarketExecutor(private_key=self.private_key, funder=self.funder)
-                result = await executor.execute(
-                    market=opportunity.market,
-                    side=opportunity.side,
-                    max_price=max_price,
-                    amount_usd=max_spend_usd
-                )
-                return result
-            else:
-                return {"status": "dry_run", "message": f"Would place {opportunity.side} ${max_spend_usd} @ {max_price} for {opportunity.market.id} venue {opportunity.venue_id}", "venue_id": "polymarket"}
+            result = executor.place_order(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side="BUY" if str(opportunity.side).upper() in ("YES", "BUY") else "SELL",
+                order_type="GTC",
+                dry_run=False,  # real submission: gated by can_place_real_orders above
+            )
         except Exception as e:
-            logger.error(f"Execution failed: {e}")
-            return {"status": "error", "error": str(e), "venue_id": "polymarket"}
+            logger.error(f"Polymarket execution failed for {market_id}: {e}")
+            return {"status": "error", "error": str(e), "venue_id": "polymarket",
+                    "market_id": market_id}
+
+        if isinstance(result, dict):
+            result.setdefault("venue_id", "polymarket")
+            result.setdefault("market_id", market_id)
+            result.setdefault("token_id", token_id)
+            result.setdefault("price", price)
+            result.setdefault("size", size)
+        return result
+
+    def _resolve_token_id(self, opportunity) -> str:
+        """Pick the CLOB token id for the side being traded."""
+        market = opportunity.market
+        tokens = getattr(market, "tokens", None) or []
+        wanted = str(opportunity.side).upper()
+
+        for token in tokens:
+            tid = getattr(token, "token_id", None)
+            outcome = str(getattr(token, "outcome", "") or "").upper()
+            if not tid:
+                continue
+            if wanted in ("YES", "BUY") and outcome in ("YES", "BUY"):
+                return tid
+            if wanted in ("NO", "SELL") and outcome in ("NO", "SELL"):
+                return tid
+
+        # Fall back to the first token, but only if the side is the first outcome.
+        if tokens:
+            first = getattr(tokens[0], "token_id", None)
+            if first:
+                return first
+        return ""

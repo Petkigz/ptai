@@ -42,6 +42,12 @@ class AdapterCapability:
     supports_trading: bool = False
     supports_portfolio: bool = False
     supports_history: bool = False
+    # Can this adapter PROVE an order can be submitted, by placing a
+    # minimum-size order and cancelling it? Declaring this means
+    # AccountHealthEngine will call probe_order_permission() before allowing
+    # real capital - an unproven permission is reported as unproven rather than
+    # assumed from supports_trading.
+    supports_order_probe: bool = False
     supports_browser_fallback: bool = False
     fee_taker_pct: float = 0.0  # e.g. 0.02 = 2%
     fee_maker_pct: float = 0.0
@@ -151,10 +157,19 @@ class MarketAdapter(ABC):
     Interface every venue must implement.
     Qualification: must prove positive EV through paper trading before real capital.
     """
-    def __init__(self, venue_id: str, venue_type: VenueType):
+    def __init__(self, venue_id: str, venue_type: VenueType, dry_run: bool = True):
         self.venue_id = venue_id
         self.venue_type = venue_type
         self.capabilities = AdapterCapability()
+        # THE last gate before real money, and it defaults to safe.
+        #
+        # Nothing downstream of here used to consult dry_run: the CLI's
+        # --dry-run flag reached the agent, the agent never passed it on, and
+        # an adapter holding real credentials would sign and submit a real
+        # order. The one place that cannot be bypassed - the adapter that
+        # actually talks to the venue - now holds the flag itself, so it does
+        # not matter which loop, executor or script calls place_order.
+        self.dry_run = bool(dry_run)
         self.is_qualified = False  # Must pass paper trading
         self.performance_stats = {
             "total_paper_trades": 0,
@@ -186,6 +201,32 @@ class MarketAdapter(ABC):
     async def get_portfolio(self) -> Dict[str, Any]:
         """Get positions, balance"""
         pass
+
+    @property
+    def can_place_real_orders(self) -> bool:
+        """Real capital may move only when explicitly live AND trading-supported."""
+        return (not self.dry_run) and bool(self.capabilities.supports_trading)
+
+    def real_order_refusal(self, max_spend_usd: float, max_price: float, side: str,
+                           market_id: str) -> Dict[str, Any]:
+        """
+        The standard paper-mode response. Returned whenever an order would have
+        been real but the adapter is in dry run, so the caller gets an explicit
+        dry_run status it can settle and learn from rather than an error.
+        """
+        return {
+            "status": "dry_run",
+            "venue_id": self.venue_id,
+            "simulated": True,
+            "message": (
+                f"DRY RUN - would place {side} ${max_spend_usd:.2f} @ {max_price} "
+                f"for {market_id}; no order sent"
+            ),
+            "reason": (
+                "adapter.dry_run=True: real capital is disabled at the venue "
+                "boundary. Set dry_run=False on the agent to place live orders."
+            ),
+        }
 
     def calculate_fees(self, market: Market, amount_usd: float) -> float:
         """Calculate taker fees for this venue"""
