@@ -118,6 +118,7 @@ from ..execution.execution_guard import ExecutionGuard
 from ..execution.reconciliation import ReconciliationEngine
 from ..execution.multi_venue_executor import MultiVenueExecutor
 from ..execution.account_health import AccountHealthEngine
+from ..execution.settlement import SettlementEngine
 from ..strategy.expected_ev import ExpectedNetEVEngine
 
 from ..learning.calibration_db import CalibrationDB
@@ -385,6 +386,17 @@ class TradingAgentV3:
         
         # Learning
         self.trade_outcome_tracker = TradeOutcomeTracker(storage=self.storage)
+        # Closes execution -> settlement -> outcome -> calibration. Without a
+        # settlement pass, `record_resolution` has no caller, the resolved count
+        # stays at 0, `is_degrading()` can never return True (it needs 50
+        # resolved forecasts) and the kill switch on calibration collapse is
+        # dead code. The agent would trade forever on its priors.
+        self.settlement_engine = SettlementEngine(
+            venue_registry=self.venue_registry,
+            storage=self.storage,
+            calibration_engine=self.calibration_engine,
+            trade_outcome_tracker=self.trade_outcome_tracker,
+        )
         self.performance_tracker = PerformanceTracker(storage=self.storage)
         
         # Mission
@@ -677,6 +689,27 @@ class TradingAgentV3:
                 "execution_time": time.time() - start
             }
         
+        # Settlement - close positions whose markets have resolved.
+        #
+        # Runs before discovery and sizing on purpose: the bankroll, win rate and
+        # calibration all feed the next decisions, so settling late would size
+        # the new cycle against a stale bankroll. This is the step that was
+        # missing entirely, and its absence is why calibration never accumulated
+        # a single resolved forecast.
+        settlement_report = None
+        try:
+            settlement_report = await self.settlement_engine.settle_pending()
+            if settlement_report.settled:
+                # Bankroll moved; refresh the derived values before sizing.
+                self.bankroll = self.storage.get_bankroll()
+                self.execution_guard.update_bankroll(self.bankroll)
+                self.account_health_engine.bankroll = self.bankroll
+        except Exception as e:
+            logger.error(
+                f"SETTLEMENT PASS FAILED: {type(e).__name__}: {e}. Resolved "
+                f"markets will not be recorded this cycle, so calibration and "
+                f"win rate will be stale.")
+
         # Eligibility - Legal/Account eligibility
         eligibility = await self.check_eligibility()
         
@@ -750,6 +783,8 @@ class TradingAgentV3:
                         "reasoning": "No markets discovered - nothing to evaluate",
                     },
                 },
+                "settlement": (settlement_report.to_dict()
+                               if settlement_report else None),
                 "alpha": {},
                 "betting": {"ok": False, "events": 0, "data_mode": "none",
                             "blockers": ["no markets discovered"]},
@@ -1039,40 +1074,99 @@ class TradingAgentV3:
                     "account_health": account_health.to_dict()
                 })
                 
-                # Record for calibration - V9 FIX #5 persistent + V10 trust tier
+                # --- Record the position so it can later be SETTLED -----------
+                #
+                # This block did not persist anything usable:
+                #   * `except: pass` around trade_outcome_tracker.record_trade
+                #     hid any failure inside it. A silent failure to record is
+                #     worse than a loud one: the agent keeps trading on unlearned
+                #     priors while the logs look fine.
+                #   * the trade was never written to the trades table at all, so
+                #     there was nothing for settlement to close, nothing for win
+                #     rate to be computed over, and nothing for the learning
+                #     chain to attribute an outcome to.
+                #   * the forecast carried no venue or trade id, so even a
+                #     settlement could not have routed it back to a position.
+                #
+                # Failures here are now loud and recorded on the execution result,
+                # so a position that was taken but cannot be learned from is
+                # visible rather than assumed.
+                data_mode_for_calib = getattr(opp.market, 'data_mode', 'live')
+                if hasattr(data_mode_for_calib, 'value'):
+                    data_mode_for_calib = data_mode_for_calib.value
+                strategy_name = (opp.raw.get("strategy", "unknown")
+                                 if hasattr(opp, 'raw') and isinstance(opp.raw, dict)
+                                 else "unknown")
+                learning_problems = []
+
+                trade_id = None
                 try:
-                    # V10 FIX #5: Track data_mode tier for qualification
-                    data_mode_for_calib = getattr(opp.market, 'data_mode', 'live')
-                    if hasattr(data_mode_for_calib, 'value'):
-                        data_mode_for_calib = data_mode_for_calib.value
-                    
+                    trade_id = self.storage.log_trade({
+                        "market_id": opp.market.id,
+                        "market_question": opp.market.question[:200],
+                        "side": opp.side,
+                        "market_price": opp.market_price,
+                        "fair_value": opp.estimated_fair,
+                        "edge": opp.effective_edge,
+                        "kelly_fraction": getattr(opp, "_kelly_fraction", None),
+                        "position_size_usd": amount_usd,
+                        "position_size_pct": (amount_usd / current_bankroll
+                                              if current_bankroll else None),
+                        "confidence": opp.confidence,
+                        "status": "open",
+                        "notes": f"venue={venue_id} strategy={strategy_name} "
+                                 f"mode={data_mode_for_calib}",
+                    })
+                except Exception as e:
+                    learning_problems.append(f"trade not persisted: {type(e).__name__}: {e}")
+                    logger.error(
+                        f"TRADE NOT PERSISTED for {opp.market.id}: {e}. Position "
+                        f"cannot be settled, so it cannot be learned from.")
+
+                # Forecast, tied to the venue and the trade so settlement can
+                # find it and close the position when the market resolves.
+                try:
                     self.calibration_engine.record_forecast(
                         market_id=opp.market.id,
                         question=opp.market.question[:200],
                         forecast_prob=opp.estimated_fair,
                         confidence=opp.confidence,
                         market_price=opp.market_price,
-                        category=opp.category
+                        category=opp.category,
+                        venue_id=venue_id,
+                        trade_id=trade_id,
                     )
-                    self.calibration_engine.save()
-                    
-                    # Also record trade outcome with trust tier
-                    if hasattr(self.trade_outcome_tracker, 'record_trade'):
-                        try:
-                            self.trade_outcome_tracker.record_trade(
-                                market_id=opp.market.id,
-                                venue_id=venue_id,
-                                strategy=opp.raw.get("strategy", "unknown") if hasattr(opp, 'raw') and isinstance(opp.raw, dict) else "unknown",
-                                edge=opp.effective_edge,
-                                confidence=opp.confidence,
-                                amount_usd=amount_usd,
-                                data_mode=str(data_mode_for_calib),
-                                trust_tier=getattr(opp.market, 'data_mode', None).trust_tier if hasattr(getattr(opp.market, 'data_mode', None), 'trust_tier') else 0
-                            )
-                        except:
-                            pass
                 except Exception as e:
-                    logger.warning(f"Calibration record/save failed for {opp.market.id}: {e}")
+                    learning_problems.append(f"forecast not recorded: {type(e).__name__}: {e}")
+                    logger.error(
+                        f"FORECAST NOT RECORDED for {opp.market.id}: {e}. The "
+                        f"probability behind this trade will not be calibrated.")
+
+                # Venue/strategy/category performance, for allocation later.
+                try:
+                    self.trade_outcome_tracker.record_trade(
+                        market_id=opp.market.id,
+                        venue_id=venue_id,
+                        strategy=strategy_name,
+                        edge=opp.effective_edge,
+                        confidence=opp.confidence,
+                        amount_usd=amount_usd,
+                        data_mode=str(data_mode_for_calib),
+                        trust_tier=getattr(getattr(opp.market, 'data_mode', None), 'trust_tier', 0)
+                    )
+                except Exception as e:
+                    learning_problems.append(f"venue/strategy outcome not recorded: {type(e).__name__}: {e}")
+                    logger.error(
+                        f"VENUE OUTCOME NOT RECORDED for {opp.market.id}: {e}. "
+                        f"Allocation will keep treating this venue as untested.")
+
+                if learning_problems:
+                    logger.error(
+                        f"LEARNING GAPS on {opp.market.id}: " + "; ".join(learning_problems))
+                    execution_results[-1]["learning_problems"] = learning_problems
+                    execution_results[-1]["learning_complete"] = False
+                else:
+                    execution_results[-1]["learning_complete"] = True
                 
             except Exception as e:
                 logger.error(f"Execution failed for {opp.market.id}: {e}")
@@ -1137,6 +1231,7 @@ class TradingAgentV3:
                 "polymarket_is_venue_1": "There is no Polymarket step - Polymarket becomes Venue #1 rather than PTAI = Polymarket bot"
             },
             "health": health,
+            "settlement": settlement_report.to_dict() if settlement_report else None,
             "eligibility": {k: v.value for k, v in eligibility.items()},
             "qualification": qual_report_dict,
             "discovery": {

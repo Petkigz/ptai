@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS trades (
     order_id TEXT,
     pnl REAL DEFAULT 0,
     resolved BOOLEAN DEFAULT 0,
-    notes TEXT
+    notes TEXT,
+    venue_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS market_scans (
@@ -86,6 +87,52 @@ CREATE TABLE IF NOT EXISTS research_logs (
     query TEXT,
     result TEXT
 );
+
+-- OrderManager.create_order has always inserted into this table, which was
+-- never created. Every insert raised "no such table: orders" into a warning, so
+-- no order was ever persisted: the platform had no record of what it had
+-- submitted, which makes reconciliation, duplicate-order detection and any
+-- audit of live trading impossible.
+CREATE TABLE IF NOT EXISTS orders (
+    id TEXT PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    token_id TEXT,
+    side TEXT,
+    max_price REAL,
+    max_spend REAL,
+    status TEXT,
+    created_at TEXT NOT NULL,
+    venue_id TEXT,
+    updated_at TEXT,
+    amount_usd REAL,
+    avg_price REAL,
+    raw_response TEXT
+);
+
+-- The calibration table was referenced by CalibrationEngine.record_forecast
+-- but never created, so every forecast insert raised "no such table" into a
+-- warning and the forecast lived only in an in-memory list on an object built
+-- fresh each cycle. Nothing persisted, nothing could ever be resolved, the
+-- resolved count stayed 0, and is_degrading() - guarded by resolved >= 50 -
+-- could never fire. The agent was structurally incapable of learning from its
+-- own outcomes.
+CREATE TABLE IF NOT EXISTS calibration (
+    id TEXT PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    question TEXT,
+    forecast_prob REAL NOT NULL,
+    confidence REAL,
+    market_price REAL,
+    category TEXT DEFAULT 'default',
+    timestamp TEXT NOT NULL,
+    actual_outcome REAL,
+    resolved_at TEXT,
+    venue_id TEXT,
+    trade_id INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibration_unresolved
+    ON calibration (actual_outcome, market_id);
 """
 
 class Storage:
@@ -97,9 +144,31 @@ class Storage:
         self._init_db()
         logger.info(f"Storage initialized at {self.db_path}")
 
+    # Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
+    # does nothing on an existing database, so an older data/ptai.db keeps its
+    # original shape and every insert naming a new column fails.
+    _MIGRATIONS = (
+        ("trades", "venue_id", "TEXT"),
+    )
+
+    def _migrate(self):
+        for table, column, sqltype in self._MIGRATIONS:
+            try:
+                cols = {r[1] for r in self.conn.execute(
+                    f"PRAGMA table_info({table})").fetchall()}
+                if not cols:
+                    continue  # table not created yet; schema will include it
+                if column not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {sqltype}")
+                    logger.info(f"Migrated: added {table}.{column}")
+            except Exception as e:
+                logger.error(f"Migration {table}.{column} failed: {e}")
+
     def _init_db(self):
         self.conn.executescript(DB_SCHEMA)
         self.conn.commit()
+        self._migrate()
         # Initialize bankroll if not exists
         if not self.get_state("bankroll"):
             self.set_state("bankroll", "50.0")
@@ -149,8 +218,8 @@ class Storage:
     def log_trade(self, trade: Dict[str, Any]) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cur = self.conn.execute("""
-            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes, venue_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now,
             trade.get("market_id"),
@@ -166,7 +235,8 @@ class Storage:
             trade.get("position_size_pct"),
             trade.get("confidence"),
             trade.get("status", "pending"),
-            trade.get("notes", "")
+            trade.get("notes", ""),
+            trade.get("venue_id"),
         ))
         self.conn.commit()
         # Update total trades
@@ -210,6 +280,50 @@ class Storage:
             VALUES (?, ?, ?, ?, ?)
         """, (now, market_id, tool, query, result[:5000]))
         self.conn.commit()
+
+    def resolve_trade(self, trade_id: int, outcome: float, pnl: float,
+                      notes: str = "") -> bool:
+        """
+        Close a trade: mark it resolved, bank the P&L, log the new bankroll.
+
+        There was no way to close a trade at all. `trades.resolved` was written
+        as 0 and never updated, `get_open_positions()` therefore returned every
+        trade ever logged, and `get_performance_summary()` computed win rate
+        over `WHERE resolved=1` - an empty set forever, so win_rate was
+        permanently 0. The bankroll could only ever go down (when a trade was
+        opened) and never up.
+
+        Returns False if the trade does not exist or was already resolved, so a
+        double settlement cannot pay out twice.
+        """
+        cur = self.conn.execute(
+            "SELECT id, resolved, position_size_usd FROM trades WHERE id = ?",
+            (trade_id,))
+        row = cur.fetchone()
+        if row is None:
+            logger.warning(f"resolve_trade: no trade with id {trade_id}")
+            return False
+        if row["resolved"]:
+            logger.warning(f"resolve_trade: trade {trade_id} already resolved, ignoring")
+            return False
+
+        self.conn.execute(
+            "UPDATE trades SET resolved = 1, outcome = ?, pnl = ?, status = 'settled', notes = ? WHERE id = ?",
+            (outcome, pnl, notes, trade_id))
+        self.conn.commit()
+
+        self.set_bankroll(self.get_bankroll() + pnl)
+        logger.info(
+            f"Trade {trade_id} settled: outcome={outcome} pnl=${pnl:+.2f} "
+            f"bankroll=${self.get_bankroll():.2f}")
+        return True
+
+    def get_unresolved_trades(self, limit: int = 200) -> List[Dict]:
+        """Open trades awaiting settlement - the settlement work queue."""
+        cur = self.conn.execute(
+            "SELECT * FROM trades WHERE resolved = 0 ORDER BY timestamp LIMIT ?",
+            (limit,))
+        return [dict(r) for r in cur.fetchall()]
 
     def count_open_positions(self) -> int:
         cur = self.conn.execute("SELECT COUNT(*) as c FROM trades WHERE resolved=0 AND status IN ('executed','pending','open')")

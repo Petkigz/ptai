@@ -234,6 +234,39 @@ class PolymarketClient:
             logger.debug(f"Midpoint fetch failed {token_id}: {e}")
             return None
 
+    def get_market_resolution(self, market_id: str) -> Optional[Dict]:
+        """
+        Ask the Gamma API whether a market has closed and how it settled.
+
+        Returns the raw market dict, or None when the lookup failed. It does NOT
+        synthesise an answer: the caller must be able to tell "not settled yet"
+        from "could not find out", because the second must never be recorded as
+        an outcome.
+
+        Gamma reports a settled market with `closed: true` and `outcomePrices`
+        set to the settlement values - exactly ["1", "0"] or ["0", "1"]. Those
+        are settlement marks, not tradeable prices.
+        """
+        try:
+            resp = self.session.get(f"{self.gamma_api}/markets",
+                                    params={"id": market_id}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"Market resolution fetch failed for {market_id}: {e}")
+            return None
+
+        if isinstance(data, list):
+            return data[0] if data else None
+        if isinstance(data, dict):
+            # Some Gamma responses wrap the market in a list under "markets".
+            for key in ("markets",):
+                inner = data.get(key)
+                if isinstance(inner, list) and inner:
+                    return inner[0]
+            return data
+        return None
+
     def get_last_trade_price(self, token_id: str) -> Optional[float]:
         try:
             resp = self.session.get(f"{self.clob_api}/price", params={"token_id": token_id, "side": "buy"}, timeout=10)

@@ -182,6 +182,39 @@ class MarketAdapter(ABC):
             "forecast_skill": 0.5
         }
 
+    async def get_settlement(self, market_id: str) -> Dict[str, Any]:
+        """
+        Report whether a market has settled, and to what outcome.
+
+        Not abstract on purpose: the default below is honest for any adapter
+        that cannot answer, and forcing twenty venue stubs to write a settlement
+        method they cannot implement would invite them to fake one.
+
+        Returns a dict:
+            settled  : bool   - the venue says this market is finished
+            outcome  : float  - 1.0 (YES/primary won), 0.0 (NO/secondary won),
+                                or None if not settled / unknown
+            is_real  : bool   - the answer came from a venue-side read
+            source   : str    - provenance token
+            reason   : str    - why, when it could not be determined
+
+        This is the one call that closes the learning loop: without it
+        `CalibrationEngine.record_resolution` had no production caller, so the
+        resolved count stayed at 0 and `is_degrading()` - guarded by
+        `resolved >= 50` - could never fire.
+
+        Default implementations must NOT guess. An adapter that cannot read
+        settlement returns settled=False, is_real=False. Assuming an outcome is
+        how a fabricated result becomes a permanent, wrong calibration point.
+        """
+        return {
+            "settled": False,
+            "outcome": None,
+            "is_real": False,
+            "source": "unsupported",
+            "reason": f"{self.venue_id} adapter cannot report settlement",
+        }
+
     @abstractmethod
     def check_eligibility(self, country_code: str = "UG") -> EligibilityStatus:
         """Check geographic/regulatory eligibility - NEVER bypass restrictions"""

@@ -30,7 +30,14 @@ class CalibrationDB(CalibrationEngine):
                 # Actually restore points into memory
                 from ..intelligence.calibration import CalibrationPoint
                 restored = 0
+                # The base class now also restores from the SQL calibration
+                # table, so the same forecast can arrive from both stores and be
+                # counted twice in every score. Deduplicate on forecast_id.
+                seen = {p.forecast_id for p in self.points}
                 for pd in points_data:
+                    fid = pd.get('forecast_id', pd.get('id', 'unknown'))
+                    if fid in seen:
+                        continue
                     try:
                         # Parse timestamp
                         ts_str = pd.get('timestamp')
@@ -54,6 +61,7 @@ class CalibrationDB(CalibrationEngine):
                             resolved_at=resolved_at
                         )
                         self.points.append(point)
+                        seen.add(point.forecast_id)
                         restored += 1
                     except Exception as e:
                         logger.debug(f"Failed to restore calibration point {pd.get('forecast_id')}: {e}")
@@ -77,6 +85,10 @@ class CalibrationDB(CalibrationEngine):
                         "question": p.question,
                         "forecast_prob": p.forecast_prob,
                         "confidence": p.confidence,
+                        # market_price was omitted, so a restart silently reset
+                        # it to forecast_prob - the logged entry price of every
+                        # historical forecast was wrong after a reload.
+                        "market_price": p.market_price,
                         "category": p.category,
                         "timestamp": p.timestamp.isoformat(),
                         "actual_outcome": p.actual_outcome,

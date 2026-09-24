@@ -2,6 +2,7 @@
 Polymarket Adapter - one venue among many
 FIXED V7: Real orderbook intelligence + Real portfolio + No dangerous fallbacks
 """
+import json
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
@@ -603,6 +604,79 @@ class PolymarketAdapter(MarketAdapter):
             result.setdefault("price", price)
             result.setdefault("size", size)
         return result
+
+    async def get_settlement(self, market_id: str) -> Dict[str, Any]:
+        """
+        Read settlement from Polymarket's Gamma API.
+
+        A closed market's `outcomePrices` holds the settlement marks, exactly
+        ["1","0"] or ["0","1"] - not prices anyone could trade at. The outcome
+        returned is the YES probability at settlement, so 1.0 means YES won and
+        0.0 means NO won.
+
+        Ambiguous settlement is reported as ambiguous rather than rounded to
+        whichever side looks closer. "Nearly 1" is not a 1, and recording it as
+        one would write a wrong calibration point permanently.
+        """
+        market_id = str(market_id).strip()
+        if not market_id:
+            return {"settled": False, "outcome": None, "is_real": False,
+                    "source": "no_market_id",
+                    "reason": "empty market id"}
+
+        try:
+            raw = self.client.get_market_resolution(market_id)
+        except Exception as e:
+            return {"settled": False, "outcome": None, "is_real": False,
+                    "source": "gamma_error",
+                    "reason": f"{type(e).__name__}: {e}"}
+
+        if raw is None:
+            return {"settled": False, "outcome": None, "is_real": False,
+                    "source": "gamma_unavailable",
+                    "reason": "Gamma returned no market for this id"}
+
+        def _truthy(value) -> bool:
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ("true", "1", "yes")
+
+        if not _truthy(raw.get("closed")):
+            return {"settled": False, "outcome": None, "is_real": True,
+                    "source": "gamma_markets",
+                    "reason": "market is not closed yet"}
+
+        prices = raw.get("outcomePrices")
+        if isinstance(prices, str):
+            try:
+                prices = json.loads(prices)
+            except (ValueError, TypeError):
+                prices = None
+        if not isinstance(prices, list) or len(prices) < 2:
+            return {"settled": True, "outcome": None, "is_real": True,
+                    "source": "gamma_markets",
+                    "reason": f"closed but outcomePrices unusable: {prices!r}"}
+
+        try:
+            nums = [float(p) for p in prices[:2]]
+        except (TypeError, ValueError):
+            return {"settled": True, "outcome": None, "is_real": True,
+                    "source": "gamma_markets",
+                    "reason": f"closed but outcomePrices not numeric: {prices!r}"}
+
+        # A real settlement is a clean 0/1 pair. Anything else is unresolved
+        # ambiguity (void, cancelled, partial) and must not be recorded.
+        if not (abs(nums[0] - 1.0) < 1e-9 and abs(nums[1]) < 1e-9) and            not (abs(nums[1] - 1.0) < 1e-9 and abs(nums[0]) < 1e-9):
+            return {"settled": True, "outcome": None, "is_real": True,
+                    "source": "gamma_markets",
+                    "reason": (
+                        f"closed but settlement is not a clean 0/1 pair: {nums} "
+                        f"- refusing to record an ambiguous outcome"
+                    )}
+
+        return {"settled": True, "outcome": nums[0], "is_real": True,
+                "source": "gamma_markets",
+                "reason": f"settled YES={nums[0]} NO={nums[1]}"}
 
     def _resolve_token_id(self, opportunity) -> str:
         """Pick the CLOB token id for the side being traded."""

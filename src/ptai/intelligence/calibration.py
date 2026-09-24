@@ -21,6 +21,11 @@ class CalibrationPoint:
     timestamp: datetime
     actual_outcome: Optional[float] = None  # 1.0 YES, 0.0 NO, None pending
     resolved_at: Optional[datetime] = None
+    # Which venue hosts this market, and which trade it backs. Without these a
+    # settlement pass cannot know whom to ask, and an outcome cannot be routed
+    # back to the position it settles.
+    venue_id: Optional[str] = None
+    trade_id: Optional[int] = None
 
 
 class CalibrationEngine:
@@ -44,8 +49,95 @@ class CalibrationEngine:
         self.learned_adjustments: Dict[str, Dict] = {}
         # Keep track of when adjustments were learned
         self.adjustment_history: List[Dict] = []
+        # Reload persisted forecasts. Without this, calibration restarted from
+        # zero on every process launch: `points` is in-memory, the engine is
+        # constructed per agent, and the cyclic agent builds one per run.
+        self.load_from_storage()
 
-    def record_forecast(self, market_id: str, question: str, forecast_prob: float, confidence: float, market_price: float, category: str = "default") -> str:
+    # -- persistence ---------------------------------------------------------
+
+    def load_from_storage(self) -> int:
+        """
+        Load previously recorded forecasts and resolutions into memory.
+
+        Called from __init__. Returns the number of points loaded.
+
+        Before this existed, every forecast lived in a list on an object that
+        was thrown away at the end of the process, so the agent began each run
+        with an empty calibration history - it could not accumulate the 50
+        resolved forecasts `is_degrading()` needs, no matter how long it ran.
+        """
+        if not self.storage:
+            return 0
+        try:
+            rows = self.storage.conn.execute(
+                "SELECT id, market_id, question, forecast_prob, confidence, "
+                "market_price, category, timestamp, actual_outcome, resolved_at, "
+                "venue_id, trade_id "
+                "FROM calibration ORDER BY timestamp"
+            ).fetchall()
+        except Exception as e:
+            logger.error(
+                f"CALIBRATION LOAD FAILED: {type(e).__name__}: {e}. The agent "
+                f"would otherwise run on unlearned priors while appearing to "
+                f"track calibration.")
+            return 0
+
+        # Deduplicate: CalibrationDB also restores points from a JSON file, and
+        # loading the same forecast twice would double-count it in the Brier
+        # score. Keyed on forecast_id, which is the primary key of both.
+        existing = {p.forecast_id for p in self.points}
+
+        loaded = 0
+        for row in rows:
+            if row["id"] in existing:
+                continue
+            try:
+                timestamp = datetime.fromisoformat(row["timestamp"])
+            except (TypeError, ValueError):
+                timestamp = datetime.now(timezone.utc)
+            resolved_at = None
+            if row["resolved_at"]:
+                try:
+                    resolved_at = datetime.fromisoformat(row["resolved_at"])
+                except (TypeError, ValueError):
+                    resolved_at = None
+            self.points.append(CalibrationPoint(
+                forecast_id=row["id"],
+                market_id=row["market_id"],
+                question=row["question"] or "",
+                forecast_prob=float(row["forecast_prob"]),
+                confidence=float(row["confidence"] or 0.0),
+                market_price=float(row["market_price"] or 0.0),
+                category=row["category"] or "default",
+                timestamp=timestamp,
+                actual_outcome=(
+                    float(row["actual_outcome"])
+                    if row["actual_outcome"] is not None else None
+                ),
+                resolved_at=resolved_at,
+                venue_id=row["venue_id"],
+                trade_id=row["trade_id"],
+            ))
+            loaded += 1
+
+        resolved = sum(1 for p in self.points if p.actual_outcome is not None)
+        logger.info(
+            f"Calibration history loaded: {loaded} forecasts, {resolved} resolved")
+        return loaded
+
+    def pending_forecasts(self, since: Optional[datetime] = None) -> List[CalibrationPoint]:
+        """Forecasts with no outcome yet - the settlement work queue."""
+        pending = [p for p in self.points if p.actual_outcome is None]
+        if since is not None:
+            pending = [p for p in pending if p.timestamp >= since]
+        return pending
+
+    def has_forecast_for(self, market_id: str) -> bool:
+        return any(p.market_id == market_id and p.actual_outcome is None
+                   for p in self.points)
+
+    def record_forecast(self, market_id: str, question: str, forecast_prob: float, confidence: float, market_price: float, category: str = "default", venue_id: str = None, trade_id: int = None) -> str:
         """Record a forecast before resolution"""
         import uuid
         forecast_id = str(uuid.uuid4())[:8]
@@ -57,32 +149,119 @@ class CalibrationEngine:
             confidence=confidence,
             market_price=market_price,
             category=category,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc),
+            venue_id=venue_id,
+            trade_id=trade_id,
         )
         self.points.append(point)
         
-        # Also store in DB if available
+        # Persist. A recorded forecast that does not survive the process is not
+        # recorded, and the agent would keep trading on unlearned priors while
+        # the log said "Calibration recorded". This raises rather than warns:
+        # silent loss of learning data is worse than a loud failure, because the
+        # agent continues as if it had learned.
         if self.storage:
             try:
                 self.storage.conn.execute(
-                    "INSERT INTO calibration (id, market_id, forecast_prob, confidence, market_price, category, timestamp) VALUES (?,?,?,?,?,?,?)",
-                    (forecast_id, market_id, forecast_prob, confidence, market_price, category, point.timestamp.isoformat())
+                    "INSERT INTO calibration (id, market_id, question, forecast_prob, confidence, market_price, category, timestamp, venue_id, trade_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (forecast_id, market_id, question, forecast_prob, confidence,
+                     market_price, category, point.timestamp.isoformat(),
+                     venue_id, trade_id)
                 )
                 self.storage.conn.commit()
             except Exception as e:
-                logger.warning(f"Calibration DB insert failed: {e}")
+                # Roll the in-memory point back so the two views cannot diverge.
+                self.points = [p for p in self.points if p.forecast_id != forecast_id]
+                logger.error(
+                    f"CALIBRATION FORECAST NOT PERSISTED for {market_id}: "
+                    f"{type(e).__name__}: {e}")
+                raise RuntimeError(
+                    f"Could not persist forecast for {market_id}: {e}"
+                ) from e
 
         logger.info(f"Calibration recorded {forecast_id}: {question[:50]} forecast={forecast_prob:.3f} market={market_price:.3f}")
         return forecast_id
 
-    def record_resolution(self, forecast_id: str, actual_outcome: float):
-        """Record actual outcome when market resolves"""
+    def record_resolution(self, forecast_id: str, actual_outcome: float) -> bool:
+        """
+        Record actual outcome when market resolves. Returns True if applied.
+
+        Persists, and reports when there is nothing to update instead of
+        silently succeeding - a resolution that lands nowhere is how the
+        resolved count stays at zero forever.
+        """
+        target = None
         for p in self.points:
             if p.forecast_id == forecast_id:
-                p.actual_outcome = actual_outcome
-                p.resolved_at = datetime.now(timezone.utc)
-                logger.info(f"Calibration resolved {forecast_id}: forecast={p.forecast_prob:.3f} actual={actual_outcome}")
+                target = p
                 break
+
+        if target is None:
+            logger.warning(
+                f"Calibration resolution for unknown forecast_id {forecast_id} "
+                f"(outcome {actual_outcome}) - nothing to update")
+            return False
+
+        if target.actual_outcome is not None:
+            logger.info(
+                f"Calibration forecast {forecast_id} already resolved as "
+                f"{target.actual_outcome}; ignoring {actual_outcome}")
+            return False
+
+        target.actual_outcome = actual_outcome
+        target.resolved_at = datetime.now(timezone.utc)
+
+        if self.storage:
+            try:
+                self.storage.conn.execute(
+                    "UPDATE calibration SET actual_outcome = ?, resolved_at = ? WHERE id = ?",
+                    (actual_outcome, target.resolved_at.isoformat(), forecast_id)
+                )
+                self.storage.conn.commit()
+            except Exception as e:
+                target.actual_outcome = None
+                target.resolved_at = None
+                logger.error(
+                    f"CALIBRATION RESOLUTION NOT PERSISTED for {forecast_id}: "
+                    f"{type(e).__name__}: {e}")
+                raise RuntimeError(
+                    f"Could not persist resolution for {forecast_id}: {e}"
+                ) from e
+
+        logger.info(
+            f"Calibration resolved {forecast_id}: forecast={target.forecast_prob:.3f} "
+            f"actual={actual_outcome} market={target.market_id}")
+        self._refresh_learned_adjustments()
+        return True
+
+    def resolved_count(self) -> int:
+        return sum(1 for p in self.points if p.actual_outcome is not None)
+
+    def _refresh_learned_adjustments(self):
+        """
+        Recompute category adjustments from resolved data.
+
+        `category_adjustments` existed but nothing ever wrote to it, so the
+        adjustments the agent applied to fair value were permanently 0.0 while
+        appearing to be learned.
+        """
+        by_category: Dict[str, List[CalibrationPoint]] = {}
+        for p in self.points:
+            if p.actual_outcome is None:
+                continue
+            by_category.setdefault(p.category, []).append(p)
+
+        for category, pts in by_category.items():
+            n = len(pts)
+            mean_forecast = sum(p.forecast_prob for p in pts) / n
+            mean_actual = sum(p.actual_outcome for p in pts) / n
+            # Positive adjustment = the model is under-confident in this
+            # category and its probabilities should be nudged up.
+            self.category_adjustments[category] = {
+                "adjustment": mean_actual - mean_forecast,
+                "learned": True,
+                "sample_size": n,
+            }
 
     def calculate_brier_score(self, category: str = None) -> float:
         """Brier score: mean squared error of forecasts - lower is better, good <0.2"""
