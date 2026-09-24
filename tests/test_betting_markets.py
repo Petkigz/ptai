@@ -989,20 +989,118 @@ def test_nfl_model_does_not_use_the_soccer_total_std():
 
 
 def test_engine_routes_basketball_to_the_normal_model():
+    """
+    Basketball must be priced by the normal margin model, never the soccer
+    scoreline grid - and the resulting card must be RETURNED, not just stored.
+
+    This test previously asserted `result is None`, which encoded the bug it
+    was meant to guard against: `_price_high_scoring_card` computed the whole
+    card, stored it, and returned None, so `run_cycle`'s `if card is not None`
+    gate discarded every basketball, gridiron, baseball and hockey card before
+    any opportunity was built from it. The card breadth existed for soccer
+    only. Asserting the intent (a card comes back, and it is the margin model)
+    is the check that would have caught it.
+    """
     engine = BettingEngine(bankroll=500.0)
     ev = sample_events(1)[0]      # sample_events[0] is NBA
     assert ev.sport == "nba" or ev.league == "nba"
     strengths = {ev.key: {"home": {"expected_points": 114.0},
                           "away": {"expected_points": 110.0}}}
     result = engine.price_card(ev, strengths)
-    # the soccer card is not produced; the high-scoring one is
-    assert result is None
+
+    # A card must come back.
+    assert result is not None, (
+        "price_card priced the fixture but returned None, so the caller "
+        "discards the card and no opportunity is ever built from it"
+    )
+    # And it must be the margin model, not the soccer grid.
+    assert getattr(result, "model", "") == "normal_margin", (
+        f"basketball was priced with {getattr(result, 'model', '?')}"
+    )
+    assert getattr(result, "sport", "") == "basketball"
+    assert not hasattr(result, "scoreline") and not hasattr(result, "correct_score"), (
+        "a basketball card must not carry a soccer scoreline grid"
+    )
+
     assert ev.key in engine.priced_high_scoring
     fair = engine.high_scoring_fair_prices(ev.key)
     assert "moneyline" in fair
     assert any(k.startswith("totals_") for k in fair)
     assert any(k.startswith("spreads_") for k in fair)
     assert "margin_bands" in fair
+
+
+def test_run_cycle_turns_basketball_cards_into_opportunities():
+    """
+    The end of the chain: a priced basketball card must reach the opportunity
+    list. Before the fix, `cards_priced` counted soccer cards only and every
+    NBA market line was silently dropped.
+    """
+    import asyncio
+
+    from src.ptai.betting.engine import BettingEngine
+    from src.ptai.betting.sports_data import BookOdds, SportsDataEngine, sample_events
+    from src.ptai.markets.base import DataMode
+
+    class _Provider:
+        name = "injected"
+        is_synthetic = False
+        last_error = ""
+        last_fetch_at = None
+        requests_made = 0
+
+        def __init__(self, events, odds):
+            self._events, self._odds = events, odds
+
+        async def events(self, leagues=()):
+            return list(self._events)
+
+        def odds_for_event(self, event):
+            return list(self._odds.get(event.event_id, []))
+
+        def health(self):
+            return {"provider": self.name, "reachable": True, "last_error": "",
+                    "last_fetch_at": None, "requests_made": 0,
+                    "is_synthetic": False}
+
+    events = sample_events(3)
+    for i, e in enumerate(events):
+        e.event_id = f"evt-{i}"
+    odds = {e.event_id: [
+        BookOdds(book="softbook", market="h2h",
+                 outcomes={e.home_team: 2.10, e.away_team: 1.95}),
+        BookOdds(book="pinnacle", market="h2h",
+                 outcomes={e.home_team: 2.05, e.away_team: 1.90}),
+    ] for e in events}
+
+    engine = BettingEngine(
+        bankroll=500.0, min_edge_pct=1.0,
+        data_engine=SportsDataEngine(providers=[_Provider(events, odds)]))
+    strengths = {
+        e.key: {"home": {"expected_points": 114.0, "attack": 1.4, "defence": 0.8},
+                "away": {"expected_points": 110.0, "attack": 1.1, "defence": 1.0}}
+        for e in events
+    }
+
+    result = asyncio.run(engine.run_cycle(
+        leagues=("nba", "epl"), strengths=strengths,
+        data_mode=DataMode.LIVE_PAPER, account_health_ok=False))
+
+    assert result["ok"] is True
+    assert result["cards_priced"] == len(engine.priced_high_scoring) + 1, (
+        f"cards_priced={result['cards_priced']} but "
+        f"{len(engine.priced_high_scoring)} high-scoring cards were priced "
+        f"plus one soccer card"
+    )
+
+    types = {o.market_type for o in engine.opportunities}
+    # These exist only on the margin model, so their presence proves the
+    # basketball card produced opportunities.
+    assert "margin_bands" in types, "the basketball margin card produced nothing"
+    assert any(t.startswith("spreads_") for t in types), (
+        "basketball spread markets produced no opportunities"
+    )
+    assert "moneyline" in types, "the basketball moneyline produced nothing"
 
 
 def test_engine_refuses_to_invent_a_basketball_score():

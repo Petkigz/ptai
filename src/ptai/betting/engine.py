@@ -520,7 +520,7 @@ class BettingEngine:
         self.priced_cards[ev.key] = card
         return card
 
-    def _price_high_scoring_card(self, ev: SportsEvent, s: Dict) -> Optional[MatchCardPrices]:
+    def _price_high_scoring_card(self, ev: SportsEvent, s: Dict) -> Optional[HighScoringCard]:
         """
         Price a basketball/gridiron/baseball/hockey fixture with the normal
         margin model.
@@ -560,7 +560,16 @@ class BettingEngine:
                                          else {"H1": 0.5} if sport == "football" else None),
         )
         self.priced_high_scoring[ev.key] = card
-        return None
+        # Return the card. This previously returned None after doing all the
+        # work, and price_card forwards that None to its caller, which gates on
+        # `if card is not None`. So every basketball, gridiron, baseball and
+        # hockey card - 17 correctly computed market lines for a single NBA
+        # fixture - was priced and then discarded: _build_card_opportunities
+        # never ran for any non-soccer sport, and the card_count that reports
+        # "cards priced" never counted them either. Card breadth existed for
+        # soccer only, and looked present for the others because the pricing
+        # ran and the dict was populated.
+        return card
 
     def high_scoring_fair_prices(self, ev_key: str) -> Dict[str, Dict[str, float]]:
         """Fair prices from the normal margin model, keyed like the soccer card."""
@@ -700,7 +709,8 @@ class BettingEngine:
             out["offsides_total"] = card.offsides.totals
         return out
 
-    def _build_card_opportunities(self, ev: SportsEvent, card: MatchCardPrices,
+    def _build_card_opportunities(self, ev: SportsEvent,
+                                  card: "MatchCardPrices | HighScoringCard",
                                   consensus_by_type: Dict[str, ConsensusOdds],
                                   data_mode: DataMode,
                                   account_health_ok: bool) -> List[BetOpportunity]:
@@ -714,9 +724,10 @@ class BettingEngine:
         price with nothing to bet against would be inventing an opportunity.
         """
         out: List[BetOpportunity] = []
+        # Both card shapes are read from self by event key rather than from the
+        # `card` argument, which is why the argument is unused below. Soccer
+        # cards live in card_fair_prices; high-scoring cards keep their own dict.
         fair = self.card_fair_prices(ev.key)
-        # High-scoring sports use the normal margin model and keep their own
-        # priced-card dict, so merge their fair prices in.
         fair.update(self.high_scoring_fair_prices(ev.key))
         books_by_type = {mt: c for mt, c in consensus_by_type.items()}
 
