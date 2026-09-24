@@ -237,7 +237,11 @@ class TradingAgentV2:
             "news": "",
             "sentiment": {"score": 0},
             "tweets": [],
-            "orderbook": {"spread": 0.02},
+            # Not a measurement. `spread: None` and is_real False, because a
+            # fabricated 2% spread is indistinguishable from a real one
+            # downstream and would be priced as if the book had been read.
+            "orderbook": {"spread": None, "is_real": False, "executable": False,
+                          "source": "not_fetched"},
             "research": "",
             "sources": []
         }
@@ -285,9 +289,17 @@ class TradingAgentV2:
                 else:
                     # If no exact adapter, DO NOT fallback to eligible[0] - that's bug
                     logger.error(f"No exact adapter for market {market.id} venue_id {getattr(market, 'venue_id', 'unknown')} - ABORT orderbook, never fallback")
-                    context["orderbook"] = {"spread": 0.02, "error": "no_exact_adapter_ABORT"}
+                    context["orderbook"] = {"spread": None, "is_real": False,
+                                            "executable": False,
+                                            "error": "no_exact_adapter_ABORT"}
             except Exception as e:
+                # Previously the fabricated default {spread: 0.02} was left in
+                # context here, so a failed fetch looked like a measured 2%
+                # spread. Record the failure instead.
                 logger.warning(f"Orderbook fetch failed for {market.id}: {e}")
+                context["orderbook"] = {"spread": None, "is_real": False,
+                                        "executable": False,
+                                        "error": f"fetch_failed: {type(e).__name__}"}
             
             # Web research - bull/bear
             research_result = await self.web_researcher.research(market, max_time_seconds=20)

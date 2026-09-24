@@ -24,6 +24,17 @@ class OrderbookSnapshot:
     price_velocity: float  # change per minute
     volume_24h: float
     liquidity: float
+    # Where the spread came from. "orderbook" means it was read from a real
+    # bid/ask; "assumed_default" means no book was available and a placeholder
+    # was used. Without this the two are indistinguishable - every consumer
+    # defaulted to a bare 0.02 and priced it as if the book had been read.
+    spread_source: str = "assumed_default"
+    is_assumed: bool = True
+    assumed_fields: List[str] = None
+
+    def __post_init__(self):
+        if self.assumed_fields is None:
+            self.assumed_fields = []
 
 
 class OrderbookAnalyzer:
@@ -34,16 +45,52 @@ class OrderbookAnalyzer:
         raw_orderbook = raw_orderbook or {}
         recent_trades = recent_trades or []
 
-        bid = raw_orderbook.get("bid", market.best_price - 0.01)
-        ask = raw_orderbook.get("ask", market.best_price + 0.01)
-        spread = ask - bid if bid and ask else raw_orderbook.get("spread", 0.02)
-        spread_pct = spread / max(0.01, (bid + ask) / 2) if bid and ask else 0.02
+        # Distinguish a real two-sided book from a placeholder.
+        #
+        # This used to read `bid = raw.get("bid", best_price - 0.01)` and the
+        # same for ask, then compute `spread = ask - bid`. Because the defaults
+        # always supplied both sides, that branch ALWAYS produced exactly 0.02 -
+        # so the spread was a constant whenever no book was passed, and no
+        # caller could tell the difference.
+        assumed: List[str] = []
+        raw_bid = raw_orderbook.get("bid")
+        raw_ask = raw_orderbook.get("ask")
 
-        bid_size = raw_orderbook.get("bid_size", market.liquidity * 0.1)
-        ask_size = raw_orderbook.get("ask_size", market.liquidity * 0.1)
-        depth = raw_orderbook.get("depth", market.liquidity)
+        if raw_bid and raw_ask and raw_ask > raw_bid:
+            bid, ask = float(raw_bid), float(raw_ask)
+            spread = ask - bid
+            spread_source = "orderbook"
+        elif raw_orderbook.get("spread") is not None:
+            spread = float(raw_orderbook["spread"])
+            bid = float(raw_bid) if raw_bid else market.best_price
+            ask = float(raw_ask) if raw_ask else market.best_price
+            spread_source = "reported_spread"
+            assumed.append("bid/ask")
+        else:
+            # No usable book. Keep a numeric spread so callers doing arithmetic
+            # do not crash, but label it, and derive the sides from the mid so
+            # the numbers at least stay self-consistent.
+            spread = 0.02
+            bid = market.best_price - spread / 2
+            ask = market.best_price + spread / 2
+            spread_source = "assumed_default"
+            assumed.extend(["bid", "ask", "spread"])
 
-        mid_price = (bid + ask) / 2 if bid and ask else market.best_price
+        mid_price = (bid + ask) / 2 if (bid and ask) else market.best_price
+        spread_pct = spread / max(0.01, mid_price) if mid_price else 0.02
+
+        bid_size = raw_orderbook.get("bid_size")
+        if bid_size is None:
+            bid_size = market.liquidity * 0.1
+            assumed.append("bid_size")
+        ask_size = raw_orderbook.get("ask_size")
+        if ask_size is None:
+            ask_size = market.liquidity * 0.1
+            assumed.append("ask_size")
+        depth = raw_orderbook.get("depth")
+        if depth is None:
+            depth = market.liquidity
+            assumed.append("depth")
 
         # Imbalance: (bid_size - ask_size) / (bid_size + ask_size)
         total_size = bid_size + ask_size
@@ -82,10 +129,20 @@ class OrderbookAnalyzer:
             recent_trades=recent_trades[-20:],
             price_velocity=price_velocity,
             volume_24h=market.volume_24h,
-            liquidity=market.liquidity
+            liquidity=market.liquidity,
+            spread_source=spread_source,
+            is_assumed=spread_source == "assumed_default",
+            assumed_fields=sorted(set(assumed)),
         )
 
-        logger.debug(f"Orderbook {market.id}: spread {spread:.3f} imbalance {imbalance:.2f} velocity {price_velocity:.3f} large_orders {len(large_orders)}")
+        if snapshot.is_assumed:
+            logger.debug(
+                f"Orderbook {market.id}: NO REAL BOOK - spread {spread:.3f} is a "
+                f"placeholder, assumed fields {snapshot.assumed_fields}")
+        else:
+            logger.debug(f"Orderbook {market.id}: spread {spread:.3f} from {spread_source} "
+                         f"imbalance {imbalance:.2f} velocity {price_velocity:.3f} "
+                         f"large_orders {len(large_orders)}")
 
         return snapshot
 

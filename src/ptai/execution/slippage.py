@@ -30,6 +30,11 @@ class SlippageEstimate:
     depth: float
     should_trade: bool
     reasoning: str
+    # Whether a real book was read. When False the spread, depth and fill price
+    # are modelled from liquidity rather than measured, and the estimate must
+    # not be treated as an executable price.
+    book_source: str = "assumed"
+    is_executable_estimate: bool = False
 
 
 @dataclass
@@ -75,6 +80,9 @@ class SlippageModel:
         depth = orderbook.get("depth", 10000)
         
         # If no detailed bids/asks, use simple model: slippage = amount / liquidity * 0.3
+        book_source = "ladder" if (bids or asks) else (
+            "reported" if orderbook.get("spread") is not None else "assumed")
+
         if not bids and not asks:
             liquidity = orderbook.get("liquidity", depth)
             if liquidity <= 0:
@@ -104,7 +112,10 @@ class SlippageModel:
                 spread=spread,
                 depth=depth,
                 should_trade=should_trade,
-                reasoning=reasoning
+                reasoning=reasoning,
+                book_source=book_source,
+                # Modelled from liquidity alone, not walked through a real book.
+                is_executable_estimate=(book_source == "ladder"),
             )
         
         # Detailed order book walk
@@ -162,7 +173,9 @@ class SlippageModel:
             spread=spread,
             depth=depth,
             should_trade=should_trade,
-            reasoning=reasoning
+            reasoning=reasoning,
+            book_source="ladder",
+            is_executable_estimate=True,
         )
 
     def check_slippage_vs_edge(self, slippage_pct: float, edge_pct: float) -> Tuple[bool, str]:
