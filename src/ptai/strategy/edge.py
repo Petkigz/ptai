@@ -52,14 +52,41 @@ class EdgeCalculator:
 
     def calculate(self, market: Market, fair_prob: float, uncertainty: float = 0.1,
                   orderbook: Dict = None, amount_usd: float = 5.0,
-                  correlation_penalty: float = 0.0, category_exposure: float = 0.0) -> EffectiveEdge:
+                  correlation_penalty: float = 0.0, category_exposure: float = 0.0,
+                  side: str = "YES") -> EffectiveEdge:
         """
-        Calculate effective edge with all deductions.
-        Example: YES 0.61, fair 0.73, raw 12%, fees 0.8%, slippage 1.2%, uncertainty 2% -> effective much less
+        Calculate effective edge with all deductions, ON THE SIDE BEING BOUGHT.
+
+        `fair_prob` is always the probability of YES, whichever side is traded.
+        That is the whole subtlety this method used to miss: it computed
+        `fair_prob - market_price` unconditionally, so a market the agent believed
+        was overpriced produced a NEGATIVE edge and was filtered out - even though
+        the same belief is a positive edge on the other side.
+
+            YES 0.55 against a 0.70 market:
+                raw_edge = 0.55 - 0.70 = -0.15   ... filtered out
+                but buying NO at 0.30 with fair value 0.45 is +0.15
+
+        So the agent could only ever trade when it thought the market UNDERPRICED
+        the outcome. Half of all mispricings - the half where the market is too
+        high - were structurally invisible to it, and the filter that removed them
+        looked like ordinary risk control.
+
+        The NO side mirrors exactly: price 1 - p_yes, fair 1 - fair_yes, so
+        edge_no = (1 - fair_yes) - (1 - market_yes) = market_yes - fair_yes.
         """
         orderbook = orderbook or {}
         market_price = market.best_price
-        raw_edge = fair_prob - market_price
+        side = str(side or "YES").upper()
+        if side == "NO":
+            # Mirror the market onto the side being traded, so every deduction
+            # below (fees, spread, slippage, penalties) is applied to the price
+            # actually paid rather than to the other side's price.
+            raw_edge = market_price - fair_prob
+            market_price = 1.0 - market_price
+            fair_prob = 1.0 - fair_prob
+        else:
+            raw_edge = fair_prob - market_price
 
         # Fees - Use accurate fee model from markets/fees.py
         # Polymarket formula: Fee = 0.06 × C × p × (1-p), at $0.50 $1.50 per 100 contracts, $3 position fee $0.09 (3%)
@@ -154,7 +181,7 @@ class EdgeCalculator:
         should_trade = effective_edge >= 0.08
 
         reasoning = (
-            f"Raw {raw_edge:.3f} (fair {fair_prob:.3f} - mkt {market_price:.3f}) | "
+            f"[{side}] Raw {raw_edge:.3f} (fair {fair_prob:.3f} - mkt {market_price:.3f}) | "
             f"Deductions: fees {fees:.3f} gas {gas_deduction:.3f} spread {spread:.3f} slip {slippage:.3f} liq {liquidity_penalty:.3f} "
             f"unc {uncertainty_penalty:.3f} corr {correlation_penalty:.3f} time {time_penalty:.3f} total {total_deductions:.3f} | "
             f"Effective {effective_edge:.3f} conservative_fair {conservative_fair:.3f} | "

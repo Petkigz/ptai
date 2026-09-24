@@ -175,7 +175,14 @@ CREATE TABLE IF NOT EXISTS trade_outcomes (
     resolved_at TEXT,
     brier_score REAL,
     was_correct INTEGER,
-    recorded_at TEXT NOT NULL
+    recorded_at TEXT NOT NULL,
+    -- Realised costs and the mode the trade was executed in. NULL means NOT
+    -- MEASURED, which the qualification gate must treat as a failure rather
+    -- than as a zero-cost trade.
+    fees_usd REAL,
+    slippage_bps REAL,
+    execution_quality REAL,
+    data_mode TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_trade_outcomes_venue
@@ -225,6 +232,14 @@ class Storage:
         # order it came from. Neither was stored: log_trade read only the columns
         # in its INSERT, so strategy/category/order_id were silently dropped -
         # which is why a delayed fill could not be attributed to anything.
+        # What a trade COST and whether it was real. The qualification gate
+        # claims to weigh fees, slippage, execution quality and a paper/live
+        # split, and none of the four was recorded anywhere, so those inputs were
+        # constant - and a constant that happens to equal the threshold passes it.
+        ("trade_outcomes", "fees_usd", "REAL"),
+        ("trade_outcomes", "slippage_bps", "REAL"),
+        ("trade_outcomes", "execution_quality", "REAL"),
+        ("trade_outcomes", "data_mode", "TEXT"),
         ("trades", "strategy", "TEXT"),
         ("trades", "category", "TEXT"),
         ("trades", "order_id", "TEXT"),

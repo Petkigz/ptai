@@ -872,7 +872,19 @@ class TestOrderProbeMakesReadinessReachable:
         _, restore = self._with_fake_clob({"success": True, "orderID": "o1"})
         class Registry:
             adapters = {"polymarket": ad}
-        engine = AccountHealthEngine()
+        # Polymarket requires identity verification for UG, and the ladder now
+        # requires a RECORD that it was completed before the top rung - an
+        # authenticated, funded account with a working probe is not evidence that
+        # a KYC check happened. The operator completes that at the venue, so it is
+        # recorded the way the operator records it.
+        import tempfile
+
+        from src.ptai.execution.account_health import record_verification
+        from src.ptai.storage.db import Storage
+
+        storage = Storage(db_path=tempfile.mktemp(suffix=".db"))
+        record_verification(storage, "polymarket", "KYC completed")
+        engine = AccountHealthEngine(storage=storage)
         engine.venue_registry = Registry()
         try:
             result = asyncio.run(engine.check_venue_health(
@@ -883,6 +895,7 @@ class TestOrderProbeMakesReadinessReachable:
         assert result.readiness == TradeReadiness.TRADE_PERMITTED
         assert result.ready_to_trade is True
         assert result.healthy is True
+        assert any("Verification recorded" in c for c in result.checks)
 
     def test_health_engine_stops_at_funded_when_the_probe_fails(self):
         from src.ptai.execution.account_health import (

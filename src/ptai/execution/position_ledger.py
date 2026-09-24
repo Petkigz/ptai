@@ -40,6 +40,13 @@ class PositionLedger:
     equity: float = 0.0
     free_cash: float = 0.0
     reserved_capital: float = 0.0
+    # Committed to orders that have not filled. Separate from reserved_capital so
+    # the two can be reported apart - they are different kinds of commitment, and
+    # a single figure hides which one is growing.
+    resting_order_cost: float = 0.0
+    # True when the working orders could not be read. Fail closed: an unknown
+    # reservation must never be treated as no reservation.
+    reservations_unknown: bool = False
     open_position_cost: float = 0.0
     open_position_value: float = 0.0
     unrealised_pnl: float = 0.0
@@ -55,7 +62,16 @@ class PositionLedger:
 
     @property
     def can_open_new(self) -> bool:
-        """Is there any free cash at all? A zero here means no new position."""
+        """
+        Is there any free cash at all? A zero here means no new position.
+
+        Also false when the capital committed to working orders is unknown.
+        Unknown committed capital and zero committed capital are opposite facts,
+        and treating the first as the second is how the agent spends money it has
+        already promised to an order resting in the book.
+        """
+        if self.reservations_unknown:
+            return False
         return self.free_cash > 0.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -63,6 +79,8 @@ class PositionLedger:
             "equity": round(self.equity, 2),
             "free_cash": round(self.free_cash, 2),
             "reserved_capital": round(self.reserved_capital, 2),
+            "resting_order_cost": round(self.resting_order_cost, 2),
+            "reservations_unknown": self.reservations_unknown,
             "open_position_cost": round(self.open_position_cost, 2),
             "open_position_value": round(self.open_position_value, 2),
             "unrealised_pnl": round(self.unrealised_pnl, 2),
@@ -175,18 +193,46 @@ class PositionLedgerBuilder:
                 f"{marked} that could be priced"
             )
 
+        # Cash locked behind orders that are still working. Booked positions do
+        # not include it - a resting order buys nothing until it fills, so its
+        # cost is not in the trades table - so the two do not double count.
+        #
+        # This was missing from free cash, and the consequence was a
+        # self-inflicted overcommit: with $50, a $3 position and a $3 GTC order
+        # resting in the book, the ledger reported $47 free when $44 was. The
+        # next cycle then sized against money that was already promised to an
+        # earlier order, and the venue rejected one of them - or worse, both
+        # filled and the agent held more exposure than it had authorised.
+        resting_usd = 0.0
+        try:
+            resting_usd = float(self.storage.resting_capital_usd() or 0.0)
+        except Exception as e:
+            # An unreadable reservation is NOT zero. Treating it as zero is the
+            # exact overcommit this guards against, so refuse to size instead.
+            ledger.warnings.append(
+                f"working orders could not be read ({type(e).__name__}: {e}), so "
+                f"the capital already committed to them is unknown - new "
+                f"positions cannot be sized safely this cycle")
+            ledger.reservations_unknown = True
+            resting_usd = bankroll  # assume fully committed: the safe end
+
         ledger.reserved_capital = ledger.open_position_cost
+        ledger.resting_order_cost = resting_usd
         ledger.unrealised_pnl = ledger.open_position_value - ledger.open_position_cost
 
-        # Free cash = the recorded bankroll minus what is committed. The stored
-        # bankroll is decremented when a position opens, so this is the honest
-        # remainder rather than a re-derivation that could double-count.
-        ledger.free_cash = max(0.0, bankroll - ledger.open_position_cost)
-        if bankroll < ledger.open_position_cost:
+        # Free cash = the recorded bankroll minus everything already committed.
+        # The stored bankroll is decremented when a position opens, so this is
+        # the honest remainder rather than a re-derivation that could
+        # double-count.
+        committed = ledger.open_position_cost + ledger.resting_order_cost
+        ledger.free_cash = max(0.0, bankroll - committed)
+        if bankroll < committed:
             ledger.warnings.append(
-                f"committed capital ${ledger.open_position_cost:.2f} exceeds the "
-                f"recorded bankroll ${bankroll:.2f} - the ledger and storage "
-                f"disagree and one of them is wrong"
+                f"committed capital ${committed:.2f} (positions "
+                f"${ledger.open_position_cost:.2f} + working orders "
+                f"${ledger.resting_order_cost:.2f}) exceeds the recorded bankroll "
+                f"${bankroll:.2f} - the ledger and storage disagree and one of "
+                f"them is wrong"
             )
 
         ledger.equity = ledger.free_cash + ledger.open_position_value

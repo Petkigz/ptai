@@ -134,7 +134,12 @@ class StrategyEngineV3:
                     market=market,
                     venue_id=venue_id_str,
                     venue_type=VenueType.PREDICTION,
-                    side="YES" if fv_result.fair_value > market.best_price else "NO",
+                    # The side the edge was measured on. Re-deriving it from the
+                    # fair value here is how the two could disagree: the edge was
+                    # computed for neither side in particular, and this line then
+                    # picked one.
+                    side=getattr(fv_result, "side", None) or (
+                        "YES" if fv_result.fair_value > market.best_price else "NO"),
                     market_price=market.best_price,
                     estimated_fair=fv_result.fair_value,
                     raw_edge=fv_result.edge,
@@ -208,10 +213,39 @@ class StrategyEngineV3:
             if context_provider:
                 try:
                     context = await context_provider.get_context(market)
-                except:
-                    context = {"orderbook": {"spread": 0.02, "depth": market.liquidity}}
+                except Exception as e:
+                    # NEVER silent. This except used to swallow an
+                    # AttributeError - the provider had no get_context - and
+                    # substitute a fabricated orderbook for every market on every
+                    # cycle. The forecast was then built on a placeholder spread
+                    # and a depth copied from the market's own liquidity field,
+                    # with nothing logged, so the pipeline looked connected while
+                    # no news, sentiment, research or real book reached it.
+                    logger.error(
+                        f"Context provider FAILED for {market.id}: "
+                        f"{type(e).__name__}: {e}. Falling back to a degraded "
+                        f"context - the forecast for this market is built WITHOUT "
+                        f"news, sentiment, research or a real orderbook, and is "
+                        f"marked degraded so nothing downstream mistakes it for a "
+                        f"researched forecast.")
+                    context = {
+                        "orderbook": {"spread": 0.02, "is_real": False},
+                        "category": "unknown",
+                        "degraded": True,
+                        "degraded_reason": f"{type(e).__name__}: {e}",
+                        "sources": [],
+                    }
             else:
-                context = {"orderbook": {"spread": 0.02, "depth": market.liquidity}, "category": "unknown"}
+                # No provider at all is also a degraded forecast, not a normal
+                # one. Same reason: silence here is indistinguishable from a
+                # researched market.
+                context = {
+                    "orderbook": {"spread": 0.02, "is_real": False},
+                    "category": "unknown",
+                    "degraded": True,
+                    "degraded_reason": "no context provider supplied",
+                    "sources": [],
+                }
             
             opps = self.evaluate_market_with_all_strategies(market, context=context)
             all_opps.extend(opps)

@@ -355,10 +355,11 @@ class PolymarketAdapter(MarketAdapter):
         """
         portfolio_sources = []
         errors = []
-        # Set only if a venue-side source produced a number. Everything below
-        # comes from local storage or a stub, so this stays None - which is what
-        # makes is_real honest.
+        # Set only if a venue-side source produced a number. Everything else in
+        # this method comes from local storage, so this staying None is what makes
+        # is_real honest.
         _venue_side_balance = None
+        balance_probe: Dict[str, Any] = {}
         
         # Source 1: Storage DB
         try:
@@ -422,19 +423,47 @@ class PolymarketAdapter(MarketAdapter):
             # Try to get on-chain balance if keys available
             onchain_balance = None
             onchain_positions = None
+            # The venue's OWN view of the account. This is the only thing that
+            # proves Polymarket authenticated us and can say how much collateral
+            # is actually there; the figures above are PTAI's own bookkeeping.
+            #
+            # This was a stub returning the string
+            # "attempted_but_not_implemented_yet", while the executor had a real
+            # get_balance_allowance() the whole time. So the account health ladder
+            # could never leave CONFIGURED, and live trading was unreachable with
+            # a perfectly good key - the capability existed and was never called.
             if self.private_key and self.funder:
                 try:
-                    # Would need to call CLOB API for real balance
-                    # For now, mark as attempted
-                    onchain_balance = "attempted_but_not_implemented_yet"
-                    portfolio_sources.append("onchain_attempted")
+                    executor = self._get_executor()
+                    if executor is None:
+                        errors.append("No CLOB client: balance not venue-verified")
+                    else:
+                        venue_balance = executor.get_balance_allowance()
+                        if venue_balance.get("is_real") and \
+                                venue_balance.get("balance") is not None:
+                            balance_probe = venue_balance
+                            _venue_side_balance = float(venue_balance["balance"])
+                            portfolio_sources.append(
+                                venue_balance.get("source") or "clob_balance_allowance")
+                        else:
+                            errors.append(
+                                "Balance not venue-verified: "
+                                f"{venue_balance.get('reason') or 'venue did not answer'}")
                 except Exception as e:
-                    errors.append(f"On-chain balance failed: {e}")
+                    errors.append(f"Venue balance read failed: {type(e).__name__}: {e}")
             
+            # When the venue answered, ITS figure is the balance - the local
+            # number is our estimate of it, and where they disagree the venue is
+            # right.
+            disclosed_balance = (_venue_side_balance
+                                 if _venue_side_balance is not None else bankroll)
             portfolio = {
-                "balance": bankroll,
-                "bankroll": bankroll,
-                "available_balance": bankroll - total_exposure_usd,
+                "balance": disclosed_balance,
+                "bankroll": disclosed_balance,
+                "available_balance": disclosed_balance - total_exposure_usd,
+                "venue_confirmed_balance": _venue_side_balance,
+                "local_bankroll": bankroll,
+                "allowance": balance_probe.get("allowance"),
                 "total_pnl": total_pnl,
                 "realized_pnl": total_pnl,
                 "unrealized_pnl": 0,  # Would need market prices
@@ -459,8 +488,21 @@ class PolymarketAdapter(MarketAdapter):
                 "win_rate": win_rate,
                 "venue": "polymarket",
                 "venue_id": "polymarket",
-                "source": "+".join(portfolio_sources),
-                # NOT is_real: True. Every number in this branch comes from the
+                # `source` is the provenance of the BALANCE, because that is the
+                # question every reader of it is asking - "where did this number
+                # come from?". Joining it with "storage" made the health engine
+                # reject a genuinely venue-confirmed balance: is_venue_side_
+                # provenance refuses a compound source when any part is local, so
+                # "storage+clob_balance_allowance" read as unverified exactly like
+                # "storage" alone. The composition is still reported, under its own
+                # key, so nothing is hidden by this.
+                "source": (balance_probe.get("source")
+                           if _venue_side_balance is not None
+                           else "+".join(portfolio_sources)),
+                "portfolio_sources": "+".join(portfolio_sources),
+                "contains_local_state": True,
+                "available": _venue_side_balance is not None,
+                # NOT is_real: True unless the venue itself answered. Every number in this branch comes from the
                 # local database - PTAI's own bookkeeping - and the on-chain read
                 # below is a stub. Declaring it real invited any consumer to treat
                 # the agent's own balance as the venue's; the account health

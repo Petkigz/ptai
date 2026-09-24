@@ -102,7 +102,8 @@ class EnsembleForecaster:
                 sources=[]
             )
 
-    def ensemble(self, forecasts: List[ModelForecast], market: Market) -> ForecastResult:
+    def ensemble(self, forecasts: List[ModelForecast], market: Market,
+                 category: str = None) -> ForecastResult:
         """Weighted ensemble of forecasts"""
         if not forecasts:
             return ForecastResult(
@@ -147,9 +148,16 @@ class EnsembleForecaster:
         calibrated_prob = ensemble_prob
         if self.calibration_engine:
             try:
+                # The market's OWN category. This was hardcoded to "default"
+                # with a comment saying it would detect the category later -
+                # so every sport, election and crypto market was calibrated
+                # against one pooled curve, and the per-category learning the
+                # calibration engine is built around never happened.
                 calibrated_prob = self.calibration_engine.calibrate(
                     probability=ensemble_prob,
-                    category="default",  # would detect category from market
+                    category=(category
+                              or getattr(market, "category", None)
+                              or "default"),
                     confidence=avg_conf
                 )
             except Exception as e:
@@ -233,4 +241,5 @@ class EnsembleForecaster:
             except Exception as e:
                 logger.warning(f"LLM forecast failed: {e}")
 
-        return self.ensemble(forecasts, market)
+        return self.ensemble(forecasts, market,
+                             category=context.get("category"))

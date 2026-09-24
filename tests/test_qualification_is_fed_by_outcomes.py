@@ -65,10 +65,15 @@ def _record(storage, tracker, venue, n, *, win_prob, forecast, win_pnl, loss_pnl
         })
         pnl = win_pnl if won else loss_pnl
         storage.resolve_trade(tid, outcome=1.0 if won else 0.0, pnl=pnl)
+        # Costs and execution quality, passed the way the loop passes them from
+        # a real fill. The gate fails closed on an unmeasured execution quality,
+        # which is asserted separately below.
         tracker.record_trade(
             trade_id=str(tid), market_id=f"{venue}-{i}", venue_id=venue,
             strategy="value", category="politics", forecast_prob=forecast,
-            market_price=0.5, edge=edge, side="YES", amount_usd=3.0)
+            market_price=0.5, edge=edge, side="YES", amount_usd=3.0,
+            fees_usd=0.06, slippage_bps=12.0, execution_quality=0.976,
+            data_mode="live_paper")
         tracker.record_resolution(str(tid), actual_outcome=1.0 if won else 0.0,
                                   pnl=pnl)
         if won:

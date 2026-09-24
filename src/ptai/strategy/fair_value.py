@@ -23,6 +23,9 @@ class FairValueResult:
     effective_edge: float
     should_trade: bool
     reasoning: str
+    # The outcome side this forecast is traded on, so no caller has to re-derive
+    # it and risk disagreeing with the edge that was computed.
+    side: str = "YES"
     forecast_result: Optional[ForecastResult] = None
     resolution_analysis: Any = None
     contradiction_report: Any = None
@@ -108,7 +111,18 @@ class FairValueEngine:
             adjusted_confidence = forecast_result.confidence
         forecast_result.confidence = adjusted_confidence
 
-        # Step 4: Effective edge calculation
+        # Step 4: Effective edge calculation, ON THE SIDE THE TRADE WOULD BE ON.
+        #
+        # A fair value BELOW the market is a positive edge on NO. Computing it as
+        # fair - market unconditionally made every such market look like a loss,
+        # so the agent only ever bought YES and half of all mispricings - the half
+        # where the market was too high - were structurally invisible to it.
+        #
+        # Derived from the forecast that was just computed, so the side the edge
+        # is measured for is the same side the trade is placed on. These used to
+        # be decided in two different files.
+        side = str(context.get("side") or (
+            "YES" if forecast_result.fair_probability > market.best_price else "NO"))
         from .edge import EdgeCalculator
         edge_calc = EdgeCalculator(uncertainty_engine=self.uncertainty_engine)
         effective = edge_calc.calculate(
@@ -118,7 +132,8 @@ class FairValueEngine:
             orderbook=context.get("orderbook"),
             amount_usd=context.get("amount_usd", 5.0),
             correlation_penalty=context.get("correlation_penalty", 0.0),
-            category_exposure=context.get("category_exposure", 0.0)
+            category_exposure=context.get("category_exposure", 0.0),
+            side=side,
         )
 
         # Step 5: Final decision with uncertainty margin
@@ -151,6 +166,7 @@ class FairValueEngine:
             uncertainty=forecast_result.uncertainty,
             edge=forecast_result.edge,
             effective_edge=effective.effective_edge,
+            side=side,
             should_trade=should_trade,
             reasoning=final_reasoning,
             forecast_result=forecast_result,

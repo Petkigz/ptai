@@ -395,7 +395,8 @@ class TradingAgentV3:
         self.execution_guard = ExecutionGuard(bankroll=bankroll)
         self.reconciliation_engine = ReconciliationEngine(storage=self.storage)
         self.multi_venue_executor = MultiVenueExecutor(registry=self.venue_registry, bankroll=bankroll)
-        self.account_health_engine = AccountHealthEngine(venue_registry=self.venue_registry)
+        self.account_health_engine = AccountHealthEngine(
+            venue_registry=self.venue_registry, storage=self.storage)
         self.expected_ev_engine = ExpectedNetEVEngine()
 
         # The one place dry_run becomes a data mode. LIVE_PAPER (not SHADOW) when
@@ -563,6 +564,26 @@ class TradingAgentV3:
             qualified_ids=qualified_ids
         )
         return markets_by_venue, qual_report
+
+    async def get_context(self, market: Market) -> Dict[str, Any]:
+        """
+        The name the strategy engine calls.
+
+        StrategyEngine does `context_provider.get_context(market)`. This class
+        only ever had `get_context_for_market()`, so every call raised
+        AttributeError into a bare `except:` which substituted
+        {"orderbook": {"spread": 0.02, "depth": market.liquidity}} - a fabricated
+        spread and a number copied from the market's own liquidity field.
+
+        The effect was that the entire intelligence pipeline - news, X sentiment,
+        web research, the real orderbook - never reached the forecast on the V3
+        path, while the code implementing all of it sat right here. The forecast
+        was built on a placeholder and nothing said so.
+
+        Kept as an alias rather than a rename so any existing caller that does use
+        the longer name keeps working.
+        """
+        return await self.get_context_for_market(market)
 
     async def get_context_for_market(self, market: Market) -> Dict[str, Any]:
         """
@@ -1678,11 +1699,21 @@ class TradingAgentV3:
                                       or opp.market_price),
                         edge=opp.effective_edge,
                         side=opp.side,
+                        confidence=opp.confidence,
+                        data_mode=str(data_mode_for_calib),
+                        # What the trade actually cost. Recorded so the
+                        # qualification gate can MEASURE fees, slippage and
+                        # execution quality instead of reading the placeholders
+                        # it used to hold - a constant that happened to equal the
+                        # execution-quality threshold, so every venue passed it.
+                        fees_usd=getattr(exec_result, "fees_usd", None),
+                        slippage_bps=(
+                            (getattr(exec_result, "paper_fill", None) or {})
+                            .get("slippage_bps")),
+                        execution_quality=self._execution_quality(exec_result),
                         amount_usd=(exec_result.filled_usd
                                     if exec_result.committed_capital
                                     else amount_usd),
-                        confidence=opp.confidence,
-                        data_mode=str(data_mode_for_calib),
                     )
                 except Exception as e:
                     learning_problems.append(f"venue/strategy outcome not recorded: {type(e).__name__}: {e}")
@@ -1841,6 +1872,29 @@ class TradingAgentV3:
         logger.info(f"V3 Report: {scan_result.reasoning}")
         
         return result
+
+    @staticmethod
+    def _execution_quality(exec_result) -> Optional[float]:
+        """
+        How well the order executed, on 0-1, from what was actually observed.
+
+        Measured from slippage against the touch: a fill at the best available
+        price is 1.0, and 5% worse than the touch is 0.0. Returns None when
+        nothing was measured, so the record says "not measured" rather than
+        asserting a quality nobody observed - the qualification gate fails closed
+        on an unmeasured value, which is the point.
+
+        Realised slippage is the only execution fact the venue actually reports.
+        A score derived from anything else would be a number about nothing.
+        """
+        paper = getattr(exec_result, "paper_fill", None) or {}
+        bps = paper.get("slippage_bps")
+        if bps is None:
+            return None
+        try:
+            return max(0.0, 1.0 - abs(float(bps)) / 500.0)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _forecast_for_order(opp, data_mode) -> Dict[str, Any]:

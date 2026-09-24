@@ -3,6 +3,16 @@ Trade Outcomes - tracks whether prediction worked, which venue/strategy/model wo
 """
 import math
 from typing import Any, Dict, List, Optional
+
+
+def _optional_float(value) -> Optional[float]:
+    """A number, or None when it was not measured. Zero and absent differ."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from loguru import logger
@@ -25,6 +35,12 @@ class TradeOutcome:
     resolved_at: Optional[datetime] = None
     brier_score: float = 0.0
     was_correct: bool = False
+    # Costs and execution mode. None means NOT MEASURED - which is different from
+    # zero, and the qualification gate must not read it as free.
+    fees_usd: Optional[float] = None
+    slippage_bps: Optional[float] = None
+    execution_quality: Optional[float] = None
+    data_mode: str = ""
 
 
 class TradeOutcomeTracker:
@@ -120,15 +136,18 @@ class TradeOutcomeTracker:
                     "INSERT OR REPLACE INTO trade_outcomes (trade_id, market_id, "
                     "venue_id, strategy, category, forecast_prob, market_price, "
                     "edge, side, amount_usd, actual_outcome, pnl, resolved_at, "
-                    "brier_score, was_correct, recorded_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "brier_score, was_correct, recorded_at, fees_usd, "
+                    "slippage_bps, execution_quality, data_mode) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (outcome.trade_id, outcome.market_id, outcome.venue_id,
                      outcome.strategy, outcome.category, outcome.forecast_prob,
                      outcome.market_price, outcome.edge, outcome.side,
                      outcome.amount_usd, outcome.actual_outcome, outcome.pnl,
                      outcome.resolved_at.isoformat() if outcome.resolved_at else None,
                      outcome.brier_score, int(outcome.was_correct),
-                     datetime.now(timezone.utc).isoformat()))
+                     datetime.now(timezone.utc).isoformat(),
+                     outcome.fees_usd, outcome.slippage_bps,
+                     outcome.execution_quality, outcome.data_mode or None))
             self.storage.conn.commit()
             return True
         except Exception as e:
@@ -194,6 +213,12 @@ class TradeOutcomeTracker:
             edge=float(edge or 0.0),
             side=side,
             amount_usd=float(amount_usd or 0.0),
+            # Genuinely optional, and stored as None when absent so the gate can
+            # tell "no fee was charged" from "we did not look".
+            fees_usd=_optional_float(extra.get("fees_usd")),
+            slippage_bps=_optional_float(extra.get("slippage_bps")),
+            execution_quality=_optional_float(extra.get("execution_quality")),
+            data_mode=str(extra.get("data_mode") or ""),
         )
         self.outcomes.append(outcome)
         self._persist(outcome)
@@ -351,9 +376,13 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "forecast_skill": 0.0, "profit_paper": 0.0, "profit_live": 0.0,
         "net_pnl": 0.0, "expected_value": 0.0, "profit_factor": 0.0,
         "drawdown_max": 0.0, "fees_total": 0.0, "slippage_total": 0.0,
-        # Not measured here. Left at the neutral value rather than invented, and
-        # named so nobody mistakes it for a measurement.
-        "execution_quality_avg": 0.5, "source": "no recorded outcomes",
+        # Unmeasured, and 0.0 rather than the 0.5 threshold: the threshold value
+        # used to sit here as a default, so every unmeasured venue passed the
+        # execution-quality check by coincidence.
+        "execution_quality_avg": 0.0,
+        "costs_measured": 0, "slippage_measured": 0,
+        "modes": [], "live_trades": 0, "paper_trades": 0,
+        "source": "no recorded outcomes",
     }
     if storage is None:
         return empty
@@ -361,7 +390,8 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         rows = storage.conn.execute(
             """
             SELECT forecast_prob, edge, actual_outcome, pnl, brier_score,
-                   was_correct
+                   was_correct, amount_usd, fees_usd, slippage_bps,
+                   execution_quality, data_mode
             FROM trade_outcomes
             WHERE venue_id = ? AND actual_outcome IS NOT NULL
             ORDER BY COALESCE(resolved_at, recorded_at)
@@ -418,8 +448,52 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (
         float("inf") if gross_profit > 0 else 0.0)
 
+    # Fees and slippage that were actually recorded. Counted only where the
+    # trade carries them, and reported alongside how many trades were measured -
+    # a total over 3 of 150 trades must not read like a total over all of them.
+    fee_values = [float(r["fees_usd"]) for r in rows if r["fees_usd"] is not None]
+    slip_values = [float(r["slippage_bps"]) for r in rows if r["slippage_bps"] is not None]
+    quality_values = [float(r["execution_quality"]) for r in rows
+                      if r["execution_quality"] is not None]
+    modes = [str(r["data_mode"] or "") for r in rows]
+
+    # Realised P&L split by execution mode. Qualification is supposed to weigh
+    # paper and live separately; with no mode recorded they were one pool, so a
+    # paper result could carry a venue toward live capital.
+    live_rows = [r for r in rows if str(r["data_mode"] or "").lower() in ("live", "real")]
+    paper_rows = [r for r in rows if str(r["data_mode"] or "").lower() not in ("live", "real")]
+    profit_live = sum(_f(r, "pnl") for r in live_rows)
+    profit_paper = sum(_f(r, "pnl") for r in paper_rows)
+
+    # Slippage in USD: basis points of the notional actually traded.
+    slippage_usd = sum(
+        float(r["slippage_bps"]) / 10000.0 * float(r["amount_usd"] or 0.0)
+        for r in rows if r["slippage_bps"] is not None
+    )
+
+    # Execution quality, MEASURED from recorded slippage. Unmeasured is 0.0, not
+    # the 0.5 threshold: an unmeasured venue must fail the execution-quality
+    # check rather than pass it by coincidence.
+    if quality_values:
+        execution_quality = sum(quality_values) / len(quality_values)
+    elif slip_values:
+        # 0 bps of slippage is perfect; 500 bps (5%) is worthless.
+        execution_quality = max(
+            0.0, 1.0 - (sum(slip_values) / len(slip_values)) / 500.0)
+    else:
+        execution_quality = 0.0
+
     # Maximum drawdown on the realised equity curve, as a fraction of the peak.
-    start = storage.get_bankroll()
+    #
+    # Starting equity is the RECORDED INITIAL bankroll, not the current one.
+    # Using the current bankroll replayed history from a point in the future: the
+    # curve was anchored at today's balance, so the drawdown described a past that
+    # never happened, and it moved every time the balance did.
+    try:
+        start = float(storage.get_performance_summary().get("initial_bankroll")
+                      or storage.get_bankroll())
+    except Exception:
+        start = storage.get_bankroll()
     equity, peak, drawdown = start, start, 0.0
     for pnl in pnls:
         equity += pnl
@@ -437,14 +511,21 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "forecast_skill": max(0.0, 1 - brier * 2),
         # Every recorded outcome, paper and live. Named profit_paper because that
         # is the key the gate reads; the split is reported alongside.
-        "profit_paper": sum(pnls),
-        "profit_live": sum(pnls),
+        "profit_paper": profit_paper,
+        "profit_live": profit_live,
         "net_pnl": sum(pnls),
         "expected_value": sum(edges) / n,
         "profit_factor": profit_factor,
         "drawdown_max": drawdown,
-        "fees_total": 0.0,
-        "slippage_total": 0.0,
-        "execution_quality_avg": 0.5,
+        "fees_total": sum(fee_values),
+        "slippage_total": slippage_usd,
+        "execution_quality_avg": execution_quality,
+        # How much of the record the cost figures actually cover, so a partial
+        # measurement cannot be mistaken for a complete one.
+        "costs_measured": len(fee_values),
+        "slippage_measured": len(slip_values),
+        "modes": sorted(set(m for m in modes if m)),
+        "live_trades": len(live_rows),
+        "paper_trades": len(paper_rows),
         "source": f"{n} recorded outcomes",
     }

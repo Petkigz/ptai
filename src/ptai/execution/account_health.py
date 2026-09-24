@@ -82,11 +82,23 @@ def readiness_rank(readiness: TradeReadiness) -> int:
 # is_real=True with source="storage" - a true statement about its own storage,
 # and no evidence whatsoever that Polymarket authenticated us. Accepting it
 # would have made the auth rung certify a local file read.
+#
+# Source of each entry: grep the adapters for the provenance strings they
+# actually emit after a successful venue request, and list those. An allowlist
+# that does not contain the string a real adapter emits refuses real evidence -
+# which is what happened to Polymarket: the executor's authenticated
+# get_balance_allowance() answered with "clob_balance_allowance", the allowlist
+# only knew "clob_real", and so a genuinely venue-confirmed balance was rejected
+# as unverified. The capability existed on both sides and the two names never
+# met.
 _VENUE_AUTH_SOURCES = frozenset({
     "betfair_account_api",
     "betfair_exchange_live",
     "kalshi_api_real",
     "clob_real",
+    # PolymarketExecutor.get_balance_allowance() - an authenticated CLOB read of
+    # the account's collateral and allowance. The venue's own number.
+    "clob_balance_allowance",
     "whitebit_api_real",
     "polymarket_data_api",
     "binance_api_real",
@@ -220,12 +232,55 @@ class AccountHealthEngine:
         "chatgpt": (("api_key",), "api_key"),
     }
 
-    def __init__(self, venue_registry: VenueRegistry = None, bankroll: float = 50.0):
+    def __init__(self, venue_registry: VenueRegistry = None, bankroll: float = 50.0,
+                 storage=None):
         self.venue_registry = venue_registry
         self.bankroll = bankroll
+        # Where a completed identity/eligibility verification is recorded. Read
+        # only for venues whose eligibility is REQUIRES_VERIFICATION - see the
+        # geography rung.
+        self.storage = storage
         self.health_cache: Dict[str, AccountHealthResult] = {}
         self.cache_ttl_seconds = 300  # 5 min cache
         self.last_check: Dict[str, float] = {}
+
+    # -- verification evidence, for venues that require it ------------------
+
+    def _verification_evidence(self, venue_id: str, adapter) -> Tuple[bool, str]:
+        """
+        Is there evidence that this account's verification was COMPLETED?
+
+        Two sources, both requiring a positive record rather than an absence of
+        complaints:
+
+          * the adapter reporting it, if the venue exposes such a state;
+          * the operator attesting to it, via record_verification(), because the
+            KYC step happens at the venue and in the operator's name - exactly
+            like the deposit.
+
+        Silence is not evidence. No record means unverified, which caps the venue
+        below live.
+        """
+        checker = getattr(adapter, "verification_evidence", None)
+        if callable(checker):
+            try:
+                note = checker()
+                if note:
+                    return True, str(note)[:200]
+            except Exception as e:
+                logger.warning(
+                    f"{venue_id}: venue verification check failed "
+                    f"({type(e).__name__}: {e}) - treating as unverified")
+        if self.storage is not None:
+            try:
+                recorded = self.storage.get_state(f"verification.{venue_id}")
+                if recorded:
+                    return True, str(recorded)[:200]
+            except Exception as e:
+                logger.error(
+                    f"Could not read the verification record for {venue_id}: "
+                    f"{type(e).__name__}: {e}. Treating as unverified.")
+        return False, ""
 
     # -- rung 3: does the API actually accept these credentials? ------------
 
@@ -489,6 +544,28 @@ class AccountHealthEngine:
         try:
             eligibility = adapter.check_eligibility("UG")
             details["eligibility_ug"] = eligibility.value
+            if eligibility == EligibilityStatus.REQUIRES_VERIFICATION:
+                # "Requires verification" is not a soft preference - it means the
+                # venue will not serve this account until a check has been
+                # completed, and an authenticated, funded account with a working
+                # order probe is NOT evidence that the check was done. Treating it
+                # as one let REQUIRES_VERIFICATION slide into TRADE_PERMITTED with
+                # nothing but the word "requires" distinguishing it from READY.
+                verified, note = self._verification_evidence(venue_id, adapter)
+                if not verified:
+                    blockers.append("verification_unproven")
+                    checks_failed.append(
+                        f"Eligibility for UG is {eligibility.value}, and no "
+                        f"completed verification is recorded")
+                    return finish(
+                        TradeReadiness.FUNDED,
+                        f"{venue_id}: authenticated and funded (${balance:.2f}), "
+                        f"but eligibility for UG is '{eligibility.value}' and "
+                        f"there is no recorded evidence that verification was "
+                        f"completed. Funded is not permitted.",
+                        True,
+                    )
+                checks.append(f"Verification recorded for {venue_id}: {note}")
             if eligibility == EligibilityStatus.RESTRICTED:
                 blockers.append("restricted_for_country")
                 checks_failed.append("Restricted for UG - cannot trade live")
@@ -587,3 +664,34 @@ class AccountHealthEngine:
                 vid: h.blockers for vid, h in self.health_cache.items() if h.blockers
             },
         }
+
+
+def record_verification(storage, venue_id: str, note: str = "") -> None:
+    """
+    Record that an account's verification with the venue was completed.
+
+    This is an OPERATOR action, like the deposit: the identity check happens at
+    the venue, in the operator's name, and the agent has no way to perform it or
+    to observe it. Without a record, a venue whose eligibility is
+    REQUIRES_VERIFICATION stops at FUNDED and cannot trade live.
+
+    What this must NOT become is a box that gets ticked to make a warning go
+    away. The note is kept and shown with the readiness evidence, so whatever is
+    written here is what the operator is asserting happened.
+    """
+    from datetime import datetime, timezone
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    storage.set_state(f"verification.{venue_id}",
+                      (note or "confirmed") + f" (recorded {stamp})")
+
+
+def verification_status(storage, venue_id: str) -> str:
+    """What is recorded, or an explicit 'not recorded'."""
+    if storage is None:
+        return "not recorded"
+    try:
+        return storage.get_state(f"verification.{venue_id}") or "not recorded"
+    except Exception as e:
+        logger.error(f"Could not read verification status for {venue_id}: {e}")
+        return "not recorded"
