@@ -291,10 +291,22 @@ class TradingAgentV2:
             
             # Web research - bull/bear
             research_result = await self.web_researcher.research(market, max_time_seconds=20)
-            context["research"] = research_result.final_summary
-            context["bull_case"] = research_result.supporting_yes
-            context["bear_case"] = research_result.supporting_no
-            context["sources"].extend(research_result.sources)
+            # Credit research only when pages were actually retrieved; an
+            # unresearched market must not carry empty bull/bear fields that
+            # read as evidence that no evidence exists.
+            if getattr(research_result, 'researched', False):
+                context["research"] = research_result.final_summary
+                context["bull_case"] = research_result.supporting_yes
+                context["bear_case"] = research_result.supporting_no
+                context["sources"].extend(research_result.sources)
+                context["research_researched"] = True
+                context["research_confidence"] = float(research_result.confidence or 0.0)
+            else:
+                context["research"] = ""
+                context["bull_case"] = ""
+                context["bear_case"] = ""
+                context["research_researched"] = False
+                context["research_blockers"] = list(research_result.warnings)[:3]
             
             # Category detection simple
             q_lower = market.question.lower()

@@ -548,15 +548,34 @@ class TradingAgentV3:
                     if should_research:
                         research_result = await self.web_researcher.research(market, max_time_seconds=45)
                         if research_result:
-                            summary = getattr(research_result, 'final_summary', '') or getattr(research_result, 'summary', '') or str(research_result)
-                            context["research"] = summary[:800]
-                            context["research_sources"] = getattr(research_result, 'sources', [])[:3] if hasattr(research_result, 'sources') else []
-                            context["research_bull"] = getattr(research_result, 'supporting_yes', '')[:200]
-                            context["research_bear"] = getattr(research_result, 'supporting_no', '')[:200]
-                            context["research_resolution_risks"] = getattr(research_result, 'resolution_risks', '')[:200]
-                            context["sources"].append("web_researcher")
-                            context["research_reason"] = research_reason
-                            logger.debug(f"Web research for {market.id} ({research_reason}): {context['research'][:100]}")
+                            # Only credit the agent with research that actually
+                            # happened. Appending "web_researcher" to sources
+                            # unconditionally made an unresearched market look
+                            # researched, and the empty bull/bear fields were
+                            # then read as evidence that none existed.
+                            researched = bool(getattr(research_result, 'researched', False))
+                            context["research_researched"] = researched
+                            context["research_confidence"] = float(
+                                getattr(research_result, 'confidence', 0.0) or 0.0)
+                            context["research_sources_retrieved"] = int(
+                                getattr(research_result, 'sources_retrieved', 0) or 0)
+                            if researched:
+                                summary = getattr(research_result, 'final_summary', '') or ''
+                                context["research"] = summary[:800]
+                                context["research_sources"] = list(
+                                    getattr(research_result, 'sources', []) or [])[:3]
+                                context["research_bull"] = getattr(research_result, 'supporting_yes', '')[:200]
+                                context["research_bear"] = getattr(research_result, 'supporting_no', '')[:200]
+                                context["research_resolution_risks"] = getattr(research_result, 'resolution_risks', '')[:200]
+                                context["sources"].append("web_researcher")
+                                context["research_reason"] = research_reason
+                                logger.debug(f"Web research for {market.id} ({research_reason}): {context['research'][:100]}")
+                            else:
+                                context["research"] = ""
+                                context["research_sources"] = []
+                                warnings = list(getattr(research_result, 'warnings', []) or [])
+                                context["research_blockers"] = warnings[:3]
+                                logger.debug(f"Web research for {market.id} fetched nothing: {warnings[:1]}")
             except Exception as e:
                 logger.debug(f"Web researcher failed for {market.id}: {e}")
             
