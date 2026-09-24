@@ -804,6 +804,18 @@ class PolymarketAdapter(MarketAdapter):
         # which is a property of the market - hardcoding 0.01 was wrong for
         # every market on a 0.001 or 0.005 tick, where 0.01 is a real bid.
         mechanics = self.get_mechanics(opportunity, token_id=token_id)
+        if not mechanics.is_real:
+            # An assumed tick makes the probe meaningless in both directions: at
+            # the finest tick it posts a price the market may not accept (so a
+            # working account reads as unverified), and on a coarser market it
+            # could post something marketable (so the probe becomes a trade).
+            # Refusing is the only honest answer.
+            logger.error(
+                f"Order probe refused: mechanics for this market were assumed, "
+                f"not read from the venue ({mechanics.source}: "
+                f"{'; '.join(mechanics.warnings) or 'no reason given'}). "
+                f"Probing against a guessed tick proves nothing.")
+            return False
         probe_price = mechanics.tick
         probe_size_usd = max(
             float(getattr(self.capabilities, "min_order_usd", 1.0) or 1.0),

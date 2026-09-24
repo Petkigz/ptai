@@ -860,6 +860,30 @@ class TestASettledWinCanBeRedeemed:
         assert available is False
         assert "connection refused" in reason
 
+class TestTheProbeRefusesToProveNothing:
+    def test_the_probe_will_not_run_against_assumed_mechanics(self):
+        """
+        "Configured" is not "ready to trade". A probe against a guessed tick can
+        fail on a working account or fill on a broken one - either way it proves
+        nothing, so it must not report a verdict at all.
+        """
+        from src.ptai.markets.base import Market, MarketSource, Token
+        from src.ptai.venues.adapter import VenueOpportunity, VenueType
+        from src.ptai.venues.polymarket_adapter import PolymarketAdapter
+
+        adapter = PolymarketAdapter(private_key="0x" + "ab" * 32,
+                                   funder="0x" + "cd" * 20, dry_run=False)
+        # No token id resolvable -> mechanics fall back to a labelled assumption.
+        market = Market(id="M1", source=MarketSource.POLYMARKET, question="Q?")
+        opportunity = VenueOpportunity(market=market, venue_id="polymarket",
+                                       venue_type=VenueType.PREDICTION, side="YES",
+                                       market_price=0.5, estimated_fair=0.6,
+                                       raw_edge=0.1)
+        assert asyncio.run(
+            adapter.probe_order_permission(opportunity)) is False
+        assert adapter.last_order_probe is None or not adapter.last_order_probe.get(
+            "attempted"), "a probe ran against assumed mechanics"
+
     def test_a_claimed_redemption_is_recorded_once(self, tmp_path):
         storage = Storage(db_path=str(tmp_path / "redeem.db"))
         relayer = _FakeRelayer()
