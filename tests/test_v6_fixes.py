@@ -304,7 +304,7 @@ def test_venue_qualification_robust():
     engine = VenueQualificationEngine(data_dir="/tmp/test_qual")
     
     # Not qualified - not enough trades
-    perf_not_enough = {"total_paper_trades": 50, "win_rate": 0.7, "brier_score": 0.18, "forecast_skill": 0.64, "profit_paper": 20, "avg_edge": 0.08, "net_pnl": 20, "expected_value": 0.08, "profit_factor": 1.5, "log_loss": 0.5, "calibration_ece": 0.1, "execution_quality_avg": 0.6}
+    perf_not_enough = {"total_paper_trades": 50, "win_rate": 0.7, "brier_score": 0.18, "forecast_skill": 0.64, "profit_paper": 20, "avg_edge": 0.08, "net_pnl": 20, "expected_value": 0.08, "expected_value_samples": 50, "expected_value_coverage": 1.0, "profit_factor": 1.5, "log_loss": 0.5, "calibration_ece": 0.1, "execution_quality_avg": 0.6, "cost_coverage": 1.0, "execution_quality_coverage": 1.0}
     result = engine.evaluate_qualification("polymarket", perf_not_enough)
     assert not result.is_qualified
     assert "50" in result.reasoning  # should mention total
@@ -319,7 +319,10 @@ def test_venue_qualification_robust():
         # execution-quality average to be a measurement of the sample it is
         # judging, not one lucky fill, so a caller claiming 0.6 must say how much
         # of the record that average came from.
-        "cost_coverage": 1.0, "execution_quality_coverage": 1.0
+        "cost_coverage": 1.0, "execution_quality_coverage": 1.0,
+        # Same rule for the EV: a caller claiming "EV >1% per trade" must say how
+        # many trades that figure was actually recorded from. 120 of 120 here.
+        "expected_value_samples": 120, "expected_value_coverage": 1.0,
     }
     result2 = engine.evaluate_qualification("kalshi", perf_qualified)
     assert result2.is_qualified

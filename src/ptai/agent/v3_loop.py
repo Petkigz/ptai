@@ -1517,8 +1517,34 @@ class TradingAgentV3:
         for opp in exploration_candidates:
             opp._proposed_amount = 1.0  # minimal shadow
             opp._is_exploration = True
+            # Measure the shadow trade the same way a qualified one is measured.
+            #
+            # Exploration is the ONLY source of evidence on a fresh install, so
+            # the venue's qualification rests on these rows. Scored records carry
+            # the expected net EV that was predicted BEFORE the trade; unscored
+            # ones carry NULL, and a gate that requires measured EV coverage
+            # would then be unsatisfiable for exactly the venue that has only
+            # exploration evidence - the bootstrap deadlock, one level down. The
+            # shadow size is what the EV is computed on, because fees, slippage
+            # and uncertainty all scale with the amount.
+            try:
+                opp._expected_ev = self.expected_ev_engine.calculate(
+                    opportunity=opp,
+                    amount_usd=opp._proposed_amount,
+                    orderbook=(opp.market.raw.get("orderbook", {})
+                               if hasattr(opp.market, "raw") else {}),
+                )
+            except Exception as e:
+                # Refusing to explore is worse than exploring unscored, but the
+                # refusal is never silent: the row says the EV was not measured.
+                logger.warning(
+                    f"Exploration EV unavailable for {opp.market.id} @ "
+                    f"{opp.venue_id}: {type(e).__name__}: {e} - the trade is "
+                    f"still simulated, and its outcome will carry no expected EV")
+                opp._expected_ev = None
             exploration_trades.append(opp)
-            logger.info(f"Exploration SHADOW: {opp.market.id} @ {opp.venue_id} score {opp.score:.3f} - shadow/paper only, NO live capital, for discovering new edges")
+            _ev = getattr(opp._expected_ev, "net_ev_usd", None)
+            logger.info(f"Exploration SHADOW: {opp.market.id} @ {opp.venue_id} score {opp.score:.3f} amount ${opp._proposed_amount:.2f} netEV ${_ev if _ev is not None else 'unmeasured'} - shadow/paper only, NO live capital, for discovering new edges")
 
         # The exploration lane is downstream of qualification, so on a fresh
         # install it is the ONLY source of evidence. Route it into the execution

@@ -211,6 +211,8 @@ def test_qualification_beyond_win_rate():
         "profit_paper": -50,  # But losing $50 because wins small losses large
         "net_pnl": -50,
         "expected_value": -0.02,  # Negative EV
+        "expected_value_samples": 100, "expected_value_coverage": 1.0,
+        "cost_coverage": 1.0, "execution_quality_coverage": 1.0,
         "profit_factor": 0.5,  # Losing
         "fees_total": 10,
         "slippage_total": 5,
@@ -248,6 +250,9 @@ def test_qualification_beyond_win_rate():
         # came from.
         "cost_coverage": 1.0,
         "execution_quality_coverage": 1.0,
+        # And the EV figure has to cover the record it is claimed from.
+        "expected_value_samples": 120,
+        "expected_value_coverage": 1.0,
     }
     
     result2 = engine.evaluate_qualification("test_venue_winning", perf_winning)

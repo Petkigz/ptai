@@ -831,6 +831,40 @@ class TestFullCycle:
             trades = agent.storage.conn.execute(
                 "SELECT COUNT(*) FROM trades").fetchone()[0]
             assert trades >= 1, "no position row from the exploration trade"
+            # And the evidence has to be SCORED. A shadow trade whose expected
+            # net EV was never recorded teaches the gate nothing about whether
+            # the agent's EV model is right, and a venue whose only evidence is
+            # exploration could never satisfy the gate's EV-coverage requirement
+            # - the bootstrap deadlock, one level down. The prediction is
+            # recorded before the outcome is known, which is what makes it
+            # evidence rather than hindsight.
+            scored = agent.storage.conn.execute(
+                "SELECT COUNT(*) FROM trade_outcomes "
+                "WHERE expected_net_ev_pct IS NOT NULL").fetchone()[0]
+            assert scored >= 1, (
+                "the exploration trade produced an outcome with no recorded "
+                "expected net EV, so its venue has no measured EV coverage"
+            )
+            # Coverage is measured over RESOLVED rows, so settle the shadow
+            # position first - the prediction is recorded at entry and the
+            # outcome arrives later, which is the order that makes the number a
+            # prediction rather than a description.
+            adapter.settled_outcome = 1.0
+            _cycle(agent)
+            from src.ptai.learning.trade_outcomes import (
+                qualification_stats_from_outcomes)
+
+            stats = qualification_stats_from_outcomes(agent.storage, VENUE)
+            assert stats["total_resolved_trades"] >= 1, (
+                f"the exploration position never settled, so it is not evidence "
+                f"the gate can read: {stats['source']}"
+            )
+            assert stats["expected_value_coverage"] > 0.0, (
+                f"a venue whose evidence came from exploration reports no "
+                f"measured EV: expected_value_samples="
+                f"{stats['expected_value_samples']} of "
+                f"{stats['total_resolved_trades']}"
+            )
         finally:
             agent.storage.close()
 

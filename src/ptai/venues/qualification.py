@@ -53,6 +53,12 @@ class QualificationResult:
     log_loss: float = 0.0
     execution_quality_avg: float = 0.0
     sample_size: int = 0
+    # Where the expected-value figure came from, and how much of the record it
+    # covers. The reasoning line carries the same words, but a field is what a
+    # console can read: a substituted mean edge must not be displayed like a
+    # measured expected net EV.
+    ev_source: str = ""
+    ev_coverage: float = 0.0
 
 class VenueQualificationEngine:
     """
@@ -88,6 +94,11 @@ class VenueQualificationEngine:
             # venue, and the totals above it were already reported with their
             # coverage for exactly this reason - now the gate requires it.
             "min_cost_coverage": 0.5,
+            # The EV bar, too, has to cover the sample it judges. `min_ev` may be
+            # cleared by one recorded value out of 150 trades, and "EV > 1% per
+            # trade" then describes a venue on the strength of a single entry
+            # nobody repeated. Same rule as the measured costs above.
+            "min_ev_coverage": 0.5,
             "min_sample_size": 100,
             "max_fees_pct": 0.05,  # fees <5% of profit
         }
@@ -101,7 +112,7 @@ class VenueQualificationEngine:
                         if qual_data.get("qualification_date"):
                             qual_data["qualification_date"] = datetime.fromisoformat(qual_data["qualification_date"])
                         # Handle old format without new fields
-                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size"]:
+                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage"]:
                             if field not in qual_data:
                                 qual_data[field] = 0.0
                         self.qualifications[venue_id] = QualificationResult(**qual_data)
@@ -136,7 +147,12 @@ class VenueQualificationEngine:
                     "calibration_ece": qual.calibration_ece,
                     "log_loss": qual.log_loss,
                     "execution_quality_avg": qual.execution_quality_avg,
-                    "sample_size": qual.sample_size
+                    "sample_size": qual.sample_size,
+                    # Written out, or the file the console reads would lose the
+                    # one field that says whether the EV it displays was
+                    # measured or substituted.
+                    "ev_source": qual.ev_source,
+                    "ev_coverage": qual.ev_coverage,
                 }
             with open(self.qualification_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -219,6 +235,18 @@ class VenueQualificationEngine:
             "min_net_pnl": net_pnl >= self.requirements["min_net_pnl"],
             "min_ev": (expected_value is not None and
                        expected_value >= self.requirements["min_expected_value"]),
+            # A value is not evidence. This is the check that says so: the mean
+            # recorded expected net EV has to come from at least
+            # `min_ev_coverage` of the resolved trades being judged.
+            #
+            # `ev_samples == 0` fails closed. There are three ways to reach this
+            # branch with no recorded EVs - legacy rows, a caller supplying a
+            # number, and a venue whose trades were never scored - and none of
+            # them is a measurement of the venue. The value is still REPORTED
+            # (with its source named) so the console shows what it was given
+            # rather than a blank, but it cannot qualify anything.
+            "min_ev_coverage": (ev_samples > 0 and
+                                ev_coverage >= self.requirements["min_ev_coverage"]),
             "min_edge": avg_edge >= self.requirements["min_avg_edge"],
             "max_drawdown": drawdown_max <= self.requirements["max_drawdown"],
             "min_profit_factor": profit_factor >= self.requirements["min_profit_factor"],
@@ -235,7 +263,7 @@ class VenueQualificationEngine:
             f"total {total} >= {self.requirements['min_trades']}? {checks['min_trades']} | "
             f"win_rate {win_rate:.2f} >= {self.requirements['min_win_rate']}? {checks['min_win_rate']} BUT win rate alone NOT profitability - example 90% wins +$0.01 10% losses -$1.00 fantastic win rate still lose money | "
             f"net_pnl ${net_pnl:.2f} >= ${self.requirements['min_net_pnl']}? {checks['min_net_pnl']} | "
-            f"expected_value {expected_value*100:.2f}% >= {self.requirements['min_expected_value']*100:.1f}%? {checks['min_ev']} ({ev_source}) | "
+            f"expected_value {expected_value*100:.2f}% >= {self.requirements['min_expected_value']*100:.1f}%? {checks['min_ev']} ({ev_source}) on >= {self.requirements['min_ev_coverage']*100:.0f}% of trades? {checks['min_ev_coverage']} | "
             f"profit_factor {profit_factor:.2f} >= {self.requirements['min_profit_factor']}? {checks['min_profit_factor']} | "
             f"brier {brier:.3f} <= {self.requirements['max_brier']}? {checks['max_brier']} | "
             f"log_loss {log_loss:.3f} <= {self.requirements['max_log_loss']}? {checks['max_log_loss']} | "
@@ -277,7 +305,9 @@ class VenueQualificationEngine:
             calibration_ece=ece,
             log_loss=log_loss,
             execution_quality_avg=execution_quality,
-            sample_size=total
+            sample_size=total,
+            ev_source=ev_source,
+            ev_coverage=ev_coverage,
         )
 
         self.qualifications[venue_id] = result

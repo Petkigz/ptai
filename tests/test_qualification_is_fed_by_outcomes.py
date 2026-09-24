@@ -45,7 +45,7 @@ def storage(tmp_path):
 
 
 def _record(storage, tracker, venue, n, *, win_prob, forecast, win_pnl, loss_pnl,
-            edge=0.15):
+            edge=0.15, expected_ev_pct=0.14, ev_every=1):
     """
     n resolved trades with a deterministic win/loss pattern.
 
@@ -76,6 +76,17 @@ def _record(storage, tracker, venue, n, *, win_prob, forecast, win_pnl, loss_pnl
             strategy="value", category="politics", forecast_prob=forecast,
             market_price=0.5, edge=edge, side="YES", amount_usd=3.0,
             fees_usd=0.06, slippage_bps=12.0, execution_quality=0.976,
+            # The expected net EV per trade, recorded BEFORE the trade was taken
+            # - the prediction the gate is supposed to weigh, and the coverage
+            # that says how much of the record it came from. The loop writes
+            # these on every position it opens, so a fixture that omits them is
+            # simulating a system that never ran.
+            expected_net_ev=(expected_ev_pct * 3.0
+                             if expected_ev_pct is not None and i % ev_every == 0
+                             else None),
+            expected_net_ev_pct=(expected_ev_pct
+                                 if expected_ev_pct is not None and i % ev_every == 0
+                                 else None),
             data_mode="live", execution_mode="paper")
         tracker.record_resolution(str(tid), actual_outcome=1.0 if won else 0.0,
                                   pnl=pnl)
@@ -152,7 +163,7 @@ def test_a_losing_venue_scores_as_a_losing_venue(storage):
     """Profit factor below 1 and negative net P&L must be reported as such."""
     tracker = TradeOutcomeTracker(storage=storage)
     _record(storage, tracker, VENUE, 150, win_prob=0.4, forecast=0.6,
-            win_pnl=1.0, loss_pnl=-2.0)
+            win_pnl=1.0, loss_pnl=-2.0, expected_ev_pct=-0.05)
     stats = qualification_stats_from_outcomes(storage, VENUE)
     assert stats["win_rate"] == pytest.approx(0.4)
     assert stats["net_pnl"] < 0
@@ -263,6 +274,80 @@ def test_a_good_record_can_actually_qualify(storage, tmp_path):
     assert result.is_qualified is True, (
         f"this record should qualify; reasoning: {result.reasoning[-300:]}"
     )
+
+
+def test_an_ev_measured_on_a_sliver_of_the_record_does_not_qualify(storage, tmp_path):
+    """
+    A value is not evidence, and this is the check that says so.
+
+    Ten recorded expected net EVs out of 150 resolved trades: the number itself
+    is healthy (+14%), every other criterion is met, and the gate must still
+    refuse - because "EV > 1% per trade" would otherwise be a statement about ten
+    trades dressed as a statement about the venue.
+    """
+    tracker = TradeOutcomeTracker(storage=storage)
+    _record(storage, tracker, VENUE, 150, win_prob=0.8, forecast=0.75,
+            win_pnl=1.2, loss_pnl=-1.8, ev_every=15)
+
+    stats = qualification_stats_from_outcomes(storage, VENUE)
+    assert stats["expected_value"] > 0, "the value it has IS good"
+    assert stats["expected_value_coverage"] == pytest.approx(10 / 150, abs=1e-6)
+
+    result = _engine(tmp_path).evaluate_qualification(VENUE, stats)
+    assert result.is_qualified is False, (
+        "a venue was qualified on expected values recorded for 10 of its 150 "
+        "trades")
+    assert "min_ev_coverage" in result.reasoning or "10%" in result.reasoning
+
+
+def test_an_unmeasured_venue_cannot_qualify_on_an_unlabelled_number(storage, tmp_path):
+    """
+    Fail closed on the third branch, not just the second.
+
+    With no recorded expected net EV per trade the gate falls back to the mean
+    edge and LABELS it, which keeps the console honest - but a labelled
+    substitution is still not a measurement. Nothing here records an EV, so the
+    venue cannot qualify however good the rest of the record looks.
+    """
+    tracker = TradeOutcomeTracker(storage=storage)
+    _record(storage, tracker, VENUE, 150, win_prob=0.8, forecast=0.75,
+            win_pnl=1.2, loss_pnl=-1.8, expected_ev_pct=None)
+
+    stats = qualification_stats_from_outcomes(storage, VENUE)
+    assert stats["expected_value_samples"] == 0
+    assert stats["expected_value"] is None, (
+        "nothing was predicted, which is not the same as predicting zero")
+
+    result = _engine(tmp_path).evaluate_qualification(VENUE, stats)
+    assert result.is_qualified is False
+    assert result.ev_source == "avg_edge fallback (no recorded expected net EV)"
+    assert result.ev_coverage == 0.0
+    assert "avg_edge fallback" in result.reasoning, (
+        "the operator must be told the number they are reading is a substitute")
+
+
+def test_a_coverage_claim_with_no_samples_is_refused(storage, tmp_path):
+    """
+    Two fields describe one measurement, and they have to agree.
+
+    A producer that asserts full coverage while reporting zero recorded samples
+    is either a bug or a bluff. Both are refused: the gate requires samples AND
+    coverage, so neither field can carry the other's claim.
+    """
+    stats = dict(qualification_stats_from_outcomes(storage, VENUE or "polymarket"))
+    stats.update({
+        "total_resolved_trades": 120, "win_rate": 0.6, "avg_edge": 0.05,
+        "brier_score": 0.18, "log_loss": 0.4, "calibration_ece": 0.05,
+        "forecast_skill": 0.7, "profit_paper": 20.0, "net_pnl": 20.0,
+        "expected_value": 0.05, "profit_factor": 1.5, "drawdown_max": 0.05,
+        "fees_total": 0.0, "slippage_total": 0.0, "execution_quality_avg": 0.8,
+        "cost_coverage": 1.0, "execution_quality_coverage": 1.0,
+        "expected_value_samples": 0, "expected_value_coverage": 1.0,
+    })
+    result = _engine(tmp_path).evaluate_qualification("polymarket", stats)
+    failed = {k: v for k, v in result.requirements.items() if k == "min_ev_coverage"}
+    assert result.is_qualified is False, (
+        f"a venue qualified on a coverage claim with no samples: {failed}")
 
 
 def test_a_mediocre_record_is_refused_for_measurable_reasons(storage, tmp_path):
