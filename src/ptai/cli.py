@@ -336,6 +336,13 @@ def status():
     perf = storage.get_performance_summary()
     sp = storage.check_self_preservation()
 
+    # The questions the operator actually asks, answered from the same snapshot
+    # the dashboard serves over /api/operator - one composition, so the terminal
+    # and the browser cannot disagree. The tables below it are the detail.
+    from .operator_view import describe_snapshot, operator_snapshot
+    console.print(Panel("\n".join(describe_snapshot(operator_snapshot(storage))),
+                        title="What the agent is doing", border_style="cyan"))
+
     # Capital first, as separate quantities. "Bankroll: $47" does not tell an
     # operator how much of it is already committed to an open position.
     from .execution.position_ledger import PositionLedgerBuilder
@@ -367,9 +374,18 @@ def status():
     performance.add_row("Total trades", str(perf["total_trades"]))
     performance.add_row("Win rate", f"{perf['win_rate']:.1f}%" if perf['win_rate'] else "no resolved trades yet")
     performance.add_row("Days active", str(sp["days_active"]))
-    # Drawdown is the risk figure that matters; the daily-cost comparison is
-    # advisory context about running costs, not a target the agent is judged on.
-    performance.add_row("Max drawdown", f"{min(0.0, perf['total_pnl_pct']):.1f}%")
+    # Drawdown is the risk figure that matters, and it is the fall from a PEAK
+    # of the live equity curve - not the distance below the starting line. The
+    # old row printed min(0, total P&L %), so an account that fell 20% and
+    # recovered to -3% was reported as a 3% drawdown, which is a different and
+    # much more comfortable number. The snapshot computes it from the live
+    # series; when there is no closed series yet it says so instead of guessing.
+    _dd = (operator_snapshot(storage).get("profit") or {}).get("max_drawdown_pct")
+    performance.add_row(
+        "Max drawdown",
+        f"{_dd:.1f}%" if _dd is not None else "no closed live series yet")
+    # The daily-cost comparison is advisory context about running costs, not a
+    # target the agent is judged on.
     performance.add_row("Running cost comparison",
                         f"${sp['required_profit']:.2f} budgeted "
                         f"({'covered' if sp['is_profitable_enough'] else 'not covered'}) "

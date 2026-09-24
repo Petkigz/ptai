@@ -46,6 +46,7 @@ Architecture:
 """
 from typing import Dict, List, Optional, Any
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 import os
@@ -2128,7 +2129,71 @@ class TradingAgentV3:
         _n_trades = (result.get("opportunities") or {}).get("final_selected", 0)
         logger.info(f"=== PTAI V3 Cycle Complete in {elapsed:.1f}s: {_n_trades} trades, DO NOTHING success: {result.get('do_nothing_success', True)} ===")
         logger.info(f"V3 Report: {scan_result.reasoning}")
-        
+
+        # Write down WHAT WAS DECIDED, so the answer survives the process.
+        #
+        # "What did the agent do last cycle, and why?" is a question the operator
+        # asks between cycles, from a console that is not holding the cycle in
+        # memory - and after a restart there is nothing to ask. The full cycle
+        # result is per-venue detail measured in hundreds of kilobytes, which
+        # would make this a log, not state; this is the decision and the reasons
+        # behind it.
+        try:
+            selection = result.get("venue_selection") or {}
+            execution = result.get("execution") or []
+            blocked = [e for e in execution
+                       if e.get("status") == "blocked_live_capital"]
+            recorded = [e for e in execution if e.get("position_recorded")]
+            ledger_dict = (self.last_ledger.to_dict()
+                           if getattr(self, "last_ledger", None) else {})
+            best = ((result.get("opportunities") or {}).get("best") or {})
+            self.storage.set_state("operator.last_cycle", json.dumps({
+                "at": datetime.now(timezone.utc).isoformat(),
+                "verdict": ("DEPLOYED" if recorded else "DO NOTHING"),
+                "why": scan_result.reasoning[:400] if scan_result.reasoning else "",
+                "cycle_seconds": round(elapsed, 1),
+                "venues_searched": len(scan_result.venue_reports),
+                "markets_scanned": scan_result.total_scanned,
+                "candidates": scan_result.total_candidates,
+                "qualified_venues": list(qualified_venue_ids),
+                "decided": {
+                    "venue": best.get("venue"),
+                    "strategy": best.get("strategy"),
+                    "question": best.get("question"),
+                    "side": best.get("side"),
+                    "edge": best.get("edge"),
+                    "score": best.get("score"),
+                    "reasoning": best.get("reasoning"),
+                },
+                "live_venue": selection.get("live_venue"),
+                "live_venue_verdict": selection.get("verdict"),
+                "venue_to_fund": selection.get("candidate"),
+                "venue_reasons": list(selection.get("reasons") or [])[:3],
+                "orders": {
+                    "attempted": len(execution),
+                    "positions_recorded": len(recorded),
+                    "blocked_live_capital": len(blocked),
+                    "blocked_reason": blocked[0].get("reason") if blocked else None,
+                },
+                "settlement": result.get("settlement") or {},
+                "capital": {
+                    "equity": ledger_dict.get("equity"),
+                    "free_cash": ledger_dict.get("free_cash"),
+                    "reserved_capital": ledger_dict.get("reserved_capital"),
+                    "realised_pnl": ledger_dict.get("realised_pnl"),
+                },
+                "risk": {
+                    "kill_switch_level": int(self.kill_switch.current_level),
+                    "can_trade": bool(self.kill_switch.can_trade()),
+                },
+            }))
+        except Exception as e:
+            # Never silently: a cycle that cannot be reported is a decision the
+            # operator cannot audit, which is worse than a noisy log line.
+            logger.warning(
+                f"Could not record the cycle decision for the operator view: "
+                f"{type(e).__name__}: {e}")
+
         return result
 
     async def _execute_with_side_aware_cap(self, opp, amount_usd: float,

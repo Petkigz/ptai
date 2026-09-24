@@ -305,6 +305,16 @@ class VenueSelector:
             logger.debug(f"Could not list known venues: {e}")
             return []
 
+    def venue_evidence(self) -> Dict[str, Dict[str, Any]]:
+        """
+        The per-venue figures, made public because they answer the operator's
+        question as well as this selector's.
+
+        One source: the ranking here and the "best validated venue" line on the
+        operator's screen must not be computed twice with different filters.
+        """
+        return self._per_venue_stats()
+
     def _per_venue_stats(self) -> Dict[str, Dict[str, Any]]:
         """
         Resolved and open counts per venue, from the trades table.

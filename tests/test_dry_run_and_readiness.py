@@ -460,17 +460,50 @@ class TestBalanceProvenance:
         assert is_real is True
         assert provenance == "betfair_account_api"
 
-    def test_explicit_zero_from_a_real_source_is_information(self):
+    def test_a_real_zero_is_information(self):
+        """
+        A zero from the VENUE means the account is empty - that is information,
+        unlike an unsourced stub zero.
+        """
         from src.ptai.execution.account_health import read_balance
 
-        balance, is_real, _ = read_balance(
+        balance, is_real, provenance = read_balance(
+            {"is_real": True, "balance": 0.0, "source": "clob_balance_allowance"}
+        )
+        assert balance == 0.0
+        assert is_real is True, (
+            "the venue answered, and it said the account is empty"
+        )
+        assert provenance == "clob_balance_allowance"
+
+    def test_local_storage_cannot_declare_itself_real(self):
+        """
+        The producer's own `is_real: True` is not evidence about the venue.
+
+        This used to return True for a storage-sourced zero, which is exactly the
+        claim the rest of the system exists to refuse: our own database may be
+        empty because the venue was never read, because a stub wrote a zero, or
+        because the record is stale. The number still comes back - it is our
+        record, and it is worth reporting - but the reality claim does not.
+        """
+        from src.ptai.execution.account_health import read_balance
+
+        balance, is_real, provenance = read_balance(
             {"is_real": True, "balance": 0.0, "source": "storage"}
         )
-        assert is_real is True
-        assert balance == 0.0, (
-            "a real zero means the account is empty - that is information, "
-            "unlike an unsourced stub zero"
+        assert balance == 0.0, "the value is still returned"
+        assert is_real is False, (
+            "local storage proved nothing about the venue, so this balance "
+            "cannot be displayed as a real one"
         )
+        assert provenance == "storage", (
+            "and the provenance says why: it is where the number came from"
+        )
+
+        # A bare declaration with no source at all is weaker still.
+        _, is_real, provenance = read_balance({"is_real": True, "balance": 42.5})
+        assert is_real is False
+        assert provenance == "declared_real"
 
     def test_self_declared_fallback_is_not_real(self):
         from src.ptai.execution.account_health import read_balance

@@ -138,9 +138,18 @@ def read_balance(portfolio: Any) -> Tuple[Optional[float], bool, str]:
         (`is_real: False`)
       * the venue said the account is not available (`available: False`)
       * the balance is not a number
+      * the provenance does not prove a VENUE answered - `is_venue_side_provenance`
+        below is the rule, and it is the same one the caller enforces, so the
+        flag and the caller can no longer disagree
 
-    A genuine 0.0 from a real source IS real: it means the account is empty,
-    which is information, not ignorance.
+    The last of those is why a producer's own `is_real: True` is not enough: the
+    local database is not evidence about the venue, and a stub that labels itself
+    real is still a stub. The number is returned either way - a 0.0 from local
+    storage is information about our own record - but the reality CLAIM follows
+    the provenance.
+
+    A genuine 0.0 from a venue read IS real: it means the account is empty, which
+    is information, not ignorance.
     """
     if not isinstance(portfolio, dict):
         return None, False, "not_a_mapping"
@@ -166,13 +175,16 @@ def read_balance(portfolio: Any) -> Tuple[Optional[float], bool, str]:
     if provenance is None:
         return None, False, "no_provenance"
 
+    # REAL means the venue answered. One decision, made here, read by the caller.
+    venue_side = is_venue_side_provenance(provenance)
+
     for key in ("balance", "available_balance", "actual_balance", "cash"):
         value = portfolio.get(key)
         if value is None:
             continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
-        return float(value), True, provenance
+        return float(value), venue_side, provenance
 
     # No usable number, but the provenance is still whatever the producer
     # declared - "clob_real" with no balance means the venue answered and told

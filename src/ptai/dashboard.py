@@ -216,6 +216,28 @@ async def api_status():
     storage.close()
     return {"performance": perf, "self_preservation": sp}
 
+@app.get("/api/operator")
+async def api_operator():
+    """
+    Everything the operator asked to be able to see, in one payload.
+
+    Deliberately NOT wrapped in a try/except that returns {"error": ...}: that
+    shape answers HTTP 200 and looks healthy while hiding the failure. The
+    snapshot reports each block's own availability and the reason it is missing,
+    so a caller always gets an answer it can act on - and `lines` is the same
+    list of sentences the CLI prints, so the two front ends cannot describe the
+    same state differently.
+    """
+    from .operator_view import describe_snapshot, operator_snapshot
+
+    storage = get_storage()
+    try:
+        snapshot = operator_snapshot(storage)
+        snapshot["lines"] = describe_snapshot(snapshot)
+        return snapshot
+    finally:
+        storage.close()
+
 @app.get("/api/trades")
 async def api_trades():
     storage = get_storage()
@@ -3430,6 +3452,14 @@ async def dashboard():
                     <div class="metric"><div class="metric-label">Days Active</div><div id="days" class="metric-value mono">0</div><div class="metric-sub">Required: <span id="required">$0</span></div></div>
                 </div>
                 
+                <div class="card">
+                    <div class="card-header">
+                        <div><div class="card-title">Operator View</div><div class="card-desc">Which venue is live, which strategy is running, what was decided last cycle</div></div>
+                        <span class="status-pill" id="operator-pill"><span class="status-dot"></span>Loading...</span>
+                    </div>
+                    <div id="operator-lines" style="font-size: 13px;">Loading...</div>
+                </div>
+                
                 <div class="grid-2">
                     <div class="card">
                         <div class="card-header">
@@ -4593,7 +4623,33 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
             item.addEventListener('click', () => switchTab(item.dataset.tab));
         });
         
+        async function fetchOperatorView() {
+            // Same source as the CLI's `ptai status`: /api/operator returns the
+            // snapshot plus the sentences to print, so the browser is not a
+            // second implementation of the operator's numbers.
+            try {
+                const res = await fetch('/api/operator');
+                const data = await res.json();
+                const lines = data.lines || [];
+                document.getElementById('operator-lines').innerHTML =
+                    lines.map(l => '<div class="mono" style="padding:2px 0">' + escapeHTML(l) + '</div>').join('');
+                const live = (data.venues || {}).live_venue;
+                const pill = document.getElementById('operator-pill');
+                if (live) {
+                    pill.innerHTML = '<span class="status-dot green"></span>LIVE: ' + escapeHTML(live);
+                    pill.className = 'status-pill ok';
+                } else {
+                    pill.innerHTML = '<span class="status-dot amber"></span>PAPER ONLY';
+                    pill.className = 'status-pill warn';
+                }
+            } catch (e) {
+                document.getElementById('operator-lines').textContent =
+                    'The operator view could not be read: ' + e;
+            }
+        }
+        
         async function fetchData() {
+            fetchOperatorView();
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
