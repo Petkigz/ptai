@@ -114,6 +114,7 @@ from ..risk.kill_switch import KillSwitch, KillLevel
 from ..risk.limits import LimitsEngine, TradeLimits
 
 from ..execution.order_manager import OrderManager
+from ..execution.redemption import Redeemer
 from ..execution.execution_guard import ExecutionGuard
 from ..execution.reconciliation import ReconciliationEngine
 from ..execution.multi_venue_executor import MultiVenueExecutor
@@ -235,9 +236,23 @@ class TradingAgentV3:
         try:
             pk = self.vault.get("Trader", "polymarket_clob", {}).get("private_key") or self.settings.polymarket_private_key
             funder = self.vault.get("Trader", "polymarket_clob", {}).get("funder") or self.settings.polymarket_funder_address
-        except:
+        except Exception as e:
+            # Not `except: pass`. Silent credential loss looks exactly like
+            # "no credentials configured", and every downstream gate then
+            # reports paper-only for a reason nobody can see.
+            logger.error(f"Could not read Polymarket credentials from the vault: "
+                         f"{type(e).__name__}: {e}. Live trading and redemption "
+                         f"will report as unconfigured.")
             pk = None
             funder = None
+
+        # Kept on the instance because the venue's order probe, the redemption
+        # client and the account-health ladder all need them. They used to be
+        # local variables, so anything built later that asked the agent for its
+        # credentials got None - which reads as "not configured" rather than
+        # "not passed".
+        self.private_key = pk
+        self.funder = funder
         
         # Polymarket - primary prediction venue
         polymarket_adapter = PolymarketAdapter(private_key=pk, funder=funder)
@@ -346,6 +361,19 @@ class TradingAgentV3:
         
         # Execution - V10 FIX #1: One canonical execution path via MultiVenueExecutor
         self.order_manager = OrderManager(storage=self.storage)
+        # Redemption closes the loop after settlement: a settled win that is
+        # never redeemed is a bookkeeping profit and unusable capital. Refuses
+        # to claim anything without a signer, and reports what it left locked.
+        self.redeemer = Redeemer(
+            funder=getattr(self, "funder", None),
+            private_key=getattr(self, "private_key", None),
+            # The relayer accepts builder-key auth as an alternative to a
+            # relayer key; read it from settings when present.
+            builder_key=getattr(self.settings, "polymarket_builder_key", None),
+            builder_secret=getattr(self.settings, "polymarket_builder_secret", None),
+            builder_passphrase=getattr(self.settings, "polymarket_builder_passphrase", None),
+            dry_run=self.dry_run,
+        )
         self.execution_guard = ExecutionGuard(bankroll=bankroll)
         self.reconciliation_engine = ReconciliationEngine(storage=self.storage)
         self.multi_venue_executor = MultiVenueExecutor(registry=self.venue_registry, bankroll=bankroll)
@@ -686,6 +714,150 @@ class TradingAgentV3:
         
         return context
 
+    async def _reconcile_working_orders(self):
+        """
+        Ask the venue about every order that has not reached a final state.
+
+        The adapter is the source of truth. An adapter that cannot answer leaves
+        its orders open, which is the conservative result: an order whose fate
+        is unknown keeps holding its capital.
+        """
+        if self.order_manager is None:
+            logger.debug("No order manager: resting orders cannot be reconciled")
+            return None
+        pending = self.order_manager.open_orders()
+        if not pending:
+            return None
+
+        logger.info(
+            f"Reconciling {len(pending)} working order(s) against the venue - "
+            f"${self.order_manager.resting_capital_usd():.4f} of capital is "
+            f"reserved behind them")
+
+        total = {"checked": 0, "filled_more": 0, "now_complete": 0,
+                 "released": 0, "unreconciled": 0, "grew_usd": 0.0,
+                 "released_usd": 0.0}
+        by_venue = {}
+        for order in pending:
+            by_venue.setdefault(order.get("venue_id") or "", []).append(order)
+
+        for venue_id in by_venue:
+            adapter = self.venue_registry.get_adapter(venue_id) if venue_id else None
+            if adapter is None:
+                logger.warning(
+                    f"No adapter for {venue_id or 'unknown venue'}: "
+                    f"{len(by_venue[venue_id])} order(s) stay unreconciled")
+                total["unreconciled"] += len(by_venue[venue_id])
+                continue
+            report = await self.order_manager.reconcile(
+                adapter, venue_id=venue_id,
+                position_opener=self._open_position_from_fill)
+            for key in total:
+                total[key] += getattr(report, key, 0) or 0
+
+        if total["grew_usd"] or total["released_usd"]:
+            # Fills move capital, so the derived figures must not stay stale into
+            # sizing - the same reason settlement refreshes the bankroll.
+            self.bankroll = self.storage.get_bankroll()
+            self.execution_guard.update_bankroll(self.bankroll)
+            self.account_health_engine.bankroll = self.bankroll
+        if total["unreconciled"]:
+            logger.warning(
+                f"{total['unreconciled']} order(s) could not be reconciled; their "
+                f"capital stays reserved until the venue answers")
+        return total
+
+    def _open_position_from_fill(self, order: Dict[str, Any], add_usd: float,
+                                 price: float) -> int:
+        """
+        Book a position for a fill that arrived on an order we did not hold one
+        for.
+
+        A resting order buys nothing, so no position is created when it is
+        submitted; when it fills hours later the fill has nowhere to go. This is
+        that destination. The row is labelled with the order it came from, so a
+        later audit can trace it back to the venue's order rather than to a
+        strategy that never chose it.
+        """
+        if not add_usd or add_usd <= 0:
+            return 0
+        market_id = str(order.get("market_id") or "")
+        if not market_id:
+            logger.error("Cannot open a position from a fill with no market id")
+            return 0
+        side = str(order.get("side") or "").upper()
+        if side not in ("YES", "NO"):
+            # The order's side is the outcome side. Without it the position
+            # cannot be settled, so it is refused rather than guessed.
+            logger.error(
+                f"Cannot open a position for {market_id}: the order carries side "
+                f"{side!r}, which is not a settleable outcome side (YES/NO)")
+            return 0
+        try:
+            trade_id = self.storage.log_trade({
+                "market_id": market_id,
+                "venue_id": order.get("venue_id") or "polymarket",
+                "side": side,
+                "position_size_usd": float(add_usd),
+                "market_price": float(price),
+                "fair_price": float(price),
+                "edge": 0.0,
+                "confidence": 0.0,
+                "strategy": "resting_order_fill",
+                "data_mode": getattr(self.data_mode, "value", str(self.data_mode)),
+                "order_id": order.get("order_id"),
+            })
+        except Exception as e:
+            logger.error(f"Could not record the resting-order fill: "
+                         f"{type(e).__name__}: {e}")
+            return 0
+        logger.info(
+            f"Resting order {order.get('order_id')} filled ${add_usd:.4f} at "
+            f"{price:.4f} - booked as position {trade_id} on {market_id} {side}")
+        return int(trade_id or 0)
+
+    async def _redeem_settled_wins(self):
+        """
+        Claim winnings that have settled.
+
+        Driven by the venue's own redeemable list, not by the agent's belief
+        that it won: only the contract knows whether collateral is still
+        claimable, and redeeming an already-redeemed condition is a no-op rather
+        than a double payment.
+        """
+        redeemer = getattr(self, "redeemer", None)
+        if redeemer is None:
+            return None
+        if not redeemer.funder:
+            logger.info(
+                "Redemption skipped: no funder address, so there is no position "
+                "list to read and nothing can be claimed")
+            return None
+
+        positions, available, reason = await asyncio.to_thread(
+            redeemer.read_redeemable)
+        if not available:
+            logger.warning(
+                f"Redemption could not read claimable positions ({reason}); "
+                f"settled winnings, if any, stay locked this cycle")
+            return None
+        if not positions:
+            return None
+
+        # Skip anything already claimed in an earlier run: the venue is
+        # idempotent, but re-submitting burns relayer quota for nothing.
+        fresh = [p for p in positions
+                 if not redeemer.already_redeemed(self.storage, p.condition_id)]
+        if not fresh:
+            return None
+
+        report = await asyncio.to_thread(redeemer.redeem, fresh)
+        redeemer.record(self.storage, report, fresh)
+        if report.claimed:
+            self.bankroll = self.storage.get_bankroll()
+            self.execution_guard.update_bankroll(self.bankroll)
+        return report.to_dict()
+
     async def run_cycle(self, target_per_venue: int = 200, max_trades: int = 3) -> Dict[str, Any]:
         """
         V3 Cycle: multi-venue × multi-strategy WITH Qualification Engine V8
@@ -726,6 +898,35 @@ class TradingAgentV3:
                 f"SETTLEMENT PASS FAILED: {type(e).__name__}: {e}. Resolved "
                 f"markets will not be recorded this cycle, so calibration and "
                 f"win rate will be stale.")
+
+        # Reconciliation - find out what the venue did with the orders we sent.
+        #
+        # Runs straight after settlement because it is the same question asked
+        # of a different source: settlement says which MARKETS resolved, this
+        # says which ORDERS are still working. An order resting in the book
+        # holds capital that sizing must not spend twice, and a partial fill is
+        # a position that grows after we booked it.
+        reconciliation = None
+        try:
+            reconciliation = await self._reconcile_working_orders()
+        except Exception as e:
+            logger.error(
+                f"ORDER RECONCILIATION FAILED: {type(e).__name__}: {e}. Any order "
+                f"resting at the venue stays invisible this cycle, so its capital "
+                f"may be sized against again.")
+
+        # Redemption - claim settled winnings.
+        #
+        # Without this step a won position is marked settled in the ledger and
+        # the collateral stays locked in the contract forever, which looks like
+        # profit on paper and is not spendable.
+        redemption = None
+        try:
+            redemption = await self._redeem_settled_wins()
+        except Exception as e:
+            logger.error(
+                f"REDEMPTION FAILED: {type(e).__name__}: {e}. Settled winnings "
+                f"stay locked in the contract and cannot be traded with.")
 
         # Eligibility - Legal/Account eligibility
         eligibility = await self.check_eligibility()
@@ -1209,6 +1410,26 @@ class TradingAgentV3:
                         f"execution status {exec_result.status} committed no "
                         f"capital, so no position exists to settle"
                     )
+                    # No position - but possibly still an ORDER. A resting order
+                    # reserves capital at the venue, and a send whose response
+                    # was lost may be resting too. Both have to be recorded or
+                    # the next cycle cannot ask the venue about them, the
+                    # reserved cash is invisible to sizing, and a later fill
+                    # never becomes a position.
+                    if exec_result.reserves_capital or exec_result.needs_reconciliation:
+                        order_key = self.order_manager.record_submission(
+                            exec_result, market_id=opp.market.id,
+                            token_id=getattr(opp.market, "tokens", [{}])[0].token_id
+                            if getattr(opp.market, "tokens", None) else None,
+                            venue_id=venue_id, side=str(opp.side).upper())
+                        execution_results[-1]["order_recorded"] = bool(order_key)
+                        execution_results[-1]["order_key"] = order_key
+                        if order_key:
+                            logger.info(
+                                f"Order {order_key} recorded for reconciliation: "
+                                f"status {exec_result.status}, "
+                                f"${exec_result.resting_usd:.4f} reserved, "
+                                f"unfilled {exec_result.unfilled_shares} shares")
                     continue
 
                 execution_results[-1]["position_recorded"] = True
@@ -1287,6 +1508,26 @@ class TradingAgentV3:
                     logger.error(
                         f"TRADE NOT PERSISTED for {opp.market.id}: {e}. Position "
                         f"cannot be settled, so it cannot be learned from.")
+
+                # Link the order to the position it produced. A partial fill
+                # that later completes must grow THIS row: settlement finds an
+                # open trade by market id, so a second row for the same market
+                # would never be closed and its P&L would never be realised.
+                if trade_id and (exec_result.needs_reconciliation
+                                 or exec_result.unfilled_shares > 0):
+                    order_key = self.order_manager.record_submission(
+                        exec_result, market_id=opp.market.id,
+                        token_id=getattr(opp.market, "tokens", [{}])[0].token_id
+                        if getattr(opp.market, "tokens", None) else None,
+                        venue_id=venue_id, trade_id=int(trade_id),
+                        side=str(opp.side).upper())
+                    execution_results[-1]["order_recorded"] = bool(order_key)
+                    execution_results[-1]["order_key"] = order_key
+                    if order_key:
+                        logger.info(
+                            f"Order {order_key} linked to position {trade_id} "
+                            f"({exec_result.unfilled_shares} shares still working); "
+                            f"further fills will grow this position")
 
                 # Forecast, tied to the venue and the trade so settlement can
                 # find it and close the position when the market resolves.

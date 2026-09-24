@@ -12,8 +12,20 @@ rich>=13.7
 typer>=0.9
 
 # Trading - Polymarket
-py-clob-client>=0.22
-web3>=6.11
+#
+# The venue cut over to CLOB/exchange V2 on 2026-04-28 with "no backward
+# compatibility". py-clob-client (V1) is still on PyPI but its surface predates
+# the cutover: it has no get_open_orders and no get_clob_market_info, so it
+# cannot see a resting order or read a market's tick size, minimum size or
+# neg-risk flag. Pinned to the V2 SDK deliberately.
+py-clob-client-v2>=1.1.0
+# Gasless redemption of settled winnings: the CTF holds the shares and the
+# collateral only returns when redeemPositions is submitted through the relayer.
+py-builder-relayer-client>=0.0.2
+# Redemption calldata is ABI-encoded locally; both arrive transitively via the
+# SDKs above, and are named here because this code imports them directly.
+eth-abi>=5.0
+eth-utils>=4.0
 eth-account>=0.10
 
 # Browser automation - local execution

@@ -2,6 +2,7 @@
 Polymarket Adapter - one venue among many
 FIXED V7: Real orderbook intelligence + Real portfolio + No dangerous fallbacks
 """
+import asyncio
 import json
 from typing import List, Dict, Any, Optional
 from loguru import logger
@@ -577,40 +578,184 @@ class PolymarketAdapter(MarketAdapter):
         # bare `except` swallowed it, and live Polymarket execution had never
         # once worked. It returned {"status": "error"} which reads like a
         # transient failure rather than a permanent wiring bug.
-        from ..markets.polymarket import PolymarketExecutor
-
-        executor = PolymarketExecutor(private_key=self.private_key, funder=self.funder)
+        executor = self._get_executor()
 
         # `place_order` is synchronous and takes (token_id, price, size, side,
         # order_type, dry_run). The old call passed market/side/max_price/
         # amount_usd to a method named `execute` that does not exist.
         price = float(max_price)
-        size = float(max_spend_usd) / price if price > 0 else 0.0
+
+        # Read the venue's rules for THIS market before building the order.
+        # The tick and the minimum size are properties of the market, not of the
+        # venue, and the agent needs both at the moment it sizes a trade - not
+        # when the SDK fetches them during signing.
+        mechanics = self.get_mechanics(opportunity)
+
+        signed_price = mechanics.round_price(price, "BUY")
+        size = mechanics.shares_for_usd(float(max_spend_usd), signed_price, "BUY")
         if size <= 0:
             return {"status": "rejected", "venue_id": "polymarket",
-                    "reason": f"Computed size {size} <= 0 from ${max_spend_usd} @ {price}"}
+                    "market_id": market_id,
+                    "reason": f"Computed size {size} <= 0 from "
+                              f"${max_spend_usd} @ {signed_price}"}
+
+        ok, size_reason = mechanics.validate_order(signed_price, size)
+        if not ok:
+            # Refused locally, before the venue sees it, and the reason names the
+            # rule rather than a generic failure.
+            logger.warning(f"Polymarket order refused locally for {market_id}: {size_reason}")
+            return {"status": "rejected", "venue_id": "polymarket",
+                    "market_id": market_id, "token_id": token_id,
+                    "reason": size_reason, "mechanics": mechanics.to_dict()}
 
         try:
             result = executor.place_order(
                 token_id=token_id,
-                price=price,
+                price=signed_price,
                 size=size,
                 side="BUY" if str(opportunity.side).upper() in ("YES", "BUY") else "SELL",
                 order_type="GTC",
                 dry_run=False,  # real submission: gated by can_place_real_orders above
+                mechanics=mechanics,
             )
         except Exception as e:
             logger.error(f"Polymarket execution failed for {market_id}: {e}")
             return {"status": "error", "error": str(e), "venue_id": "polymarket",
-                    "market_id": market_id}
+                    "market_id": market_id, "unconfirmed_send": True}
 
         if isinstance(result, dict):
             result.setdefault("venue_id", "polymarket")
             result.setdefault("market_id", market_id)
             result.setdefault("token_id", token_id)
-            result.setdefault("price", price)
+            # The SIGNED values, because those are what the venue acts on. The
+            # requested price and size are kept alongside so any adjustment the
+            # tick forced is visible rather than silent.
+            result.setdefault("price", signed_price)
             result.setdefault("size", size)
+            result["requested_price"] = price
+            result["mechanics"] = mechanics.to_dict()
         return result
+
+    # ------------------------------------------------------------------
+    # market mechanics and reconciliation reads
+    # ------------------------------------------------------------------
+
+    def _get_executor(self):
+        """
+        One long-lived executor per adapter.
+
+        A new client per order re-derived API credentials on every call, threw
+        away the mechanics cache, and made it impossible to reuse a connection.
+        """
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            from ..markets.polymarket import PolymarketExecutor
+
+            executor = PolymarketExecutor(private_key=self.private_key,
+                                          funder=self.funder)
+            self._executor = executor
+        return executor
+
+    def get_mechanics(self, opportunity=None, token_id: Optional[str] = None):
+        """
+        The venue's order rules for a market: tick size, neg-risk, minimum size.
+
+        Never raises and never returns None: a caller that cannot get real
+        mechanics gets a labelled assumption, because silently using a guessed
+        tick would round prices onto a grid the venue does not share.
+        """
+        from ..markets.mechanics import MarketMechanics
+
+        market = getattr(opportunity, "market", None) if opportunity is not None else None
+        if token_id is None and opportunity is not None:
+            token_id = self._resolve_token_id(opportunity)
+        if token_id is None and market is not None:
+            token_id = self._resolve_token_id_from_market(market)
+
+        condition_id = None
+        if market is not None:
+            # Market carries condition_id directly; the raw payload is only a
+            # fallback, because reading the wrong one of the three spellings is
+            # how a market ends up with assumed mechanics.
+            condition_id = getattr(market, "condition_id", None) or None
+            if not condition_id:
+                raw = getattr(market, "raw", None) or {}
+                condition_id = (raw.get("conditionId") or raw.get("condition_id")
+                                or raw.get("conditionID"))
+        try:
+            return self._get_executor().get_mechanics(
+                token_id, condition_id=condition_id)
+        except Exception as e:
+            logger.warning(
+                f"Could not read venue mechanics for {token_id or market}: "
+                f"{type(e).__name__}: {e} - falling back to a labelled assumption")
+            return MarketMechanics.assumed(
+                f"venue mechanics unavailable ({type(e).__name__})")
+
+    def _resolve_token_id_from_market(self, market) -> str:
+        """The CLOB token id for a market, without needing a side."""
+        if market is None:
+            return ""
+        tokens = getattr(market, "tokens", None) or []
+        for token in tokens:
+            token_id = getattr(token, "token_id", None) or getattr(token, "id", None)
+            if token_id:
+                return str(token_id)
+        raw = getattr(market, "raw", None) or {}
+        for key in ("clobTokenIds", "clob_token_ids", "token_ids"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip().startswith("["):
+                try:
+                    parsed = json.loads(value)
+                    if parsed:
+                        return str(parsed[0])
+                except Exception:
+                    pass
+            if isinstance(value, list) and value:
+                return str(value[0])
+        return ""
+
+    async def get_open_orders(self, market_id: Optional[str] = None,
+                              asset_id: Optional[str] = None,
+                              order_id: Optional[str] = None) -> Dict[str, Any]:
+        """Orders resting in the book. The input reconciliation needs."""
+        try:
+            return await asyncio.to_thread(
+                self._get_executor().get_open_orders, market_id, asset_id, order_id)
+        except Exception as e:
+            logger.warning(f"get_open_orders failed: {type(e).__name__}: {e}")
+            return {"available": False, "is_real": False, "orders": [],
+                    "reason": f"{type(e).__name__}: {e}"}
+
+    async def get_order(self, order_id: str) -> Dict[str, Any]:
+        """One order's state, including how much of it has matched."""
+        try:
+            return await asyncio.to_thread(self._get_executor().get_order, order_id)
+        except Exception as e:
+            logger.warning(f"get_order({order_id}) failed: {type(e).__name__}: {e}")
+            return {"available": False, "is_real": False,
+                    "reason": f"{type(e).__name__}: {e}"}
+
+    async def get_trades(self, market_id: Optional[str] = None,
+                         asset_id: Optional[str] = None) -> Dict[str, Any]:
+        """Fills, including the trade ids that V2 returns instead of tx hashes."""
+        try:
+            return await asyncio.to_thread(
+                self._get_executor().get_trades, market_id, asset_id)
+        except Exception as e:
+            logger.warning(f"get_trades failed: {type(e).__name__}: {e}")
+            return {"available": False, "is_real": False, "trades": [],
+                    "reason": f"{type(e).__name__}: {e}"}
+
+    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Withdraw a resting order. Failure is reported, never swallowed."""
+        try:
+            return await asyncio.to_thread(
+                self._get_executor().cancel_order, order_id)
+        except Exception as e:
+            logger.error(f"cancel_order({order_id}) raised {type(e).__name__}: {e}")
+            return {"status": "error", "order_id": order_id,
+                    "error": f"{type(e).__name__}: {e}"}
 
     async def probe_order_permission(self, opportunity=None) -> bool:
         """
@@ -652,44 +797,41 @@ class PolymarketAdapter(MarketAdapter):
                 "requires a specific tradeable market.")
             return False
 
-        from ..markets.polymarket import PolymarketExecutor
-        executor = PolymarketExecutor(private_key=self.private_key,
-                                      funder=self.funder)
+        executor = self._get_executor()
 
-        # A minimum-size BUY placed far below the best bid cannot cross. The
-        # tick size is 0.01, so 0.01 is the lowest expressible price and is
-        # effectively never a marketable bid.
-        probe_price = 0.01
-        probe_size_usd = float(getattr(self.capabilities, "min_order_usd", 1.0) or 1.0)
+        # The probe must test PERMISSION without taking a position, so it posts
+        # at the lowest price the market allows. That price is the tick size,
+        # which is a property of the market - hardcoding 0.01 was wrong for
+        # every market on a 0.001 or 0.005 tick, where 0.01 is a real bid.
+        mechanics = self.get_mechanics(opportunity, token_id=token_id)
+        probe_price = mechanics.tick
+        probe_size_usd = max(
+            float(getattr(self.capabilities, "min_order_usd", 1.0) or 1.0),
+            float(mechanics.min_order_notional_usd or 1.0))
 
-        client = getattr(executor, "client", None)
-        if client is None:
+        if not executor.can_sign:
             logger.error(
-                "Order probe refused: the CLOB client did not initialise "
-                "(credentials present but auth failed).")
+                f"Order probe refused: the CLOB V2 client did not initialise "
+                f"({executor.client_error or 'credentials present but auth failed'}).")
             return False
 
-        try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY
-        except Exception as e:
-            logger.error(f"Order probe refused: py_clob_client unavailable ({e})")
-            return False
-
-        shares = max(1.0, round(probe_size_usd / probe_price, 2))
+        shares = mechanics.round_size(probe_size_usd / probe_price) if probe_price else 0.0
+        # A tick can be small enough that the venue's minimum size needs more
+        # than the minimum notional; take whichever binds.
+        shares = max(shares, mechanics.min_order_size, 1.0)
         order_id = ""
         reason = ""
 
         try:
-            order_args = OrderArgs(price=probe_price, size=shares, side=BUY,
-                                   token_id=token_id)
-            signed = client.create_order(order_args)
-            response = client.post_order(signed, OrderType.GTC)
+            response = executor.place_order(
+                token_id=token_id, price=probe_price, size=shares, side="BUY",
+                order_type="GTC", dry_run=False, mechanics=mechanics)
             if isinstance(response, dict):
-                order_id = str(response.get("orderID")
-                               or response.get("order_id") or "")
-                if response.get("success") is False:
-                    reason = f"post rejected: {response}"
+                order_id = str(response.get("order_id")
+                               or response.get("orderID") or "")
+                status = str(response.get("status") or "")
+                if status in ("rejected", "error", "failed"):
+                    reason = f"post refused: {response.get('reason') or status}"
             if not order_id:
                 reason = reason or f"post returned no order id: {response}"
         except Exception as e:
@@ -719,6 +861,7 @@ class PolymarketAdapter(MarketAdapter):
             "cancelled": cancelled,
             "reason": reason,
             "cancel_result": cancel_result,
+            "mechanics": mechanics.to_dict(),
         }
 
         if order_id and cancelled:

@@ -651,6 +651,7 @@ class TestRiskChainCallsTheRealMethods:
 class TestOrderProbeMakesReadinessReachable:
     def _opportunity(self):
         m = Market(id="M1", source=MarketSource.POLYMARKET, question="Q?",
+                   condition_id="0xcond1",
                    tokens=[Token(token_id="tok-1", outcome="YES", price=0.5)])
         return VenueOpportunity(market=m, venue_id="polymarket",
                                 venue_type=VenueType.PREDICTION, side="YES",
@@ -698,22 +699,38 @@ class TestOrderProbeMakesReadinessReachable:
         import src.ptai.markets.polymarket as pm
 
         class FakeClient:
+            """The V2 CLOB surface, which is what the executor now calls."""
+
             def __init__(self):
-                self.order_args, self.posted, self.cancelled = [], [], []
+                self.order_args, self.options, self.posted, self.cancelled = [], [], [], []
 
-            def create_order(self, args):
-                self.order_args.append(args)
-                return {"signed": True}
+            def get_clob_market_info(self, condition_id):
+                # A real market payload, so the probe reads a real tick.
+                return {"min_tick_size": "0.01", "neg_risk": False,
+                        "min_order_size": 1.0, "taker_base_fee": 0.0,
+                        "maker_base_fee": 0.0, "seconds_delay": 0,
+                        "accepting_orders": True}
 
-            def post_order(self, signed, order_type):
-                self.posted.append(signed)
+            def get_tick_size(self, token_id):
+                return "0.01"
+
+            def get_neg_risk(self, token_id):
+                return False
+
+            def create_and_post_order(self, order_args, options, order_type, post_only):
+                self.order_args.append(order_args)
+                self.options.append(options)
+                self.posted.append((order_type, post_only))
                 return post_response
 
-            def cancel(self, order_id):
+            def cancel_order(self, payload):
+                order_id = getattr(payload, "orderID", payload)
                 if cancel_raises:
                     raise RuntimeError("network down")
                 self.cancelled.append(order_id)
-                return {"not_canceled": {"x": "y"} if not_cancelled else {}}
+                if not_cancelled:
+                    return {"canceled": [], "not_canceled": {order_id: "order not found"}}
+                return {"canceled": [order_id], "not_canceled": {}}
 
         client = FakeClient()
         real_cls = pm.PolymarketExecutor
@@ -722,8 +739,10 @@ class TestOrderProbeMakesReadinessReachable:
             def __init__(self, **kwargs):
                 # Bypass client construction entirely; everything else is real.
                 self.client = client
+                self.client_error = None
                 self.private_key = kwargs.get("private_key")
                 self.funder = kwargs.get("funder")
+                self._mechanics_cache = {}
 
         pm.PolymarketExecutor = FakeExecutor
         return client, lambda: setattr(pm, "PolymarketExecutor", real_cls)
@@ -741,7 +760,8 @@ class TestOrderProbeMakesReadinessReachable:
     def test_the_probe_order_cannot_cross(self):
         """
         The probe must test permission without taking a position. It posts at
-        the lowest expressible price.
+        the market's OWN lowest expressible price - the tick size - not at a
+        hardcoded 0.01, which on a 0.001-tick market is a real bid.
         """
         ad = self._adapter()
         client, restore = self._with_fake_clob({"success": True, "orderID": "o1"})
@@ -752,6 +772,29 @@ class TestOrderProbeMakesReadinessReachable:
         args = client.order_args[0]
         assert args.price == 0.01, (
             f"probe posted at {args.price}, which could fill and become a real position"
+        )
+        assert ad.last_order_probe["mechanics"]["tick_size"] == "0.01"
+
+    def test_the_probe_reads_the_market_tick_not_a_constant(self):
+        """
+        On a market with a finer tick, the lowest safe price is lower than
+        0.01. Posting 0.01 there is a genuine bid that could fill.
+        """
+        ad = self._adapter()
+        client, restore = self._with_fake_clob({"success": True, "orderID": "o1"})
+        original = client.get_clob_market_info
+
+        def finer(cid):
+            info = original(cid)
+            info["min_tick_size"] = "0.001"
+            return info
+        client.get_clob_market_info = finer
+        try:
+            asyncio.run(ad.probe_order_permission(self._opportunity()))
+        finally:
+            restore()
+        assert client.order_args[0].price == 0.001, (
+            "the probe ignored the market's tick and used a constant"
         )
 
     def test_a_rejected_post_does_not_verify(self):

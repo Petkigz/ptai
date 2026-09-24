@@ -21,7 +21,11 @@ dependencies = [
     "tenacity>=8.2",
     "rich>=13.7",
     "typer>=0.9",
-    "py-clob-client>=0.22",
+    # CLOB V2 SDK: V1 cannot list resting orders or read per-market mechanics.
+    "py-clob-client-v2>=1.1.0",
+    "py-builder-relayer-client>=0.0.2",
+    "eth-abi>=5.0",
+    "eth-utils>=4.0",
     "web3>=6.11",
     "eth-account>=0.10",
     "playwright>=1.40",

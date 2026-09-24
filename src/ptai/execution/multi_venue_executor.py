@@ -39,17 +39,25 @@ class ExecutionResult:
     filled_price: float = 0.0
     order_id: str = ""
     raw_response: Dict[str, Any] = field(default_factory=dict)
+    # The venue's own count of how much of the order has matched, and how much
+    # there was. A marketable order that took only part of the book returns
+    # "matched" with size_matched below original_size.
+    size_matched: Optional[float] = None
+    original_size: Optional[float] = None
+    # Unfilled shares still working in the book, as USD at the limit price.
+    resting_usd: float = 0.0
+    # A send that failed with no venue confirmation: the order may exist.
+    unconfirmed_send: bool = False
+    trade_ids: List[str] = field(default_factory=list)
 
     @property
     def committed_capital(self) -> bool:
         """
-        Did this execution actually commit capital?
+        Did this execution actually BUY something?
 
-        The three states are distinct and must not be conflated:
-
-          filled/partial/submitted -> capital committed, record a position
-          dry_run/simulated/paper  -> no real capital, record a PAPER position
-          everything else          -> nothing happened, record nothing
+        Distinct from `reserves_capital`. A resting order reserves cash at the
+        venue without buying anything, and treating that as a position would
+        invent shares the agent does not own.
         """
         return self.status in FILLED_STATUSES and self.filled_usd > 0
 
@@ -58,7 +66,56 @@ class ExecutionResult:
         return self.status in SIMULATED_STATUSES
 
     @property
+    def reserves_capital(self) -> bool:
+        """
+        Is real money locked at the venue by this result?
+
+        True for a filled position (the cost is spent) and for an order still
+        working in the book (the cash is reserved against it). The position
+        ledger must subtract both, or the agent will size a new trade against
+        cash the venue has already locked.
+        """
+        if self.unconfirmed_send:
+            return True
+        if self.committed_capital:
+            return True
+        if self.status in ("submitted", "partial"):
+            return True
+        return False
+
+    @property
+    def needs_reconciliation(self) -> bool:
+        """
+        Is this order's fate still unknown?
+
+        A resting or partially filled order has to be re-read from the venue
+        until it reaches a final state. So does an unconfirmed send, because the
+        order may be in the book while the response was lost.
+        """
+        if self.unconfirmed_send:
+            return True
+        if self.status in ("submitted", "partial") and self.unfilled_shares > 0:
+            return True
+        return False
+
+    @property
+    def unfilled_shares(self) -> float:
+        if self.original_size is None:
+            return 0.0
+        matched = self.size_matched if self.size_matched is not None else 0.0
+        return max(0.0, float(self.original_size) - float(matched))
+
+    @property
     def should_record_position(self) -> bool:
+        """
+        Should a POSITION row be written?
+
+        A partial fill is a real position of the filled size, so it is recorded
+        and then reconciled upward as more of the order fills. A resting order
+        with nothing matched is not a position - it is an ORDER, and it belongs
+        in the order book table where it reserves capital without claiming
+        shares.
+        """
         return self.committed_capital or self.is_simulated
 
     def to_position_dict(self) -> Dict[str, Any]:
@@ -74,8 +131,60 @@ class ExecutionResult:
             "gas_usd": self.gas_usd,
             "order_id": self.order_id,
             "simulated": self.is_simulated,
+            "size_matched": self.size_matched,
+            "original_size": self.original_size,
+            "unfilled_shares": self.unfilled_shares,
+            "resting_usd": self.resting_usd,
+            "reserves_capital": self.reserves_capital,
+            "needs_reconciliation": self.needs_reconciliation,
+            "unconfirmed_send": self.unconfirmed_send,
+            "trade_ids": list(self.trade_ids),
             "reasoning": self.reasoning,
         }
+
+
+def _num(value: Any) -> Optional[float]:
+    """
+    A number from a venue payload field, or None.
+
+    The CLOB reports size_matched, original_size and price as STRINGS
+    ("5.45"), so an isinstance(value, (int, float)) check silently discards
+    every real fill size - and a partial fill that cannot be quantified is
+    reported as unknown, which erases the position.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _resting_usd(fill: Dict[str, Any], requested_usd: float) -> float:
+    """
+    How much of an order is still working in the book, in USD.
+
+    Derived from the venue's own numbers only. With no size_matched figure the
+    remainder is unknown, so the whole unfilled request is reported as resting -
+    the conservative direction, because under-counting locked cash is the way an
+    agent sizes a second trade against money the venue has already reserved.
+    """
+    if fill.get("status") not in ("submitted", "partial"):
+        return 0.0
+    if fill.get("unconfirmed_send"):
+        return float(requested_usd or 0.0)
+    matched = _num(fill.get("size_matched"))
+    original = _num(fill.get("original_size"))
+    price = _num(fill.get("price")) or 0.0
+    if matched is None or not original or not price:
+        # Nothing quantifiable: assume the whole request is still committed.
+        return max(0.0, float(requested_usd or 0.0) - float(fill.get("filled_usd") or 0.0))
+    remaining = max(0.0, float(original) - float(matched))
+    return round(remaining * float(price), 6)
 
 
 class MultiVenueExecutor:
@@ -227,6 +336,11 @@ class MultiVenueExecutor:
                 filled_price=fill["price"],
                 order_id=fill["order_id"],
                 raw_response=result if isinstance(result, dict) else {"raw": str(result)},
+                size_matched=fill.get("size_matched"),
+                original_size=fill.get("original_size"),
+                resting_usd=_resting_usd(fill, max_spend_usd),
+                unconfirmed_send=bool(fill.get("unconfirmed_send")),
+                trade_ids=list(fill.get("trade_ids") or []),
             )
         except Exception as e:
             latency = (time.time() - start) * 1000
@@ -252,6 +366,12 @@ class MultiVenueExecutor:
         "partial": "partial", "partially_filled": "partial",
         "submitted": "submitted", "placed": "submitted", "accepted": "submitted",
         "open": "submitted", "ok": "submitted", "success": "submitted",
+        # The CLOB's own word for an order resting in the book with nothing
+        # matched yet. It is neither a fill nor a refusal: the capital is
+        # committed and the exposure is real, so it must be reconciled against
+        # the venue rather than dropped.
+        "live": "submitted",
+        "delayed": "submitted",
         "dry_run": "dry_run", "simulated": "dry_run", "paper": "dry_run",
         # Keep refusals under their own names. They are all no-position
         # outcomes, but collapsing them into "unknown" would throw away the
@@ -260,6 +380,10 @@ class MultiVenueExecutor:
         "aborted": "aborted", "rate_limited": "rate_limited",
         "insufficient_funds": "rejected", "unauthorized": "rejected",
         "invalid": "rejected",
+        # A send that failed without a venue confirmation. It is distinct from
+        # a rejection because the order may exist: the failure could be the
+        # response that was lost, not the request.
+        "failed": "failed",
     }
 
     def _read_fill(self, result: Any, requested_usd: float,
@@ -297,43 +421,70 @@ class MultiVenueExecutor:
         filled_usd = 0.0
         for key in ("filled_usd", "amount_usd", "cost_usd", "size_usd",
                     "notional_usd"):
-            value = result.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                filled_usd = float(value)
+            value = _num(result.get(key))
+            if value is not None:
+                filled_usd = value
                 break
+        # The CLOB reports matched size separately from the original size, so
+        # "matched" alone does not mean fully filled. A marketable order that
+        # took only part of the book comes back "matched" with size_matched
+        # below original_size, and booking that as a complete fill overstates
+        # the position by the unfilled remainder.
+        size_matched = _num(result.get("size_matched"))
+        original_size = _num(result.get("original_size"))
+
         if filled_usd <= 0:
-            for key in ("size", "filled_size", "matched_size", "shares",
-                        "quantity", "amount"):
-                value = result.get(key)
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
+            for key in ("size_matched", "size", "filled_size", "matched_size",
+                        "shares", "quantity", "amount"):
+                value = _num(result.get(key))
+                if value is not None:
                     price_hint = self._read_price(result, requested_price)
-                    filled_usd = float(value) * (price_hint or requested_price)
+                    filled_usd = value * (price_hint or requested_price)
                     break
 
         price = self._read_price(result, requested_price)
 
+        # Downgrade a "filled" claim that the venue's own numbers contradict.
+        if status == "filled" and size_matched is not None and original_size:
+            if size_matched + 1e-9 < original_size:
+                status = "partial"
+
         if status in ("filled", "partial", "submitted"):
             if filled_usd <= 0:
-                # The venue says it took the order but gave us no size. We
-                # cannot account for capital we cannot quantify.
-                return {"status": "unknown", "filled_usd": 0.0, "price": price,
-                        "order_id": order_id,
-                        "note": f"status {raw_status!r} but no fill size reported - "
-                                f"cannot account for an unquantified position"}
+                if status == "submitted" and (size_matched is not None
+                                              or original_size is not None):
+                    # An order resting in the book with nothing matched yet. The
+                    # venue quantified it: zero of a known size has filled and
+                    # the rest is still working. That is a KNOWN state, and
+                    # calling it "unknown" would erase the order - and with it
+                    # the capital it is holding.
+                    logger.info(
+                        f"Order {order_id} is resting: 0 of {original_size} "
+                        f"shares matched, capital reserved and awaiting "
+                        f"reconciliation")
+                else:
+                    # The venue says it took the order but gave us no size. We
+                    # cannot account for capital we cannot quantify.
+                    return {"status": "unknown", "filled_usd": 0.0, "price": price,
+                            "order_id": order_id,
+                            "note": f"status {raw_status!r} but no fill size reported - "
+                                    f"cannot account for an unquantified position"}
         else:
             filled_usd = 0.0
 
         return {"status": status, "filled_usd": filled_usd, "price": price,
-                "order_id": order_id, "raw_status": raw_status}
+                "order_id": order_id, "raw_status": raw_status,
+                "size_matched": size_matched, "original_size": original_size,
+                "unconfirmed_send": bool(result.get("unconfirmed_send")),
+                "trade_ids": list(result.get("trade_ids") or [])}
 
     @staticmethod
     def _read_price(result: Dict[str, Any], fallback: float) -> float:
         for key in ("filled_price", "average_price", "avg_price", "price",
                     "fill_price"):
-            value = result.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                if 0.0 < float(value) <= 1.0:
-                    return float(value)
+            value = _num(result.get(key))
+            if value is not None and 0.0 < value <= 1.0:
+                return value
         return 0.0
 
     async def execute_arbitrage_pair(self, arb, amount_per_leg: float = 3.0) -> List[ExecutionResult]:

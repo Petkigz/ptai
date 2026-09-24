@@ -12,6 +12,14 @@ import os
 
 from loguru import logger
 
+# Order states that will never change again. Anything else is still working and
+# has capital behind it. Kept here rather than in the execution layer so the
+# storage layer can answer "what is still open" without importing execution.
+TERMINAL_ORDER_STATUSES = (
+    "filled", "cancelled", "canceled", "rejected", "failed", "expired",
+    "unmatched", "not_cancelled", "abandoned",
+)
+
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +101,19 @@ CREATE TABLE IF NOT EXISTS research_logs (
 -- no order was ever persisted: the platform had no record of what it had
 -- submitted, which makes reconciliation, duplicate-order detection and any
 -- audit of live trading impossible.
+CREATE TABLE IF NOT EXISTS redemptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id TEXT NOT NULL,
+    asset TEXT,
+    outcome TEXT,
+    size REAL,
+    value_usd REAL,
+    transaction_id TEXT,
+    redeemed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redemptions_condition
+    ON redemptions(condition_id);
+
 CREATE TABLE IF NOT EXISTS orders (
     id TEXT PRIMARY KEY,
     market_id TEXT NOT NULL,
@@ -175,6 +196,24 @@ class Storage:
     # original shape and every insert naming a new column fails.
     _MIGRATIONS = (
         ("trades", "venue_id", "TEXT"),
+        # Resting-order reconciliation. An order that rests in the book, or
+        # fills in pieces, has state the trades table cannot express: how much
+        # of it is still working, and how much of the requested size has
+        # matched. Without these columns the agent could not tell a filled
+        # order from one that is still sitting there, and the capital locked
+        # behind it stayed invisible.
+        ("orders", "token_id", "TEXT"),
+        ("orders", "venue_id", "TEXT"),
+        ("orders", "original_size", "REAL"),
+        ("orders", "size_matched", "REAL"),
+        ("orders", "matched_usd", "REAL"),
+        ("orders", "limit_price", "REAL"),
+        ("orders", "trade_id", "INTEGER"),
+        ("orders", "updated_at", "TEXT"),
+        ("orders", "last_synced_at", "TEXT"),
+        ("orders", "terminal_reason", "TEXT"),
+        ("orders", "raw_response", "TEXT"),
+        ("orders", "requested_usd", "REAL"),
     )
 
     def _migrate(self):
@@ -269,6 +308,175 @@ class Storage:
         total = int(self.get_state("total_trades") or 0) + 1
         self.set_state("total_trades", str(total))
         return cur.lastrowid
+
+    # ------------------------------------------------------------------
+    # orders - resting and partially filled
+    # ------------------------------------------------------------------
+
+    def upsert_order(self, order: Dict[str, Any]) -> bool:
+        """
+        Record or update an order by the VENUE's order id.
+
+        Keyed on the venue id rather than a local uuid, because reconciliation
+        asks the venue about an order by the id the venue knows. A local
+        generated id cannot be looked up anywhere.
+        """
+        order_id = str(order.get("order_id") or order.get("id") or "")
+        if not order_id:
+            logger.error("upsert_order refused: no order id, so it can never be reconciled")
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self.conn.execute(
+            "SELECT id FROM orders WHERE id = ?", (order_id,)).fetchone()
+        fields = {
+            "market_id": order.get("market_id"),
+            "token_id": order.get("token_id"),
+            "side": order.get("side"),
+            "max_price": order.get("limit_price", order.get("max_price")),
+            "max_spend": order.get("requested_usd", order.get("max_spend")),
+            "status": order.get("status"),
+            "venue_id": order.get("venue_id"),
+            "amount_usd": order.get("matched_usd"),
+            "avg_price": order.get("limit_price", order.get("avg_price")),
+            "raw_response": json.dumps(order.get("raw") or order.get("raw_response") or {},
+                                       default=str)[:4000],
+            "original_size": order.get("original_size"),
+            "size_matched": order.get("size_matched"),
+            "matched_usd": order.get("matched_usd"),
+            "limit_price": order.get("limit_price", order.get("max_price")),
+            "requested_usd": order.get("requested_usd", order.get("max_spend")),
+            "trade_id": order.get("trade_id"),
+            "last_synced_at": order.get("last_synced_at", now),
+            "terminal_reason": order.get("terminal_reason"),
+        }
+        try:
+            if existing:
+                # A partial update must not erase columns it does not mention.
+                # Reconciliation re-writes an order with only its state, and
+                # assigning the untouched fields from the caller's sparse dict
+                # set market_id to NULL and aborted the whole write.
+                changed = {k: v for k, v in fields.items() if v is not None}
+                changed["updated_at"] = now
+                assignments = ", ".join(f"{k} = ?" for k in changed)
+                self.conn.execute(
+                    f"UPDATE orders SET {assignments} WHERE id = ?",
+                    (*changed.values(), order_id))
+            else:
+                fields["id"] = order_id
+                fields["created_at"] = order.get("created_at", now)
+                fields["updated_at"] = now
+                columns = ", ".join(fields)
+                placeholders = ", ".join("?" for _ in fields)
+                self.conn.execute(
+                    f"INSERT INTO orders ({columns}) VALUES ({placeholders})",
+                    tuple(fields.values()))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"upsert_order({order_id}) failed: {type(e).__name__}: {e}")
+            return False
+
+    @staticmethod
+    def _order_row(row) -> Dict[str, Any]:
+        order = dict(row)
+        order["order_id"] = order.get("id")
+        order["limit_price"] = order.get("limit_price") or order.get("max_price") or 0.0
+        order["requested_usd"] = order.get("requested_usd") or order.get("max_spend") or 0.0
+        order["size_matched"] = order.get("size_matched") or 0.0
+        order["matched_usd"] = order.get("matched_usd") or 0.0
+        return order
+
+    def get_open_orders(self, venue_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Orders that are not in a final state, from the local record.
+
+        The authoritative copy is the venue's; this is what the agent believes,
+        and reconciliation is the act of checking the two against each other.
+        """
+        try:
+            if venue_id:
+                rows = self.conn.execute(
+                    "SELECT * FROM orders WHERE status NOT IN "
+                    f"({','.join('?' for _ in TERMINAL_ORDER_STATUSES)}) "
+                    "AND venue_id = ? ORDER BY created_at DESC",
+                    (*TERMINAL_ORDER_STATUSES, venue_id)).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM orders WHERE status NOT IN "
+                    f"({','.join('?' for _ in TERMINAL_ORDER_STATUSES)}) "
+                    "ORDER BY created_at DESC",
+                    tuple(TERMINAL_ORDER_STATUSES)).fetchall()
+        except Exception as e:
+            logger.error(f"get_open_orders failed: {type(e).__name__}: {e}")
+            return []
+        return [self._order_row(r) for r in rows]
+
+    def get_order_row(self, order_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (str(order_id),)).fetchone()
+        return self._order_row(row) if row else None
+
+    def resting_capital_usd(self, venue_id: Optional[str] = None) -> float:
+        """
+        Cash locked behind orders that have not filled.
+
+        For each working order, the unfilled share of the request. Booked
+        positions are NOT included here - their cost is already in the trades
+        table - so there is no double count between the two.
+        """
+        total = 0.0
+        for order in self.get_open_orders(venue_id=venue_id):
+            requested = float(order.get("requested_usd") or 0.0)
+            matched = float(order.get("matched_usd") or 0.0)
+            if order.get("status") == "unconfirmed_send":
+                # The send failed without a confirmation: the whole request may
+                # be committed. Assume the worst until the venue says otherwise.
+                total += requested
+                continue
+            total += max(0.0, requested - matched)
+        return round(total, 6)
+
+    def add_to_position(self, trade_id: int, add_usd: float,
+                        add_price: float) -> bool:
+        """
+        Grow an existing position by a later fill of the same order.
+
+        ONE position row per market is required, not one per fill: settlement
+        resolves a market's open trade by looking it up by market id, so a
+        second row for the same market would never be closed and its P&L would
+        never be realised. Later fills therefore increase the size of the row
+        that exists, and the entry price becomes the size-weighted average of
+        what was actually paid.
+        """
+        cur = self.conn.execute(
+            "SELECT position_size_usd, market_price, resolved FROM trades WHERE id = ?",
+            (trade_id,))
+        row = cur.fetchone()
+        if row is None:
+            logger.error(f"add_to_position: no trade {trade_id}")
+            return False
+        if row["resolved"]:
+            logger.error(
+                f"add_to_position: trade {trade_id} is already resolved; refusing "
+                f"to add a fill to a closed position")
+            return False
+        if add_usd <= 0:
+            return False
+
+        old_size = float(row["position_size_usd"] or 0.0)
+        old_price = float(row["market_price"] or 0.0)
+        new_size = old_size + float(add_usd)
+        if new_size <= 0:
+            return False
+        new_price = ((old_size * old_price) + (float(add_usd) * float(add_price))) / new_size
+        self.conn.execute(
+            "UPDATE trades SET position_size_usd = ?, market_price = ? WHERE id = ?",
+            (new_size, new_price, trade_id))
+        self.conn.commit()
+        logger.info(
+            f"Position {trade_id} grown by ${add_usd:.4f} at {add_price:.4f} -> "
+            f"${new_size:.4f} at {new_price:.4f} entry")
+        return True
 
     def log_market_analysis(self, analysis: Dict[str, Any]):
         now = datetime.now(timezone.utc).isoformat()

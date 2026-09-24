@@ -203,12 +203,26 @@ class TestPolymarketExecutionIsWired:
         """
         import src.ptai.venues.polymarket_adapter as mod
 
+        # The import lives in _get_executor now, so the executor is built once
+        # and reused instead of re-deriving API credentials per order. The
+        # assertion covers the whole path from place_order to that helper.
         source = inspect.getsource(mod.PolymarketAdapter.place_order)
-        assert "from ..markets.polymarket import PolymarketExecutor" in source, (
-            "place_order must import the executor from markets.polymarket, "
-            "where the class actually is"
+        helper = inspect.getsource(mod.PolymarketAdapter._get_executor)
+        assert "self._get_executor()" in source, (
+            "place_order must obtain the executor through _get_executor()"
         )
-        assert "execution.polymarket_executor import PolymarketExecutor" not in source
+        assert "from ..markets.polymarket import PolymarketExecutor" in helper, (
+            "the executor must be imported from markets.polymarket, where the "
+            "class actually is"
+        )
+        for text in (source, helper):
+            assert "execution.polymarket_executor import PolymarketExecutor" not in text, (
+                "the executor does not live in execution.polymarket_executor"
+            )
+            assert "except ImportError" not in text, (
+                "an ImportError must not be swallowed: a permanently broken "
+                "import then reads as a transient runtime error"
+            )
 
     def test_place_order_signature_matches_what_we_call(self):
         """
