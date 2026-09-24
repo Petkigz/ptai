@@ -78,6 +78,11 @@ class VenueQualificationEngine:
             "max_drawdown": 0.20,  # max 20% drawdown
             "min_profit_factor": 1.1,  # gross profit / gross loss >1.1
             "min_execution_quality": 0.5,  # avg execution quality
+            # ...MEASURED on at least half the trades being judged. An average
+            # taken from one measurement out of 150 is not a measurement of the
+            # venue, and the totals above it were already reported with their
+            # coverage for exactly this reason - now the gate requires it.
+            "min_cost_coverage": 0.5,
             "min_sample_size": 100,
             "max_fees_pct": 0.05,  # fees <5% of profit
         }
@@ -158,7 +163,13 @@ class VenueQualificationEngine:
         ev_samples = int(performance_stats.get("expected_value_samples") or 0)
         ev_coverage = float(performance_stats.get("expected_value_coverage") or 0.0)
         expected_value = performance_stats.get("expected_value")
-        if expected_value is None and ev_samples == 0:
+        if ev_samples > 0:
+            # The real thing: the expected net EV each trade was predicted to
+            # have, recorded before it was taken.
+            expected_value = float(expected_value or 0.0)
+            ev_source = (f"recorded expected net EV over {ev_samples} trade(s), "
+                         f"{ev_coverage*100:.0f}% coverage")
+        elif expected_value is None:
             # Older rows carry no expected EV. Falling back to the mean edge is
             # the old behaviour and is allowed, but only when there is nothing
             # measured - and it is labelled, so a reader can tell which number
@@ -166,14 +177,20 @@ class VenueQualificationEngine:
             expected_value = avg_edge
             ev_source = "avg_edge fallback (no recorded expected net EV)"
         else:
-            expected_value = float(expected_value or 0.0)
-            ev_source = (f"recorded expected net EV over {ev_samples} trade(s), "
-                         f"{ev_coverage*100:.0f}% coverage")
+            # Supplied by the caller rather than read from the outcome log. It is
+            # used, and labelled as unverified - claiming it was "recorded over 0
+            # trades" would be a false statement about where the number came from.
+            expected_value = float(expected_value)
+            ev_source = ("caller-supplied expected value, not verified against "
+                         "per-trade entries")
         fees_total = performance_stats.get("fees_total", 0)
         slippage_total = performance_stats.get("slippage_total", 0)
         drawdown_max = performance_stats.get("drawdown_max", 0)
         profit_factor = performance_stats.get("profit_factor", 0)
         execution_quality = performance_stats.get("execution_quality_avg", 0.5)
+        cost_coverage = float(performance_stats.get("cost_coverage") or 0.0)
+        quality_coverage = float(
+            performance_stats.get("execution_quality_coverage") or 0.0)
         skill = performance_stats.get("forecast_skill", 0.5)
 
         # FIXED V7: Check all requirements beyond win rate
@@ -191,7 +208,9 @@ class VenueQualificationEngine:
             "min_edge": avg_edge >= self.requirements["min_avg_edge"],
             "max_drawdown": drawdown_max <= self.requirements["max_drawdown"],
             "min_profit_factor": profit_factor >= self.requirements["min_profit_factor"],
-            "min_execution": execution_quality >= self.requirements["min_execution_quality"],
+            "min_execution": (execution_quality >= self.requirements["min_execution_quality"]
+                              and min(cost_coverage, quality_coverage)
+                              >= self.requirements["min_cost_coverage"]),
         }
 
         is_qualified = all(checks.values())
@@ -211,7 +230,10 @@ class VenueQualificationEngine:
             f"profit ${profit_paper:.2f} >= ${self.requirements['min_profit_paper']}? {checks['min_profit']} | "
             f"avg_edge {avg_edge*100:.1f}% >= {self.requirements['min_avg_edge']*100:.1f}%? {checks['min_edge']} | "
             f"drawdown {drawdown_max*100:.1f}% <= {self.requirements['max_drawdown']*100:.0f}%? {checks['max_drawdown']} | "
-            f"exec_quality {execution_quality:.2f} >= {self.requirements['min_execution_quality']}? {checks['min_execution']} | "
+            f"exec_quality {execution_quality:.2f} >= {self.requirements['min_execution_quality']} "
+            f"on >= {self.requirements['min_cost_coverage']*100:.0f}% of trades "
+            f"(fees measured {cost_coverage*100:.0f}%, quality measured "
+            f"{quality_coverage*100:.0f}%)? {checks['min_execution']} | "
             f"fees ${fees_total:.2f} slippage ${slippage_total:.2f} | "
             f"Qualified {is_qualified} | "
             f"FIXED: now considers net P&L, EV, fees, slippage, drawdown, profit factor, calibration, Brier/log loss, sample size, execution quality not just win rate"

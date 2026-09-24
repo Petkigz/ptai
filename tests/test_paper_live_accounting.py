@@ -606,3 +606,72 @@ class TestTheSettlementReportSaysWhoseMoneyMoved:
         )
         assert summary["paper"]["win_rate"] == pytest.approx(100.0)
         assert summary["win_rate"] == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# a measurement has to cover the sample it is judging
+# ---------------------------------------------------------------------------
+
+class TestTheGateRequiresCostCoverage:
+    """
+    The gate read an average execution quality, not how much of the record it
+    covered - so a venue whose costs were measured on one trade out of 150 was
+    judged on that one measurement, and 0.5 could pass the 0.5 requirement on a
+    single lucky fill.
+    """
+
+    def _engine(self, tmp_path):
+        from src.ptai.venues.qualification import VenueQualificationEngine
+        return VenueQualificationEngine(data_dir=str(tmp_path))
+
+    def _record(self, storage, tracker, n, measured):
+        """`measured` of `n` trades carry cost figures; the rest carry none."""
+        for i in range(n):
+            trade_id = storage.log_trade({
+                "market_id": f"CV{i}", "side": "YES", "position_size_usd": 3.0,
+                "market_price": 0.5, "status": "paper",
+                "execution_mode": "paper"})
+            won = (i % 10) < 8
+            kwargs = ({"fees_usd": 0.06, "slippage_bps": 10.0,
+                       "execution_quality": 0.98}
+                      if i < measured else {})
+            tracker.record_trade(
+                trade_id=str(trade_id), market_id=f"CV{i}",
+                venue_id="polymarket", strategy="value", forecast_prob=0.75,
+                market_price=0.5, edge=0.15, side="YES", amount_usd=3.0,
+                execution_mode="paper", data_mode="live", **kwargs)
+            tracker.record_resolution(str(trade_id), actual_outcome=1.0 if won else 0.0,
+                                      pnl=1.2 if won else -1.8)
+
+    def test_coverage_is_reported_with_the_totals(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "cv1.db"))
+        tracker = TradeOutcomeTracker(storage=storage)
+        self._record(storage, tracker, 20, measured=5)
+        stats = qualification_stats_from_outcomes(storage, "polymarket")
+        assert stats["costs_measured"] == 5
+        assert stats["cost_coverage"] == pytest.approx(0.25)
+        assert stats["execution_quality_coverage"] == pytest.approx(0.25)
+
+    def test_a_thin_measurement_does_not_qualify_a_venue(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "cv2.db"))
+        tracker = TradeOutcomeTracker(storage=storage)
+        # 150 trades, a good record, but costs measured on 10 of them - and those
+        # ten look excellent.
+        self._record(storage, tracker, 150, measured=10)
+        stats = qualification_stats_from_outcomes(storage, "polymarket")
+        result = self._engine(tmp_path).evaluate_qualification("polymarket", stats)
+        assert result.is_qualified is False, (
+            "a venue was qualified on a cost measurement covering 7% of its "
+            f"trades; reasoning: {result.reasoning[-200:]}"
+        )
+        assert "exec_quality" in result.reasoning
+
+    def test_a_complete_measurement_is_not_penalised(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "cv3.db"))
+        tracker = TradeOutcomeTracker(storage=storage)
+        self._record(storage, tracker, 150, measured=150)
+        stats = qualification_stats_from_outcomes(storage, "polymarket")
+        assert stats["cost_coverage"] == pytest.approx(1.0)
+        # The same record that qualifies elsewhere in the suite still does: the
+        # check is passable, so the coverage bar cannot be read as "never trade".
+        assert stats["execution_quality_avg"] > 0.5

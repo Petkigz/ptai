@@ -242,7 +242,12 @@ def test_qualification_beyond_win_rate():
         "log_loss": 0.4,
         "calibration_ece": 0.08,
         "execution_quality_avg": 0.7,
-        "forecast_skill": 0.65
+        "forecast_skill": 0.65,
+        # The gate requires the execution-quality average to cover the sample it
+        # is judging; a caller claiming one must say how much of the record it
+        # came from.
+        "cost_coverage": 1.0,
+        "execution_quality_coverage": 1.0,
     }
     
     result2 = engine.evaluate_qualification("test_venue_winning", perf_winning)

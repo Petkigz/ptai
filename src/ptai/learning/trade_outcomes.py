@@ -424,6 +424,8 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         # execution-quality check by coincidence.
         "execution_quality_avg": 0.0,
         "costs_measured": 0, "slippage_measured": 0,
+        "execution_quality_measured": 0, "cost_coverage": 0.0,
+        "execution_quality_coverage": 0.0,
         "modes": [], "live_trades": 0, "paper_trades": 0,
         "unclassified_trades": 0,
         # None, not 0.0: nothing was ever predicted, which is not the same as
@@ -505,6 +507,12 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
     quality_values = [float(r["execution_quality"]) for r in rows
                       if r["execution_quality"] is not None]
     modes = [str(r["data_mode"] or "") for r in rows]
+    # How much of the sample the cost figures actually cover. A total over 3 of
+    # 150 trades, or an execution-quality average from one measurement, must not
+    # be readable as a measured venue - the gate needs the fraction, not just the
+    # totals.
+    cost_coverage = len(fee_values) / n if n else 0.0
+    quality_coverage = len(quality_values) / n if n else 0.0
 
     # Realised P&L split by EXECUTION mode, which is what this split is about.
     #
@@ -604,6 +612,9 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         # measurement cannot be mistaken for a complete one.
         "costs_measured": len(fee_values),
         "slippage_measured": len(slip_values),
+        "execution_quality_measured": len(quality_values),
+        "cost_coverage": cost_coverage,
+        "execution_quality_coverage": quality_coverage,
         "modes": sorted(set(m for m in modes if m)),
         "live_trades": len(live_rows),
         "paper_trades": len(paper_rows),

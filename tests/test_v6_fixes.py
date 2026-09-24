@@ -314,7 +314,12 @@ def test_venue_qualification_robust():
         "total_paper_trades": 120, "win_rate": 0.60, "brier_score": 0.20, "forecast_skill": 0.65, 
         "profit_paper": 15, "avg_edge": 0.05, "net_pnl": 15, "expected_value": 0.05, 
         "profit_factor": 1.5, "log_loss": 0.5, "calibration_ece": 0.1, "execution_quality_avg": 0.6,
-        "fees_total": 2, "slippage_total": 1, "drawdown_max": 0.1
+        "fees_total": 2, "slippage_total": 1, "drawdown_max": 0.1,
+        # How much of the record the cost figures cover. The gate requires the
+        # execution-quality average to be a measurement of the sample it is
+        # judging, not one lucky fill, so a caller claiming 0.6 must say how much
+        # of the record that average came from.
+        "cost_coverage": 1.0, "execution_quality_coverage": 1.0
     }
     result2 = engine.evaluate_qualification("kalshi", perf_qualified)
     assert result2.is_qualified
