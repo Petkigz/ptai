@@ -530,8 +530,16 @@ class TestFullCycle:
         """
         Paper trading is how a venue earns qualification. It must build the
         track record without touching the money.
+
+        Note what changed: the dry-run venue now SIMULATES a fill against its
+        real book before a paper position exists. It used to return a bare
+        refusal, and the loop booked a paper position at the REQUESTED size for
+        it - so the track record this test protects was built on fills that were
+        never priced. The qualification gate would then have been fed positions
+        the venue never produced.
         """
         agent, adapter = build_agent(tmp_path, dry_run=True)
+        adapter.place_order = _simulating_place_order(adapter)
         _force_qualified(agent, monkeypatch)
         _inject_opportunity(agent, adapter._market(), monkeypatch)
         try:
@@ -660,3 +668,201 @@ class TestSettlementDoesNotDependOnCalibration:
             )
         finally:
             agent.storage.close()
+
+
+# ==========================================================================
+# Paper mode: the whole cycle, simulated, against a real book
+# ==========================================================================
+
+def _simulating_place_order(adapter, book=None):
+    """
+    A dry-run venue that simulates its fill, the way the real adapter now does.
+
+    A stub that refuses without pricing anything is still a valid venue - it just
+    produces no paper evidence, which is the correct outcome.
+    """
+    from src.ptai.execution.paper_broker import PaperBroker
+    from src.ptai.markets.mechanics import MarketMechanics
+
+    book = book if book is not None else {
+        "bids": [{"price": "0.54", "size": "5000"}],
+        "asks": [{"price": "0.56", "size": "5000"}]}
+
+    async def place_order(opportunity, max_spend_usd, max_price):
+        adapter.orders_placed += 1
+        mechanics = MarketMechanics(tick_size="0.01", min_order_size=1.0,
+                                    source="clob_market_info", is_real=True)
+        fill = PaperBroker().simulate(book, "BUY", float(max_spend_usd),
+                                      limit_price=float(max_price),
+                                      mechanics=mechanics, book_source="orderbook")
+        return {
+            "status": "paper", "is_real": False, "simulated": True,
+            "venue_id": VENUE, "market_id": opportunity.market.id,
+            "simulated_filled_usd": fill.filled_usd,
+            "filled_usd": fill.filled_usd, "filled_price": fill.avg_price,
+            "price": fill.avg_price or float(max_price),
+            "size": fill.filled_shares, "fees_usd": fill.fee_usd,
+            "paper_fill": fill.to_dict(), "reason": fill.reason,
+        }
+    return place_order
+
+
+class TestPaperModeSimulatesTheWholeCycle:
+    """
+    Paper mode has to be the real system with the order replaced by a
+    simulation. Not a stub that reports success, and not a refusal that reports
+    nothing.
+
+    The venue here is in dry-run, so nothing can be sent. What is asserted is
+    that a trade still comes out the other end - priced by walking the book, at
+    the size the book would actually have filled, recorded as a paper position,
+    consuming paper capital and not live capital.
+    """
+
+    def _paper_venue(self, tmp_path, book):
+        """
+        A dry-run venue that simulates its fill the way the real adapter now
+        does: walk the real ladder, report the size it found, charge the fee.
+        """
+        from src.ptai.execution.paper_broker import PaperBroker
+        from src.ptai.markets.mechanics import MarketMechanics
+
+        adapter = StubVenue(dry_run=True)
+
+        async def get_orderbook(market):
+            adapter.last_book_requested = market.id
+            return dict(book)
+
+        async def place_order(opportunity, max_spend_usd, max_price):
+            adapter.orders_placed += 1
+            mechanics = MarketMechanics(tick_size="0.01", min_order_size=1.0,
+                                        source="clob_market_info", is_real=True)
+            fill = PaperBroker(taker_fee_rate=0.0).simulate(
+                book, "BUY", float(max_spend_usd),
+                limit_price=float(max_price), mechanics=mechanics,
+                book_source="orderbook")
+            return {
+                "status": "paper", "is_real": False, "simulated": True,
+                "venue_id": VENUE, "market_id": opportunity.market.id,
+                "simulated_filled_usd": fill.filled_usd,
+                "filled_usd": fill.filled_usd,
+                "filled_price": fill.avg_price,
+                "price": fill.avg_price or float(max_price),
+                "size": fill.filled_shares,
+                "fees_usd": fill.fee_usd,
+                "paper_fill": fill.to_dict(),
+                "reason": fill.reason,
+            }
+
+        adapter.get_orderbook = get_orderbook
+        adapter.place_order = place_order
+        return adapter
+
+    def _build(self, tmp_path, book):
+        adapter = self._paper_venue(tmp_path, book)
+        agent = TradingAgentV3(country_code="UG", dry_run=True)
+        agent.storage = Storage(db_path=str(tmp_path / "paper.db"))
+        agent.storage.set_bankroll(50.0)
+        _repoint_storage(agent, agent.storage)
+        agent.venue_registry = stub_registry(adapter)
+        agent.multi_venue_executor.registry = agent.venue_registry
+        agent.account_health_engine.venue_registry = agent.venue_registry
+        agent.capability_engine.venue_registry = agent.venue_registry
+        agent.settlement_engine.venue_registry = agent.venue_registry
+        agent._qualified_venue_ids = [VENUE]
+        return agent, adapter
+
+    def test_a_paper_trade_flows_through_the_whole_cycle(self, tmp_path, monkeypatch):
+        """
+        Depth-limited book: $3.00 requested, only $2.26 reachable, so the
+        simulated fill is a fraction of the request. If paper mode books the
+        REQUEST as the position, the ledger is fiction - so that is exactly what
+        this asserts against.
+        """
+        # $1.12 at 0.56 and $1.14 at 0.57: $2.26 reachable inside a $3 guard
+        # cap, so the simulated fill is genuinely short AND the average price
+        # comes from walking two levels.
+        book = {"asks": [{"price": "0.56", "size": "2"},
+                         {"price": "0.57", "size": "2"}]}
+        agent, adapter = self._build(tmp_path, book)
+        _force_qualified(agent, monkeypatch)
+        _inject_opportunity(agent, adapter._market(), monkeypatch)
+
+        result = _cycle(agent)
+        assert adapter.orders_placed >= 1, "the paper venue was never asked"
+        assert result["execution"], "the cycle recorded no execution at all"
+
+        entry = result["execution"][0]
+        fill = entry.get("fill") or {}
+        assert entry.get("position_recorded") is True, (
+            f"a simulated fill did not become a paper position: "
+            f"{entry.get('position_reason')}"
+        )
+        assert fill.get("simulated") is True, "the result was recorded as live"
+
+        requested = fill["requested_usd"]
+        filled = fill["filled_usd"]
+        assert 0 < filled < requested, (
+            f"paper mode filled ${filled:.4f} of a ${requested:.4f} request "
+            f"against a book holding only $14.05 - depth was ignored"
+        )
+
+        positions = agent.storage.get_open_positions()
+        assert len(positions) == 1
+        position = positions[0]
+        assert position["status"] == "paper", (
+            "a simulated fill must not be recorded as a live position holding "
+            "real capital"
+        )
+        assert position["position_size_usd"] == pytest.approx(filled, abs=0.01), (
+            f"the ledger was charged ${position['position_size_usd']:.4f} for a "
+            f"${filled:.4f} simulated fill"
+        )
+        # The average price came from walking the ladder, so it is above the
+        # touch the strategy was looking at.
+        assert position["market_price"] > 0.56
+
+    def test_a_paper_fill_does_not_consume_live_capital(self, tmp_path, monkeypatch):
+        """
+        Two pools. The paper engine must be able to trade all day without
+        touching the budget reserve for real money - that is what makes it safe
+        to leave running.
+        """
+        from src.ptai.execution.capital import CapitalLedger
+
+        book = {"asks": [{"price": "0.56", "size": "5000"}]}
+        agent, adapter = self._build(tmp_path, book)
+        _force_qualified(agent, monkeypatch)
+        _inject_opportunity(agent, adapter._market(), monkeypatch)
+        _cycle(agent)
+
+        plan = CapitalLedger(storage=agent.storage).build(
+            mode="live", budgets={"polymarket": 50.0},
+            balances={"polymarket": {"available": True, "balance": 50.0}})
+        account = plan.accounts[0]
+        assert account.in_positions_usd == 0.0, (
+            "a paper position was charged to live capital"
+        )
+        assert account.available_usd == pytest.approx(50.0)
+
+    def test_paper_mode_with_no_book_records_nothing(self, tmp_path, monkeypatch):
+        """
+        The other half of the honesty rule. With no book there is no fill to
+        simulate, so the cycle must record no position - not a position at the
+        requested price, which is what the old fallback did.
+        """
+        agent, adapter = self._build(tmp_path, {})
+
+        async def no_book(market):
+            return {}
+        adapter.get_orderbook = no_book
+        _force_qualified(agent, monkeypatch)
+        _inject_opportunity(agent, adapter._market(), monkeypatch)
+
+        result = _cycle(agent)
+        positions = agent.storage.get_open_positions()
+        assert positions == [], (
+            "a paper position was opened with no orderbook to price it against"
+        )
+        if result["execution"]:
+            assert result["execution"][0].get("position_recorded") is not True

@@ -1480,16 +1480,25 @@ class TradingAgentV3:
                         "side": opp.side,
                         # The FILL price, not the requested max price. A limit
                         # order at 0.52 that filled at 0.49 changes the P&L and
-                        # the edge, and settlement uses this price.
+                        # the edge, and settlement uses this price. For a paper
+                        # fill it is the average of the levels the simulation
+                        # walked, which is how slippage enters the P&L at all.
                         "market_price": (exec_result.filled_price
                                          or opp.market_price),
                         "fair_value": opp.estimated_fair,
                         "edge": opp.effective_edge,
                         "kelly_fraction": getattr(opp, "_kelly_fraction", None),
                         # The FILLED size, not the intended size.
-                        "position_size_usd": (exec_result.filled_usd
-                                              if exec_result.committed_capital
-                                              else amount_usd),
+                        # What actually went into the position, for real AND
+                        # paper. A simulated fill is usually smaller than the
+                        # request, because the book has finite depth; charging
+                        # the ledger the requested amount overstates exposure and
+                        # is how a paper equity curve drifts into fiction.
+                        # Guaranteed positive by should_record_position, which
+                        # refuses a simulated result that filled nothing. The old
+                        # `or amount_usd` fallback was a live trap: a paper fill
+                        # of $0 booked the whole request.
+                        "position_size_usd": exec_result.position_size_usd,
                         "position_size_pct": (amount_usd / current_bankroll
                                               if current_bankroll else None),
                         "confidence": opp.confidence,

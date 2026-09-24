@@ -139,15 +139,35 @@ class TestAdapterDryRunIsTheGate:
         assert not reached["called"], (
             "place_order reached the real CLOB client during a dry run"
         )
-        assert result["status"] == "dry_run"
+        # A SIMULATED fill, not a no-op refusal. Paper mode has to produce a
+        # number, and the number has to come from the book - the status is still
+        # in the simulated family, so the ledger records a paper position.
+        assert result["status"] == "paper"
         assert result.get("simulated") is True
+        assert result.get("is_real") is False
 
     def test_place_order_in_dry_run_reports_why(self):
         adapter = _credentialed_polymarket(dry_run=True)
         result = asyncio.run(adapter.place_order(_opportunity(), 2.0, 0.5))
+        assert "paper" in result["message"].lower()
         assert "dry run" in result["message"].lower()
-        assert "would place" in result["message"].lower()
-        assert "dry_run=true" in result["reason"].lower()
+        assert "dry_run=true" in result["dry_run_reason"].lower()
+
+    def test_a_simulated_fill_reports_the_book_it_walked(self):
+        """
+        The difference between a simulation and a wish: it says which book it
+        priced against, and labels a fill from an assumed book as not evidence.
+        """
+        adapter = _credentialed_polymarket(dry_run=True)
+        result = asyncio.run(adapter.place_order(_opportunity(), 2.0, 0.5))
+        paper = result.get("paper_fill") or {}
+        assert paper, "no simulated fill detail was returned"
+        assert paper["book_source"] in ("orderbook", "assumed_default")
+        if paper["book_source"] == "assumed_default":
+            assert paper["is_real"] is False
+            assert paper["warnings"], (
+                "a fill simulated with no book must carry its warning"
+            )
 
     def test_live_adapter_without_a_client_does_not_claim_success(self):
         """

@@ -41,6 +41,7 @@ from src.ptai.execution.multi_venue_executor import (
     FILLED_STATUSES,
     NO_POSITION_STATUSES,
     SIMULATED_STATUSES,
+    ExecutionResult,
     MultiVenueExecutor,
 )
 from src.ptai.execution.position_ledger import PositionLedgerBuilder
@@ -198,7 +199,24 @@ class TestExecutionResultClassification:
         r = self._result(status)
         assert r.committed_capital is False
         assert r.is_simulated is True
-        assert r.should_record_position is True, (
+        # A simulated result records a position only if it SIMULATED a fill.
+        # This used to be True for any simulated status, and the loop then
+        # booked the REQUESTED size - so a dry run with no fill became a paper
+        # position at a price nobody traded at. A venue that cannot price a
+        # fill produces no paper evidence, which is the honest outcome: a
+        # fabricated position would qualify a venue on trades that never
+        # existed.
+        result_with_size = ExecutionResult(
+            venue_id="v", market_id="m", status="dry_run", amount_usd=2.0,
+            price=0.5, fees_usd=0.0, gas_usd=0.0, latency_ms=1.0, reasoning="",
+            filled_usd=1.8, filled_price=0.5,
+            paper_fill={"filled_usd": 1.8})
+        assert result_with_size.should_record_position is True, (
+            "a simulated fill with a size must become a paper position, which "
+            "is how paper trading qualifies venues"
+        )
+        assert result_with_size.position_size_usd == pytest.approx(1.8)
+        assert r.should_record_position is False, (
             "a dry run still produces a PAPER position, which is how paper "
             "trading qualifies venues"
         )

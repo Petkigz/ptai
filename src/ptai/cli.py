@@ -301,6 +301,34 @@ def run(
     except KeyboardInterrupt:
         console.print("[yellow]Stopped by user[/yellow]")
 
+@app.command("console")
+def console_command(
+    port: int = typer.Option(8101, "--port", help="Port for the console"),
+    host: str = typer.Option("0.0.0.0", "--host", help="Bind address"),
+):
+    """
+    Open the operator console: capital, mode switch, orders, results.
+
+    Starts in PAPER mode. Paper simulates the whole loop against the real
+    orderbook and moves no money, so it needs neither capital nor credentials -
+    which is why it is where a new install should start.
+
+    Live mode is refused from the UI until a venue is both funded and authorised,
+    because an armed system that cannot fire is worse than an honest paper one.
+    """
+    from .ui.console import main as console_main
+
+    console.print(Panel(
+        f"[bold]PTAI Console[/bold]\n"
+        f"http://localhost:{port}\n\n"
+        f"Starts in PAPER mode. Nothing is sent to a venue until you switch to "
+        f"live, and live is refused unless a venue is funded and authorised.\n\n"
+        f"[dim]Funding: money goes to the VENUE account, not to the agent. "
+        f"See the Capital & Funding tab.[/dim]",
+        title="Operator Console"
+    ))
+    console_main(host=host, port=port)
+
 @app.command()
 def status():
     """Show agent status and performance"""

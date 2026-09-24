@@ -49,6 +49,10 @@ class ExecutionResult:
     # A send that failed with no venue confirmation: the order may exist.
     unconfirmed_send: bool = False
     trade_ids: List[str] = field(default_factory=list)
+    # The simulated fill, when this was a paper execution: the walk of the real
+    # book behind the numbers above. Kept so the reason a paper trade filled at
+    # 0.564 rather than 0.56 is inspectable rather than folklore.
+    paper_fill: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def committed_capital(self) -> bool:
@@ -106,6 +110,26 @@ class ExecutionResult:
         return max(0.0, float(self.original_size) - float(matched))
 
     @property
+    def position_size_usd(self) -> float:
+        """
+        What this execution actually put at risk.
+
+        For a real fill it is what filled. For a paper fill it is what the
+        simulation says would have filled, which is usually less than the request
+        because depth is finite. Charging the ledger the REQUESTED amount for a
+        paper trade overstates exposure and understates free cash, and it is how
+        a paper equity curve becomes fiction.
+        """
+        if self.filled_usd > 0:
+            return self.filled_usd
+        if self.is_simulated:
+            simulated = self.paper_fill or {}
+            value = simulated.get("filled_usd")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return 0.0
+
+    @property
     def should_record_position(self) -> bool:
         """
         Should a POSITION row be written?
@@ -115,8 +139,17 @@ class ExecutionResult:
         with nothing matched is not a position - it is an ORDER, and it belongs
         in the order book table where it reserves capital without claiming
         shares.
+
+        A SIMULATED execution with nothing filled is the same case. Paper mode
+        against a book that cannot supply the order, or with no book at all,
+        would otherwise record a position at the REQUESTED size - which is the
+        old fiction wearing a new label.
         """
-        return self.committed_capital or self.is_simulated
+        if self.committed_capital:
+            return True
+        if self.is_simulated:
+            return self.position_size_usd > 0
+        return False
 
     def to_position_dict(self) -> Dict[str, Any]:
         """The facts of what filled. Zeros are honest: nothing filled."""
@@ -341,6 +374,8 @@ class MultiVenueExecutor:
                 resting_usd=_resting_usd(fill, max_spend_usd),
                 unconfirmed_send=bool(fill.get("unconfirmed_send")),
                 trade_ids=list(fill.get("trade_ids") or []),
+                paper_fill=(result.get("paper_fill")
+                            if isinstance(result, dict) else None) or {},
             )
         except Exception as e:
             latency = (time.time() - start) * 1000
@@ -469,6 +504,20 @@ class MultiVenueExecutor:
                             "order_id": order_id,
                             "note": f"status {raw_status!r} but no fill size reported - "
                                     f"cannot account for an unquantified position"}
+        elif status in SIMULATED_STATUSES:
+            # A SIMULATED fill carries numbers too, and they are the point of
+            # paper mode. The old code zeroed every field for a simulated result,
+            # so the loop fell back to the REQUESTED size and price and paper
+            # trading filled every order completely, instantly, at the price the
+            # agent wanted. The simulated values come from a walk of the real
+            # orderbook and must survive to the ledger, or paper mode measures
+            # nothing.
+            if filled_usd <= 0:
+                for key in ("simulated_filled_usd", "filled_usd", "amount_usd"):
+                    value = _num(result.get(key))
+                    if value is not None:
+                        filled_usd = value
+                        break
         else:
             filled_usd = 0.0
 
@@ -476,7 +525,8 @@ class MultiVenueExecutor:
                 "order_id": order_id, "raw_status": raw_status,
                 "size_matched": size_matched, "original_size": original_size,
                 "unconfirmed_send": bool(result.get("unconfirmed_send")),
-                "trade_ids": list(result.get("trade_ids") or [])}
+                "trade_ids": list(result.get("trade_ids") or []),
+                "simulated": status in SIMULATED_STATUSES}
 
     @staticmethod
     def _read_price(result: Dict[str, Any], fallback: float) -> float:

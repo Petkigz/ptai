@@ -550,14 +550,30 @@ class PolymarketAdapter(MarketAdapter):
                 if self.dry_run else
                 "adapter has no live credentials (private_key + funder)"
             )
-            logger.info(f"Polymarket {market_id}: {reason} - returning simulated fill")
-            sim = self.real_order_refusal(max_spend_usd, max_price,
-                                          opportunity.side, market_id)
-            sim["message"] = (
-                f"DRY RUN - would place {opportunity.side} ${max_spend_usd:.2f} "
+            # A SIMULATED FILL, not a no-op refusal. Paper mode that reports
+            # "would have placed $3 at 0.55" and then books the position at
+            # exactly $3 and 0.55 is not a simulation: it fills every order
+            # completely, instantly, at the price the agent chose, with no fees
+            # and no depth limit. That system reports an excellent equity curve
+            # and has learned nothing, because it never models the book.
+            #
+            # So: walk the real ladder, charge the real fee, and report the fill
+            # the book would actually have produced - including none at all.
+            paper = await self.place_paper_order(opportunity, float(max_spend_usd),
+                                                 float(max_price))
+            if paper.get("status") != "paper":
+                # The book could not be read, so no honest fill can be produced.
+                # Still a refusal, and it says why.
+                sim = self.real_order_refusal(max_spend_usd, max_price,
+                                              opportunity.side, market_id)
+                sim["message"] = f"{reason}; no fill could be simulated: {paper.get('reason')}"
+                return sim
+            paper["dry_run_reason"] = reason
+            paper["message"] = (
+                f"PAPER - simulated {opportunity.side} ${max_spend_usd:.2f} "
                 f"@ {max_price} for {market_id} ({reason})"
             )
-            return sim
+            return paper
 
         # Resolve the token to trade. Polymarket orders are placed against a
         # CLOB token id, not a market id.
@@ -622,6 +638,10 @@ class PolymarketAdapter(MarketAdapter):
             logger.error(f"Polymarket execution failed for {market_id}: {e}")
             return {"status": "error", "error": str(e), "venue_id": "polymarket",
                     "market_id": market_id, "unconfirmed_send": True}
+        except Exception as e:
+            logger.error(f"Polymarket execution failed for {market_id}: {e}")
+            return {"status": "error", "error": str(e), "venue_id": "polymarket",
+                    "market_id": market_id, "unconfirmed_send": True}
 
         if isinstance(result, dict):
             result.setdefault("venue_id", "polymarket")
@@ -634,6 +654,83 @@ class PolymarketAdapter(MarketAdapter):
             result.setdefault("size", size)
             result["requested_price"] = price
             result["mechanics"] = mechanics.to_dict()
+        return result
+
+    async def place_paper_order(self, opportunity, max_spend_usd: float,
+                                 max_price: float) -> Dict[str, Any]:
+        """
+        Simulate the order against the real book and report what WOULD have filled.
+
+        This is what makes paper mode worth running. It does not send anything,
+        but it does not pretend either: it walks the actual ladder, charges the
+        fee, respects the tick and the venue minimum, and reports a partial fill
+        or a resting order when that is what the book would have produced.
+
+        The failures are kept in: an order that would have rested unfilled is a
+        paper result of zero, which is information. A simulator that fills it
+        anyway manufactures an edge that does not exist.
+        """
+        from ..execution.paper_broker import PaperBroker
+
+        token_id = self._resolve_token_id(opportunity)
+        if not token_id:
+            return {"status": "rejected", "venue_id": "polymarket",
+                    "reason": "no token id, so there is no book to simulate against"}
+
+        mechanics = self.get_mechanics(opportunity, token_id=token_id)
+        side = "BUY" if str(opportunity.side).upper() in ("YES", "BUY") else "SELL"
+        limit = mechanics.round_price(float(max_price), side)
+
+        book = None
+        source = "assumed_default"
+        try:
+            book = await asyncio.to_thread(self.client.get_orderbook, token_id)
+            if isinstance(book, dict) and (book.get("bids") or book.get("asks")):
+                source = "orderbook"
+        except Exception as e:
+            logger.warning(f"Paper order could not read a book for {token_id}: "
+                           f"{type(e).__name__}: {e}")
+
+        broker = PaperBroker(
+            mechanics=mechanics,
+            taker_fee_rate=float(getattr(mechanics, "taker_fee_rate", 0.0) or 0.0),
+        )
+        fill = broker.simulate(book, side, float(max_spend_usd), limit_price=limit,
+                               mechanics=mechanics, book_source=source)
+
+        result = {
+            # "paper" keeps this in the SIMULATED_STATUSES family: no real
+            # capital, and the ledger records a paper position.
+            "status": "paper",
+            "is_real": False,
+            "simulated": True,
+            "venue_id": "polymarket",
+            "market_id": getattr(opportunity.market, "id", ""),
+            "token_id": token_id,
+            "requested_price": float(max_price),
+            "requested_size": float(max_spend_usd) / float(max_price) if max_price else 0.0,
+            "signed_price": limit,
+            "signed_size": mechanics.shares_for_usd(float(max_spend_usd), limit, side),
+            "price": fill.avg_price or limit,
+            "size": fill.filled_shares,
+            # What the executor reads. The simulated size and price, never the
+            # requested ones.
+            "simulated_filled_usd": fill.filled_usd,
+            "filled_usd": fill.filled_usd,
+            "filled_price": fill.avg_price,
+            "fees_usd": fill.fee_usd,
+            "paper_fill": fill.to_dict(),
+            "mechanics": mechanics.to_dict(),
+            "reason": fill.reason,
+        }
+        if fill.is_fill:
+            logger.info(
+                f"PAPER fill {opportunity.market.id}: ${fill.filled_usd:.4f} at "
+                f"{fill.avg_price:.4f} ({fill.slippage_bps:.0f}bps vs touch, "
+                f"fee ${fill.fee_usd:.4f}) - simulated, no order sent")
+        else:
+            logger.info(
+                f"PAPER no fill {opportunity.market.id}: {fill.reason}")
         return result
 
     # ------------------------------------------------------------------
