@@ -233,18 +233,31 @@ class TradingAgentV3:
         )
         
         # Register all venues
+        #
+        # The vault read was `self.vault.get(...)`, and Vault has no `get` - so
+        # this raised AttributeError on EVERY construction, and the handler then
+        # set both credentials to None. The settings fallback was never reached,
+        # because the exception happened before it was evaluated. The result was
+        # an agent that could not go live with correct credentials in the vault
+        # AND in settings, reporting "unconfigured" as if nothing had been
+        # supplied. Credentials are now read by their real names, and a vault
+        # failure still falls through to settings rather than discarding them.
         try:
-            pk = self.vault.get("Trader", "polymarket_clob", {}).get("private_key") or self.settings.polymarket_private_key
-            funder = self.vault.get("Trader", "polymarket_clob", {}).get("funder") or self.settings.polymarket_funder_address
+            stored = self.vault.get_tool_credentials("Trader", "polymarket_clob") or {}
         except Exception as e:
             # Not `except: pass`. Silent credential loss looks exactly like
             # "no credentials configured", and every downstream gate then
             # reports paper-only for a reason nobody can see.
             logger.error(f"Could not read Polymarket credentials from the vault: "
-                         f"{type(e).__name__}: {e}. Live trading and redemption "
-                         f"will report as unconfigured.")
-            pk = None
-            funder = None
+                         f"{type(e).__name__}: {e}. Falling back to settings.")
+            stored = {}
+        pk = stored.get("private_key") or self.settings.polymarket_private_key
+        funder = stored.get("funder") or self.settings.polymarket_funder_address
+        if not pk or not funder:
+            logger.info(
+                "No Polymarket credentials from the vault or settings, so live "
+                "trading and redemption report as unconfigured. Paper trading "
+                "needs neither.")
 
         # Kept on the instance because the venue's order probe, the redemption
         # client and the account-health ladder all need them. They used to be
@@ -941,6 +954,23 @@ class TradingAgentV3:
         # Flow: ALL AVAILABLE VENUES -> Capability Check -> Trading available? Data quality? Liquidity sufficient? -> Strategy Check -> Historical Edge? -> Fees/Slippage -> Legal/Account -> QUALIFIED -> OPPORTUNITY ENGINE
         logger.info("V8 Qualification Engine: Checking all venues capability - trading available? data quality? liquidity? historical edge? fees/slippage? legal eligibility?")
         logger.info("Core Objective: PTAI searches every qualified venue and strategy available to it, measures the opportunity on a common risk-adjusted basis, and only deploys capital when the opportunity passes its independently enforced rules.")
+        # Requalification from what actually resolved. This is the connection
+        # that was missing: the gate reads adapter.performance_stats (never
+        # written) and a JSON file only tests ever wrote, so its sample size was
+        # permanently zero and no venue could ever earn its way to live - while a
+        # stale file was read back as evidence. Every cycle, every registered
+        # venue's numbers are rebuilt from the outcome log.
+        try:
+            refreshed = self._refresh_qualifications()
+            logger.info(
+                f"Qualification inputs refreshed from recorded outcomes: "
+                f"{refreshed} venue(s)")
+        except Exception as e:
+            logger.error(
+                f"Could not refresh qualification inputs: {type(e).__name__}: {e}. "
+                f"The gate will read whatever it last held, so treat the "
+                f"qualification result as stale.")
+
         try:
             qualification_report = await self.capability_engine.evaluate_all_venues(target_per_venue=20)
             logger.info(f"Qualification: {qualification_report.reasoning}")
@@ -1755,6 +1785,24 @@ class TradingAgentV3:
         logger.info(f"V3 Report: {scan_result.reasoning}")
         
         return result
+
+    def _refresh_qualifications(self) -> int:
+        """
+        Rebuild the qualification gate's inputs from the recorded outcomes.
+
+        Returns the number of venues refreshed. A venue with no recorded
+        outcomes is refreshed too, with zeros - which fail every statistical
+        check. That is deliberate: an unmeasured venue must not inherit the
+        result of a measurement that was never made, and a venue that loses its
+        evidence must lose its qualification with it.
+        """
+        from ..learning.trade_outcomes import qualification_stats_from_outcomes
+
+        registered = list(getattr(self.venue_registry, "adapters", {}) or {})
+        for venue_id in registered:
+            stats = qualification_stats_from_outcomes(self.storage, venue_id)
+            self.qualification_engine.evaluate_qualification(venue_id, stats)
+        return len(registered)
 
     def _venue_selection(self, qualified_venue_ids=None) -> Optional[Dict[str, Any]]:
         """

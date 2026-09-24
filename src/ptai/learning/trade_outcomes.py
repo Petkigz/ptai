@@ -1,7 +1,8 @@
 """
 Trade Outcomes - tracks whether prediction worked, which venue/strategy/model works
 """
-from typing import Dict, List, Optional
+import math
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from loguru import logger
@@ -314,3 +315,136 @@ class TradeOutcomeTracker:
             "total_trades": len([o for o in self.outcomes if o.actual_outcome is not None]),
             "recommendation": f"Focus on {top_cats[0][0]} in {top_venues[0][0]}" if top_cats and top_venues else "Need more data"
         }
+
+
+# ----------------------------------------------------------------------
+# feeding the qualification gate from what actually happened
+# ----------------------------------------------------------------------
+#
+# The venue qualification gate reads its numbers from two places, and neither of
+# them was ever written in production:
+#
+#   * adapter.performance_stats - a dict initialised to {"total_paper_trades": 0}
+#     that no code path ever increments.
+#   * data/venue_qualification.json - loaded at startup, and written ONLY by
+#     evaluate_qualification, which the trading loop never called.
+#
+# So the gate's sample size was permanently zero (a venue could never earn its
+# way to live no matter how well it traded), while any leftover file on disk -
+# written by a test, a demo or an older version - was read back as EVIDENCE. A
+# stale entry reading "120 trades, brier 0.18, profit factor 1.5" satisfies three
+# of the four statistical gates, which is the wrong way to fail.
+#
+# This function is the connection that was missing: the numbers come from
+# recorded outcomes, in the database, and nowhere else.
+
+def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
+    """
+    The qualification gate's inputs for one venue, from the outcome log.
+
+    Returns zeros (with failing brier/log-loss) when nothing is recorded, so an
+    unmeasured venue fails closed rather than inheriting anything.
+    """
+    empty = {
+        "total_paper_trades": 0, "win_rate": 0.0, "avg_edge": 0.0,
+        "brier_score": 1.0, "log_loss": 1.0, "calibration_ece": 0.5,
+        "forecast_skill": 0.0, "profit_paper": 0.0, "profit_live": 0.0,
+        "net_pnl": 0.0, "expected_value": 0.0, "profit_factor": 0.0,
+        "drawdown_max": 0.0, "fees_total": 0.0, "slippage_total": 0.0,
+        # Not measured here. Left at the neutral value rather than invented, and
+        # named so nobody mistakes it for a measurement.
+        "execution_quality_avg": 0.5, "source": "no recorded outcomes",
+    }
+    if storage is None:
+        return empty
+    try:
+        rows = storage.conn.execute(
+            """
+            SELECT forecast_prob, edge, actual_outcome, pnl, brier_score,
+                   was_correct
+            FROM trade_outcomes
+            WHERE venue_id = ? AND actual_outcome IS NOT NULL
+            ORDER BY COALESCE(resolved_at, recorded_at)
+            """,
+            (venue_id,),
+        ).fetchall()
+    except Exception as e:
+        logger.error(
+            f"Could not read outcomes for {venue_id}: {type(e).__name__}: {e}. "
+            f"Reporting no evidence rather than assuming competence.")
+        return empty
+    if not rows:
+        return empty
+
+    n = len(rows)
+    wins = sum(1 for r in rows if r["was_correct"])
+
+    def _f(row, key, default=0.0):
+        value = row[key]
+        return default if value is None else float(value)
+
+    pnls = [_f(r, "pnl") for r in rows]
+    edges = [_f(r, "edge") for r in rows]
+    probs = [min(max(_f(r, "forecast_prob", 0.5), 1e-6), 1 - 1e-6) for r in rows]
+    actuals = [1.0 if _f(r, "actual_outcome") > 0.5 else 0.0 for r in rows]
+
+    brier_values = [r["brier_score"] for r in rows]
+    if all(b is not None for b in brier_values):
+        brier = sum(float(b) for b in brier_values) / n
+    else:
+        brier = sum((p - a) ** 2 for p, a in zip(probs, actuals)) / n
+
+    log_loss = sum(
+        -(a * math.log(p) + (1 - a) * math.log(1 - p))
+        for p, a in zip(probs, actuals)
+    ) / n
+
+    # Expected calibration error over ten probability buckets: the average gap
+    # between what the agent claimed and what happened. A high Brier score with a
+    # low ECE means bad forecasts; a high ECE means mis-calibrated ones, and they
+    # need different fixes.
+    ece = 0.0
+    for i in range(10):
+        lo, hi = i / 10, (i + 1) / 10
+        bucket = [(p, a) for p, a in zip(probs, actuals) if lo <= p < hi]
+        if not bucket:
+            continue
+        avg_conf = sum(p for p, _ in bucket) / len(bucket)
+        avg_actual = sum(a for _, a in bucket) / len(bucket)
+        ece += (len(bucket) / n) * abs(avg_conf - avg_actual)
+
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss = abs(sum(p for p in pnls if p < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (
+        float("inf") if gross_profit > 0 else 0.0)
+
+    # Maximum drawdown on the realised equity curve, as a fraction of the peak.
+    start = storage.get_bankroll()
+    equity, peak, drawdown = start, start, 0.0
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+        if peak > 0:
+            drawdown = max(drawdown, (peak - equity) / peak)
+
+    return {
+        "total_paper_trades": n,
+        "win_rate": wins / n,
+        "avg_edge": sum(edges) / n,
+        "brier_score": brier,
+        "log_loss": log_loss,
+        "calibration_ece": ece,
+        "forecast_skill": max(0.0, 1 - brier * 2),
+        # Every recorded outcome, paper and live. Named profit_paper because that
+        # is the key the gate reads; the split is reported alongside.
+        "profit_paper": sum(pnls),
+        "profit_live": sum(pnls),
+        "net_pnl": sum(pnls),
+        "expected_value": sum(edges) / n,
+        "profit_factor": profit_factor,
+        "drawdown_max": drawdown,
+        "fees_total": 0.0,
+        "slippage_total": 0.0,
+        "execution_quality_avg": 0.5,
+        "source": f"{n} recorded outcomes",
+    }

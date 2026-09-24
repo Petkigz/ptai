@@ -473,3 +473,91 @@ class TestRestrictedIsNotUnknown:
             "the report must state that these are blocked on research rather "
             "than on law"
         )
+
+
+class TestCredentialsReachTheAgent:
+    """
+    A credential that never arrives looks exactly like a credential that was
+    never configured.
+
+    `TradingAgentV3.__init__` read the vault with `self.vault.get(...)`, and Vault
+    has no `get`. That raised AttributeError on EVERY construction, and the
+    handler set both credentials to None. The settings fallback on the same line
+    was never evaluated, because the exception happened first. So an operator
+    with a correct key in the vault AND in settings got an agent that reported
+    "unconfigured" - and live trading, the order probe and redemption were all
+    permanently unreachable for a reason no message explained.
+    """
+
+    def test_credentials_from_the_vault_reach_the_agent(self, monkeypatch):
+        from src.ptai.agent import v3_loop as mod
+
+        class FakeVault:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_tool_credentials(self, teammate, tool):
+                return {"private_key": "0xKEY", "funder": "0xFUNDER"}
+
+        monkeypatch.setattr(mod, "Vault", FakeVault)
+        agent = mod.TradingAgentV3(country_code="UG", dry_run=True)
+        assert agent.private_key == "0xKEY"
+        assert agent.funder == "0xFUNDER"
+        # ... and reach the venue that needs them, or the read proved nothing.
+        adapter = agent.venue_registry.adapters["polymarket"]
+        assert adapter.capabilities.supports_trading is True, (
+            "the adapter still believes it cannot trade, so the credentials "
+            "stopped at the agent"
+        )
+
+    def test_a_broken_vault_falls_back_to_settings(self, monkeypatch):
+        """
+        A vault that cannot be read must not discard credentials that settings
+        already hold. Losing them silently is worse than the vault error itself.
+        """
+        from src.ptai.agent import v3_loop as mod
+
+        class BrokenVault:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_tool_credentials(self, teammate, tool):
+                raise RuntimeError("vault unreadable")
+
+        monkeypatch.setattr(mod, "Vault", BrokenVault)
+        # The agent shares the process settings object, so patch it in a way
+        # that is undone afterwards - mutating it directly leaks into every
+        # later test in the session.
+        probe = mod.TradingAgentV3(country_code="UG", dry_run=True)
+        monkeypatch.setattr(probe.settings, "polymarket_private_key",
+                            "0xFROM_SETTINGS")
+        monkeypatch.setattr(probe.settings, "polymarket_funder_address",
+                            "0xFUNDER_SETTINGS")
+
+        # Constructed again with those settings in place.
+        agent2 = mod.TradingAgentV3(country_code="UG", dry_run=True)
+        assert agent2.private_key == "0xFROM_SETTINGS"
+        assert agent2.funder == "0xFUNDER_SETTINGS"
+
+    def test_no_credentials_anywhere_is_none_and_paper_still_works(self, monkeypatch):
+        """
+        The honest default. No credentials means no live trading - and paper
+        trading, which is how a venue earns the right to hold money, is
+        unaffected.
+        """
+        from src.ptai.agent import v3_loop as mod
+
+        class EmptyVault:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_tool_credentials(self, teammate, tool):
+                return None
+
+        monkeypatch.setattr(mod, "Vault", EmptyVault)
+        agent = mod.TradingAgentV3(country_code="UG", dry_run=True)
+        assert agent.private_key is None
+        assert agent.funder is None
+        # A redemption client with no funder must skip rather than raise: there
+        # is no position list to read without an address.
+        assert getattr(agent.redeemer, "funder", None) in (None, "")
