@@ -561,6 +561,99 @@ class TestFullCycle:
         finally:
             agent.storage.close()
 
+    def test_the_cycle_refreshes_qualification_from_recorded_outcomes(
+            self, tmp_path, monkeypatch):
+        """
+        A real cycle must re-read the gate's inputs, not just be capable of it.
+
+        An external review concluded `_refresh_qualifications` was "defined but
+        never called". It is called, but the test that should have settled the
+        argument called the helper DIRECTLY - so it would have passed even if the
+        call site were deleted. This runs the cycle and inspects the gate.
+        """
+        from src.ptai.learning.trade_outcomes import TradeOutcomeTracker
+
+        agent, adapter = build_agent(tmp_path, dry_run=True)
+        _force_qualified(agent, monkeypatch)
+        # Start from an empty gate. VenueQualificationEngine loads
+        # data/venue_qualification.json at construction, and a value left there by
+        # an earlier run would satisfy the assertion below without the refresh
+        # ever running - which is exactly the contamination this whole change is
+        # about.
+        agent.qualification_engine.qualifications.clear()
+        try:
+            # A losing record that is nothing like a qualification.
+            tracker = TradeOutcomeTracker(storage=agent.storage)
+            for i in range(120):
+                tid = agent.storage.log_trade({
+                    "market_id": f"Q{i}", "venue_id": VENUE, "side": "YES",
+                    "position_size_usd": 3.0, "market_price": 0.5,
+                    "fair_value": 0.9, "edge": -0.3, "confidence": 0.8,
+                    "strategy": "value"})
+                agent.storage.resolve_trade(tid, outcome=0.0, pnl=-3.0)
+                tracker.record_trade(trade_id=str(tid), market_id=f"Q{i}",
+                                     venue_id=VENUE, strategy="value",
+                                     forecast_prob=0.9, market_price=0.5,
+                                     edge=-0.3, side="YES", amount_usd=3.0)
+                tracker.record_resolution(str(tid), actual_outcome=0.0, pnl=-3.0)
+
+            _cycle(agent)
+
+            qual = agent.qualification_engine.qualifications.get(VENUE)
+            assert qual is not None, (
+                "the cycle never refreshed qualification, so the gate has no "
+                "numbers for a venue with 120 recorded outcomes")
+            assert qual.total_paper_trades == 120, (
+                f"the gate read {qual.total_paper_trades} trades, not the 120 "
+                f"recorded - the cycle is not feeding it from the outcome log"
+            )
+            assert qual.is_qualified is False, (
+                "a venue losing $3 on every trade was qualified"
+            )
+            assert qual.net_pnl < 0
+        finally:
+            agent.storage.close()
+
+    def test_the_refresh_assertion_is_not_vacuous(self, tmp_path, monkeypatch):
+        """
+        Prove the test above depends on the CALL, not just on the helper existing.
+
+        With the refresh stubbed out, the gate must end up with no numbers for a
+        venue that has 120 recorded outcomes. If this still passed, the previous
+        test would be asserting nothing.
+        """
+        from src.ptai.learning.trade_outcomes import TradeOutcomeTracker
+
+        agent, adapter = build_agent(tmp_path, dry_run=True)
+        _force_qualified(agent, monkeypatch)
+        agent.qualification_engine.qualifications.clear()
+        try:
+            tracker = TradeOutcomeTracker(storage=agent.storage)
+            for i in range(120):
+                tid = agent.storage.log_trade({
+                    "market_id": f"V{i}", "venue_id": VENUE, "side": "YES",
+                    "position_size_usd": 3.0, "market_price": 0.5,
+                    "fair_value": 0.9, "edge": -0.3, "confidence": 0.8,
+                    "strategy": "value"})
+                agent.storage.resolve_trade(tid, outcome=0.0, pnl=-3.0)
+                tracker.record_trade(trade_id=str(tid), market_id=f"V{i}",
+                                     venue_id=VENUE, strategy="value",
+                                     forecast_prob=0.9, market_price=0.5,
+                                     edge=-0.3, side="YES", amount_usd=3.0)
+                tracker.record_resolution(str(tid), actual_outcome=0.0, pnl=-3.0)
+
+            monkeypatch.setattr(type(agent), "_refresh_qualifications",
+                                lambda self: 0)
+            _cycle(agent)
+
+            qual = agent.qualification_engine.qualifications.get(VENUE)
+            assert qual is None or qual.total_paper_trades == 0, (
+                "the gate filled itself without the refresh, so the assertion "
+                "in the previous test does not depend on the call site"
+            )
+        finally:
+            agent.storage.close()
+
     def test_paper_positions_do_not_consume_live_capital(self, tmp_path, monkeypatch):
         """
         Paper trading is how a venue earns qualification. It must build the

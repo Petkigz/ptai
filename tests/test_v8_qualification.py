@@ -1,6 +1,8 @@
 """
 Tests for V8 Venue/Strategy Qualification Engine - properly connected to main loop
 """
+import tempfile
+
 import pytest
 from src.ptai.venues.registry import VenueRegistry
 from src.ptai.venues.polymarket_adapter import PolymarketAdapter
@@ -30,7 +32,7 @@ async def test_capability_check_trading_available():
     poly = PolymarketAdapter(private_key=None, funder=None)  # No keys
     registry.register(poly)
     
-    qual = VenueQualificationEngine()
+    qual = VenueQualificationEngine(data_dir=tempfile.mkdtemp())
     cap_engine = VenueStrategyQualificationEngine(
         venue_registry=registry,
         qualification_engine=qual,
@@ -51,7 +53,7 @@ async def test_capability_check_data_quality():
     poly = PolymarketAdapter()
     registry.register(poly)
     
-    qual = VenueQualificationEngine()
+    qual = VenueQualificationEngine(data_dir=tempfile.mkdtemp())
     cap_engine = VenueStrategyQualificationEngine(registry, qual, "UG")
     
     # Good data
@@ -68,7 +70,7 @@ async def test_capability_check_liquidity_insufficient():
     poly = PolymarketAdapter()
     registry.register(poly)
     
-    qual = VenueQualificationEngine()
+    qual = VenueQualificationEngine(data_dir=tempfile.mkdtemp())
     cap_engine = VenueStrategyQualificationEngine(registry, qual, "UG")
     
     # Thin markets
@@ -95,7 +97,7 @@ async def test_capability_check_historical_edge():
     }
     registry.register(poly)
     
-    qual = VenueQualificationEngine()
+    qual = VenueQualificationEngine(data_dir=tempfile.mkdtemp())
     # Also add qualification result
     qual.qualifications["polymarket"] = qual.evaluate_qualification("polymarket", {
         "total_paper_trades": 120,
@@ -129,7 +131,7 @@ async def test_qualification_engine_all_venues():
     registry.register(PolymarketAdapter())
     registry.register(KalshiAdapter())
     
-    qual = VenueQualificationEngine()
+    qual = VenueQualificationEngine(data_dir=tempfile.mkdtemp())
     cap_engine = VenueStrategyQualificationEngine(registry, qual, "UG")
     
     report = await cap_engine.evaluate_all_venues(target_per_venue=5)
@@ -153,7 +155,7 @@ def test_qualified_adapters_only():
     registry.register(poly)
     registry.register(KalshiAdapter())
     
-    qual = VenueQualificationEngine()
+    qual = VenueQualificationEngine(data_dir=tempfile.mkdtemp())
     cap_engine = VenueStrategyQualificationEngine(registry, qual, "UG")
     
     # Simulate qualified

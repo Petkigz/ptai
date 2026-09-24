@@ -921,3 +921,153 @@ class TestOrderProbeMakesReadinessReachable:
         assert "opportunity=opp" in source, (
             "V3 must pass the opportunity so the probe has a market to test on"
         )
+
+
+class TestDelayedFillsKeepTheirThesis:
+    """
+    An order that rests and fills hours later used to become "resting_order_fill"
+    with edge 0 and confidence 0.
+
+    The trade had a thesis; the fill had amnesia. Learning from the outcome then
+    taught the agent about a strategy that never chose the trade, which is worse
+    than not learning at all - it is learning something false. The forecast is now
+    written down WITH the order and read back when the fill arrives.
+    """
+
+    def _order_manager(self, tmp_path):
+        from src.ptai.execution.order_manager import OrderManager
+
+        return OrderManager(storage=Storage(db_path=str(tmp_path / "orders.db")))
+
+    def _submitted(self, manager, forecast):
+        from src.ptai.execution.multi_venue_executor import ExecutionResult
+
+        # `needs_reconciliation` is derived, not passed: it is a property of the
+        # result, computed from the status and the unfilled remainder.
+        result = ExecutionResult(
+            venue_id="polymarket", market_id="M-REST",
+            status="resting", amount_usd=3.0, price=0.55,
+            fees_usd=0.0, gas_usd=0.0, latency_ms=12.0,
+            reasoning="limit order rested in the book",
+            filled_usd=0.0, order_id="ORD-REST-1", resting_usd=3.0)
+        key = manager.record_submission(
+            result, market_id="M-REST", venue_id="polymarket", side="YES",
+            forecast=forecast)
+        assert key, "the order was not recorded, so nothing could be reconciled"
+        return key
+
+    def test_the_forecast_is_stored_with_the_order(self, tmp_path):
+        manager = self._order_manager(tmp_path)
+        self._submitted(manager, {
+            "fair_price": 0.72, "edge": 0.17, "confidence": 0.81,
+            "strategy": "value_poisson", "category": "sports",
+            "data_mode": "live_paper"})
+
+        row = manager.storage.get_order_row("ORD-REST-1")
+        assert row is not None, "the order was not stored at all"
+        assert row["fair_price"] == pytest.approx(0.72)
+        assert row["edge"] == pytest.approx(0.17)
+        assert row["confidence"] == pytest.approx(0.81)
+        assert row["strategy"] == "value_poisson"
+        assert row["category"] == "sports"
+
+    def test_a_delayed_fill_inherits_the_original_thesis(self, tmp_path):
+        """
+        The position opened hours later must carry what the agent believed when it
+        decided - not the price the fill happened to land at.
+        """
+        from src.ptai.agent.v3_loop import TradingAgentV3
+
+        manager = self._order_manager(tmp_path)
+        self._submitted(manager, {
+            "fair_price": 0.72, "edge": 0.17, "confidence": 0.81,
+            "strategy": "value_poisson", "category": "sports",
+            "data_mode": "live_paper"})
+
+        agent = TradingAgentV3(country_code="UG", dry_run=True)
+        agent.storage = manager.storage
+        agent.trade_outcome_tracker.storage = manager.storage
+
+        row = manager.storage.get_order_row("ORD-REST-1")
+        trade_id = agent._open_position_from_fill(dict(row), 3.0, 0.55)
+        assert trade_id > 0, "the fill produced no position"
+
+        position = manager.storage.conn.execute(
+            "SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        assert position["strategy"] == "value_poisson", (
+            "the position was filed under strategy "
+            f"{position['strategy']!r} instead of the strategy that chose it"
+        )
+        assert position["category"] == "sports"
+        assert position["fair_value"] == pytest.approx(0.72), (
+            "the fair value was replaced by the fill price, so the forecast "
+            "cannot be scored"
+        )
+        assert position["edge"] == pytest.approx(0.17)
+        assert position["confidence"] == pytest.approx(0.81)
+        assert str(position["order_id"]) == "ORD-REST-1", (
+            "the position cannot be traced back to the venue order it came from"
+        )
+
+    def test_the_delayed_fill_reaches_the_learning_record(self, tmp_path):
+        """The point of keeping the thesis: the outcome must be learnable."""
+        from src.ptai.agent.v3_loop import TradingAgentV3
+
+        manager = self._order_manager(tmp_path)
+        self._submitted(manager, {
+            "fair_price": 0.72, "edge": 0.17, "confidence": 0.81,
+            "strategy": "value_poisson", "category": "sports",
+            "data_mode": "live_paper"})
+
+        agent = TradingAgentV3(country_code="UG", dry_run=True)
+        agent.storage = manager.storage
+        tracker = agent.trade_outcome_tracker
+        tracker.storage = manager.storage
+
+        row = manager.storage.get_order_row("ORD-REST-1")
+        trade_id = agent._open_position_from_fill(dict(row), 3.0, 0.55)
+
+        recorded = [o for o in tracker.outcomes if o.trade_id == str(trade_id)]
+        assert recorded, (
+            "the delayed fill produced no learning record, so the agent cannot "
+            "study its decisions that took time to execute"
+        )
+        outcome = recorded[0]
+        assert outcome.venue_id == "polymarket"
+        assert outcome.strategy == "value_poisson"
+        assert outcome.forecast_prob == pytest.approx(0.72)
+        assert outcome.edge == pytest.approx(0.17)
+
+    def test_a_fill_with_no_forecast_is_labelled_unknown_not_invented(self, tmp_path):
+        """
+        An order with no stored forecast - placed by an older version, or created
+        by reconciliation itself. The position must still be opened (the exposure
+        is real) but it must be marked as unattributed rather than dressed up as a
+        decision the agent made.
+        """
+        from src.ptai.agent.v3_loop import TradingAgentV3
+
+        manager = self._order_manager(tmp_path)
+        self._submitted(manager, None)  # no forecast supplied
+
+        agent = TradingAgentV3(country_code="UG", dry_run=True)
+        agent.storage = manager.storage
+        agent.trade_outcome_tracker.storage = manager.storage
+
+        row = manager.storage.get_order_row("ORD-REST-1")
+        trade_id = agent._open_position_from_fill(dict(row), 3.0, 0.55)
+        assert trade_id > 0, "the exposure is real; the position must exist"
+
+        position = manager.storage.conn.execute(
+            "SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        assert position["strategy"] == "resting_order_fill"
+        assert position["edge"] == 0.0
+        assert position["confidence"] == 0.0
+        # The fair value falls back to the fill price, which is the only price
+        # known, and the outcome is flagged unattributed so it is not mistaken
+        # for a measured forecast.
+        assert position["fair_value"] == pytest.approx(0.55)
+        unattributed = [
+            o for o in agent.trade_outcome_tracker.outcomes
+            if o.trade_id == str(trade_id)]
+        assert unattributed, "even an unattributed fill must reach the record"

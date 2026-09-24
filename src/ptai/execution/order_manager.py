@@ -244,7 +244,8 @@ class OrderManager:
                           token_id: Optional[str] = None,
                           venue_id: Optional[str] = None,
                           trade_id: Optional[int] = None,
-                          side: Optional[str] = None) -> Optional[str]:
+                          side: Optional[str] = None,
+                          forecast: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
         Persist an order that has been sent, so it can be reconciled later.
 
@@ -255,6 +256,14 @@ class OrderManager:
         An unconfirmed send is recorded deliberately: its whole purpose is to be
         asked about next cycle. `side` is the outcome side, kept so that a fill
         arriving later can open a position that settlement can actually resolve.
+
+        `forecast` is the thesis behind the order - fair value, edge, confidence,
+        strategy, category. It is written down HERE, with the order, because an
+        order that rests and fills hours later is attributed to whatever the fill
+        knows about it, and a fill knows nothing. Without this the position was
+        recorded as strategy "resting_order_fill" with edge 0 and confidence 0,
+        so the outcome taught the agent about a strategy that never chose the
+        trade.
         """
         if self.storage is None:
             logger.error("OrderManager has no storage: a submitted order cannot be "
@@ -291,6 +300,15 @@ class OrderManager:
             "trade_id": trade_id,
             "raw": getattr(exec_result, "raw_response", {}) or {},
         }
+        if forecast:
+            recorded.update({
+                "fair_price": forecast.get("fair_price"),
+                "edge": forecast.get("edge"),
+                "confidence": forecast.get("confidence"),
+                "strategy": forecast.get("strategy"),
+                "category": forecast.get("category"),
+                "data_mode": forecast.get("data_mode"),
+            })
         if not self.storage.upsert_order(recorded):
             return None
         return key

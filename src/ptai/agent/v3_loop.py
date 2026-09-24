@@ -811,6 +811,24 @@ class TradingAgentV3:
                 f"Cannot open a position for {market_id}: the order carries side "
                 f"{side!r}, which is not a settleable outcome side (YES/NO)")
             return 0
+        # The forecast the order was placed WITH. Not the fill price standing in
+        # for a fair value, and not edge 0: the fill is where the trade executed,
+        # not what the agent believed when it decided. Falling back to the fill
+        # price is honest only when the order genuinely has no forecast (an order
+        # placed by an older version, or one written by reconciliation itself),
+        # and it is labelled so the outcome can be recognised as unattributed.
+        fair_price = order.get("fair_price")
+        edge = order.get("edge")
+        confidence = order.get("confidence")
+        strategy = order.get("strategy")
+        category = order.get("category")
+        attributed = fair_price is not None and strategy is not None
+        if not attributed:
+            fair_price = float(price)
+            edge = 0.0
+            confidence = 0.0
+            strategy = "resting_order_fill"
+
         try:
             trade_id = self.storage.log_trade({
                 "market_id": market_id,
@@ -818,20 +836,54 @@ class TradingAgentV3:
                 "side": side,
                 "position_size_usd": float(add_usd),
                 "market_price": float(price),
-                "fair_price": float(price),
-                "edge": 0.0,
-                "confidence": 0.0,
-                "strategy": "resting_order_fill",
-                "data_mode": getattr(self.data_mode, "value", str(self.data_mode)),
+                # `fair_value` is the column that exists. The old call passed
+                # `fair_price`, which log_trade ignores, so this row carried no
+                # fair value at all.
+                "fair_value": float(fair_price),
+                "edge": float(edge or 0.0),
+                "confidence": float(confidence or 0.0),
+                "strategy": strategy,
+                "category": category,
+                "data_mode": (order.get("data_mode")
+                              or getattr(self.data_mode, "value", str(self.data_mode))),
                 "order_id": order.get("order_id"),
             })
         except Exception as e:
             logger.error(f"Could not record the resting-order fill: "
                          f"{type(e).__name__}: {e}")
             return 0
+
+        # And into the learning record, which is the whole point of keeping the
+        # forecast: a delayed fill must be learnable, or the agent's most
+        # expensive decisions - the ones it committed to and waited on - are the
+        # ones it never studies.
+        try:
+            self.trade_outcome_tracker.record_trade(
+                trade_id=str(trade_id),
+                market_id=market_id,
+                venue_id=order.get("venue_id") or "polymarket",
+                strategy=str(strategy),
+                category=str(category or ""),
+                forecast_prob=float(fair_price),
+                market_price=float(price),
+                edge=float(edge or 0.0),
+                side=side,
+                amount_usd=float(add_usd),
+                delayed_fill=True,
+                attributed=bool(attributed),
+            )
+        except Exception as e:
+            # Loud, and attached to the result: a position the agent cannot learn
+            # from is a fact the operator needs, not a debug line.
+            logger.error(
+                f"Position {trade_id} opened from a delayed fill but could not be "
+                f"recorded for learning: {type(e).__name__}: {e}")
+
         logger.info(
             f"Resting order {order.get('order_id')} filled ${add_usd:.4f} at "
-            f"{price:.4f} - booked as position {trade_id} on {market_id} {side}")
+            f"{price:.4f} - booked as position {trade_id} on {market_id} {side} "
+            f"(strategy {strategy}, fair {float(fair_price):.4f}, "
+            f"{'attributed' if attributed else 'UNATTRIBUTED - no forecast on the order'})")
         return int(trade_id or 0)
 
     async def _redeem_settled_wins(self):
@@ -1468,7 +1520,9 @@ class TradingAgentV3:
                             exec_result, market_id=opp.market.id,
                             token_id=getattr(opp.market, "tokens", [{}])[0].token_id
                             if getattr(opp.market, "tokens", None) else None,
-                            venue_id=venue_id, side=str(opp.side).upper())
+                            venue_id=venue_id, side=str(opp.side).upper(),
+                        forecast=self._forecast_for_order(
+                            opp, getattr(opp.market, "data_mode", "live")))
                         execution_results[-1]["order_recorded"] = bool(order_key)
                         execution_results[-1]["order_key"] = order_key
                         if order_key:
@@ -1576,7 +1630,9 @@ class TradingAgentV3:
                         token_id=getattr(opp.market, "tokens", [{}])[0].token_id
                         if getattr(opp.market, "tokens", None) else None,
                         venue_id=venue_id, trade_id=int(trade_id),
-                        side=str(opp.side).upper())
+                        side=str(opp.side).upper(),
+                        forecast=self._forecast_for_order(
+                            opp, getattr(opp.market, "data_mode", "live")))
                     execution_results[-1]["order_recorded"] = bool(order_key)
                     execution_results[-1]["order_key"] = order_key
                     if order_key:
@@ -1785,6 +1841,25 @@ class TradingAgentV3:
         logger.info(f"V3 Report: {scan_result.reasoning}")
         
         return result
+
+    @staticmethod
+    def _forecast_for_order(opp, data_mode) -> Dict[str, Any]:
+        """
+        The thesis behind an order, in the shape the orders table stores.
+
+        Written down at submission so a fill that arrives hours later is still
+        attributed to the strategy that chose the trade - rather than to
+        "resting_order_fill" with edge 0, which teaches the agent nothing about
+        the decision it actually made.
+        """
+        return {
+            "fair_price": getattr(opp, "estimated_fair", None),
+            "edge": getattr(opp, "effective_edge", None),
+            "confidence": getattr(opp, "confidence", None),
+            "strategy": getattr(opp, "strategy", None) or getattr(opp, "strategy_name", None),
+            "category": getattr(opp, "category", None),
+            "data_mode": str(getattr(data_mode, "value", data_mode)),
+        }
 
     def _refresh_qualifications(self) -> int:
         """

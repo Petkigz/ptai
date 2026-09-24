@@ -355,6 +355,10 @@ class PolymarketAdapter(MarketAdapter):
         """
         portfolio_sources = []
         errors = []
+        # Set only if a venue-side source produced a number. Everything below
+        # comes from local storage or a stub, so this stays None - which is what
+        # makes is_real honest.
+        _venue_side_balance = None
         
         # Source 1: Storage DB
         try:
@@ -456,7 +460,14 @@ class PolymarketAdapter(MarketAdapter):
                 "venue": "polymarket",
                 "venue_id": "polymarket",
                 "source": "+".join(portfolio_sources),
-                "is_real": True,
+                # NOT is_real: True. Every number in this branch comes from the
+                # local database - PTAI's own bookkeeping - and the on-chain read
+                # below is a stub. Declaring it real invited any consumer to treat
+                # the agent's own balance as the venue's; the account health
+                # ladder refuses it by provenance, and this stops the claim at its
+                # source instead of relying on that check to catch it.
+                "is_real": _venue_side_balance is not None,
+                "venue_confirmed": _venue_side_balance is not None,
                 "is_placeholder": False,
                 "sources_detail": {
                     "storage": True,
@@ -475,12 +486,23 @@ class PolymarketAdapter(MarketAdapter):
                     "win_rate": win_rate
                 },
                 "confidence": "high" if len(portfolio_sources) >= 1 else "low",
-                "reasoning": f"Real portfolio: balance ${bankroll:.2f} available ${bankroll - total_exposure_usd:.2f} pnl ${total_pnl:.2f} open {len(positions)} exposure {exposure_pct_calc*100:.1f}% (${total_exposure_usd:.2f}) orders {len(open_orders)} trades {total_trades} win {win_rate*100:.0f}% - sources {portfolio_sources}",
+                "reasoning": (f"{'Venue-confirmed' if _venue_side_balance is not None else 'Local state only (NOT venue-verified)'} portfolio: balance ${bankroll:.2f} available ${bankroll - total_exposure_usd:.2f} pnl ${total_pnl:.2f} open {len(positions)} exposure {exposure_pct_calc*100:.1f}% (${total_exposure_usd:.2f}) orders {len(open_orders)} trades {total_trades} win {win_rate*100:.0f}% - sources {portfolio_sources}"),
                 "warnings": errors if errors else [],
                 "critical_blocker_fixed": "Previously placeholder balance:0 positions:[] orders:[] - now real storage sync"
             }
             
-            logger.success(f"Portfolio REAL: balance ${bankroll:.2f} available ${bankroll - total_exposure_usd:.2f} pnl ${total_pnl:.2f} open {len(positions)} exposure {exposure_pct_calc*100:.1f}%")
+            # Said plainly. This line used to read "Portfolio REAL", which is
+            # how a local database read came to look like a verified venue
+            # balance in the logs.
+            if _venue_side_balance is not None:
+                logger.success(
+                    f"Portfolio venue-confirmed: balance ${bankroll:.2f} "
+                    f"available ${bankroll - total_exposure_usd:.2f}")
+            else:
+                logger.info(
+                    f"Portfolio from LOCAL STATE: balance ${bankroll:.2f} "
+                    f"(PTAI's own bookkeeping, NOT verified with Polymarket - "
+                    f"the venue has not confirmed this account or this amount)")
             return portfolio
             
         except Exception as e:

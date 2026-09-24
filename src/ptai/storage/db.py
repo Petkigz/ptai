@@ -214,6 +214,26 @@ class Storage:
         ("orders", "terminal_reason", "TEXT"),
         ("orders", "raw_response", "TEXT"),
         ("orders", "requested_usd", "REAL"),
+        # The forecast that JUSTIFIED the order, stored with the order.
+        #
+        # Without these, an order that rested and filled hours later produced a
+        # position attributed to strategy "resting_order_fill" with edge 0 and
+        # confidence 0. The trade had a thesis; the fill had amnesia. Learning
+        # from the outcome then taught the agent about a strategy that never
+        # chose the trade, which is worse than not learning at all.
+        # A position row has to remember WHICH strategy chose it, and which
+        # order it came from. Neither was stored: log_trade read only the columns
+        # in its INSERT, so strategy/category/order_id were silently dropped -
+        # which is why a delayed fill could not be attributed to anything.
+        ("trades", "strategy", "TEXT"),
+        ("trades", "category", "TEXT"),
+        ("trades", "order_id", "TEXT"),
+        ("orders", "fair_price", "REAL"),
+        ("orders", "edge", "REAL"),
+        ("orders", "confidence", "REAL"),
+        ("orders", "strategy", "TEXT"),
+        ("orders", "category", "TEXT"),
+        ("orders", "data_mode", "TEXT"),
     )
 
     def _migrate(self):
@@ -283,8 +303,8 @@ class Storage:
     def log_trade(self, trade: Dict[str, Any]) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cur = self.conn.execute("""
-            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes, venue_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes, venue_id, strategy, category, order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now,
             trade.get("market_id"),
@@ -302,6 +322,9 @@ class Storage:
             trade.get("status", "pending"),
             trade.get("notes", ""),
             trade.get("venue_id"),
+            trade.get("strategy"),
+            trade.get("category"),
+            trade.get("order_id"),
         ))
         self.conn.commit()
         # Update total trades
@@ -348,6 +371,14 @@ class Storage:
             "trade_id": order.get("trade_id"),
             "last_synced_at": order.get("last_synced_at", now),
             "terminal_reason": order.get("terminal_reason"),
+            # The forecast travels WITH the order, so a fill that arrives hours
+            # later can still be attributed to the strategy that chose it.
+            "fair_price": order.get("fair_price"),
+            "edge": order.get("edge"),
+            "confidence": order.get("confidence"),
+            "strategy": order.get("strategy"),
+            "category": order.get("category"),
+            "data_mode": order.get("data_mode"),
         }
         try:
             if existing:
