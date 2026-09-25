@@ -573,9 +573,32 @@ class MultiVenueExecutor:
 
     async def execute_arbitrage_pair(self, arb, amount_per_leg: float = 3.0) -> List[ExecutionResult]:
         """
-        V10 FIX #7: Arbitrage atomicity with state machine - avoid naked exposure
-        Previously: LEG A → LEG B sequential, if A fills and B fails → naked exposure
-        Now: PRECHECK → RESERVE → VERIFY BOTH BOOKS → SUBMIT A → SUBMIT B → BOTH FILLED or HEDGE
+        A sequential pair with an explicit hedge - NOT an atomic transaction.
+
+        An earlier version of this docstring called it "arbitrage atomicity".
+        There is no atomic cross-venue primitive: leg A and leg B are separate
+        orders at separate venues, they cannot be submitted as one unit, and the
+        window between them is real. Claiming atomicity in a comment is worse
+        than the exposure, because it stops anyone looking for it.
+
+        What the state machine actually guarantees, and what it now does:
+
+          PRECHECK      the spread survives the fee model
+          RESERVE       both legs fit inside the bankroll cap
+          VERIFY_BOOKS  both books are readable and not too wide
+          SUBMIT_A      only this may open exposure
+          size_B to     the amount A ACTUALLY FILLED, not the amount requested,
+          SUBMIT_B      so a partial A cannot be "balanced" by a full B
+          HEDGE         the UNMATCHED remainder - if B underfills, or if the
+                        price moved while A was filling - sized on the real gap
+
+        Two things this deliberately does not do. It does not submit both legs
+        concurrently: with no cross-venue primitive, concurrent submits double
+        the chance of a leg resting unfilled, and a resting leg is exposure that
+        no hedge is watching. And it does not cancel a resting remainder -
+        there is no cancel path here yet, so a partially-filled A leaves a
+        resting order that `order_manager` tracks for reconciliation, and the
+        result says so rather than implying a clean pair.
         """
         venue_a = arb.venue_a
         venue_b = arb.venue_b
@@ -665,41 +688,189 @@ class MultiVenueExecutor:
             logger.warning(f"Arb {state} FAIL: leg A {result_a.status} - aborting leg B to avoid naked exposure - state machine")
             return [result_a]
         
+        # ------------------------------------------------------------------
+        # How much does A actually have to be balanced by?
+        #
+        # `amount_per_leg` is what we ASKED for. Leg B was sized on it, and so
+        # was the hedge - so a partial fill of A produced a leg B larger than
+        # the position it was supposed to offset, and a hedge larger than the
+        # exposure it was supposed to close. Either way the "riskless" pair ends
+        # up holding a one-sided position, which is the exact failure the state
+        # machine exists to prevent.
+        # ------------------------------------------------------------------
+        leg_a_fill = float(getattr(result_a, "filled_usd", 0.0) or 0.0)
+        resting_a = float(getattr(result_a, "resting_usd", 0.0) or 0.0)
+        if not result_a.committed_capital or leg_a_fill <= 0:
+            # A bought nothing, so there is nothing to balance and no reason to
+            # send the second leg. Sending it anyway would be a naked bet that
+            # the "arb" had nothing to do with.
+            logger.warning(
+                f"Arb SUBMIT_A produced no position ({result_a.status}, "
+                f"${leg_a_fill:.2f} filled, ${resting_a:.2f} resting) - leg B "
+                f"not submitted: there is nothing to hedge against")
+            result_a.reasoning += (
+                " | PAIR NOT ATTEMPTED: leg A committed no capital, so leg B "
+                "would have been a one-sided position")
+            return [result_a]
+
+        # Recheck the price B would actually have to pay. `_side_aware_cap` was
+        # computed from the spread DISCOVERED earlier; by the time A has filled,
+        # that number is history. A pair admitted at the old cap can fill B at a
+        # price where the arb no longer exists - paying to close a spread that
+        # is no longer open.
+        cap_b, price_recheck = await self._arb_leg_cap(arb, opp_a, opp_b, adapter_b)
+        if cap_b is None:
+            logger.warning(
+                f"Arb RECHECK: leg B edge is gone by the time A filled "
+                f"({price_recheck}) - hedging A instead of paying up for B")
+            result_b = ExecutionResult(
+                venue_id=venue_b, market_id=arb.market_b.id, status="aborted",
+                amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0,
+                reasoning=f"RECHECK failed: {price_recheck}")
+            return await self._hedge_naked_leg(
+                arb, opp_a, result_a, result_b, leg_a_fill,
+                f"leg B no longer priced ({price_recheck})")
+
         state = "SUBMIT_B"
         result_b = await self.execute_single(
-            opp_b, max_spend_usd=amount_per_leg,
-            max_price=_side_aware_cap(opp_b))
-        
+            opp_b, max_spend_usd=leg_a_fill, max_price=cap_b)
+
         if result_b.status in ["error", "rejected", "rate_limited", "blocked", "aborted"]:
-            logger.error(f"Arb {state} FAIL: leg A FILLED {result_a.status} but leg B FAIL {result_b.status} - NAKED EXPOSURE - need HEDGE A")
-            state = "HEDGE_A"
-            try:
-                hedge_side = "NO" if opp_a.side == "YES" else "YES"
-                hedge_opp = VenueOpportunity(
-                    market=arb.market_a,
-                    venue_id=venue_a,
-                    venue_type=_coerce_venue_type(arb.market_a.raw.get("venue_type")),
-                    side=hedge_side,
-                    market_price=arb.market_a.best_price,
-                    estimated_fair=arb.market_a.best_price,
-                    raw_edge=0,
-                    effective_edge=0,
-                    confidence=0.5,
-                    should_trade=False
-                )
-                hedge_result = await self.execute_single(
-                    hedge_opp, max_spend_usd=amount_per_leg,
-                    max_price=_side_aware_cap(hedge_opp))
-                logger.info(f"Arb HEDGE_A result: {hedge_result.status} - attempted to close naked exposure")
-                result_a.reasoning += f" | HEDGE attempted: {hedge_result.status} {hedge_result.reasoning}"
-            except Exception as e:
-                logger.error(f"Arb HEDGE_A failed: {e} - naked exposure remains!")
-                result_a.reasoning += f" | HEDGE FAILED: {e} - NAKED EXPOSURE REMAINS"
-            
-            return [result_a, result_b]
+            logger.error(f"Arb {state} FAIL: leg A FILLED ${leg_a_fill:.2f} ({result_a.status}) but leg B FAIL {result_b.status} - NAKED EXPOSURE - hedging A")
+            return await self._hedge_naked_leg(
+                arb, opp_a, result_a, result_b, leg_a_fill,
+                f"leg B {result_b.status}")
         
+        # Both legs are in - but "filled" is not a boolean. Whatever B did not
+        # take is still A's exposure, and the hedge closes THAT, not the request.
+        leg_b_fill = float(getattr(result_b, "filled_usd", 0.0) or 0.0)
+        unmatched = leg_a_fill - leg_b_fill
+        if unmatched > 0.01:
+            logger.warning(
+                f"Arb PARTIAL PAIR: A filled ${leg_a_fill:.2f}, B filled "
+                f"${leg_b_fill:.2f} - ${unmatched:.2f} of A is unmatched - hedging")
+            hedged = await self._hedge_naked_leg(
+                arb, opp_a, result_a, result_b, unmatched,
+                f"B filled ${leg_b_fill:.2f} of ${leg_a_fill:.2f}")
+            return hedged
+
         state = "BOTH_FILLED"
-        logger.success(f"Arb {state} SUCCESS: both legs filled A {result_a.status} B {result_b.status} spread {arb.spread*100:.1f}% - DONE")
+        result_a.reasoning += (
+            f" | PAIR MATCHED: A ${leg_a_fill:.2f}, B ${leg_b_fill:.2f} "
+            f"({price_recheck})")
+        logger.success(f"Arb {state}: both legs filled A {result_a.status} B {result_b.status} spread {arb.spread*100:.1f}% - DONE")
+        return [result_a, result_b]
+
+    async def _arb_leg_cap(self, arb, opp_a, opp_b, adapter_b):
+        """
+        The cap for leg B, recomputed from the book as it is NOW.
+
+        Returns (cap, note), or (None, reason) when the pair is no longer worth
+        completing. The discovered spread is not a price: between measuring it
+        and filling leg A, the book that made the arb can move, and completing
+        the pair at the old cap would buy the second leg at a price that turns a
+        riskless pair into a loss that is certain rather than expected.
+
+        A book that cannot be re-read is reported as such and the OLD cap is
+        used - refusing every arb whose venue will not let us re-read would be
+        its own failure mode - but the note travels with the result so nobody
+        reads a stale number as a measurement.
+        """
+        stale_cap = _side_aware_cap(opp_b)
+        if adapter_b is None or not hasattr(adapter_b, "get_orderbook"):
+            return stale_cap, "cap from the discovered spread (no adapter to re-read)"
+        try:
+            book = await adapter_b.get_orderbook(arb.market_b)
+        except Exception as e:
+            return stale_cap, f"cap from the discovered spread (re-read failed: {e})"
+        if not isinstance(book, dict) or not book.get("is_real", False):
+            return stale_cap, "cap from the discovered spread (book not real)"
+
+        # The side B is buying: YES buys the ask, NO buys 1 - bid.
+        best_ask = None
+        best_bid = None
+        for level in (book.get("asks") or []):
+            try:
+                best_ask = float(level.get("price"))
+                break
+            except (TypeError, ValueError):
+                continue
+        for level in (book.get("bids") or []):
+            try:
+                best_bid = float(level.get("price"))
+                break
+            except (TypeError, ValueError):
+                continue
+        if str(opp_b.side).upper() == "NO":
+            if best_bid is None:
+                return stale_cap, "cap from the discovered spread (no bid to price NO)"
+            live_price = 1.0 - best_bid
+        else:
+            if best_ask is None:
+                return stale_cap, "cap from the discovered spread (no ask to price YES)"
+            live_price = best_ask
+
+        # What B would cost now, against what A actually paid. The pair is worth
+        # completing while the two prices still sum to less than a dollar; the
+        # moment they do not, B is a loss and hedging A is the cheaper mistake.
+        a_price = float(getattr(opp_a, "market_price", 0.0) or 0.0)
+        if a_price > 0 and (live_price + a_price) >= 1.0:
+            return None, (f"B would cost {live_price:.3f} against A's {a_price:.3f} "
+                          f"- the pair costs {live_price + a_price:.3f} for a $1 "
+                          f"payoff, so the spread is gone")
+        return min(stale_cap, live_price + 0.02), (
+            f"cap re-read: B {live_price:.3f} against A {a_price:.3f}")
+
+    async def _hedge_naked_leg(self, arb, opp_a, result_a, result_b,
+                               naked_usd: float, why: str) -> List[ExecutionResult]:
+        """
+        Close the exposure that exists, measured - not the exposure requested.
+
+        `naked_usd` is the unmatched capital in leg A. The previous version
+        hedged `amount_per_leg`: on a partial fill it bought more of the
+        opposite side than the position it was closing, which does not remove
+        exposure, it flips it.
+        """
+        naked_usd = float(naked_usd or 0.0)
+        if naked_usd <= 0.01:
+            result_a.reasoning += f" | NOTHING TO HEDGE: {why}"
+            return [result_a, result_b]
+
+        hedge_side = "NO" if str(opp_a.side).upper() == "YES" else "YES"
+        hedge_opp = VenueOpportunity(
+            market=arb.market_a,
+            venue_id=arb.venue_a,
+            venue_type=_coerce_venue_type(arb.market_a.raw.get("venue_type")),
+            side=hedge_side,
+            market_price=arb.market_a.best_price,
+            estimated_fair=arb.market_a.best_price,
+            raw_edge=0,
+            effective_edge=0,
+            confidence=0.5,
+            should_trade=False,
+        )
+        try:
+            hedge_result = await self.execute_single(
+                hedge_opp, max_spend_usd=naked_usd,
+                max_price=_side_aware_cap(hedge_opp))
+            closed = (float(getattr(hedge_result, "filled_usd", 0.0) or 0.0)
+                      if getattr(hedge_result, "committed_capital", False) else 0.0)
+            remaining = max(0.0, naked_usd - closed)
+            logger.info(
+                f"Arb HEDGE: {why} - ${naked_usd:.2f} naked, hedged "
+                f"${closed:.2f} ({hedge_result.status}), ${remaining:.2f} exposed")
+            result_a.reasoning += (
+                f" | HEDGE ({why}): ${naked_usd:.2f} naked, ${closed:.2f} "
+                f"hedged ({hedge_result.status}), ${remaining:.2f} exposure "
+                f"remains")
+            if remaining > 0.01:
+                # The honest label. A failed hedge is not "attempted".
+                result_a.reasoning += " | NAKED EXPOSURE REMAINS - reconcile"
+        except Exception as e:
+            logger.error(f"Arb HEDGE failed: {e} - ${naked_usd:.2f} naked exposure remains!")
+            result_a.reasoning += (
+                f" | HEDGE FAILED ({why}): {type(e).__name__}: {e} - "
+                f"${naked_usd:.2f} NAKED EXPOSURE REMAINS")
         return [result_a, result_b]
 
     def get_report(self) -> Dict[str, Any]:
@@ -709,6 +880,12 @@ class MultiVenueExecutor:
             "rate_limits": "Pionex 10 req/sec, WhiteBIT HMAC-SHA512, AFX DEX EIP-712 wallet-signed no API keys, etc",
             "min_orders": self.min_order_sizes,
             "operational_overhead": "Each venue has own API auth model rate limits failure modes, start with one additional venue prove pipeline works then add next",
-            "atomicity": "Arb both legs must settle exactly same event definition, fund transfers between venues slow, need to ensure both legs execute or none to avoid naked exposure",
+            "atomicity": ("NO cross-venue atomic primitive exists. Both legs are "
+                          "separate orders at separate venues and cannot be "
+                          "submitted as one unit: leg B is sized on leg A's ACTUAL "
+                          "fill, the price is re-read before B is sent, and the "
+                          "UNMATCHED remainder is hedged. This is a sequential "
+                          "pair with an explicit hedge, and the exposure window "
+                          "is real - see execute_arbitrage_pair"),
             "capital_fragmentation": "Splitting $50 across multiple venues tiny positions fixed costs gas withdrawal fees min order eat larger percentage concentrate 2-3 venues until bankroll grows"
         }
