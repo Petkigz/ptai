@@ -12,7 +12,6 @@ from src.ptai.venues.adapter import VenueOpportunity, VenueType
 from src.ptai.markets.market_normalizer import MarketNormalizer
 from src.ptai.strategy.opportunity import OpportunityEngine, FastModelClassifier
 from src.ptai.venues.qualification import VenueQualificationEngine
-from src.ptai.learning.paper_trading import PaperTradingEngine
 
 def make_market(id="M1", question="Will Trump win?", price=0.6, vol=10000, liq=10000, venue="polymarket", category="politics"):
     return Market(
@@ -337,18 +336,67 @@ def test_venue_qualification_robust():
     # Check V7 reasoning mentions win rate alone not profitability
     assert "win rate alone NOT profitability" in result2.reasoning or "net P&L" in result2.reasoning
 
-def test_paper_trading_engine():
-    engine = PaperTradingEngine(data_dir="/tmp/test_paper")
-    
-    m = make_market(id="M1", question="Will event happen?", price=0.6)
-    opp = VenueOpportunity(market=m, venue_id="polymarket", venue_type=VenueType.PREDICTION, side="YES", market_price=0.6, estimated_fair=0.7, raw_edge=0.1, effective_edge=0.08, confidence=0.7, category="politics", should_trade=True)
-    
-    trade = engine.record_paper_trade(opportunity=opp, amount_usd=3.0)
-    assert trade.venue_id == "polymarket"
-    assert trade.amount_usd == 3.0
-    
-    engine.resolve_trade(trade_id=trade.trade_id, outcome=1, profit_usd=1.5)
-    
-    perf = engine.get_venue_performance("polymarket")
-    assert perf["total_paper_trades"] >= 1
-    assert perf["resolved"] >= 1
+def test_the_paper_engine_is_the_real_one():
+    """
+    This used to test `learning.paper_trading.PaperTradingEngine`, a second
+    paper engine that stored its own JSON and had its own weaker qualification
+    rule (100 trades, 55% wins, Brier <= 0.25). Qualification reads the outcome
+    log, so paper qualification properly belongs to whatever fills the log -
+    and there is now exactly one thing that produces a paper fill, the broker
+    the live path also simulates against.
+
+    What is asserted here is the reason that matters: the paper fill is priced
+    off the actual ladder, not off a price and a hope.
+    """
+    from src.ptai.execution.paper_broker import PaperBroker
+    from src.ptai.markets.mechanics import MarketMechanics
+
+    mechanics = MarketMechanics(tick_size="0.01", min_order_size=5.0,
+                                min_order_notional_usd=1.0, source="test",
+                                is_real=True)
+    broker = PaperBroker(mechanics=mechanics, taker_fee_rate=0.02)
+
+    # $3 into a ladder that only has $2 of depth at the touch: the fill must
+    # walk to the next level and pay a worse average price, and the remainder
+    # must REST rather than being quietly filled.
+    book = {"bids": [{"price": "0.58", "size": "100"}],
+            "asks": [{"price": "0.60", "size": "3.33"},
+                     {"price": "0.64", "size": "100"}],
+            "spread": 0.02, "is_real": True}
+
+    fill = broker.simulate(book, "BUY", 3.0, limit_price=0.64,
+                           mechanics=mechanics, book_source="ladder")
+    assert fill.is_fill
+    assert fill.filled_usd == pytest.approx(3.0, abs=0.05)
+    assert fill.best_price == pytest.approx(0.60)
+    assert fill.levels_consumed == 2
+    assert 0.60 < fill.avg_price <= 0.64, "the ladder walk must cost more than the touch"
+    assert fill.fee_usd == pytest.approx(fill.filled_usd * 0.02)
+    assert fill.slippage_bps > 0
+    assert fill.is_real, "a fill walked down a real ladder is evidence"
+
+    # Thin book: the same $3 fills part of the way and the rest would rest.
+    thin = {"bids": [{"price": "0.58", "size": "10"}],
+            "asks": [{"price": "0.60", "size": "2.0"}],
+            "spread": 0.02, "is_real": True}
+    partial = broker.simulate(thin, "BUY", 3.0, limit_price=0.60,
+                              mechanics=mechanics, book_source="ladder")
+    assert partial.is_partial
+    assert partial.would_rest, "the unfilled remainder of a GTC order rests"
+    assert partial.unfilled_usd > 0
+
+    # A limit that the market does not cross fills NOTHING. This is the case a
+    # naive simulator gets wrong and the one that makes a strategy look viable.
+    resting = broker.simulate(book, "BUY", 3.0, limit_price=0.50,
+                              mechanics=mechanics, book_source="ladder")
+    assert not resting.is_fill
+    assert resting.would_rest
+    assert resting.unfilled_usd == pytest.approx(3.0)
+
+    # And an assumed book is labelled, because a fill priced off one is not
+    # evidence about the venue - the qualification gate refuses a sample of them.
+    assumed = broker.simulate(book, "BUY", 3.0, limit_price=0.64,
+                              mechanics=MarketMechanics.assumed("test"),
+                              book_source="assumed_default")
+    assert not assumed.is_real
+    assert assumed.warnings

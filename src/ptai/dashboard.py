@@ -2492,139 +2492,6 @@ async def api_v5_discovery(target_per_venue: int = 20):
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
-@app.get("/api/v6/fixes")
-async def api_v6_fixes():
-    try:
-        from .venues.registry import VenueRegistry
-        from .venues.polymarket_adapter import PolymarketAdapter
-        from .venues.kalshi_adapter import KalshiAdapter
-        from .markets.market_normalizer import MarketNormalizer
-        from .venues.qualification import VenueQualificationEngine
-        from .learning.paper_trading import PaperTradingEngine
-        from .strategy.opportunity import FastModelClassifier
-        
-        registry = VenueRegistry(country_code="UG")
-        registry.register(PolymarketAdapter())
-        registry.register(KalshiAdapter())
-        
-        # Simulate learning bug fix
-        # Previously: venue_performance[venue_id] but stored venue_id:category
-        # Now fixed: lookup venue_id:category first then fallbacks
-        registry.venue_performance = {
-            "polymarket:politics": {"total": 50, "wins": 25, "win_rate": 0.5, "brier_score": 0.30, "forecast_skill": 0.4, "brier_sum": 15, "avg_edge": 0.05, "profit": -10},
-            "polymarket:sports": {"total": 50, "wins": 35, "win_rate": 0.7, "brier_score": 0.18, "forecast_skill": 0.64, "brier_sum": 9, "avg_edge": 0.08, "profit": 20},
-            "kalshi:economics": {"total": 60, "wins": 45, "win_rate": 0.75, "brier_score": 0.15, "forecast_skill": 0.7, "brier_sum": 9, "avg_edge": 0.10, "profit": 30},
-        }
-        
-        # Test fixed ranking
-        from .venues.adapter import VenueOpportunity, VenueType
-        from .markets.base import Market, MarketSource, Token
-        m1 = Market(id="M1", source=MarketSource.POLYMARKET, question="Will Trump win?", outcomes=["YES","NO"], outcome_prices=[0.6,0.4], tokens=[Token(token_id="M1", outcome="YES", price=0.6)], volume=10000, volume_24h=5000, liquidity=10000, raw={"category": "politics"})
-        m2 = Market(id="M2", source=MarketSource.POLYMARKET, question="Will Lakers win?", outcomes=["YES","NO"], outcome_prices=[0.6,0.4], tokens=[Token(token_id="M2", outcome="YES", price=0.6)], volume=10000, volume_24h=5000, liquidity=10000, raw={"category": "sports"})
-        m3 = Market(id="M3", source=MarketSource.KALSHI, question="Will CPI exceed 3.5%?", outcomes=["YES","NO"], outcome_prices=[0.6,0.4], tokens=[Token(token_id="M3", outcome="YES", price=0.6)], volume=10000, volume_24h=5000, liquidity=10000, raw={"category": "economics"})
-        
-        opp1 = VenueOpportunity(market=m1, venue_id="polymarket", venue_type=VenueType.PREDICTION, side="YES", market_price=0.6, estimated_fair=0.7, raw_edge=0.1, effective_edge=0.08, confidence=0.7, category="politics", should_trade=True)
-        opp2 = VenueOpportunity(market=m2, venue_id="polymarket", venue_type=VenueType.PREDICTION, side="YES", market_price=0.6, estimated_fair=0.7, raw_edge=0.1, effective_edge=0.08, confidence=0.7, category="sports", should_trade=True)
-        opp3 = VenueOpportunity(market=m3, venue_id="kalshi", venue_type=VenueType.PREDICTION, side="YES", market_price=0.6, estimated_fair=0.7, raw_edge=0.1, effective_edge=0.08, confidence=0.7, category="economics", should_trade=True)
-        
-        for opp in [opp1, opp2, opp3]:
-            opp.calculate_common_score()
-        
-        ranked = registry.rank_opportunities([opp1, opp2, opp3])
-        
-        normalizer = MarketNormalizer()
-        qualification = VenueQualificationEngine()
-        paper_trading = PaperTradingEngine()
-        fast_classifier = FastModelClassifier()
-        
-        return {
-            "fixes": {
-                "A_real_orderbook": {
-                    "issue": "Polymarket adapter Mock orderbook for now - bid/ask based on market price, not trustworthy real orderbook intelligence",
-                    "fix": "Now tries CLOB API real orderbook via client.get_orderbook(token_id), parses bids/asks best bid/ask spread depth bid_size ask_size, calculates slippage amount/liquidity*0.5, execution_quality 1 - spread*5 - slippage*2, falls back to enhanced estimation based on liquidity/volume not just price: >20k liq + >10k vol => 1% spread 0.9 exec quality, >10k liq =>2% spread 0.8, >5k =>4% 0.6, else 8% 0.3, includes imbalance random realistic",
-                    "file": "src/ptai/venues/polymarket_adapter.py get_orderbook",
-                    "importance": "Using spread/slippage/liquidity/execution quality to decide attractiveness needs real market data"
-                },
-                "B_real_portfolio": {
-                    "issue": "Portfolio retrieval placeholder {balance:0, positions:[], orders:[]} - major blocker for live autonomous operation needs actual balance positions open orders fills exposure",
-                    "fix": "Now tries CLOB + storage for actual balance bankroll total_pnl open_positions exposure_pct positions from recent trades, fills, exposure total_usd total_pct, checks actual_balance actual_positions actual_open_orders actual_fills actual_exposure, on-chain balance check via funder, source storage+clob+onchain is_real True",
-                    "file": "src/ptai/venues/polymarket_adapter.py get_portfolio",
-                    "importance": "PTAI needs actual balance positions open orders fills exposure before decisions"
-                },
-                "C_fast_model": {
-                    "issue": "fast_model_screen() currently sort by volume take top 50 rather than actually running fast model, 200 markets -> FAST AI SCREEN currently closer to 200 -> SORT BY VOLUME -> 50 needs upgrading",
-                    "fix": "Now FastModelClassifier with keywords classification politics sports crypto economics weather ai general confidence scores, news extraction has_news_potential earnings fed election cpi fomo trump btc, duplicate detection SequenceMatcher >0.8 similar questions keep highest volume mark others duplicate, deep research score volume*0.3 + liquidity*0.2 + category*0.2 + news*0.2 + time*0.1, category diversity limit per category 15 until 30 selected ensure coverage politics sports crypto economics, not just volume",
-                    "file": "src/ptai/strategy/opportunity.py fast_model_screen + FastModelClassifier",
-                    "importance": "200 -> FAST AI SCREEN not just sort by volume"
-                },
-                "D_strategic_edge": {
-                    "issue": "Current system edge>=8% good safety filter but 8% alone shouldn't determine which opportunity gets capital, need Expected EV liquidity risk uncertainty portfolio impact capital allocation",
-                    "fix": "Now rank_and_select calculates Expected EV = edge*prob_correct*amount - fees - slippage - risk, amount $3 on $50 6% cap, risk_adjusted_ev = expected_profit - fees - slippage - uncertainty*amount*0.5, checks liquidity_score<0.3 NO TRADE, portfolio impact correlation same event across venues is one bet not two aggregate per event max 12% $6 on $50, capital allocation total exposure max 50% $25, time efficiency short resolution <24h 1.2x long >720h 0.7x, final_score risk_adjusted_ev*liquidity*execution*time/(uncertainty+0.01), asks Which opportunity gives best risk-adjusted expected return for capital available not Which market has edge>8%",
-                    "file": "src/ptai/strategy/opportunity.py rank_and_select",
-                    "importance": "Which opportunity gives best risk-adjusted expected return for capital available"
-                },
-                "E_venue_learning_bug": {
-                    "issue": "registry.py stores venue_performance[venue_id:category] but ranking code looks up venue_performance[venue_id] while update_performance stores venue_id:category, intended to learn polymarket:politics polymarket:sports kalshi:economics but ranking doesn't consistently use key, learning/concentration system not as effective",
-                    "fix": "Now rank_opportunities lookup venue_id:category first exact key, then venue_id legacy, then any key starting venue_id: best total, then category match across venues, plus calibration multiplier brier>0.3 0.7x brier<0.2 1.2x, win_rate multiplier 0.5+win_rate, debug logging learning adjustment skill brier win_rate multiplier, helper get_performance_for_venue_category correct key handling, test shows polymarket politics weak 0.5 win 0.30 brier 0.4 skill vs polymarket sports good 0.7 win 0.18 brier 0.64 skill vs kalshi economics excellent 0.75 win 0.15 brier 0.7 skill, ranking now correctly boosts kalshi economics and polymarket sports over politics",
-                    "file": "src/ptai/venues/registry.py rank_opportunities",
-                    "importance": "Learning/concentration system actually effective now",
-                    "demo": {
-                        "before_fix": "All would get same 0.5 skill multiplier regardless of category performance",
-                        "after_fix": f"Ranked order: {[opp.venue_id+':'+opp.category+f' score {opp.score:.3f}' for opp in ranked]}",
-                        "expected": "kalshi:economics should be top (skill 0.7 win 0.75 brier 0.15), polymarket:sports second (skill 0.64 win 0.7), polymarket:politics last (skill 0.4 win 0.5)",
-                        "is_fixed": ranked[0].category == "economics" and ranked[0].venue_id == "kalshi"
-                    }
-                },
-                "F_market_scanner_duplication": {
-                    "issue": "Two market-discovery systems: VenueRegistry (new) all adapters vs MarketScanner (old) Polymarket only, duplication needs cleaning up otherwise two competing concepts",
-                    "fix": "MarketScanner now delegates to VenueRegistry as single source of truth if available, creates registry with 3 adapters for unified discovery if not provided, scan() uses_registry True tries VenueRegistry but sync compatibility uses PolymarketClient with log intention, new method scan_multi_venue() truly multi-venue via VenueRegistry looping all adapters discover_markets target_per_venue, total across venues, fixes duplication",
-                    "file": "src/ptai/markets/scanner.py"
-                },
-                "G_kalshi_stub": {
-                    "issue": "src/ptai/markets/kalshi.py stub scan_markets() -> Kalshi scanning not yet implemented -> [] with TODOs auth market API conversion to Market execution, existence of kalshi.py fool you PTAI currently doesn't have functioning second venue abstraction there adapter implementation isn't",
-                    "fix": "Now KalshiClient uses KalshiAdapter real implementation with API https://api.elections.kalshi.com/trade-api/v2/markets + mock fallback 200 realistic markets, _parse_kalshi_market, mock titles CPI Fed unemployment S&P candidate team temperature earnings, not just stub",
-                    "file": "src/ptai/markets/kalshi.py"
-                },
-                "H_market_normalization_robust": {
-                    "issue": "Need to make adapter contract market normalization real portfolio/orderbook data opportunity ranking paper-trading qualification learning loop robust, then adding each new venue straightforward, not add more venues blindly",
-                    "fix": "MarketNormalizer now robust for 19 venues not just 2, normalize_generic handles any venue various price formats volume formats date formats fallback generic, category detection 7 categories via keywords, validation checks id question price 0-1 liquidity volume non-negative, report supported venues 19 fields normalized",
-                    "file": "src/ptai/markets/market_normalizer.py"
-                },
-                "I_paper_trading_qualification_robust": {
-                    "issue": "Need robust paper-trading qualification learning loop",
-                    "fix": "VenueQualificationEngine comprehensive qualification min_trades 100 win_rate 0.55 max_brier 0.25 min_skill 0.6 min_profit 0 min_edge 3% min_calibration 50% max_drawdown 20%, checks dict, reasoning, is_qualified all checks, qualification_date, save/load json, should_concentrate_on strong venues, principle don't assume profitable prove via paper trading/backtesting cautiously allocate",
-                    "file": "src/ptai/venues/qualification.py + src/ptai/learning/paper_trading.py"
-                }
-            },
-            "architecture": {
-                "before": "Framework multi-venue but actual market coverage mostly Polymarket, Polymarket adapter mock orderbook placeholder portfolio, fast model sort by volume, edge>=8% alone determines capital, venue learning bug inconsistent keys, MarketScanner Polymarket-centric duplication",
-                "after": "Foundation already in branch correct next evolution: Opportunity AI -> Prediction Financial Other Markets -> Polymarket Kalshi etc Stocks ETFs Crypto -> Normalized Data -> Forecast+Edge -> Fees/Slippage/Risk -> Portfolio Allocation -> Execution -> Learning loop, now fixed real orderbook real portfolio fast AI screening classification news duplicate category diversity, expected EV liquidity risk uncertainty portfolio impact capital allocation best risk-adjusted return, venue learning bug fixed consistent venue_id:category lookup calibration win_rate multipliers, MarketScanner uses VenueRegistry single source, Kalshi real implementation, MarketNormalizer robust 19 venues, paper-trading qualification robust",
-                "assessment_table": {
-                    "Polymarket architecture": "🟢 Strong",
-                    "Multi-venue architecture": "🟢 Already designed",
-                    "Venue registry": "🟢 Good foundation -> Fixed bug now robust",
-                    "Opportunity abstraction": "🟢 Good -> Enhanced with EV portfolio impact",
-                    "Multi-strategy architecture": "🟢 Present",
-                    "Intelligence architecture": "🟢 Present",
-                    "Risk architecture": "🟢 Strong foundation",
-                    "Polymarket discovery": "🟢 Implemented",
-                    "Polymarket execution": "🟡 Partial -> Enhanced guards",
-                    "Real orderbook intelligence": "🔴 Not finished -> 🟢 Fixed real CLOB + enhanced estimation",
-                    "Real portfolio synchronization": "🔴 Not finished -> 🟢 Fixed storage+clob+onchain",
-                    "Kalshi": "🔴 Stub -> 🟢 Real implementation",
-                    "Other financial markets": "🔴 Not implemented -> 🟢 19 venues now",
-                    "Automatic venue selection": "🟡 Architecture exists -> 🟢 Learning fixed",
-                    "Venue performance learning": "🟡 Needs correction -> 🟢 Fixed",
-                    "Fast AI screening": "🟡 Currently heuristic -> 🟢 Real classification",
-                    "Proven profitability": "🔴 Not established -> Needs 100+ resolved paper trading"
-                }
-            },
-            "next_evolution": "PTAI already designed multi-market/multi-venue Polymarket is one adapter among many VenueRegistry discovers all eligible adapters ranks across venues learns venue/category combos strongest. Don't redesign as Polymarket-only, don't rebuild architecture already right work. Correct next evolution: Opportunity AI -> Prediction Financial Other -> Polymarket Kalshi etc Stocks ETFs Crypto -> Normalized Data -> Forecast+Edge -> Fees/Slippage/Risk -> Portfolio Allocation -> Execution -> Learning loop. Foundation already in branch main work turning stubbed/placeholder into real implementations and making venue/strategy learning genuinely function. Not add more venues blindly first make adapter contract market normalization real portfolio/orderbook data opportunity ranking paper-trading qualification learning loop robust then adding each new venue straightforward"
-        }
-    except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc()}
-
 @app.get("/api/v6/portfolio/{venue_id}")
 async def api_v6_portfolio(venue_id: str = "polymarket"):
     try:
@@ -2668,91 +2535,6 @@ async def api_v6_portfolio(venue_id: str = "polymarket"):
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
-
-@app.get("/api/v6/opportunity-ranking")
-async def api_v6_opportunity_ranking():
-    try:
-        from .strategy.opportunity import OpportunityEngine, FastModelClassifier
-        from .markets.base import DataMode, Market, MarketSource, Token
-        from .markets.orderbook import execution_quality_from_book
-        
-        # Create mock markets with different categories.
-        #
-        # They are marked MOCK explicitly. `Market` defaults to `data_mode=LIVE`,
-        # so these hand-written markets - and the hand-written opportunities
-        # below them (fair = price + 0.10, edge 0.09, for every one of them) -
-        # carried live provenance, and the only thing keeping them out of an
-        # order was that this endpoint never feeds the agent. Now the data mode
-        # says what they are, and the guard would refuse them.
-        markets = [
-            Market(id="M1", source=MarketSource.POLYMARKET, question="Will Trump win election?", outcomes=["YES","NO"], outcome_prices=[0.60,0.40], tokens=[Token(token_id="M1", outcome="YES", price=0.60)], volume=50000, volume_24h=20000, liquidity=25000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
-            Market(id="M2", source=MarketSource.POLYMARKET, question="Will Lakers win championship? NBA finals", outcomes=["YES","NO"], outcome_prices=[0.55,0.45], tokens=[Token(token_id="M2", outcome="YES", price=0.55)], volume=100000, volume_24h=50000, liquidity=50000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
-            Market(id="M3", source=MarketSource.POLYMARKET, question="Will Fed cut rates in June? CPI inflation", outcomes=["YES","NO"], outcome_prices=[0.50,0.50], tokens=[Token(token_id="M3", outcome="YES", price=0.50)], volume=80000, volume_24h=30000, liquidity=30000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
-            Market(id="M4", source=MarketSource.POLYMARKET, question="Will BTC be above $100k? Bitcoin crypto", outcomes=["YES","NO"], outcome_prices=[0.62,0.38], tokens=[Token(token_id="M4", outcome="YES", price=0.62)], volume=20000, volume_24h=8000, liquidity=8000, raw={}, is_mock=True, data_mode=DataMode.MOCK),
-        ]
-        
-        classifier = FastModelClassifier()
-        engine = OpportunityEngine()
-        
-        classifications = []
-        for m in markets:
-            cls = classifier.classify(m)
-            classifications.append({"market_id": m.id, "question": m.question[:40], "category": cls["category"], "confidence": cls["confidence"], "news_potential": cls["has_news_potential"], "should_deep": cls["should_deep_research"]})
-        
-        duplicates = classifier.detect_duplicates(markets)
-        
-        after_fast = engine.fast_model_screen(markets)
-        
-        # Demonstrate new ranking with EV not just edge>=8%
-        from .venues.adapter import VenueOpportunity, VenueType
-        opps = []
-        for m in markets:
-            opp = VenueOpportunity(market=m, venue_id="polymarket", venue_type=VenueType.PREDICTION, side="YES", market_price=m.best_price, estimated_fair=m.best_price+0.10, raw_edge=0.10, effective_edge=0.09, confidence=0.7, uncertainty=0.1, liquidity_score=min(1.0, m.liquidity/20000), execution_quality=execution_quality_from_book(None, m), category=classifier.classify(m)["category"], should_trade=True, fees_pct=0.02, slippage_pct=0.01, spread_pct=0.02)
-            opp.calculate_common_score()
-            opps.append(opp)
-        
-        ranked = engine.rank_and_select(opps, max_trades=3, bankroll=50.0, current_positions=[])
-        
-        return {
-            "fast_model": {
-                "before": "sort by volume take top 50 heuristic",
-                "after": "classification via keywords, news extraction, duplicate detection SequenceMatcher >0.8, deep research score volume*0.3+liquidity*0.2+category*0.2+news*0.2+time*0.1, category diversity limit 15 per cat",
-                "classifications": classifications,
-                "duplicates_found": len(duplicates),
-                "after_fast_count": len(after_fast),
-                "categories": list(set(c["category"] for c in classifications))
-            },
-            "opportunity_ranking": {
-                "before": "edge>=8% alone determines which opportunity gets capital",
-                "after": "Expected EV = edge*prob_correct*amount - fees - slippage - risk, liquidity risk uncertainty portfolio impact capital allocation, Which opportunity gives best risk-adjusted expected return for capital available",
-                "ranked": [
-                    {"market_id": opp.market.id, "question": opp.market.question[:40], "category": opp.category, "edge": opp.effective_edge, "confidence": opp.confidence, "liquidity_score": opp.liquidity_score, "score": opp.score, "ev": opp.effective_edge*3.0*opp.confidence - opp.fees_pct*3.0 - opp.slippage_pct*3.0}
-                    for opp in ranked
-                ],
-                "reasoning": "Best risk-adjusted expected return for capital available, not just edge>8%, portfolio impact same event across venues one bet not two max 12% per event, total exposure max 50%"
-            },
-            # Said plainly rather than left for the operator to work out from an
-            # empty list: these are hand-written markets with hand-written
-            # opportunities and no real orderbook, and the selector refuses an
-            # unmeasured execution. A demo that showed a confident ranking here
-            # would be showing a constant.
-            "demo_data": {
-                "is_mock": True,
-                "data_mode": "mock",
-                "orderbook": None,
-                "note": (
-                    "Hand-written markets and opportunities for demonstrating the "
-                    "ranking logic. They are marked MOCK, and with no real "
-                    "orderbook the execution quality is 0.0, so the selector "
-                    "correctly returns no tradeable opportunities - mock data "
-                    "must never look tradeable."
-                ),
-            },
-        }
-    except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc()}
-
 
 @app.get("/api/v7/status")
 async def api_v7_status():
@@ -3080,7 +2862,10 @@ async def api_v8_qualification():
                 "multiple_strategies": "Present",
                 "intelligence": "Strong foundation",
                 "calibration_learning": "Present",
-                "paper_trading": "Present",
+                # One paper engine, and it is the broker the live path is also
+                # priced against. The legacy second engine and its weaker
+                # qualification rule were deleted rather than kept as a fallback.
+                "paper_engine": "execution/paper_broker.py (paper_trading.py deleted)",
                 "risk_architecture": "Strong",
                 "autonomous_loops": "Present, multiple versions",
                 "production_validation": "Still needs serious testing - V8 qualification engine now properly connected",
@@ -3185,7 +2970,7 @@ async def api_v8_decision_process():
                     "Verify - reconciliation",
                     "Monitor - order_manager, monitor",
                     "Record prediction + outcome - calibration_db, trade_outcomes",
-                    "Update calibration/performance - learning loop, paper_trading, performance",
+                    "Update calibration/performance - learning loop, paper_broker, performance",
                     "Repeat"
                 ],
                 "notice": "There is no Polymarket step in that logic. Polymarket becomes Venue #1 rather than PTAI = Polymarket bot",

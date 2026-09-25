@@ -448,7 +448,30 @@ class OpportunityEngine:
         for opp in ranked:
             if len(selected) >= max_trades:
                 break
-            
+
+            # MOCK provenance is refused HERE as well as at the execution
+            # guard, and the "as well as" is the point.
+            #
+            # The guard blocks it at the last layer before an order, so no
+            # invented market could actually trade - but everything before that
+            # treated a mock market as a candidate: it was scored, ranked, and
+            # counted against the bankroll's exposure limits, which is how a
+            # demo came to look like a live ranking. Inputs that should never
+            # reach a decision do not belong in the decision.
+            data_mode = getattr(opp.market, "data_mode", None)
+            if hasattr(data_mode, "value"):
+                data_mode = data_mode.value
+            data_mode = str(data_mode).lower() if data_mode else ""
+            if (getattr(opp.market, "is_mock", False)
+                    or data_mode in ("mock", "historical_sim")
+                    or "MOCK" in str(opp.market.id).upper()):
+                logger.error(
+                    f"REFUSING MOCK_DATA opportunity {opp.market.id} at "
+                    f"selection: data_mode={data_mode or 'mock'} "
+                    f"source={getattr(opp.market, 'data_source', 'unknown')} - "
+                    f"invented markets are not candidates")
+                continue
+
             # 8% of mispricing, not of post-cost edge - see
             # `hunted_mispricing`. Costs are charged in the net EV terms and in
             # the positive-effective-edge check below.
@@ -469,11 +492,13 @@ class OpportunityEngine:
             orderbook = opp.market.raw.get("orderbook", {}) if hasattr(opp.market, 'raw') and isinstance(opp.market.raw, dict) else {}
             ev_result = self.expected_ev_engine.calculate(opp, amount_usd, orderbook)
             
-            # Old scoring for comparison
-            expected_profit = opp.effective_edge * amount_usd * opp.confidence
-            fees = opp.fees_pct * amount_usd
-            slippage = opp.slippage_pct * amount_usd
-            risk_adjusted_ev = expected_profit - fees - slippage - opp.uncertainty * amount_usd * 0.5
+            # The old edge-minus-fees scoring used to be computed here "for
+            # comparison" and then never compared: `risk_adjusted_ev` was
+            # assigned and read by nothing. It was also the one place left that
+            # treated a cost as a number unconditionally, so when the cost
+            # contract became three-valued (None = not known) a live scan with
+            # an undeclared fee or no orderbook raised TypeError here and the
+            # opportunity was lost. The EV engine below computes the real thing.
             
             # V10 FIX #9: New scoring = net EV per dollar per risk per capital-time
             if ev_result.net_ev_usd <= 0:

@@ -492,27 +492,51 @@ def test_one_execution_quality_rule_for_every_stage():
         execution_quality_from_book(real_book, market)
 
 
-def test_the_ranking_demo_cannot_be_mistaken_for_live_opportunities():
+def test_mock_markets_cannot_be_ranked_as_tradeable():
     """
     The dashboard's ranking demo built hand-written markets and hand-written
     opportunities (fair = price + 0.10 for all of them) with `Market`'s default
-    `data_mode=LIVE`. Nothing but the fact that the endpoint never feeds the
-    agent kept them out of an order. Now they say what they are, and the
-    selector refuses them for the honest reason: no real orderbook.
-    """
-    import asyncio
-    from src.ptai.dashboard import api_v6_opportunity_ranking
+    `data_mode=LIVE`, and they were ranked as though they were tradeable. The
+    demo has since been deleted - nothing on the page fetched it, and a route
+    whose purpose is to rank invented markets is not something the console
+    should be able to reach.
 
-    out = asyncio.run(api_v6_opportunity_ranking())
-    assert "error" not in out, out.get("error")
-    demo = out["demo_data"]
-    assert demo["is_mock"] is True
-    assert demo["data_mode"] == "mock"
-    assert demo["orderbook"] is None
-    # Every demo market carries MOCK provenance, so the guard would refuse them.
-    assert out["opportunity_ranking"]["ranked"] == [], (
-        "mock markets with no real book were ranked as tradeable"
-    )
+    The contract it was made to honour is the part worth keeping, so it is
+    asserted here against the real selector rather than through a demo
+    endpoint: mock markets, whatever they claim about their execution quality,
+    are never returned as opportunities.
+    """
+    from src.ptai.markets.base import DataMode, Market, MarketSource, Token
+    from src.ptai.strategy.opportunity import OpportunityEngine
+    from src.ptai.venues.adapter import VenueOpportunity, VenueType
+
+    def _mock(market_id: str, price: float) -> Market:
+        return Market(
+            id=market_id, source=MarketSource.POLYMARKET,
+            question=f"Will {market_id} happen?",
+            outcomes=["YES", "NO"], outcome_prices=[price, 1 - price],
+            tokens=[Token(token_id=market_id, outcome="YES", price=price)],
+            volume=50_000.0, volume_24h=20_000.0, liquidity=25_000.0,
+            raw={}, is_mock=True, data_mode=DataMode.MOCK,
+        )
+
+    def _opp(market: Market, price: float) -> VenueOpportunity:
+        return VenueOpportunity(
+            market=market, venue_id="polymarket", venue_type=VenueType.PREDICTION,
+            side="YES", market_price=price, estimated_fair=price + 0.10,
+            raw_edge=0.10, effective_edge=0.10, confidence=0.9,
+            liquidity_score=0.9, execution_quality=0.9, category="general",
+            should_trade=True)
+
+    markets = [_mock("M1", 0.60), _mock("M2", 0.55), _mock("M3", 0.50)]
+    # MOCK provenance survives the object, so nothing downstream has to guess.
+    assert all(m.is_mock and m.data_mode == DataMode.MOCK for m in markets)
+
+    ranked = OpportunityEngine().rank_and_select(
+        [_opp(m, m.outcome_prices[0]) for m in markets],
+        max_trades=3, bankroll=50.0, current_positions=[])
+    assert ranked == [], (
+        f"invented markets were ranked as tradeable opportunities: {ranked}")
 
 
 def test_the_dashboard_routes_that_should_work_do_work():
@@ -531,7 +555,12 @@ def test_the_dashboard_routes_that_should_work_do_work():
 
     checked = {"/api/status", "/api/v2/status", "/api/v3/status",
                "/api/v7/status", "/api/vault/status",
-               "/api/v6/opportunity-ranking"}
+               # `/api/v6/opportunity-ranking` and `/api/v6/fixes` used to be
+               # here. They ranked five mock markets and printed a hand-written
+               # list of fixes, nothing on the page fetched either, and they are
+               # deleted. The operator snapshot took their place as the thing a
+               # reader should be able to trust.
+               "/api/operator"}
     seen = set()
     for route in dashboard.app.routes:
         path = getattr(route, "path", None)

@@ -270,3 +270,45 @@ class TestTheVenueFeeReachesTheScan:
                 agent.memory.close()
             except Exception:
                 pass
+
+
+class TestEveryConsumerHandlesAnUnknownCost:
+    def test_the_selector_does_not_multiply_an_unknown_cost(self):
+        """
+        The contract only holds if every consumer honours it.
+
+        `rank_and_select` computed an old "edge minus fees minus slippage" score
+        that nothing read, and computed it with `opp.fees_pct * amount_usd`. With
+        the three-valued contract that is `None * float`, so a live scan of an
+        opportunity with an undeclared fee - or, more commonly, with no
+        orderbook to measure slippage from - raised TypeError and the
+        opportunity was lost before it could be judged. Found by driving the
+        selector with an UNKNOWN cost rather than by reading the code.
+        """
+        from src.ptai.markets.base import Market, MarketSource, Token
+        from src.ptai.strategy.opportunity import OpportunityEngine
+        from src.ptai.venues.adapter import VenueOpportunity, VenueType
+
+        market = Market(
+            id="N-1", source=MarketSource.POLYMARKET,
+            question="Will N-1 happen?", outcomes=["YES", "NO"],
+            outcome_prices=[0.60, 0.40],
+            tokens=[Token(token_id="N-1", outcome="YES", price=0.60)],
+            volume=200_000.0, volume_24h=100_000.0, liquidity=50_000.0,
+            raw={"orderbook": _real_book(), "venue_id": "polymarket"},
+        )
+        opp = VenueOpportunity(
+            market=market, venue_id="polymarket", venue_type=VenueType.PREDICTION,
+            side="YES", market_price=0.60, estimated_fair=0.72,
+            raw_edge=0.12, effective_edge=0.10, confidence=0.8,
+            liquidity_score=0.8, execution_quality=0.9, category="politics",
+            should_trade=True,
+            # Nothing declared: the venue's schedule was not read and the book
+            # gave no slippage estimate. Both consumers must cope.
+            fees_pct=None, spread_pct=None, slippage_pct=None,
+        )
+        engine = OpportunityEngine()
+        selected = engine.rank_and_select([opp], max_trades=1, bankroll=50.0,
+                                          current_positions=[])
+        assert isinstance(selected, list), (
+            "an unknown cost crashed the selector instead of being priced")
