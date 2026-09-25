@@ -103,6 +103,15 @@ def get_storage() -> Storage:
     if _STORAGE["instance"] is None or _STORAGE["path"] != path:
         _STORAGE["instance"] = Storage(db_path=path)
         _STORAGE["path"] = path
+    else:
+        # Something may have closed the handle anyway (a helper that closes what
+        # it was handed). A closed handle must not turn into a console that
+        # answers 500 for every panel until it is restarted, so the connection is
+        # checked and rebuilt if needed.
+        try:
+            _STORAGE["instance"].conn.execute("SELECT 1")
+        except Exception:
+            _STORAGE["instance"] = Storage(db_path=path)
     return _STORAGE["instance"]
 
 
@@ -368,11 +377,11 @@ async def api_agent() -> JSONResponse:
     """
     from ..operator_view import operator_snapshot
 
+    # The storage is shared by every request in this process, so it is NOT
+    # closed here: closing it left the whole console answering 500s with
+    # "Cannot operate on a closed database" until it was restarted.
     storage = get_storage()
-    try:
-        snapshot = operator_snapshot(storage)
-    finally:
-        storage.close()
+    snapshot = operator_snapshot(storage)
 
     blockers = list(snapshot.get("blockers") or [])
     brain = _brain_status()
@@ -531,11 +540,6 @@ async def api_status() -> JSONResponse:
         "win_rate": profit.get("win_rate_pct"),
         "open_positions": (snapshot.get("positions") or {}).get("live_count"),
     }
-    try:
-        storage.close()
-    except Exception:
-        pass
-
     out["steps"] = [
         {"step": "agent", "label": "Agent running",
          "ok": bool(agt.get("running")),

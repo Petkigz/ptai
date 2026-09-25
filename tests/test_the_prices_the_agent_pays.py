@@ -368,6 +368,30 @@ class TestTheConsoleStopsTalkingToItself:
         second = console.get_storage()
         assert first is not second
 
+    def test_no_request_closes_the_shared_storage(self):
+        """
+        The two routes that used to close it made every later request fail with
+        "Cannot operate on a closed database" once one Storage is shared.
+        """
+        import inspect
+
+        from src.ptai.ui import console as console_module
+        source = inspect.getsource(console_module)
+        assert "storage.close()" not in source
+        # ...and a handle closed by something else is rebuilt, not served broken
+        assert '_STORAGE["instance"].conn.execute("SELECT 1")' in source
+
+    def test_the_routes_still_answer_after_repeated_use(self, tmp_path, monkeypatch):
+        import importlib
+        monkeypatch.setenv("PTAI_DB", str(tmp_path / "console.db"))
+        console = importlib.import_module("src.ptai.ui.console")
+        from fastapi.testclient import TestClient
+        client = TestClient(console.app)
+        for _ in range(3):
+            assert client.get("/api/console/agent").status_code == 200
+            assert client.get("/api/console/status").status_code == 200
+            assert client.get("/api/console/capital").status_code == 200
+
     def test_the_page_only_polls_while_it_is_visible(self):
         import inspect
 
