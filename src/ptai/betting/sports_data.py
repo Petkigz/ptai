@@ -156,6 +156,19 @@ BROWSER_USER_AGENT = (
 )
 
 
+# A provider that refuses this machine is not a provider that was asked and had
+# nothing to say. The operator's log repeated this every 10-minute cycle:
+#
+#   [espn] fetch failed .../basketball/nba/scoreboard: HTTPStatusError: 403 Forbidden
+#   [espn] fetch failed .../soccer/eng.1/scoreboard: HTTPStatusError: 403 Forbidden
+#   [sports] 0 unique fixtures, 2 provider issue(s)
+#   [betting] cycle aborted: no fixtures from any feed
+#
+# ...and the whole sports lane - goals, cards, corners, totals, halves - priced
+# nothing. A 403 is an answer, and it is worth re-asking only occasionally.
+BLOCKED_RETRY_SECONDS = 900.0
+
+
 class BaseProvider:
     name = "base"
     is_synthetic = False
@@ -166,6 +179,33 @@ class BaseProvider:
         self.last_error: str = ""
         self.last_fetch_at: Optional[datetime] = None
         self.requests_made = 0
+        # Set when the feed refuses us outright (401/403/407). While it is set the
+        # provider is skipped, so the log says once why an entire lane is dark
+        # instead of printing the same 403 every cycle forever.
+        self.blocked_reason: str = ""
+        self.blocked_until: Optional[datetime] = None
+
+    @property
+    def is_blocked(self) -> bool:
+        if not self.blocked_reason:
+            return False
+        if self.blocked_until and datetime.now(timezone.utc) >= self.blocked_until:
+            self.blocked_reason = ""
+            self.blocked_until = None
+            return False
+        return True
+
+    def _mark_blocked(self, status: int, url: str) -> None:
+        self.blocked_reason = (
+            f"{self.name} refuses this network with HTTP {status} "
+            f"({url.split('/scoreboard')[0].split('//')[-1]})")
+        self.blocked_until = datetime.now(timezone.utc) + timedelta(
+            seconds=BLOCKED_RETRY_SECONDS)
+        logger.warning(
+            f"[{self.name}] HTTP {status} - this feed is refusing this machine. "
+            f"Skipping it for {BLOCKED_RETRY_SECONDS/60:.0f} min; the sports lane "
+            f"stays dark until it lifts or another feed is added "
+            f"(THE_ODDS_API_KEY / FOOTBALL_DATA_TOKEN in Setup).")
 
     async def _get(self, client: httpx.AsyncClient, url: str, params: Dict = None,
                    headers: Dict = None) -> Optional[Any]:
@@ -176,6 +216,10 @@ class BaseProvider:
             if r.status_code == 429:
                 self.last_error = f"429 rate limited by {self.name}"
                 logger.warning(self.last_error)
+                return None
+            if r.status_code in (401, 403, 407):
+                self.last_error = f"HTTP {r.status_code} from {self.name}"
+                self._mark_blocked(r.status_code, url)
                 return None
             r.raise_for_status()
             self.last_fetch_at = datetime.now(timezone.utc)
@@ -573,10 +617,23 @@ class SportsDataEngine:
 
     async def fetch_events(self, leagues: Sequence[str] = ("nba", "epl")) -> List[SportsEvent]:
         self.diagnostics.clear()
+        # A feed that refused us recently is not asked again on every cycle; the
+        # reason is carried so the caller can say "every feed refused" rather than
+        # "no fixtures" - the two mean completely different things.
+        active = [p for p in self.providers if not getattr(p, "is_blocked", False)]
+        for p in self.providers:
+            if getattr(p, "is_blocked", False):
+                self.diagnostics.append(p.blocked_reason)
+        if not active:
+            logger.warning(
+                "[sports] every fixture feed is refusing this machine - "
+                f"{'; '.join(self.diagnostics) or 'no providers configured'}")
+            self.events_cache = []
+            return self.events_cache
         results = await asyncio.gather(
-            *[p.events(leagues) for p in self.providers], return_exceptions=True)
+            *[p.events(leagues) for p in active], return_exceptions=True)
         merged: Dict[str, SportsEvent] = {}
-        for provider, res in zip(self.providers, results):
+        for provider, res in zip(active, results):
             if isinstance(res, Exception):
                 self.diagnostics.append(f"{provider.name}: {type(res).__name__} {res}")
                 continue

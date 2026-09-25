@@ -165,13 +165,27 @@ class EnsembleForecaster:
         if total_weight > 0:
             ensemble_prob = weighted_prob / total_weight
         else:
-            ensemble_prob = sum(f.probability for f in forecasts) / len(forecasts)
+            # Not one model had data. The average of a set of models that all
+            # declined to answer is not a forecast - it used to be whatever
+            # midpoint their placeholders averaged to (0.5), which is how a
+            # market priced 0.007 could come back with a fair value near 0.10 and
+            # an edge worth trading. With no information the market's own price is
+            # the estimate; there is no edge to claim.
+            ensemble_prob = market.best_price
 
-        avg_conf = total_conf / len(forecasts) if forecasts else 0.5
-        avg_uncertainty = total_uncertainty / len(forecasts) if forecasts else 0.5
+        if total_weight > 0:
+            avg_conf = total_conf / len(forecasts) if forecasts else 0.5
+            avg_uncertainty = total_uncertainty / len(forecasts) if forecasts else 0.5
+        else:
+            avg_conf = 0.0
+            avg_uncertainty = 0.5
 
         # Calibration adjustment
         calibrated_prob = ensemble_prob
+        if total_weight <= 0:
+            logger.info(
+                f"Ensemble {market.id}: no model had data (market {market.best_price:.3f}) "
+                f"- reporting the market price and no confidence, not an opinion")
         if self.calibration_engine:
             try:
                 # The market's OWN category. This was hardcoded to "default"

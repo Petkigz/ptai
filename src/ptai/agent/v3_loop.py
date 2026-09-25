@@ -1329,6 +1329,15 @@ class TradingAgentV3:
             max_final_trades=max_trades
         )
         logger.info(f"Common scoring: {len(scan_result.venue_reports)} venues, {scan_result.total_candidates} candidates, {scan_result.total_tradeable} tradeable after fees/liquidity/uncertainty")
+        # WHY nothing traded. A cycle that refused everything used to look
+        # identical to a cycle that found nothing, which is how a resolution
+        # rule blocking a whole category stayed invisible for a week.
+        try:
+            summary = self.strategy_engine_v3.fair_value_engine.outcome_summary()
+            logger.info(f"Market outcomes this cycle: {summary}")
+            self.strategy_engine_v3.fair_value_engine.reset_outcomes()
+        except Exception as e:
+            logger.debug(f"Could not summarise market outcomes: {e}")
         
         # Core Objective Step 4: Only deploys capital when passes independently enforced rules
         # V10 FIX #2: Consistent risk sizing - Kelly first, then same amount through all checks

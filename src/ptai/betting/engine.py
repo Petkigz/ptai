@@ -217,16 +217,34 @@ class BettingEngine:
 
         events = await self.data.fetch_events(leagues)
         if not events:
+            # "No fixtures today" and "every feed refused us" are different facts
+            # and the operator needs to see which one they have. The old message
+            # said "no fixtures from any feed" for both, so a feed blocking the
+            # machine read as an empty schedule - for as long as it lasted.
+            refused = [p for p in getattr(self.data, "providers", [])
+                       if getattr(p, "is_blocked", False)]
+            if refused:
+                reason = ("every fixture feed refused this machine: "
+                          + "; ".join(p.blocked_reason for p in refused))
+                remedy = ("Sports markets cannot be priced against a consensus "
+                          "while this lasts. Add THE_ODDS_API_KEY or "
+                          "FOOTBALL_DATA_TOKEN in Setup for a second feed.")
+            else:
+                reason = f"no fixtures from any feed: {self.data.diagnostics[:5]}"
+                remedy = ("Nothing scheduled, or the feeds returned nothing. "
+                          "Invented sports prices must never reach the sizing layer.")
             result = {
                 "ok": False, "events": 0, "opportunities": 0, "arbs": 0,
                 "data_mode": data_mode.value,
-                "blockers": [f"no fixtures from any feed: {self.data.diagnostics[:5]}"],
+                "blockers": [reason],
+                "degraded": True,
+                "remedy": remedy,
                 "health": self.data.health(),
-                "message": "Refusing to proceed - no real fixture data. "
-                           "Invented sports prices must never reach the sizing layer.",
+                "message": f"Refusing to proceed - {remedy}",
             }
             self.last_cycle = result
-            logger.warning(f"[betting] cycle aborted: {result['blockers'][0]}")
+            logger.warning(f"[betting] sports lane skipped: {reason}")
+            logger.warning(f"[betting] {remedy}")
             return result
 
         opps: List[BetOpportunity] = []

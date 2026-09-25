@@ -299,6 +299,32 @@ class TestEdgeWithFeesGas:
         assert opp.effective_edge < 0.08
         # 5 shares * 0.10 edge = $0.50 gross; costs 0.0941 of $3 = $0.28.
         assert opp.effective_edge > 0
+        # The expectancy is positive; the TRADE is still refused, because no
+        # orderbook was supplied and so there is no price that can be paid.
+        # Trading needs an executable price, not just favourable arithmetic.
+        assert not opp.should_trade
+        assert "not real" in opp.blocked_by
+
+    def test_the_same_edge_with_a_real_book_and_a_payable_price_is_a_trade(self):
+        """
+        The other half of the rule above: the same arithmetic, with a real
+        two-sided book whose ask still leaves the edge intact.
+        """
+        calc = EdgeCalculator()
+        market = Market(
+            id="M1", source=MarketSource.POLYMARKET, question="Will Trump win election?",
+            volume=50000, liquidity=10000, raw={}
+        )
+        market.outcome_prices = [0.60, 0.40]
+        opp = calc.calculate(
+            market=market, fair_prob=0.70, uncertainty=0.1, amount_usd=3.0,
+            orderbook={"bid": 0.599, "ask": 0.601, "spread": 0.002,
+                       "bid_size": 5000, "ask_size": 5000, "is_real": True},
+            side="YES")
+        assert opp.book_is_real
+        assert abs(opp.price_paid - 0.601) < 1e-9
+        assert opp.executable_edge > 0
+        assert opp.blocked_by == ""
         assert opp.should_trade
 
     def test_costs_that_consume_the_edge_still_refuse_it(self):
@@ -333,9 +359,14 @@ class TestEdgeWithFeesGas:
         )
         market.outcome_prices = [0.60, 0.40]
         # 20% raw edge 0.60->0.80, fees 2.4%+gas 1.7%+spread 2%+unc 5% = 11.1% total, effective 8.9%
-        opp = calc.calculate(market=market, fair_prob=0.80, uncertainty=0.1, amount_usd=3.0)
+        opp = calc.calculate(
+            market=market, fair_prob=0.80, uncertainty=0.1, amount_usd=3.0,
+            orderbook={"bid": 0.598, "ask": 0.602, "spread": 0.004,
+                       "bid_size": 5000, "ask_size": 5000, "is_real": True},
+            side="YES")
         assert abs(opp.raw_edge - 0.20) < 0.001
         assert opp.effective_edge >= 0.08
+        assert opp.executable_edge > 0
         assert opp.should_trade
 
 

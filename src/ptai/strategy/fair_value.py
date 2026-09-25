@@ -38,6 +38,12 @@ class FairValueEngine:
     """
     def __init__(self, llm_router=None, calibration_engine=None, uncertainty_engine=None,
                  web_researcher=None):
+        # Why this cycle's markets were refused, counted once per reason. The
+        # operator's log showed each market's refusal buried in a wall of text and
+        # no line that said how many were refused and for what, so a scan that
+        # blocked everything on resolution wording read the same as a scan that
+        # found nothing.
+        self.outcome_counts: Dict[str, int] = {}
         self.llm_router = llm_router
         self.calibration_engine = calibration_engine or CalibrationEngine()
         self.uncertainty_engine = uncertainty_engine or UncertaintyEngine()
@@ -54,12 +60,26 @@ class FairValueEngine:
             llm_router=llm_router
         )
 
+    def _record_outcome(self, label: str) -> None:
+        self.outcome_counts[label] = self.outcome_counts.get(label, 0) + 1
+
+    def outcome_summary(self) -> str:
+        """One line: what this cycle's markets came back as."""
+        if not self.outcome_counts:
+            return "no market reached a decision"
+        ranked = sorted(self.outcome_counts.items(), key=lambda kv: -kv[1])
+        return ", ".join(f"{count} {label}" for label, count in ranked)
+
+    def reset_outcomes(self) -> None:
+        self.outcome_counts = {}
+
     def estimate(self, market: Market, context: Dict = None) -> FairValueResult:
         context = context or {}
 
         # Step 1: Resolution risk check - if ambiguous, no trade
         resolution_analysis = self.resolution_analyzer.analyze(market)
         if not resolution_analysis.should_trade:
+            self._record_outcome("refused: resolution")
             logger.warning(f"Resolution risk blocks trade for {market.id}: {resolution_analysis.risks}")
             return FairValueResult(
                 market_id=market.id,
@@ -147,16 +167,29 @@ class FairValueEngine:
             side=side,
         )
 
-        # Step 5: Final decision with uncertainty margin
+        # Step 5: Final decision with uncertainty margin.
+        #
+        # The edge handed to the gate is the EXECUTABLE one: after crossing to the
+        # price actually available, not after the mid. The two differ by the
+        # spread, and on the operator's 2026-09-25 log they differed by 99 points
+        # - a market whose mid said +0.200 and whose ask said 0.999.
         should_trade, reason = self.uncertainty_engine.should_trade(
-            effective_edge=effective.effective_edge,
+            effective_edge=effective.executable_edge,
             confidence=adjusted_confidence,
             uncertainty=forecast_result.uncertainty,
             resolution_risks=resolution_analysis.risks,
-            # The 8% rule is about mispricing; the costs are charged once, here
-            # and in the net EV, not twice.
+            # The 8% rule is about mispricing, and it stays on the mid: a market
+            # can be mispriced (raw) and still not worth crossing (executable),
+            # which is exactly what the refusal below records.
             raw_edge=raw_edge,
         )
+
+        # ...and the trade must be possible at all: a real two-sided book, at a
+        # price that still pays after everything. `EdgeCalculator` reaches this
+        # verdict once, so there is one definition of "tradable" in the system.
+        if should_trade and effective.blocked_by:
+            should_trade = False
+            reason = f"Not executable: {effective.blocked_by}"
 
         # Override if contradiction report says high risk.
         # Measured on the same mispricing scale as the 12% in the uncertainty
@@ -169,9 +202,25 @@ class FairValueEngine:
             reason = (f"High conflicting evidence + mispricing "
                       f"{raw_edge:.3f} < 12%")
 
+        # What happened to this market, in words the operator can count.
+        if should_trade:
+            label = "tradeable"
+        elif effective.blocked_by:
+            label = ("refused: spread" if "spread" in effective.blocked_by
+                     else "refused: no executable price" if "not real" in effective.blocked_by
+                     else "refused: executable edge")
+        elif "Confidence" in reason:
+            label = "refused: confidence"
+        elif "Mispricing" in reason:
+            label = "refused: no mispricing"
+        else:
+            label = "refused: " + (reason.split(":")[0].strip().lower() or "other")
+        self._record_outcome(label)
+
         final_reasoning = (
             f"Ensemble fair {forecast_result.fair_probability:.3f} market {market.best_price:.3f} "
-            f"raw edge [{side}] {raw_edge:.3f} effective {effective.effective_edge:.3f} | "
+            f"raw edge [{side}] {raw_edge:.3f} effective {effective.effective_edge:.3f} "
+            f"executable {effective.executable_edge:.3f} (pay {effective.price_paid:.3f}) | "
             f"Conf {adjusted_confidence:.2f} unc {forecast_result.uncertainty:.2f} | "
             f"Resolution risk {resolution_analysis.risk_score:.2f} | "
             f"Contradiction net {contradiction_report.net_score:.2f} | "
@@ -185,7 +234,7 @@ class FairValueEngine:
             confidence=adjusted_confidence,
             uncertainty=forecast_result.uncertainty,
             edge=raw_edge,  # the mispricing on `side`, not the ensemble's YES edge
-            effective_edge=effective.effective_edge,
+            effective_edge=effective.executable_edge,
             side=side,
             should_trade=should_trade,
             reasoning=final_reasoning,

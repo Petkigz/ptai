@@ -33,6 +33,21 @@ class BaseRateModel:
     """
     Statistical/base-rate model:
     historical frequencies, event type, time remaining, analogues, polling
+
+    IT HAS NO DATA. `historical_data` is an empty list and nothing loads it, so
+    every number this model produced was one of the constants below - and it
+    claimed confidence 0.6 for them, more than most real evidence in the stack.
+
+    That is what manufactured the trade in the operator's 2026-09-25 log:
+
+        market 2774057 priced 0.007 (real book bid 0.001 / ask 0.999)
+        base_rate said 0.50 with confidence 0.6
+        ensemble          -> fair 0.207
+        edge              -> raw 0.200 "Should trade: True"
+                          -> cost to break even 106.7% of the position
+
+    A constant is not a forecast. With no data behind it this model has no
+    opinion, so it says so and stops contributing weight.
     """
     def __init__(self):
         # Historical base rates by category (would be learned from calibration DB)
@@ -45,9 +60,36 @@ class BaseRateModel:
             "default": 0.50
         }
         self.historical_data = []  # Would load from DB
+        self._warned_no_data = False
+
+    @property
+    def has_data(self) -> bool:
+        """True only when real historical frequencies were loaded."""
+        return bool(self.historical_data)
 
     def forecast(self, market: Market, category: str = "default") -> ModelForecast:
         base = self.base_rates.get(category, self.base_rates["default"])
+        if not self.has_data:
+            # No data, no opinion. The probability is still the prior so the
+            # object is well formed, but confidence 0 removes its weight from
+            # the ensemble and the reasoning says why.
+            if not self._warned_no_data:
+                self._warned_no_data = True
+                logger.warning(
+                    "Base-rate model has no historical data loaded: its category "
+                    "constants (politics 0.52, sports 0.50, ...) are not evidence "
+                    "and are excluded from the ensemble until real frequencies "
+                    "are loaded")
+            return ModelForecast(
+                model_name="base_rate",
+                probability=max(0.05, min(0.95, base)),
+                confidence=0.0,
+                uncertainty=1.0,
+                reasoning=("no historical data loaded - category constant "
+                           f"{base:.2f} is not a forecast, so this model "
+                           "contributes no weight"),
+                sources=[]
+            )
         
         # Adjust by time remaining - closer to resolution, more certainty if market stable?
         # For now simple: if very short time, lean toward market price (efficient)
@@ -111,6 +153,19 @@ class NewsModel:
         pos_count = sum(1 for w in positive_words if w in text)
         neg_count = sum(1 for w in negative_words if w in text)
         
+        if not news_text:
+            # "No news available - neutral" was a forecast with confidence 0.4
+            # built from an empty string. Same rule as everywhere else: no input,
+            # no weight.
+            return ModelForecast(
+                model_name="news",
+                probability=max(0.05, min(0.95, market.best_price)),
+                confidence=0.0,
+                uncertainty=1.0,
+                reasoning="no news retrieved - this model contributes no weight",
+                sources=[]
+            )
+
         sentiment = (pos_count - neg_count) / max(1, pos_count + neg_count)
         # Convert sentiment to probability adjustment
         adjustment = sentiment * 0.1  # max 10% adjustment
@@ -174,6 +229,25 @@ class XModel:
     def forecast(self, market: Market, sentiment_result: Dict = None, tweets: List[Dict] = None) -> ModelForecast:
         sentiment_result = sentiment_result or {}
         tweets = tweets or []
+
+        # No X data at all is not a neutral opinion, it is no opinion. This model
+        # answered `prob = 0.5 + 0` with the credibility floor of 0.3 -> confidence
+        # 0.21, and that 0.5 carried real weight in the ensemble. On the operator's
+        # machine - where the scraper was blocked and the circuit breaker was open
+        # for every market - it was the single largest pull away from the market
+        # price, which is how a 0.007 market acquired a 0.096 fair value from an
+        # empty context.
+        has_x_data = bool(tweets) or abs(float(sentiment_result.get("score", 0) or 0)) > 0
+        if not has_x_data:
+            return ModelForecast(
+                model_name="x_sentiment",
+                probability=max(0.05, min(0.95, market.best_price)),
+                confidence=0.0,
+                uncertainty=1.0,
+                reasoning="no X data - no posts scraped and no sentiment signal, "
+                          "so this model contributes no weight",
+                sources=[]
+            )
 
         credibility = self.analyze_credibility(tweets)
         

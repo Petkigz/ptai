@@ -67,6 +67,68 @@ class EffectiveEdge:
     market_price: float
     reasoning: str
     should_trade: bool = False
+    # What a share actually costs, and what is left after paying it. `market_price`
+    # above is the market's own quote (the mid); on a book with a 99.8% spread
+    # there is no trade anywhere near it.
+    price_paid: float = 0.0
+    executable_edge: float = 0.0
+    book_is_real: bool = False
+    blocked_by: str = ""
+
+
+def _as_price(value) -> Optional[float]:
+    """A price from a book, or None. Never a made-up number."""
+    try:
+        if value is None:
+            return None
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if price < 0.0 or price > 1.0:
+        return None
+    return price
+
+
+# A book this wide cannot pay for the fees and still leave the 8% mispricing
+# rule anything to act on: crossing it costs a quarter of the position before
+# anything else is charged.
+MAX_TRADABLE_SPREAD = 0.25
+
+
+def _best_quote(book: Dict, side: str):
+    """
+    The best (price, size) on one side of a book, from either shape.
+
+    Production books carry top-level `bid`/`ask` plus depth arrays; a book that
+    only carries its depth arrays is the same book. Reading both means a real
+    book is never mistaken for an unusable one just because of how it was
+    serialised.
+    """
+    direct = _as_price(book.get("bid" if side == "bid" else "ask"))
+    levels = book.get("bids" if side == "bid" else "asks") or []
+    if direct is not None and direct > 0:
+        size = book.get(f"{side}_size")
+        return direct, (float(size) if isinstance(size, (int, float)) else None)
+    best = None
+    for level in levels[:25]:
+        price = size = None
+        if isinstance(level, dict):
+            price = _as_price(level.get("price"))
+            try:
+                size = float(level.get("size"))
+            except (TypeError, ValueError):
+                size = None
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _as_price(level[0])
+            try:
+                size = float(level[1])
+            except (TypeError, ValueError):
+                size = None
+        if price is None or price <= 0:
+            continue
+        if best is None or (price > best[0] if side == "bid" else price < best[0]):
+            best = (price, size)
+    return best if best else (None, None)
 
 
 class EdgeCalculator:
@@ -223,11 +285,57 @@ class EdgeCalculator:
             conservative_fair = fair_prob + uncertainty_cost_price_units
         conservative_fair = max(0.01, min(0.99, conservative_fair))
 
+        # -- The price that can actually be paid --------------------------------
+        # `raw_edge` above is measured against the market's own quote, which is
+        # the right basis for "is this market mispriced" and the wrong basis for
+        # "what does one share cost me". The operator's log has the two apart by
+        # 99 points:
+        #
+        #   market 2774057, real CLOB: bid 0.001 / ask 0.999
+        #   the agent's own arithmetic: fair 0.207 vs market 0.007 -> edge +0.200
+        #   "Should trade: True", cost to break even printed as 106.7%
+        #
+        # A yes share cost 0.999 there, and a no share cost 1 - 0.001 = 0.999.
+        # There was no trade at any price near the mid, and the trade it was
+        # about to place was a straight loss with a positive-looking edge.
+        book = orderbook or {}
+        bid, bid_size = _best_quote(book, "bid")
+        ask, ask_size = _best_quote(book, "ask")
+        quoted_sizes = (bid_size, ask_size)
+        book_is_real = (bool(book.get("is_real", False)) and bid is not None
+                        and ask is not None)
+
+        blocked_by = ""
+        if book_is_real:
+            if side == "YES":
+                price_paid, size_there = ask, quoted_sizes[1]
+            else:
+                price_paid, size_there = 1.0 - bid, quoted_sizes[0]
+            # The spread is inside `price_paid` now - crossing it IS the cost -
+            # so it must not be deducted a second time.
+            executable_deductions = total_deductions - spread
+            executable_edge = fair_prob - price_paid - executable_deductions * price_paid
+
+            if size_there is not None and not size_there:
+                blocked_by = (
+                    f"nothing to trade against: the {('ask' if side == 'YES' else 'bid')} "
+                    f"side of {market.id} is empty")
+            spread_measured = ask - bid
+            if not blocked_by and spread_measured > MAX_TRADABLE_SPREAD:
+                blocked_by = (f"spread {spread_measured:.1%} on {market.id} cannot pay "
+                              f"for fees and leave an edge")
+            if not blocked_by and executable_edge <= 0:
+                blocked_by = (f"no executable edge: fair {fair_prob:.3f} vs the "
+                              f"{price_paid:.3f} a share actually costs")
+        else:
+            price_paid = market_price
+            executable_edge = effective_edge
+            blocked_by = "orderbook is not real - there is no executable price to trade on"
+
         # Should trade? The 8% is the same mispricing rule as everywhere else,
-        # and the costs must not have eaten the edge entirely. This flag is
-        # informational (nothing consumes it), but leaving it on the post-cost
-        # edge would have been a second, weaker copy of the rule.
-        should_trade = raw_edge >= 0.08 and effective_edge > 0
+        # the costs must not have eaten the edge entirely, and the trade has to
+        # be possible at a price that still pays.
+        should_trade = raw_edge >= 0.08 and effective_edge > 0 and not blocked_by
 
         reasoning = (
             f"[{side}] Raw {raw_edge:.3f} (fair {fair_prob:.3f} - mkt {market_price:.3f}) | "
@@ -236,7 +344,10 @@ class EdgeCalculator:
             f"fees {fees:.3f} gas {gas_deduction:.3f} spread {spread:.3f} slip {slippage:.3f} liq {liquidity_penalty:.3f} "
             f"unc {uncertainty_penalty:.3f} corr {correlation_penalty:.3f} time {time_penalty:.3f} | "
             f"Effective {effective_edge:.3f} conservative_fair {conservative_fair:.3f} | "
-            f"Should trade: {should_trade} (raw>=8%, effective>0) | $50 math: fee {fees*100:.1f}% + gas {gas_deduction*100:.1f}% + spread {spread*100:.1f}% = { (fees+gas_deduction+spread)*100:.1f}% cost must exceed to break even"
+            f"Should trade: {should_trade} (raw>=8%, effective>0) | $50 math: fee {fees*100:.1f}% + gas {gas_deduction*100:.1f}% + spread {spread*100:.1f}% = { (fees+gas_deduction+spread)*100:.1f}% cost must exceed to break even | "
+            f"Executable: pay {price_paid:.3f} -> {executable_edge:+.3f} "
+            f"{'(book not real)' if not book_is_real else ''}"
+            f"{(' REFUSED: ' + blocked_by) if blocked_by else ''}"
         )
 
         logger.info(f"Edge calc {market.id}: {reasoning}")
@@ -254,7 +365,11 @@ class EdgeCalculator:
             conservative_fair=conservative_fair,
             market_price=market_price,
             reasoning=reasoning,
-            should_trade=should_trade
+            should_trade=should_trade,
+            price_paid=price_paid,
+            executable_edge=executable_edge,
+            book_is_real=book_is_real,
+            blocked_by=blocked_by,
         )
 
     def calculate_for_opportunity(self, opportunity: VenueOpportunity, orderbook: Dict = None) -> EffectiveEdge:

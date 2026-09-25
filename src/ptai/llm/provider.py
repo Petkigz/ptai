@@ -4,6 +4,7 @@ All local, no cloud. LM Studio is primary for this user.
 """
 import re
 import json
+import time
 from typing import Optional, Dict, Any, Literal, List
 from dataclasses import dataclass
 import requests
@@ -210,30 +211,44 @@ class LMStudioProvider(BaseLLMProvider):
         return []
 
     def chat(self, prompt: str, system: str = "") -> Optional[LLMResponse]:
+        started = time.time()
+        model_to_use = self.model
         try:
             from openai import OpenAI
             # A bounded wait. Without it the client's own 600 s default applies
             # and one market can hold the whole cycle.
+            #
+            # `max_retries=0` is not a detail. The OpenAI client retries twice by
+            # default, and each retry re-sends the whole prompt, so a "180 second"
+            # limit was really 3 x 180 = ~540 seconds of the user's cycle. Their
+            # log shows exactly that: 22:12:01 -> 22:21:08 = 547 s per market,
+            # and 848 s on the first one. A limit that the client is allowed to
+            # multiply by three is not a limit.
             client = OpenAI(api_key=self.api_key, base_url=self.base_url,
-                            timeout=self.timeout_seconds)
+                            timeout=self.timeout_seconds, max_retries=0)
             messages = []
             if system:
                 messages.append({"role": "system", "content": system})
             messages.append({"role": "user", "content": prompt})
             
-            model_to_use = self.model
             if model_to_use in UNPINNED_MODELS:
                 models = self.list_models()
                 if models:
                     model_to_use, reason = choose_loaded_model(models, self.model)
                     logger.info(f"LM Studio model choice: {reason}")
             
+            started = time.time()
             response = client.chat.completions.create(
                 model=model_to_use,
                 messages=messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens
             )
+            elapsed = time.time() - started
+            if elapsed > max(20.0, self.timeout_seconds * 0.5):
+                logger.warning(
+                    f"LM Studio took {elapsed:.0f}s for one forecast with "
+                    f"{model_to_use} (limit {self.timeout_seconds:.0f}s)")
             content = response.choices[0].message.content
             return LLMResponse(
                 content=content,
@@ -244,14 +259,16 @@ class LMStudioProvider(BaseLLMProvider):
         except ImportError:
             logger.error("openai package not installed, needed for LM Studio")
         except Exception as e:
-            logger.error(f"LM Studio chat failed: {e}")
+            logger.error(
+                f"LM Studio chat failed after {time.time() - started:.0f}s with "
+                f"{model_to_use} (limit {self.timeout_seconds:.0f}s, no retry): {e}")
         return None
 
 class OpenAICompatibleProvider(BaseLLMProvider):
     """Generic OpenAI compatible (for any local server)"""
-    def __init__(self, model: str, host: str, api_key: str = "not-needed", temperature: float = 0.2, max_tokens: int = 1200):
+    def __init__(self, model: str, host: str, api_key: str = "not-needed", temperature: float = 0.2, max_tokens: int = 1200, timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
         safe_host = host or "http://localhost:1234"
-        super().__init__(model, safe_host, temperature, max_tokens)
+        super().__init__(model, safe_host, temperature, max_tokens, timeout_seconds)
         self.api_key = api_key or "not-needed"
         self.base_url = self.host if self.host.endswith("/v1") else f"{self.host}/v1"
 
@@ -265,7 +282,11 @@ class OpenAICompatibleProvider(BaseLLMProvider):
     def chat(self, prompt: str, system: str = "") -> Optional[LLMResponse]:
         try:
             from openai import OpenAI
-            client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            # Same bound as the LM Studio path: this class had no timeout at all,
+            # so any OpenAI-compatible server inherited the client's 600 s default
+            # and could hold a whole cycle on one market.
+            client = OpenAI(api_key=self.api_key, base_url=self.base_url,
+                            timeout=self.timeout_seconds, max_retries=0)
             messages = []
             if system:
                 messages.append({"role": "system", "content": system})
@@ -326,7 +347,7 @@ class LLMRouter:
                 logger.info(f"Ollama not available at {self.ollama_host}")
 
         if self.preferred == "auto":
-            generic = OpenAICompatibleProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens)
+            generic = OpenAICompatibleProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens, timeout_seconds=self.timeout_seconds)
             if generic.is_available():
                 logger.success(f"Generic OpenAI compatible at {self.lm_studio_host}")
                 self.provider = generic

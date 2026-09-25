@@ -80,9 +80,30 @@ class ConsoleState:
         return authorised_budgets(self.storage)
 
 
+_STORAGE: Dict[str, Any] = {"instance": None, "path": ""}
+
+
 def get_storage() -> Storage:
+    """
+    ONE Storage per console process, shared by every request.
+
+    It used to build a new one per HTTP request, and the operator's log shows
+    what that looks like from the outside - the page asks for eight panels every
+    fifteen seconds:
+
+        2026-09-25 21:51:58.956 | INFO | ptai.storage.db:__init__:232 - Storage initialized at data\ptai.db
+        ...the same line 34 times in the next three seconds, per browser tab...
+
+    Each construction re-opens the database, re-runs schema setup and prints a
+    line, so the log was mostly about the console talking to itself and the real
+    agent messages were lost in it.
+    """
     import os
-    return Storage(db_path=os.getenv("PTAI_DB", "./data/ptai.db"))
+    path = os.getenv("PTAI_DB", "./data/ptai.db")
+    if _STORAGE["instance"] is None or _STORAGE["path"] != path:
+        _STORAGE["instance"] = Storage(db_path=path)
+        _STORAGE["path"] = path
+    return _STORAGE["instance"]
 
 
 # ----------------------------------------------------------------------
@@ -1754,12 +1775,25 @@ async function loadBrainSetup(){
   if(iv && body.agent) iv.textContent = String(body.agent.interval_min||10);
 }
 
+let _loading = false;
 async function loadAll(){
-  await Promise.all([
-    loadAgent(), loadStatus(), loadBrainSetup(),
-    loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
-  ]);
-  spyScroll();
+  // One round at a time. Eight endpoints per round taking longer than the timer
+  // is how a page ends up with several rounds in flight at once.
+  if(_loading) return;
+  // Only the tab the operator is looking at polls. Every open console tab used
+  // to ask for all eight panels every fifteen seconds; five tabs left open meant
+  // forty requests a round, all of them logging.
+  if(document.visibilityState === 'hidden') return;
+  _loading = true;
+  try{
+    await Promise.all([
+      loadAgent(), loadStatus(), loadBrainSetup(),
+      loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
+    ]);
+    spyScroll();
+  } finally {
+    _loading = false;
+  }
 }
 
 // Everything, on open and on the timer. The panels are read-only views of the
@@ -1767,6 +1801,9 @@ async function loadAll(){
 // input is never re-rendered by a refresh.
 loadAll();
 setInterval(loadAll, 15000);
+// Coming back to a backgrounded tab refreshes immediately instead of waiting
+// out the rest of the interval.
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') loadAll(); });
 </script>
 </body>
 </html>

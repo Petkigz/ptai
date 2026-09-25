@@ -165,6 +165,12 @@ class ResearchResult:
     provenance: str = "web_fetch"
 
 
+# How long to stop asking a search engine that just refused us. Long enough to
+# cover a whole scan of 500-1000 markets, short enough that research comes back
+# by itself when the network does.
+SEARCH_COOLDOWN_SECONDS = 1800.0
+
+
 class WebResearcher:
     """
     Researches a market from real sources.
@@ -191,6 +197,18 @@ class WebResearcher:
         self.source_engine = source_engine or SourceQualityEngine()
         self.user_agent = user_agent
         self.last_error: str = ""
+        # Search that cannot be reached is remembered. The operator's log asked
+        # DuckDuckGo once per market and waited out a 12 s connect timeout every
+        # single time (and on one market a DNS failure, Errno 11001):
+        #
+        #   [research] fetch https://html.duckduckgo.com/... ConnectTimeout (12.0)
+        #   Web research for 4910857 fetched nothing
+        #   ...same line for 4910858, 4910859, 4910860, ... every 13 seconds
+        #
+        # Nothing about the seventh market is different from the first, so after
+        # a search failure this stops asking for a while and says so once.
+        self._search_unavailable_until: float = 0.0
+        self._search_blocked_reason: str = ""
 
     # ------------------------------------------------------------------
     # Fetching
@@ -250,8 +268,20 @@ class WebResearcher:
         still gets an honest empty list - it does not fall back to inventing
         URLs or to pretending the question itself was a source.
         """
+        if time.time() < self._search_unavailable_until:
+            self.last_error = self._search_blocked_reason
+            return []
         status, html = await self._fetch_one(f"{self.search_url}?q={quote_plus(query)}")
         if status != 200 or not html:
+            # One failure is a fact about the network, not about this market.
+            self._search_unavailable_until = time.time() + SEARCH_COOLDOWN_SECONDS
+            self._search_blocked_reason = (
+                f"search is unreachable from this machine ({self.last_error[:120]}) - "
+                f"not retrying for {int(SEARCH_COOLDOWN_SECONDS/60)} min")
+            logger.warning(
+                f"[research] {self._search_blocked_reason}. Markets will report "
+                f"unresearched without the {int(SEARCH_COOLDOWN_SECONDS/60)}-minute "
+                f"wait per market; research resumes on its own when search answers.")
             return []
         urls = re.findall(r'uddg=([^&"\']+)', html)
         if not urls:
@@ -403,9 +433,12 @@ class WebResearcher:
         if not urls:
             urls = await self.discover_sources(question)
             if not urls:
-                warnings.append(
-                    "no sources could be discovered - nothing was fetched, so this "
-                    "market was not researched")
+                if self._search_blocked_reason:
+                    warnings.append(self._search_blocked_reason)
+                else:
+                    warnings.append(
+                        "no sources could be discovered - nothing was fetched, so this "
+                        "market was not researched")
 
         sources: List[FetchedSource] = []
         deadline = start + max_time_seconds

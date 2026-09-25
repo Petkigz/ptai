@@ -158,7 +158,19 @@ class StrategyEngineV3:
         
         # Strategy 1: Mispricing (fair value vs market) - existing engine
         try:
+            _t0 = time.time()
             fv_result = self.fair_value_engine.estimate(market, context=context)
+            _elapsed = time.time() - _t0
+            # One line per market. The operator's log had five hundred seconds of
+            # silence per market and then a paragraph; this says which market,
+            # how long it took and what was decided, in the order it happened.
+            logger.info(
+                f"Priced {market.id} in {_elapsed:.1f}s: "
+                f"{'TRADEABLE ' + str(getattr(fv_result, 'side', 'YES')) if fv_result.should_trade else 'no trade'}"
+                f" (fair {fv_result.fair_value:.3f} vs market {market.best_price:.3f}, "
+                f"edge {fv_result.edge:+.3f}, conf {fv_result.confidence:.2f})"
+                + (f" - {fv_result.reasoning.split('Decision: ', 1)[-1].split(' | ')[0]}"
+                   if not fv_result.should_trade else ""))
             # The opportunity is built on the hunt criterion plus a positive
             # post-cost edge. A 5% POST-COST floor also stood here, so the same
             # profitable NO trade (effective 0.028) was refused before it existed
