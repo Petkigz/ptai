@@ -170,7 +170,7 @@ def stub_registry(*adapters):
 def _repoint_storage(agent, storage):
     """Point every storage-holding component at the same database."""
     for name in ("ledger_builder", "settlement_engine", "trade_outcome_tracker",
-                 "calibration_engine"):
+                 "calibration_engine", "order_manager"):
         component = getattr(agent, name, None)
         if component is not None and hasattr(component, "storage"):
             component.storage = storage
@@ -1161,7 +1161,13 @@ class TestPaperModeSimulatesTheWholeCycle:
                 book, "BUY", float(max_spend_usd),
                 limit_price=float(max_price), mechanics=mechanics,
                 book_source="orderbook")
-            return {
+            # The adapter's paper contract: the venue's declared fee rate
+            # when the mechanics carry no real rate of their own, and the
+            # partial-fill numbers when the book cannot supply the order.
+            signed = fill.filled_shares + (
+                fill.unfilled_usd / float(max_price) if fill.unfilled_usd > 0
+                and max_price else 0.0)
+            result = {
                 "status": "paper", "is_real": False, "simulated": True,
                 "venue_id": VENUE, "market_id": opportunity.market.id,
                 "simulated_filled_usd": fill.filled_usd,
@@ -1173,6 +1179,12 @@ class TestPaperModeSimulatesTheWholeCycle:
                 "paper_fill": fill.to_dict(),
                 "reason": fill.reason,
             }
+            if fill.unfilled_usd > 1e-9:
+                result["size_matched"] = fill.filled_shares
+                result["original_size"] = signed
+                result["resting_usd"] = fill.unfilled_usd
+                result["resting_limit_price"] = float(max_price)
+            return result
 
         adapter.get_orderbook = get_orderbook
         adapter.place_order = place_order

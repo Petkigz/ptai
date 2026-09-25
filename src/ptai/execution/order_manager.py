@@ -300,7 +300,12 @@ class OrderManager:
             # order fills later, the position it opens must be settleable, and
             # settlement resolves a market by its outcome side.
             "side": side,
-            "limit_price": float(getattr(exec_result, "filled_price", 0.0)
+            # The resting LIMIT, not the average fill: a multi-level walk
+            # fills below the limit, but the remainder rests AT the limit,
+            # and that is the price reconciliation re-simulates a cross
+            # against.
+            "limit_price": float(getattr(exec_result, "limit_price", 0.0)
+                                 or getattr(exec_result, "filled_price", 0.0)
                                  or getattr(exec_result, "price", 0.0) or 0.0),
             "requested_usd": float(getattr(exec_result, "amount_usd", 0.0) or 0.0),
             "status": status,
@@ -445,6 +450,14 @@ class OrderManager:
                 continue
             report.checked += 1
             item = {"order_id": order_id, "market_id": order.get("market_id")}
+
+            # A paper order never reached the venue, so asking the venue
+            # about it would be a question with no answer. Its venue is the
+            # current book, and its fate is re-simulated against it.
+            if str(order.get("execution_mode") or "").lower() == "paper":
+                await self._reconcile_paper_order(adapter, order, item, report,
+                                                  position_opener)
+                continue
 
             if order_id.startswith("local-"):
                 # Never reached the venue with an id, so it cannot be looked up.
@@ -613,6 +626,146 @@ class OrderManager:
             f"{report.released} (${report.released_usd:.4f}), unreconciled "
             f"{report.unreconciled}")
         return report
+
+    async def _reconcile_paper_order(self, adapter, order: Dict[str, Any],
+                                     item: Dict[str, Any],
+                                     report: "ReconciliationReport",
+                                     position_opener=None) -> None:
+        """
+        Re-simulate a paper order's fate against the current book.
+
+        A paper order never reached the venue, so `get_order` would be a
+        question with no answer. The venue's CURRENT book is the simulator:
+        a cross is a fill, booked exactly the way a live resting fill is
+        (grow the position it belongs to, or open one); no cross means it
+        is still resting and keeps reserving capital; a book that cannot be
+        read leaves the order open - the same conservative rule as a live
+        venue that does not answer.
+        """
+        from .paper_broker import PaperBroker
+
+        order_id = str(order.get("order_id") or "")
+        now = datetime.now(timezone.utc).isoformat()
+        remaining_usd = max(0.0, float(order.get("requested_usd") or 0.0)
+                            - float(order.get("matched_usd") or 0.0))
+        if remaining_usd <= 0:
+            self.storage.upsert_order({
+                "order_id": order_id, "status": "filled",
+                "size_matched": order.get("size_matched"),
+                "matched_usd": order.get("matched_usd"),
+                "terminal_reason": "paper order fully matched",
+                "last_synced_at": now,
+            })
+            report.now_complete += 1
+            item.update({"outcome": "final", "status": "filled",
+                         "reason": "fully matched"})
+            report.items.append(item)
+            return
+
+        limit = float(order.get("limit_price") or 0.0)
+        side = str(order.get("side") or "YES").upper()
+        token_id = str(order.get("token_id") or "")
+        reader = getattr(adapter, "get_token_orderbook", None)
+        if reader is None or not token_id or limit <= 0:
+            report.unreconciled += 1
+            item.update({"outcome": "unavailable",
+                         "reason": ("no book can be read for this paper "
+                                    "order, so it stays open and keeps its "
+                                    "capital reserved")})
+            report.items.append(item)
+            return
+
+        try:
+            book_env = await reader(token_id)
+        except Exception as e:
+            book_env = {"available": False, "reason": f"{type(e).__name__}: {e}"}
+        book = (book_env or {}).get("book") if isinstance(book_env, dict) else None
+        if not isinstance(book, dict) or not (book.get("bids") or book.get("asks")):
+            # A book that cannot be read is not a book that did not cross.
+            # The order stays open and keeps reserving capital, exactly as
+            # an unanswered live venue would.
+            reason = (book_env or {}).get("reason", "no book") \
+                if isinstance(book_env, dict) else "no book"
+            report.unreconciled += 1
+            item.update({"outcome": "unavailable",
+                         "reason": f"paper book unreadable: {reason}"})
+            report.items.append(item)
+            return
+
+        fill = PaperBroker().simulate_resting(limit, side, remaining_usd, book,
+                                              book_source="orderbook")
+        previous_usd = float(order.get("matched_usd") or 0.0)
+        previous_size = float(order.get("size_matched") or 0.0)
+        grew_usd = fill.filled_usd
+
+        if grew_usd > 1e-9:
+            price = float(fill.avg_price or limit)
+            if order.get("trade_id"):
+                ok = self.storage.add_to_position(
+                    trade_id=int(order["trade_id"]), add_usd=grew_usd,
+                    add_price=float(price))
+                if ok:
+                    report.filled_more += 1
+                    report.grew_usd += grew_usd
+                else:
+                    report.unreconciled += 1
+                    item["position_update_failed"] = True
+            else:
+                new_trade_id = None
+                if position_opener is not None:
+                    try:
+                        new_trade_id = position_opener(order, grew_usd, price)
+                    except Exception as e:
+                        logger.error(
+                            f"Opening a position for paper order {order_id} "
+                            f"raised {type(e).__name__}: {e}")
+                if new_trade_id:
+                    self.attach_position(order_id, int(new_trade_id))
+                    report.filled_more += 1
+                    report.grew_usd += grew_usd
+                    report.opened += 1
+                    item["opened_trade_id"] = int(new_trade_id)
+                else:
+                    logger.error(
+                        f"Paper order {order_id} filled ${grew_usd:.4f} and no "
+                        f"position was opened for it; the ledger will "
+                        f"understate exposure")
+                    report.unreconciled += 1
+                    item["orphan_fill"] = round(grew_usd, 6)
+
+        new_usd = previous_usd + grew_usd
+        new_size = previous_size + fill.filled_shares
+        original_size = order.get("original_size")
+        fully_matched = (bool(original_size)
+                         and new_size + 1e-9 >= float(original_size))
+
+        if fully_matched:
+            released = max(0.0, float(order.get("requested_usd") or 0.0)
+                           - new_usd)
+            report.released += 1
+            report.released_usd += released
+            report.now_complete += 1
+            self.storage.upsert_order({
+                "order_id": order_id, "status": "filled",
+                "size_matched": new_size, "matched_usd": new_usd,
+                "terminal_reason": "paper order fully simulated",
+                "last_synced_at": now,
+            })
+            item.update({"outcome": "final", "status": "filled",
+                         "grew_usd": round(grew_usd, 6),
+                         "released_usd": round(released, 6)})
+        else:
+            self.storage.upsert_order({
+                "order_id": order_id,
+                "status": order.get("status") or "dry_run",
+                "size_matched": new_size, "matched_usd": new_usd,
+                "last_synced_at": now,
+            })
+            item.update({"outcome": "still_resting",
+                         "grew_usd": round(grew_usd, 6),
+                         "size_matched": new_size,
+                         "original_size": original_size})
+        report.items.append(item)
 
     async def cancel_working(self, adapter, reason: str = "operator") -> int:
         """

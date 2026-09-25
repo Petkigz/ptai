@@ -131,6 +131,43 @@ from ..sentiment.x_scraper import XScraper
 from ..sentiment.analyzer import SentimentAnalyzer
 
 
+def _side_token_id(market, side):
+    """
+    The token id for the SIDE being ordered.
+
+    The order row stores it, and paper reconciliation re-simulates a cross
+    against THAT token's book. The first token on the market is not
+    necessarily the one for the side: on a binary market it is the YES
+    token, and a NO order resting against a YES book would be re-simulated
+    against prices it never faces.
+    """
+    want = str(side or "").upper()
+    tokens = getattr(market, "tokens", None) or []
+    for token in tokens:
+        outcome = str(getattr(token, "outcome", "") or "").upper()
+        if outcome == want:
+            token_id = getattr(token, "token_id", None) or getattr(token, "id", None)
+            if token_id:
+                return str(token_id)
+    for token in tokens:
+        token_id = getattr(token, "token_id", None) or getattr(token, "id", None)
+        if token_id:
+            return str(token_id)
+    raw = getattr(market, "raw", None) or {}
+    for key in ("clobTokenIds", "clob_token_ids", "token_ids"):
+        value = raw.get(key)
+        if isinstance(value, list) and value:
+            return str(value[0])
+        if isinstance(value, str) and value.strip().startswith("["):
+            try:
+                parsed = json.loads(value)
+                if parsed:
+                    return str(parsed[0])
+            except Exception:
+                pass
+    return None
+
+
 class TradingAgentV3:
     """
     PTAI V3 - genuinely multi-venue, multi-strategy
@@ -2379,8 +2416,7 @@ class TradingAgentV3:
             if exec_result.reserves_capital or exec_result.needs_reconciliation:
                 order_key = self.order_manager.record_submission(
                     exec_result, market_id=opp.market.id,
-                    token_id=getattr(opp.market, "tokens", [{}])[0].token_id
-                    if getattr(opp.market, "tokens", None) else None,
+                    token_id=_side_token_id(opp.market, opp.side),
                     venue_id=venue_id, side=str(opp.side).upper(),
                 forecast=self._forecast_for_order(
                     opp, getattr(opp.market, "data_mode", "live")))
@@ -2401,8 +2437,15 @@ class TradingAgentV3:
         # ledger is a snapshot taken before any of these trades, so
         # without this every position in the batch would size against
         # the same free cash - the original bug, one level down.
+        # A simulated fill put only the FILLED amount at risk; the unfilled
+        # remainder is an ORDER that rests in the book and reserves its cash
+        # in the order table - the same structure as a live partial fill.
+        # Charging the ledger the whole request for a paper trade would
+        # double-reserve the remainder.
         _committed = (exec_result.filled_usd
-                      if exec_result.committed_capital else amount_usd)
+                      if exec_result.committed_capital
+                      else (exec_result.position_size_usd
+                            if exec_result.is_simulated else amount_usd))
         free_capital = max(0.0, free_capital - _committed)
         if free_capital <= 0:
             logger.warning(
@@ -2517,8 +2560,7 @@ class TradingAgentV3:
                          or exec_result.unfilled_shares > 0):
             order_key = self.order_manager.record_submission(
                 exec_result, market_id=opp.market.id,
-                token_id=getattr(opp.market, "tokens", [{}])[0].token_id
-                if getattr(opp.market, "tokens", None) else None,
+                token_id=_side_token_id(opp.market, opp.side),
                 venue_id=venue_id, trade_id=int(trade_id),
                 side=str(opp.side).upper(),
                 forecast=self._forecast_for_order(
@@ -2737,8 +2779,7 @@ class TradingAgentV3:
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _forecast_for_order(opp, data_mode) -> Dict[str, Any]:
+    def _forecast_for_order(self, opp, data_mode) -> Dict[str, Any]:
         """
         The thesis behind an order, in the shape the orders table stores.
 

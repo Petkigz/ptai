@@ -889,6 +889,27 @@ class PolymarketAdapter(MarketAdapter):
         side = "BUY"
         limit = mechanics.round_price(float(max_price), side)
 
+        # The same pre-sign checks the live path runs, on the same signed
+        # order. An order the venue's own rules reject must not "fill" in
+        # paper mode, or the simulation trades executions that cannot exist
+        # and the evidence is systematically kinder than live.
+        signed_size = mechanics.shares_for_usd(float(max_spend_usd), limit, side)
+        if signed_size <= 0:
+            return {"status": "rejected", "venue_id": "polymarket",
+                    "market_id": getattr(opportunity.market, "id", ""),
+                    "reason": (f"Computed size {signed_size} <= 0 from "
+                               f"${max_spend_usd} @ {limit} (paper)")}
+        ok, size_reason = mechanics.validate_order(limit, signed_size)
+        if not ok:
+            logger.warning(
+                f"Paper order refused for "
+                f"{getattr(opportunity.market, 'id', '')}: {size_reason} - "
+                f"the live order would be refused the same way")
+            return {"status": "rejected", "venue_id": "polymarket",
+                    "market_id": getattr(opportunity.market, "id", ""),
+                    "token_id": token_id, "reason": size_reason,
+                    "mechanics": mechanics.to_dict()}
+
         book = None
         source = "assumed_default"
         try:
@@ -899,9 +920,18 @@ class PolymarketAdapter(MarketAdapter):
             logger.warning(f"Paper order could not read a book for {token_id}: "
                            f"{type(e).__name__}: {e}")
 
+        # The fee the live path books for this venue: the rate the venue's
+        # own market info declares when it carries one, otherwise the rate in
+        # capabilities - the same rate calculate_fees() books for the live
+        # fill. The simulated evidence must not show a lower fee than the
+        # live ledger books, or paper mode is kind to a cost live will pay.
+        declared_rate = float(getattr(self.capabilities, "fee_taker_pct", 0.0) or 0.0)
+        venue_rate = float(getattr(mechanics, "taker_fee_rate", 0.0) or 0.0)
+        fee_rate = venue_rate if (mechanics.is_real and venue_rate > 0.0) \
+            else declared_rate
         broker = PaperBroker(
             mechanics=mechanics,
-            taker_fee_rate=float(getattr(mechanics, "taker_fee_rate", 0.0) or 0.0),
+            taker_fee_rate=fee_rate,
         )
         fill = broker.simulate(book, side, float(max_spend_usd), limit_price=limit,
                                mechanics=mechanics, book_source=source)
@@ -918,7 +948,11 @@ class PolymarketAdapter(MarketAdapter):
             "requested_price": float(max_price),
             "requested_size": float(max_spend_usd) / float(max_price) if max_price else 0.0,
             "signed_price": limit,
-            "signed_size": mechanics.shares_for_usd(float(max_spend_usd), limit, side),
+            "signed_size": signed_size,
+            # Where an unfilled remainder would rest - the signed limit, not
+            # the average fill price. Reconciliation re-simulates a cross
+            # against it.
+            "resting_limit_price": limit,
             "price": fill.avg_price or limit,
             "size": fill.filled_shares,
             # What the executor reads. The simulated size and price, never the
@@ -931,6 +965,15 @@ class PolymarketAdapter(MarketAdapter):
             "mechanics": mechanics.to_dict(),
             "reason": fill.reason,
         }
+        # The same partial-fill numbers the live path reports, so the
+        # executor, the order ledger and the capital reserve all see the
+        # remainder the book left unfilled. Without them a paper partial
+        # "filled" and the unfilled cash stayed free - which is more capital
+        # than the same live order would leave free.
+        if fill.unfilled_usd > 1e-9:
+            result["size_matched"] = fill.filled_shares
+            result["original_size"] = signed_size
+            result["resting_usd"] = fill.unfilled_usd
         if fill.is_fill:
             logger.info(
                 f"PAPER fill {opportunity.market.id}: ${fill.filled_usd:.4f} at "
@@ -1019,6 +1062,27 @@ class PolymarketAdapter(MarketAdapter):
             if isinstance(value, list) and value:
                 return str(value[0])
         return ""
+
+    async def get_token_orderbook(self, token_id: str) -> Dict[str, Any]:
+        """
+        The raw CLOB book for ONE token.
+
+        `get_orderbook` reads the market's YES book and shapes it; this returns
+        the venue's raw payload for whichever token a resting paper order was
+        placed on - including NO tokens - so reconciliation can re-simulate a
+        cross against the right ladder.
+        """
+        try:
+            book = await asyncio.to_thread(self.client.get_orderbook, token_id)
+            if isinstance(book, dict) and (book.get("bids") or book.get("asks")):
+                return {"available": True, "book": book, "is_real": True}
+            return {"available": False,
+                    "reason": "no book levels on either side"}
+        except Exception as e:
+            logger.warning(
+                f"get_token_orderbook({token_id}) failed: "
+                f"{type(e).__name__}: {e}")
+            return {"available": False, "reason": f"{type(e).__name__}: {e}"}
 
     async def get_open_orders(self, market_id: Optional[str] = None,
                               asset_id: Optional[str] = None,

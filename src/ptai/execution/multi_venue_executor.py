@@ -71,6 +71,9 @@ class ExecutionResult:
     original_size: Optional[float] = None
     # Unfilled shares still working in the book, as USD at the limit price.
     resting_usd: float = 0.0
+    # The price the unfilled remainder rests at (paper: the signed limit).
+    # None where there is no remainder or the venue does not report one.
+    limit_price: Optional[float] = None
     # A send that failed with no venue confirmation: the order may exist.
     unconfirmed_send: bool = False
     trade_ids: List[str] = field(default_factory=list)
@@ -127,6 +130,13 @@ class ExecutionResult:
         if self.committed_capital:
             return True
         if self.status in ("submitted", "partial"):
+            return True
+        # A simulated order with an unfilled remainder locks cash in the
+        # simulation the same way a live order locks it at the venue. If
+        # paper did not reserve it, free capital would be higher in paper
+        # than in live for the identical order, and sizing would spend cash
+        # the live venue has already locked.
+        if self.is_simulated and self.unfilled_shares > 0:
             return True
         return False
 
@@ -234,6 +244,7 @@ class ExecutionResult:
             "original_size": self.original_size,
             "unfilled_shares": self.unfilled_shares,
             "resting_usd": self.resting_usd,
+            "limit_price": self.limit_price,
             "reserves_capital": self.reserves_capital,
             "needs_reconciliation": self.needs_reconciliation,
             "unconfirmed_send": self.unconfirmed_send,
@@ -272,13 +283,15 @@ def _resting_usd(fill: Dict[str, Any], requested_usd: float) -> float:
     the conservative direction, because under-counting locked cash is the way an
     agent sizes a second trade against money the venue has already reserved.
     """
-    if fill.get("status") not in ("submitted", "partial"):
+    if fill.get("status") not in ("submitted", "partial",
+                                   "dry_run", "simulated", "paper"):
         return 0.0
     if fill.get("unconfirmed_send"):
         return float(requested_usd or 0.0)
     matched = _num(fill.get("size_matched"))
     original = _num(fill.get("original_size"))
-    price = _num(fill.get("price")) or 0.0
+    # The remainder rests at the LIMIT, not at the average fill price.
+    price = _num(fill.get("limit_price")) or _num(fill.get("price")) or 0.0
     if matched is None or not original or not price:
         # Nothing quantifiable: assume the whole request is still committed.
         return max(0.0, float(requested_usd or 0.0) - float(fill.get("filled_usd") or 0.0))
@@ -536,6 +549,7 @@ class MultiVenueExecutor:
                 size_matched=fill.get("size_matched"),
                 original_size=fill.get("original_size"),
                 resting_usd=_resting_usd(fill, max_spend_usd),
+                limit_price=fill.get("limit_price"),
                 unconfirmed_send=bool(fill.get("unconfirmed_send")),
                 trade_ids=list(fill.get("trade_ids") or []),
                 paper_fill=(result.get("paper_fill")
@@ -632,6 +646,16 @@ class MultiVenueExecutor:
         size_matched = _num(result.get("size_matched"))
         original_size = _num(result.get("original_size"))
 
+        # Where an unfilled remainder rests: the signed limit, not the
+        # average fill price. Paper reports it explicitly; a live venue
+        # does not, so this stays None there and _resting_usd falls back.
+        limit_price = None
+        for key in ("resting_limit_price", "signed_price", "limit_price"):
+            value = _num(result.get(key))
+            if value is not None:
+                limit_price = value
+                break
+
         if filled_usd <= 0:
             for key in ("size_matched", "size", "filled_size", "matched_size",
                         "shares", "quantity", "amount"):
@@ -688,6 +712,7 @@ class MultiVenueExecutor:
         return {"status": status, "filled_usd": filled_usd, "price": price,
                 "order_id": order_id, "raw_status": raw_status,
                 "size_matched": size_matched, "original_size": original_size,
+                "limit_price": limit_price,
                 "unconfirmed_send": bool(result.get("unconfirmed_send")),
                 "trade_ids": list(result.get("trade_ids") or []),
                 "simulated": status in SIMULATED_STATUSES}
