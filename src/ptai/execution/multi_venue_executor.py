@@ -95,6 +95,24 @@ class ExecutionResult:
         return self.status in SIMULATED_STATUSES
 
     @property
+    def bought_something(self) -> bool:
+        """
+        Did this execution buy a position - REAL or SIMULATED?
+
+        `committed_capital` is the LIVE question ("did real money leave?"), and
+        it is deliberately False for a paper fill. The arbitrage state machine
+        used it to decide whether leg A had anything to balance, which made the
+        pair live-only by accident: in paper, leg A had "committed no capital",
+        leg B was never sent, and the arb lane could not run at all - on the one
+        strategy whose entire economics are testable in paper.
+
+        Same rule as `should_record_position`, because they are the same
+        question: a position exists when a real fill happened, or when a
+        simulation says one would have.
+        """
+        return self.should_record_position
+
+    @property
     def reserves_capital(self) -> bool:
         """
         Is real money locked at the venue by this result?
@@ -683,6 +701,48 @@ class MultiVenueExecutor:
                 return value
         return 0.0
 
+    def arb_leg_opportunities(self, arb):
+        """
+        The two legs of a pair, as opportunities.
+
+        The cheaper side of the pair is bought at A and the other side at B.
+        ONE definition, because the gate that decides whether to send the pair
+        and the state machine that sends it must not be able to disagree about
+        which market, side or price they are talking about.
+
+        A VenueType, not a bare string: `raw.get("venue_type", "prediction")`
+        produces a str wherever the market does not carry that key - which is
+        everywhere - and downstream code compares against the enum.
+        """
+        side_a = "YES" if arb.price_a < arb.price_b else "NO"
+        return (
+            VenueOpportunity(
+                market=arb.market_a,
+                venue_id=arb.venue_a,
+                venue_type=_coerce_venue_type(arb.market_a.raw.get("venue_type")),
+                side=side_a,
+                market_price=arb.price_a,
+                estimated_fair=arb.price_b,
+                raw_edge=arb.spread,
+                effective_edge=arb.fee_adjusted_profit,
+                confidence=arb.confidence_same_event,
+                should_trade=arb.should_trade,
+            ),
+            VenueOpportunity(
+                market=arb.market_b,
+                venue_id=arb.venue_b,
+                venue_type=_coerce_venue_type(arb.market_b.raw.get("venue_type")),
+                side="NO" if side_a == "YES" else "YES",
+                market_price=arb.price_b,
+                estimated_fair=arb.price_a,
+                raw_edge=arb.spread,
+                effective_edge=arb.fee_adjusted_profit,
+                confidence=arb.confidence_same_event,
+                should_trade=arb.should_trade,
+            ),
+        )
+
+
     async def execute_arbitrage_pair(self, arb, amount_per_leg: float = 3.0) -> List[ExecutionResult]:
         """
         A sequential pair with an explicit hedge - NOT an atomic transaction.
@@ -761,33 +821,7 @@ class MultiVenueExecutor:
         except Exception as e:
             logger.warning(f"Arb VERIFY_BOOKS error {e} - continuing with caution")
         
-        opp_a = VenueOpportunity(
-            market=arb.market_a,
-            venue_id=venue_a,
-            # A VenueType, not a bare string. `raw.get("venue_type", "prediction")`
-            # produces a str wherever the market does not carry that key - which
-            # is everywhere - and downstream code compares against the enum.
-            venue_type=_coerce_venue_type(arb.market_a.raw.get("venue_type")),
-            side="YES" if arb.price_a < arb.price_b else "NO",
-            market_price=arb.price_a,
-            estimated_fair=arb.price_b,
-            raw_edge=arb.spread,
-            effective_edge=arb.fee_adjusted_profit,
-            confidence=arb.confidence_same_event,
-            should_trade=arb.should_trade
-        )
-        opp_b = VenueOpportunity(
-            market=arb.market_b,
-            venue_id=venue_b,
-            venue_type=_coerce_venue_type(arb.market_b.raw.get("venue_type")),
-            side="NO" if arb.price_a < arb.price_b else "YES",
-            market_price=arb.price_b,
-            estimated_fair=arb.price_a,
-            raw_edge=arb.spread,
-            effective_edge=arb.fee_adjusted_profit,
-            confidence=arb.confidence_same_event,
-            should_trade=arb.should_trade
-        )
+        opp_a, opp_b = self.arb_leg_opportunities(arb)
         
         state = "SUBMIT_A"
         # The pair is sized in SHARES, and leg A is sized so the pair can still
@@ -835,7 +869,7 @@ class MultiVenueExecutor:
         leg_a_fill = float(getattr(result_a, "filled_usd", 0.0) or 0.0)
         leg_a_shares = float(getattr(result_a, "filled_shares", 0.0) or 0.0)
         resting_a = float(getattr(result_a, "resting_usd", 0.0) or 0.0)
-        if not result_a.committed_capital or leg_a_fill <= 0:
+        if not result_a.bought_something or leg_a_fill <= 0:
             # A bought nothing, so there is nothing to balance and no reason to
             # send the second leg. Sending it anyway would be a naked bet that
             # the "arb" had nothing to do with.
@@ -869,7 +903,7 @@ class MultiVenueExecutor:
         # is no longer open.
         # ...against the price A ACTUALLY paid. `opp_a.market_price` is the
         # price the opportunity was discovered at, which is history by now.
-        cap_b, price_recheck = await self._arb_leg_cap(
+        cap_b, price_b_expected, price_recheck = await self._arb_leg_cap(
             arb, opp_a, opp_b, adapter_b,
             a_price=float(getattr(result_a, "filled_price", 0.0) or 0.0) or None)
         if cap_b is None:
@@ -891,8 +925,20 @@ class MultiVenueExecutor:
         # does not fit inside what is left of the pair budget, leg B is not
         # sent and A is hedged instead.
         pair_budget_left = max(0.0, total_needed - leg_a_fill)
-        needed_b = leg_a_shares * cap_b
-        if needed_b > pair_budget_left + 1e-9:
+        # The budget was planned in SHARES AT THE CAPS: `shares_target` shares,
+        # each allowed up to cap_a + cap_b. A fill BETTER than the cap buys more
+        # shares than the plan expected, and those shares have to be matched too
+        # - otherwise a good price would be what stopped the pair completing.
+        # The allowance is that excess, priced at B's cap: the pair is still
+        # bounded, and it is bounded by the shares that exist.
+        extra_shares = max(0.0, leg_a_shares - shares_target)
+        pair_budget_left += extra_shares * cap_b
+        # Sized on the price B is expected to pay, capped at `cap_b`. Sizing on
+        # the cap would buy more shares than A holds whenever the book fills
+        # better than the limit - a directional position wearing the word
+        # "pair", which is the thing this whole path exists to prevent.
+        needed_b = leg_a_shares * price_b_expected
+        if needed_b > pair_budget_left + 0.01:
             logger.warning(
                 f"Arb COMPLETE FAIL: balancing {leg_a_shares:.4f} shares costs "
                 f"${needed_b:.2f} at the {cap_b:.3f} cap but only "
@@ -902,8 +948,8 @@ class MultiVenueExecutor:
                 venue_id=venue_b, market_id=arb.market_b.id, status="aborted",
                 amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0,
                 reasoning=(f"COMPLETE FAIL: {leg_a_shares:.4f} shares at "
-                           f"{cap_b:.3f} costs ${needed_b:.2f} against "
-                           f"${pair_budget_left:.2f} of budget left"))
+                           f"{price_b_expected:.3f} costs ${needed_b:.2f} "
+                           f"against ${pair_budget_left:.2f} of budget left"))
             return await self._hedge_naked_leg(
                 arb, opp_a, result_a, result_b, leg_a_shares,
                 f"balancing costs ${needed_b:.2f}, ${pair_budget_left:.2f} left")
@@ -943,8 +989,8 @@ class MultiVenueExecutor:
         """
         The cap for leg B, recomputed from the book as it is NOW.
 
-        Returns (cap, note), or (None, reason) when the pair is no longer worth
-        completing. The discovered spread is not a price: between measuring it
+        Returns (cap, price_to_size_on, note), or (None, reason) when the pair
+        is no longer worth completing. The discovered spread is not a price: between measuring it
         and filling leg A, the book that made the arb can move, and completing
         the pair at the old cap would buy the second leg at a price that turns a
         riskless pair into a loss that is certain rather than expected.
@@ -955,19 +1001,20 @@ class MultiVenueExecutor:
         reads a stale number as a measurement.
         """
         stale_cap = _side_aware_cap(opp_b)
+        stale_price = _token_price(opp_b)
         if adapter_b is None or not hasattr(adapter_b, "get_orderbook"):
-            return stale_cap, "cap from the discovered spread (no adapter to re-read)"
+            return stale_cap, stale_price, "cap from the discovered spread (no adapter to re-read)"
         try:
             book = await adapter_b.get_orderbook(arb.market_b)
         except Exception as e:
-            return stale_cap, f"cap from the discovered spread (re-read failed: {e})"
+            return stale_cap, stale_price, f"cap from the discovered spread (re-read failed: {e})"
         if not isinstance(book, dict) or not book.get("is_real", False):
-            return stale_cap, "cap from the discovered spread (book not real)"
+            return stale_cap, stale_price, "cap from the discovered spread (book not real)"
 
         # The side B is buying: YES buys the ask, NO buys 1 - bid.
         live_price, quote_note = _best_quote(book, opp_b.side)
         if live_price is None:
-            return stale_cap, f"cap from the discovered spread ({quote_note})"
+            return stale_cap, stale_price, f"cap from the discovered spread ({quote_note})"
 
         # What a share of B would cost now, against what A actually PAID for
         # its share. One share of each pays $1, so the pair is worth completing
@@ -976,11 +1023,16 @@ class MultiVenueExecutor:
         a_price = float(a_price or 0.0) or float(
             getattr(opp_a, "market_price", 0.0) or 0.0)
         if a_price > 0 and (live_price + a_price) >= 1.0:
-            return None, (f"B would cost {live_price:.3f} against A's {a_price:.3f} "
-                          f"- the pair costs {live_price + a_price:.3f} for a $1 "
-                          f"payoff, so the spread is gone")
-        return min(stale_cap, live_price + _PRICE_SLIPPAGE), (
-            f"cap re-read: {quote_note} against A's fill {a_price:.3f}")
+            return None, None, (
+                f"B would cost {live_price:.3f} against A's {a_price:.3f} "
+                f"- the pair costs {live_price + a_price:.3f} for a $1 "
+                f"payoff, so the spread is gone")
+        # The cap is the limit; the price is what the dollars are sized on. They
+        # are different numbers: sizing the order at the CAP buys MORE shares
+        # when the book fills cheaper, which turns a matched pair into a
+        # directional position on the other side.
+        return (min(stale_cap, live_price + _PRICE_SLIPPAGE), live_price,
+                f"cap re-read: {quote_note} against A's fill {a_price:.3f}")
 
     async def _hedge_naked_leg(self, arb, opp_a, result_a, result_b,
                                naked_shares: float,
@@ -1022,7 +1074,7 @@ class MultiVenueExecutor:
                 hedge_opp, max_spend_usd=naked_shares * cap, max_price=cap)
             closed_shares = (
                 float(getattr(hedge_result, "filled_shares", 0.0) or 0.0)
-                if getattr(hedge_result, "committed_capital", False) else 0.0)
+                if getattr(hedge_result, "bought_something", False) else 0.0)
             remaining = max(0.0, naked_shares - closed_shares)
             logger.info(
                 f"Arb HEDGE: {why} - {naked_shares:.4f} shares naked, "

@@ -267,10 +267,24 @@ def test_the_loop_records_which_book_the_fill_walked():
     from pathlib import Path
     src = Path("src/ptai/agent/v3_loop.py").read_text()
     # The open-position call site is the LAST one; the earlier one resolves a
-    # delayed fill and has its own fields.
+    # delayed fill and has its own fields. The call now lives in
+    # `_record_execution`, which both the single path and the arbitrage lane
+    # use, so the window is found by the keyword rather than by its indent: an
+    # indent-sensitive terminator silently widened the window when the block
+    # moved, which is how a guard like this stops guarding.
     idx = src.rindex("self.trade_outcome_tracker.record_trade(")
-    # The window has to cover the whole call, comments included.
-    call = src[idx:src.index("\n                    )", idx)]
+    # The whole call, found by matching parentheses rather than by guessing an
+    # indent or a length: comments inside it are allowed to move.
+    open_at = src.index("(", idx)
+    depth = 0
+    for pos in range(open_at, len(src)):
+        if src[pos] == "(":
+            depth += 1
+        elif src[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+    call = src[idx:pos + 1]
     assert "book_source=" in call, "the fill's book never reaches the outcome row"
     assert "venue_fill" in call, "a live fill must be labelled as its own evidence"
     assert "gas_usd=" in call, "the gas charged must be recorded with the trade"

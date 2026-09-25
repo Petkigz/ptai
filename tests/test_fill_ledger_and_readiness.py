@@ -55,6 +55,7 @@ from src.ptai.venues.adapter import (
     VenueType,
 )
 from src.ptai.markets.base import Market, MarketSource, Token
+from tests.execution_source import execution_path_source
 
 
 # --------------------------------------------------------------------------
@@ -94,7 +95,7 @@ class TestQualificationGateIsOneWay:
     def test_source_no_longer_contains_the_inverted_gate(self):
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "not qualified_venue_ids or" not in source, (
             "the inverted qualification gate is back"
         )
@@ -105,7 +106,7 @@ class TestQualificationGateIsOneWay:
     def test_exploration_lane_is_the_only_destination_without_qualification(self):
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "paper/shadow" in source, (
             "unqualified venues must be routed to paper/shadow explicitly"
         )
@@ -242,7 +243,7 @@ class TestExecutionResultClassification:
     def test_run_cycle_gates_recording_on_the_fill(self):
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "should_record_position" in source, (
             "position recording must be gated on a proven fill"
         )
@@ -251,7 +252,7 @@ class TestExecutionResultClassification:
     def test_trade_row_uses_the_fill_not_the_request(self):
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "exec_result.filled_price" in source, (
             "the trade must be recorded at the price that filled"
         )
@@ -528,7 +529,7 @@ class TestPositionLedger:
     def test_v3_sizes_against_free_capital(self):
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "free_capital * kelly_result.kelly_fraction_adj" in source, (
             "sizing must use free capital"
         )
@@ -576,7 +577,7 @@ class TestRiskChainCallsTheRealMethods:
         import re
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         calls = re.findall(r"kelly_calculator\.calculate\((.*?)\)", source, re.S)
         assert calls, "no kelly_calculator.calculate call found at all"
         for call in calls:
@@ -599,7 +600,7 @@ class TestRiskChainCallsTheRealMethods:
         """
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "kelly_result.should_bet" in source, (
             "Kelly's refusal is being ignored"
         )
@@ -615,7 +616,7 @@ class TestRiskChainCallsTheRealMethods:
         )
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "exposure_manager.can_open_position" not in source, (
             "the dead ExposureManager call is back"
         )
@@ -630,7 +631,7 @@ class TestRiskChainCallsTheRealMethods:
         )
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "limits_engine.validate(" not in source, (
             "the dead LimitsEngine call is back"
         )
@@ -645,7 +646,7 @@ class TestRiskChainCallsTheRealMethods:
         """
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         for key in ('"trade": True', '"fair_probability"', '"market_probability"'):
             assert key in source, f"validate_proposal is not given {key}"
 
@@ -656,7 +657,7 @@ class TestRiskChainCallsTheRealMethods:
         """
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert 'adjusted.get("max_spend_usd")' in source, (
             "the limits-approved size is being discarded"
         )
@@ -930,7 +931,7 @@ class TestOrderProbeMakesReadinessReachable:
         """
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "opportunity=opp" in source, (
             "V3 must pass the opportunity so the probe has a market to test on"
         )

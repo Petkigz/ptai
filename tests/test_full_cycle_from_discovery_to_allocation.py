@@ -54,14 +54,20 @@ class StubVenue(MarketAdapter):
     market) to prove the loop reacts to them.
     """
 
-    def __init__(self, dry_run: bool = True, fill_response=None):
+    def __init__(self, dry_run: bool = True, fill_response=None,
+                 venue_id: str = VENUE):
         # Registered under the real Polymarket venue id, and its markets carry
         # MarketSource.POLYMARKET, because the executor requires the adapter's
         # venue id and the market's source to agree. A stub that violates that
         # invariant gets correctly aborted by the executor, which is a useful
         # safety property but tests nothing about the accounting chain.
-        super().__init__(venue_id=VENUE, venue_type=VenueType.PREDICTION,
+        super().__init__(venue_id=venue_id, venue_type=VenueType.PREDICTION,
                          dry_run=dry_run)
+        # The venue id is a parameter so a test needing TWO venues (a
+        # cross-venue arbitrage pair, for one) does not have to invent a
+        # second stub. The executor requires the adapter's venue id and the
+        # market's source to agree, so the market is built from the name.
+        self.venue_name = venue_id
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
@@ -103,7 +109,9 @@ class StubVenue(MarketAdapter):
     def _market(self) -> Market:
         return Market(
             id=MARKET_ID,
-            source=MarketSource.POLYMARKET,
+            source={"kalshi": MarketSource.KALSHI,
+                    "predictit": MarketSource.PREDICTIT,
+                    }.get(self.venue_name, MarketSource.POLYMARKET),
             question="Will the stub event happen?",
             outcomes=["YES", "NO"],
             outcome_prices=[0.55, 0.45],
@@ -111,7 +119,7 @@ class StubVenue(MarketAdapter):
                     Token(token_id="STUB-NO", outcome="NO", price=0.45)],
             volume=250_000.0, volume_24h=120_000.0, liquidity=90_000.0,
             active=True, closed=False, slug="stub-m1",
-            raw={"venue": VENUE},
+            raw={"venue": self.venue_name},
         )
 
     async def get_orderbook(self, market: Market):
@@ -145,16 +153,17 @@ class StubVenue(MarketAdapter):
     def estimate_spread(self, orderbook): return 0.02
 
 
-def stub_registry(adapter):
+def stub_registry(*adapters):
     """
-    A real VenueRegistry holding one stub adapter.
+    A real VenueRegistry holding one or more stub adapters.
 
     Using the real registry rather than a stand-in keeps routing, eligibility
     and adapter lookup on the code path that production uses - so a bug in
     routing cannot hide behind the test double.
     """
     registry = VenueRegistry(country_code="UG")
-    registry.register(adapter)
+    for adapter in adapters:
+        registry.register(adapter)
     return registry
 
 

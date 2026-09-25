@@ -105,14 +105,18 @@ class _StubVenue:
         if not self.fills:
             return {"status": "rejected", "reason": "no fill scripted"}
         payload = dict(self.fills.pop(0))
-        if payload.pop("fill_all", False):
+        fill_at = payload.pop("fill_all_at", None)
+        if payload.pop("fill_all", False) or fill_at is not None:
             # "The venue filled the whole order at the limit it was given."
             # Scripting that in dollars would hardcode a number the sizing
             # decides - and the sizing is what these tests are about.
             payload.setdefault("status", "matched")
             payload.setdefault("orderID", "o-auto")
             payload["filled_usd"] = max_spend_usd
-            payload["filled_price"] = max_price
+            # `fill_all_at` says what the book actually pays: sized on the CAP
+            # it would buy more shares than the other leg holds the moment the
+            # fill is better than the limit.
+            payload["filled_price"] = fill_at or max_price
         return payload
 
 
@@ -187,7 +191,7 @@ class TestLegBSizedOnLegAsActualFill:
         """
         venues = {
             "stub_a": _StubVenue("stub_a", [_fills(filled_usd=1.20, size=2.67)]),
-            "stub_b": _StubVenue("stub_b", [_fills(fill_all=True)],
+            "stub_b": _StubVenue("stub_b", [{"fill_all_at": 0.50}],
                                  book=dict(BOOK_B)),
         }
         ex = _executor(venues)
@@ -197,13 +201,19 @@ class TestLegBSizedOnLegAsActualFill:
         assert len(b_orders) == 1
         a_shares = results[0].filled_shares
         assert a_shares == pytest.approx(2.6667, abs=1e-3)
-        b_shares = b_orders[0]["max_spend_usd"] / b_orders[0]["max_price"]
-        assert b_shares == pytest.approx(a_shares, abs=1e-4), (
-            f"leg B was sent for {b_shares:.4f} shares while leg A filled "
-            f"{a_shares:.4f} - the pair is unbalanced by the difference")
+        # The order is sized so that TWO DOLLARS AT THE QUOTED PRICE buy the
+        # shares A holds: 2.6667 x 0.50 = $1.3333, against a 0.52 limit. Sizing
+        # it on the LIMIT would buy 2.56 shares - fewer than A holds - and the
+        # pair would be one-sided while reading as matched.
+        assert b_orders[0]["max_spend_usd"] == pytest.approx(a_shares * 0.50,
+                                                            abs=1e-4), (
+            f"leg B was sent for ${b_orders[0]['max_spend_usd']:.4f} for "
+            f"{a_shares:.4f} shares of A at a 0.50 quote")
         assert b_orders[0]["max_spend_usd"] != pytest.approx(1.20), (
             "B was sent for the DOLLARS A spent, which is a different share "
             "count on the other side")
+        assert results[1].filled_shares == pytest.approx(a_shares, abs=1e-4), (
+            "the two legs did not end up holding the same number of shares")
         assert len(results) == 2
         assert "PAIR MATCHED" in results[0].reasoning
 
@@ -263,7 +273,7 @@ class TestTheHedgeClosesTheRealGap:
         """The control: no gap, no hedge, no extra order."""
         venues = {
             "stub_a": _StubVenue("stub_a", [_fills(fill_all=True)]),
-            "stub_b": _StubVenue("stub_b", [_fills(fill_all=True)],
+            "stub_b": _StubVenue("stub_b", [{"fill_all_at": 0.50}],
                                  book=dict(BOOK_B)),
         }
         ex = _executor(venues)
@@ -325,7 +335,7 @@ class TestThePriceIsRecheckedBeforeLegB:
         """The other direction, so the recheck is not simply refusing everything."""
         venues = {
             "stub_a": _StubVenue("stub_a", [_fills(fill_all=True)]),
-            "stub_b": _StubVenue("stub_b", [_fills(fill_all=True)],
+            "stub_b": _StubVenue("stub_b", [{"fill_all_at": 0.50}],
                                  books=[dict(BOOK_B)]),
         }
         ex = _executor(venues)

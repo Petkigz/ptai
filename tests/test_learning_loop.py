@@ -39,6 +39,7 @@ from src.ptai.venues.adapter import (
     MarketAdapter,
     VenueType,
 )
+from tests.execution_source import execution_path_source
 
 
 # --------------------------------------------------------------------------
@@ -191,7 +192,7 @@ class TestSettlementClosesTheChain:
         import inspect
         from src.ptai.agent import v3_loop
 
-        source = inspect.getsource(v3_loop.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "except:\n                            pass" not in source, (
                 "a bare except: pass around learning recording is back")
         assert "learning_problems" in source, (
@@ -635,7 +636,7 @@ class TestSettlementIsWiredIntoTheRuntime:
         import inspect
         from src.ptai.agent import v3_loop
 
-        source = inspect.getsource(v3_loop.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         settle_at = source.index("settle_pending()")
         qualify_at = source.index("evaluate_all_venues")
         assert settle_at < qualify_at, (

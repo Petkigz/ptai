@@ -1583,12 +1583,8 @@ class TradingAgentV3:
         for opp in final_trades[:max_trades]:
             try:
                 # V9 FIX #1 + V10: MOCK blocking - 4 layers
-                market_data_mode = getattr(opp.market, 'data_mode', None)
-                if hasattr(market_data_mode, 'value'):
-                    market_data_mode = market_data_mode.value
-                market_data_mode = str(market_data_mode).lower() if market_data_mode else "live"
-                is_mock_market = getattr(opp.market, 'is_mock', False) or market_data_mode in ("mock", "historical_sim") or "MOCK" in str(opp.market.id).upper()
-                
+                market_data_mode, is_mock_market = self._market_is_mock(opp.market)
+
                 if is_mock_market:
                     logger.error(f"ABORT TRADE: Market {opp.market.id} is MOCK_DATA data_mode={market_data_mode} source={getattr(opp.market, 'data_source', 'unknown')} - BLOCKED")
                     execution_results.append({
@@ -1736,309 +1732,10 @@ class TradingAgentV3:
                     "account_health": account_health.to_dict()
                 })
                 
-                # --- ONLY a proven fill may become a position ------------------
-                #
-                # Recording used to happen unconditionally after execution, so a
-                # result of rejected, error, rate_limited or blocked still
-                # created an "open" position - sized at the REQUESTED amount and
-                # priced at the REQUESTED price, because the executor copied
-                # those straight through. That is a position in the ledger that
-                # never existed at the venue: settlement would later close it
-                # against a real outcome and book a P&L for a trade that never
-                # happened, and the bankroll would drift away from reality.
-                if not exec_result.should_record_position:
-                    logger.warning(
-                        f"NO POSITION: {opp.market.id} @ {venue_id} status="
-                        f"{exec_result.status} - recorded nothing. {exec_result.reasoning[:120]}")
-                    execution_results[-1]["position_recorded"] = False
-                    execution_results[-1]["position_reason"] = (
-                        f"execution status {exec_result.status} committed no "
-                        f"capital, so no position exists to settle"
-                    )
-                    # No position - but possibly still an ORDER. A resting order
-                    # reserves capital at the venue, and a send whose response
-                    # was lost may be resting too. Both have to be recorded or
-                    # the next cycle cannot ask the venue about them, the
-                    # reserved cash is invisible to sizing, and a later fill
-                    # never becomes a position.
-                    if exec_result.reserves_capital or exec_result.needs_reconciliation:
-                        order_key = self.order_manager.record_submission(
-                            exec_result, market_id=opp.market.id,
-                            token_id=getattr(opp.market, "tokens", [{}])[0].token_id
-                            if getattr(opp.market, "tokens", None) else None,
-                            venue_id=venue_id, side=str(opp.side).upper(),
-                        forecast=self._forecast_for_order(
-                            opp, getattr(opp.market, "data_mode", "live")))
-                        execution_results[-1]["order_recorded"] = bool(order_key)
-                        execution_results[-1]["order_key"] = order_key
-                        if order_key:
-                            logger.info(
-                                f"Order {order_key} recorded for reconciliation: "
-                                f"status {exec_result.status}, "
-                                f"${exec_result.resting_usd:.4f} reserved, "
-                                f"unfilled {exec_result.unfilled_shares} shares")
-                    continue
-
-                execution_results[-1]["position_recorded"] = True
-                execution_results[-1]["fill"] = exec_result.to_position_dict()
-
-                # Draw the committed amount down as we go. Within one cycle the
-                # ledger is a snapshot taken before any of these trades, so
-                # without this every position in the batch would size against
-                # the same free cash - the original bug, one level down.
-                _committed = (exec_result.filled_usd
-                              if exec_result.committed_capital else amount_usd)
-                free_capital = max(0.0, free_capital - _committed)
-                if free_capital <= 0:
-                    logger.warning(
-                        "Free capital exhausted mid-cycle - no further positions "
-                        "will be opened in this batch.")
-
-                # --- Record the position so it can later be SETTLED -----------
-                #
-                # This block did not persist anything usable:
-                #   * `except: pass` around trade_outcome_tracker.record_trade
-                #     hid any failure inside it. A silent failure to record is
-                #     worse than a loud one: the agent keeps trading on unlearned
-                #     priors while the logs look fine.
-                #   * the trade was never written to the trades table at all, so
-                #     there was nothing for settlement to close, nothing for win
-                #     rate to be computed over, and nothing for the learning
-                #     chain to attribute an outcome to.
-                #   * the forecast carried no venue or trade id, so even a
-                #     settlement could not have routed it back to a position.
-                #
-                # Failures here are now loud and recorded on the execution result,
-                # so a position that was taken but cannot be learned from is
-                # visible rather than assumed.
-                # TWO labels, and they answer different questions.
-                #
-                # `data_mode` describes the market data - real books and prices
-                # from a live venue. `execution_mode` describes what happened to
-                # the money. An exploration trade is executed in paper against
-                # live data, so it is data_mode=live AND execution_mode=paper,
-                # and the learning chain must read the second one or it counts
-                # simulated trades as live outcomes.
-                data_mode_for_calib = getattr(opp.market, 'data_mode', 'live')
-                if hasattr(data_mode_for_calib, 'value'):
-                    data_mode_for_calib = data_mode_for_calib.value
-                execution_mode = "paper" if exec_result.is_simulated else "live"
-
-                # The price actually paid per share, on the token being bought.
-                # `filled_price` is that price; `opp.market_price` is the YES
-                # price, so it is only usable as the token price for a YES buy.
-                yes_price_at_entry = float(opp.market_price or 0.0)
-                if exec_result.filled_price:
-                    token_price_at_entry = float(exec_result.filled_price)
-                elif str(opp.side or "").upper() == "YES":
-                    token_price_at_entry = yes_price_at_entry
-                else:
-                    token_price_at_entry = round(1.0 - yes_price_at_entry, 6)
-                strategy_name = (opp.raw.get("strategy", "unknown")
-                                 if hasattr(opp, 'raw') and isinstance(opp.raw, dict)
-                                 else "unknown")
-                learning_problems = []
-
-                trade_id = None
-                try:
-                    trade_id = self.storage.log_trade({
-                        "market_id": opp.market.id,
-                        "market_question": opp.market.question[:200],
-                        "side": opp.side,
-                        # The FILL price, not the requested max price. A limit
-                        # order at 0.52 that filled at 0.49 changes the P&L and
-                        # the edge, and settlement uses this price. For a paper
-                        # fill it is the average of the levels the simulation
-                        # walked, which is how slippage enters the P&L at all.
-                        # Kept as the YES price it means to the strategy, with
-                        # the token price beside it. This column used to hold
-                        # the fill price when there was one and the YES price
-                        # when there was not, so it meant two different numbers
-                        # in the same column - and settlement, which needs the
-                        # token price, was given whichever it happened to be.
-                        "yes_price_at_entry": yes_price_at_entry,
-                        "token_price_at_entry": token_price_at_entry,
-                        "market_price": yes_price_at_entry,
-                        "execution_mode": execution_mode,
-                        "fees_usd": getattr(exec_result, "fees_usd", None),
-                        "fair_value": opp.estimated_fair,
-                        "edge": opp.effective_edge,
-                        "kelly_fraction": getattr(opp, "_kelly_fraction", None),
-                        # The FILLED size, not the intended size.
-                        # What actually went into the position, for real AND
-                        # paper. A simulated fill is usually smaller than the
-                        # request, because the book has finite depth; charging
-                        # the ledger the requested amount overstates exposure and
-                        # is how a paper equity curve drifts into fiction.
-                        # Guaranteed positive by should_record_position, which
-                        # refuses a simulated result that filled nothing. The old
-                        # `or amount_usd` fallback was a live trap: a paper fill
-                        # of $0 booked the whole request.
-                        "position_size_usd": exec_result.position_size_usd,
-                        "position_size_pct": (amount_usd / current_bankroll
-                                              if current_bankroll else None),
-                        "confidence": opp.confidence,
-                        # A simulated execution is recorded as paper, never as a
-                        # live position holding real capital.
-                        "status": "paper" if exec_result.is_simulated else "open",
-                        "notes": f"venue={venue_id} strategy={strategy_name} "
-                                 f"mode={data_mode_for_calib} "
-                                 f"exec_status={exec_result.status} "
-                                 f"order_id={exec_result.order_id} "
-                                 f"filled=${exec_result.filled_usd:.2f}"
-                                 f"@{exec_result.filled_price or 0:.4f}",
-                    })
-                except Exception as e:
-                    learning_problems.append(f"trade not persisted: {type(e).__name__}: {e}")
-                    logger.error(
-                        f"TRADE NOT PERSISTED for {opp.market.id}: {e}. Position "
-                        f"cannot be settled, so it cannot be learned from.")
-
-                # Link the order to the position it produced. A partial fill
-                # that later completes must grow THIS row: settlement finds an
-                # open trade by market id, so a second row for the same market
-                # would never be closed and its P&L would never be realised.
-                if trade_id and (exec_result.needs_reconciliation
-                                 or exec_result.unfilled_shares > 0):
-                    order_key = self.order_manager.record_submission(
-                        exec_result, market_id=opp.market.id,
-                        token_id=getattr(opp.market, "tokens", [{}])[0].token_id
-                        if getattr(opp.market, "tokens", None) else None,
-                        venue_id=venue_id, trade_id=int(trade_id),
-                        side=str(opp.side).upper(),
-                        forecast=self._forecast_for_order(
-                            opp, getattr(opp.market, "data_mode", "live")))
-                    execution_results[-1]["order_recorded"] = bool(order_key)
-                    execution_results[-1]["order_key"] = order_key
-                    if order_key:
-                        logger.info(
-                            f"Order {order_key} linked to position {trade_id} "
-                            f"({exec_result.unfilled_shares} shares still working); "
-                            f"further fills will grow this position")
-
-                # Forecast, tied to the venue and the trade so settlement can
-                # find it and close the position when the market resolves.
-                try:
-                    self.calibration_engine.record_forecast(
-                        market_id=opp.market.id,
-                        question=opp.market.question[:200],
-                        forecast_prob=opp.estimated_fair,
-                        confidence=opp.confidence,
-                        market_price=opp.market_price,
-                        category=opp.category,
-                        venue_id=venue_id,
-                        trade_id=trade_id,
-                    )
-                except Exception as e:
-                    learning_problems.append(f"forecast not recorded: {type(e).__name__}: {e}")
-                    logger.error(
-                        f"FORECAST NOT RECORDED for {opp.market.id}: {e}. The "
-                        f"probability behind this trade will not be calibrated.")
-
-                # Venue/strategy/category performance, for allocation later.
-                try:
-                    # The fields this tracker actually needs. It used to
-                    # receive confidence/data_mode/trust_tier and none of
-                    # trade_id/category/forecast_prob/market_price/side, so
-                    # every call raised TypeError and no venue or strategy
-                    # outcome was ever recorded.
-                    self.trade_outcome_tracker.record_trade(
-                        trade_id=trade_id,
-                        market_id=opp.market.id,
-                        venue_id=venue_id,
-                        strategy=strategy_name,
-                        category=opp.category,
-                        forecast_prob=opp.estimated_fair,
-                        market_price=(exec_result.filled_price
-                                      or opp.market_price),
-                        edge=opp.effective_edge,
-                        side=opp.side,
-                        confidence=opp.confidence,
-                        # PAPER or LIVE - the money, not the data.
-                        execution_mode=execution_mode,
-                        # The expected net EV computed BEFORE the trade was
-                        # taken, so qualification can weigh what was actually
-                        # predicted instead of the average edge.
-                        #
-                        # Read from THIS opportunity, not from a local: `expected_ev`
-                        # belongs to the sizing loop, and on the exploration path
-                        # it was never assigned at all - passing it raised
-                        # UnboundLocalError, which refused the whole learning
-                        # record. An outcome that is not written teaches nothing.
-                        # None when this trade was never scored, which the gate
-                        # treats as unmeasured rather than as zero.
-                        expected_net_ev=getattr(
-                            getattr(opp, "_expected_ev", None), "net_ev_usd", None),
-                        expected_net_ev_pct=getattr(
-                            getattr(opp, "_expected_ev", None), "net_ev_pct", None),
-                        # The market data mode, kept for context. The
-                        # paper/live split reads execution_mode, above.
-                        data_mode=str(data_mode_for_calib),
-                        # What the trade actually cost. Recorded so the
-                        # qualification gate can MEASURE fees, slippage and
-                        # execution quality instead of reading the placeholders
-                        # it used to hold - a constant that happened to equal the
-                        # execution-quality threshold, so every venue passed it.
-                        fees_usd=getattr(exec_result, "fees_usd", None),
-                        slippage_bps=(
-                            (getattr(exec_result, "paper_fill", None) or {})
-                            .get("slippage_bps")),
-                        execution_quality=self._execution_quality(exec_result),
-                        # WHICH BOOK this fill was priced against, from the
-                        # broker that walked it. A paper fill can be perfectly
-                        # simulated and still be evidence about nothing; the
-                        # qualification gate refuses a sample that is mostly
-                        # priced against an assumed book, and it can only do
-                        # that if the label reaches the outcome row.
-                        # THE SAME EV, REPRICED AT THE FILL THAT HAPPENED.
-                        #
-                        # `expected_net_ev` above is the prediction, made at the
-                        # price the book showed when the opportunity was found.
-                        # These are that quantity recomputed at the price the
-                        # order actually paid and the fees it actually incurred,
-                        # so the qualification gate can judge what the fills were
-                        # worth instead of trusting a model of execution. The
-                        # slippage is already inside `filled_price` - the ladder
-                        # walk is how the order got there - so it is not
-                        # deducted a second time here.
-                        **self._executable_ev_fields(
-                            opp=opp,
-                            exec_result=exec_result,
-                            # Read from THIS opportunity, never from a local:
-                            # `expected_ev` belongs to the sizing loop and on the
-                            # exploration path it is never assigned, so passing
-                            # it raises UnboundLocalError inside the record call
-                            # and the whole outcome - score, costs, forecast and
-                            # all - is lost. Reading it here rather than the
-                            # local is what stopped that happening before.
-                            modelled=getattr(opp, "_expected_ev", None),
-                            amount_usd=amount_usd,
-                        ),
-                        book_source=(
-                            (getattr(exec_result, "paper_fill", None) or {})
-                            .get("book_source")
-                            # A live fill is its own evidence: real money,
-                            # real book, no simulation involved.
-                            or ("venue_fill" if execution_mode == "live" else "")),
-                        gas_usd=getattr(exec_result, "gas_usd", None),
-                        amount_usd=(exec_result.filled_usd
-                                    if exec_result.committed_capital
-                                    else amount_usd),
-                    )
-                except Exception as e:
-                    learning_problems.append(f"venue/strategy outcome not recorded: {type(e).__name__}: {e}")
-                    logger.error(
-                        f"VENUE OUTCOME NOT RECORDED for {opp.market.id}: {e}. "
-                        f"Allocation will keep treating this venue as untested.")
-
-                if learning_problems:
-                    logger.error(
-                        f"LEARNING GAPS on {opp.market.id}: " + "; ".join(learning_problems))
-                    execution_results[-1]["learning_problems"] = learning_problems
-                    execution_results[-1]["learning_complete"] = False
-                else:
-                    execution_results[-1]["learning_complete"] = True
-                
+                free_capital = self._record_execution(
+                    opp, exec_result, execution_results[-1],
+                    venue_id=venue_id, amount_usd=amount_usd,
+                    current_bankroll=current_bankroll, free_capital=free_capital)
             except Exception as e:
                 logger.error(f"Execution failed for {opp.market.id}: {e}")
                 import traceback
@@ -2048,6 +1745,13 @@ class TradingAgentV3:
                     "traceback": traceback.format_exc()[:500]
                 })
         
+        # --- the arbitrage lane -------------------------------------------
+        # Discovered, reported, and until now never traded. Same executor, same
+        # recorder, same gates as the path above.
+        free_capital = await self._execute_arbitrage_lane(
+            scan_result, execution_results,
+            current_bankroll=current_bankroll, free_capital=free_capital)
+
         # V10 FIX #8: Log exploration lane results (shadow only, no capital)
         if exploration_trades:
             logger.info(f"V10 FIX #8 Exploration lane complete: {len(exploration_trades)} shadow trades for learning, NO live capital deployed")
@@ -2125,6 +1829,9 @@ class TradingAgentV3:
             "arbitrage": {
                 "total_found": len(scan_result.arbitrage_opportunities),
                 "tradeable": len([a for a in scan_result.arbitrage_opportunities if a.should_trade]),
+                # What the lane DID with them. Without this the report looked
+                # identical whether the pair executor ran or was unreachable.
+                "execution": dict(getattr(self, "_last_arb_execution", None) or {}),
                 "top": [
                     {
                         "venue_a": a.venue_a,
@@ -2455,6 +2162,499 @@ class TradingAgentV3:
             return False, f"execution_quality {opp.execution_quality:.2f} < 0.3"
         return True, (f"mispricing {mispricing*100:.1f}% effective "
                       f"{opp.effective_edge*100:.1f}% conf {opp.confidence:.2f}")
+
+    @staticmethod
+    def _market_is_mock(market) -> tuple:
+        """
+        (data_mode, is_mock) for a market - one definition.
+
+        The arbitrage lane needs the same refusal as the single-opportunity
+        path, and a second copy of this test would eventually disagree with this
+        one about what "mock" means. The fallback is `live`, which is the
+        direction that REFUSES: a market whose mode cannot be read is not
+        silently admitted to execution.
+        """
+        mode = getattr(market, "data_mode", None)
+        if hasattr(mode, "value"):
+            mode = mode.value
+        mode = str(mode).lower() if mode else "live"
+        is_mock = (bool(getattr(market, "is_mock", False))
+                   or mode in ("mock", "historical_sim")
+                   or "MOCK" in str(getattr(market, "id", "")).upper())
+        return mode, is_mock
+
+    async def _execute_arbitrage_lane(self, scan_result, execution_results, *,
+                                      current_bankroll, free_capital,
+                                      max_pairs: int = 1) -> float:
+        """
+        Execute the arbitrage the scan found, and record both legs.
+
+        This lane did not exist. The pair executor was written, tested and
+        unreachable: arbitrage was discovered, reported in the cycle report, and
+        never traded - so the sequential state machine, the price recheck and
+        the hedge were bounding an exposure window that never opened. The
+        strategy with the cleanest economics in the whole system was the one
+        wired to nothing.
+
+        The same gates the single path passes are applied here, per leg:
+
+          * a mock market is refused,
+          * the venue has to answer an account-health check,
+          * a leg that would move REAL money has to pass the live-capital
+            boundary - which, with one venue funded at a time, means a
+            cross-venue pair cannot go live: the honest answer is to say so
+            rather than to fund it anyway.
+
+        The pair is not put through the venue qualification gate the way a
+        directional trade is: it has no forecast to be qualified on, and its
+        risk is execution risk, which the recheck and the hedge bound directly.
+        The operator's live venue and budget still apply, because that is where
+        real money is authorised.
+
+        Returns the free capital left after the legs are drawn down.
+        """
+        pairs = list(getattr(scan_result, "arbitrage_opportunities", None) or [])
+        candidates = [a for a in pairs if getattr(a, "should_trade", False)]
+        summary = {"found": len(pairs), "tradeable": len(candidates),
+                   "attempted": 0, "legs_filled": 0, "hedged": 0, "results": []}
+        self._last_arb_execution = summary
+        if not candidates:
+            return free_capital
+
+        for arb in candidates[:max_pairs]:
+            try:
+                opp_a, opp_b = self.multi_venue_executor.arb_leg_opportunities(arb)
+            except Exception as e:
+                logger.error(f"Arb lane could not build the legs of {arb}: {e}")
+                continue
+
+            reason = await self._arbitrage_blocked(arb, opp_a, opp_b, free_capital)
+            if reason:
+                logger.warning(f"Arb blocked: {arb.venue_a} vs {arb.venue_b} - {reason}")
+                summary["results"].append({
+                    "venue_a": arb.venue_a, "venue_b": arb.venue_b,
+                    "attempted": False, "reason": reason})
+                execution_results.append({
+                    "lane": "arbitrage", "venue": f"{arb.venue_a}+{arb.venue_b}",
+                    "market_id": f"{arb.market_a.id}+{arb.market_b.id}",
+                    "status": "blocked", "reason": reason,
+                    "position_recorded": False})
+                continue
+
+            pair_budget = min(current_bankroll * 0.06, free_capital)
+            amount_per_leg = pair_budget / 2.0
+            summary["attempted"] += 1
+            try:
+                results = await self.multi_venue_executor.execute_arbitrage_pair(
+                    arb, amount_per_leg=amount_per_leg)
+            except Exception as e:
+                logger.error(
+                    f"Arb lane failed to execute {arb.venue_a} vs {arb.venue_b}: "
+                    f"{type(e).__name__}: {e}")
+                summary["results"].append({
+                    "venue_a": arb.venue_a, "venue_b": arb.venue_b,
+                    "attempted": True, "error": f"{type(e).__name__}: {e}"})
+                continue
+
+            for opp, result in zip((opp_a, opp_b), list(results)):
+                slot = {
+                    "lane": "arbitrage",
+                    "venue": opp.venue_id,
+                    "market_id": opp.market.id,
+                    "side": opp.side,
+                    "amount": amount_per_leg,
+                    "expected_net_ev": {},
+                    "executor_result": {
+                        "status": result.status,
+                        "amount_usd": result.amount_usd,
+                        "price": result.price,
+                        "filled_usd": result.filled_usd,
+                        "filled_price": result.filled_price,
+                        "filled_shares": result.filled_shares,
+                        "fees_usd": result.fees_usd,
+                        "gas_usd": result.gas_usd,
+                        "latency_ms": result.latency_ms,
+                        "reasoning": result.reasoning,
+                    },
+                    "result": {"status": result.status,
+                               "message": result.reasoning},
+                    "canonical_path": ("V3 -> Guard -> MultiVenueExecutor -> "
+                                       "execute_arbitrage_pair -> adapter -> "
+                                       "place_order()"),
+                }
+                execution_results.append(slot)
+                # The SAME recorder the single path uses. A leg is a position
+                # like any other: it has to be recorded, settled, and learned
+                # from, or the pair's P&L is folklore.
+                free_capital = self._record_execution(
+                    opp, result, slot, venue_id=opp.venue_id,
+                    amount_usd=amount_per_leg, current_bankroll=current_bankroll,
+                    free_capital=free_capital)
+                if result.bought_something:
+                    summary["legs_filled"] += 1
+                if "HEDGE" in str(result.reasoning):
+                    summary["hedged"] += 1
+                summary["results"].append({
+                    "venue": opp.venue_id, "market_id": opp.market.id,
+                    "side": opp.side, "status": result.status,
+                    "filled_usd": result.filled_usd,
+                    "filled_shares": result.filled_shares,
+                    "reasoning": result.reasoning[:200]})
+        return free_capital
+
+    async def _arbitrage_blocked(self, arb, opp_a, opp_b, free_capital) -> str:
+        """
+        Why this pair must not be sent, or an empty string if it may.
+
+        Returns the reason instead of raising: a refused pair is a normal
+        outcome, and the cycle report has to be able to say which gate refused
+        it - the same discipline the single path uses.
+        """
+        for label, opp in (("leg A", opp_a), ("leg B", opp_b)):
+            _, is_mock = self._market_is_mock(opp.market)
+            if is_mock:
+                return (f"{label} market {opp.market.id} is MOCK_DATA - it "
+                        f"cannot reach execution")
+            try:
+                health = await self.account_health_engine.check_venue_health(
+                    opp.venue_id, opportunity=opp)
+            except Exception as e:
+                return f"{label} venue {opp.venue_id} health unreadable: {e}"
+            try:
+                self._last_account_health[opp.venue_id] = health.to_dict()
+            except Exception:
+                pass
+            if not health.healthy and not health.paper_trading_ok:
+                return (f"{label} venue {opp.venue_id} health FAIL: "
+                        f"{health.reason}")
+            allowed, why = self._live_execution_allowed(opp, free_capital / 2.0)
+            if not allowed:
+                return f"{label} {opp.venue_id}: {why}"
+        return ""
+
+    def _record_execution(self, opp, exec_result, slot, *, venue_id,
+                          amount_usd, current_bankroll, free_capital):
+        """
+        Turn a proven fill into a position, and the position into learning.
+
+        Returns the free capital left after this fill's cost is drawn down.
+
+        `slot` is the report entry this execution belongs to; it is annotated
+        with what happened so the cycle report can be read without parsing logs.
+        The two labels this writes are not the same question: `data_mode`
+        describes the MARKET DATA and `execution_mode` describes the MONEY, and
+        the learning chain reads the second one - an exploration trade runs in
+        paper against live data and must never be counted as a live outcome.
+
+        Extracted from the body of the single-opportunity loop so that the
+        arbitrage lane records its legs through the SAME path. A second copy of
+        this logic would eventually disagree with this one about what a position
+        is, and the copy that is wrong is always the one nobody is looking at.
+        """
+        # --- ONLY a proven fill may become a position ------------------
+        #
+        # Recording used to happen unconditionally after execution, so a
+        # result of rejected, error, rate_limited or blocked still
+        # created an "open" position - sized at the REQUESTED amount and
+        # priced at the REQUESTED price, because the executor copied
+        # those straight through. That is a position in the ledger that
+        # never existed at the venue: settlement would later close it
+        # against a real outcome and book a P&L for a trade that never
+        # happened, and the bankroll would drift away from reality.
+        if not exec_result.should_record_position:
+            logger.warning(
+                f"NO POSITION: {opp.market.id} @ {venue_id} status="
+                f"{exec_result.status} - recorded nothing. {exec_result.reasoning[:120]}")
+            slot["position_recorded"] = False
+            slot["position_reason"] = (
+                f"execution status {exec_result.status} committed no "
+                f"capital, so no position exists to settle"
+            )
+            # No position - but possibly still an ORDER. A resting order
+            # reserves capital at the venue, and a send whose response
+            # was lost may be resting too. Both have to be recorded or
+            # the next cycle cannot ask the venue about them, the
+            # reserved cash is invisible to sizing, and a later fill
+            # never becomes a position.
+            if exec_result.reserves_capital or exec_result.needs_reconciliation:
+                order_key = self.order_manager.record_submission(
+                    exec_result, market_id=opp.market.id,
+                    token_id=getattr(opp.market, "tokens", [{}])[0].token_id
+                    if getattr(opp.market, "tokens", None) else None,
+                    venue_id=venue_id, side=str(opp.side).upper(),
+                forecast=self._forecast_for_order(
+                    opp, getattr(opp.market, "data_mode", "live")))
+                slot["order_recorded"] = bool(order_key)
+                slot["order_key"] = order_key
+                if order_key:
+                    logger.info(
+                        f"Order {order_key} recorded for reconciliation: "
+                        f"status {exec_result.status}, "
+                        f"${exec_result.resting_usd:.4f} reserved, "
+                        f"unfilled {exec_result.unfilled_shares} shares")
+            return free_capital
+
+        slot["position_recorded"] = True
+        slot["fill"] = exec_result.to_position_dict()
+
+        # Draw the committed amount down as we go. Within one cycle the
+        # ledger is a snapshot taken before any of these trades, so
+        # without this every position in the batch would size against
+        # the same free cash - the original bug, one level down.
+        _committed = (exec_result.filled_usd
+                      if exec_result.committed_capital else amount_usd)
+        free_capital = max(0.0, free_capital - _committed)
+        if free_capital <= 0:
+            logger.warning(
+                "Free capital exhausted mid-cycle - no further positions "
+                "will be opened in this batch.")
+
+        # --- Record the position so it can later be SETTLED -----------
+        #
+        # This block did not persist anything usable:
+        #   * `except: pass` around trade_outcome_tracker.record_trade
+        #     hid any failure inside it. A silent failure to record is
+        #     worse than a loud one: the agent keeps trading on unlearned
+        #     priors while the logs look fine.
+        #   * the trade was never written to the trades table at all, so
+        #     there was nothing for settlement to close, nothing for win
+        #     rate to be computed over, and nothing for the learning
+        #     chain to attribute an outcome to.
+        #   * the forecast carried no venue or trade id, so even a
+        #     settlement could not have routed it back to a position.
+        #
+        # Failures here are now loud and recorded on the execution result,
+        # so a position that was taken but cannot be learned from is
+        # visible rather than assumed.
+        # TWO labels, and they answer different questions.
+        #
+        # `data_mode` describes the market data - real books and prices
+        # from a live venue. `execution_mode` describes what happened to
+        # the money. An exploration trade is executed in paper against
+        # live data, so it is data_mode=live AND execution_mode=paper,
+        # and the learning chain must read the second one or it counts
+        # simulated trades as live outcomes.
+        data_mode_for_calib = getattr(opp.market, 'data_mode', 'live')
+        if hasattr(data_mode_for_calib, 'value'):
+            data_mode_for_calib = data_mode_for_calib.value
+        execution_mode = "paper" if exec_result.is_simulated else "live"
+
+        # The price actually paid per share, on the token being bought.
+        # `filled_price` is that price; `opp.market_price` is the YES
+        # price, so it is only usable as the token price for a YES buy.
+        yes_price_at_entry = float(opp.market_price or 0.0)
+        if exec_result.filled_price:
+            token_price_at_entry = float(exec_result.filled_price)
+        elif str(opp.side or "").upper() == "YES":
+            token_price_at_entry = yes_price_at_entry
+        else:
+            token_price_at_entry = round(1.0 - yes_price_at_entry, 6)
+        strategy_name = (opp.raw.get("strategy", "unknown")
+                         if hasattr(opp, 'raw') and isinstance(opp.raw, dict)
+                         else "unknown")
+        learning_problems = []
+
+        trade_id = None
+        try:
+            trade_id = self.storage.log_trade({
+                "market_id": opp.market.id,
+                "market_question": opp.market.question[:200],
+                "side": opp.side,
+                # The FILL price, not the requested max price. A limit
+                # order at 0.52 that filled at 0.49 changes the P&L and
+                # the edge, and settlement uses this price. For a paper
+                # fill it is the average of the levels the simulation
+                # walked, which is how slippage enters the P&L at all.
+                # Kept as the YES price it means to the strategy, with
+                # the token price beside it. This column used to hold
+                # the fill price when there was one and the YES price
+                # when there was not, so it meant two different numbers
+                # in the same column - and settlement, which needs the
+                # token price, was given whichever it happened to be.
+                "yes_price_at_entry": yes_price_at_entry,
+                "token_price_at_entry": token_price_at_entry,
+                "market_price": yes_price_at_entry,
+                "execution_mode": execution_mode,
+                "fees_usd": getattr(exec_result, "fees_usd", None),
+                "fair_value": opp.estimated_fair,
+                "edge": opp.effective_edge,
+                "kelly_fraction": getattr(opp, "_kelly_fraction", None),
+                # The FILLED size, not the intended size.
+                # What actually went into the position, for real AND
+                # paper. A simulated fill is usually smaller than the
+                # request, because the book has finite depth; charging
+                # the ledger the requested amount overstates exposure and
+                # is how a paper equity curve drifts into fiction.
+                # Guaranteed positive by should_record_position, which
+                # refuses a simulated result that filled nothing. The old
+                # `or amount_usd` fallback was a live trap: a paper fill
+                # of $0 booked the whole request.
+                "position_size_usd": exec_result.position_size_usd,
+                "position_size_pct": (amount_usd / current_bankroll
+                                      if current_bankroll else None),
+                "confidence": opp.confidence,
+                # A simulated execution is recorded as paper, never as a
+                # live position holding real capital.
+                "status": "paper" if exec_result.is_simulated else "open",
+                "notes": f"venue={venue_id} strategy={strategy_name} "
+                         f"mode={data_mode_for_calib} "
+                         f"exec_status={exec_result.status} "
+                         f"order_id={exec_result.order_id} "
+                         f"filled=${exec_result.filled_usd:.2f}"
+                         f"@{exec_result.filled_price or 0:.4f}",
+            })
+        except Exception as e:
+            learning_problems.append(f"trade not persisted: {type(e).__name__}: {e}")
+            logger.error(
+                f"TRADE NOT PERSISTED for {opp.market.id}: {e}. Position "
+                f"cannot be settled, so it cannot be learned from.")
+
+        # Link the order to the position it produced. A partial fill
+        # that later completes must grow THIS row: settlement finds an
+        # open trade by market id, so a second row for the same market
+        # would never be closed and its P&L would never be realised.
+        if trade_id and (exec_result.needs_reconciliation
+                         or exec_result.unfilled_shares > 0):
+            order_key = self.order_manager.record_submission(
+                exec_result, market_id=opp.market.id,
+                token_id=getattr(opp.market, "tokens", [{}])[0].token_id
+                if getattr(opp.market, "tokens", None) else None,
+                venue_id=venue_id, trade_id=int(trade_id),
+                side=str(opp.side).upper(),
+                forecast=self._forecast_for_order(
+                    opp, getattr(opp.market, "data_mode", "live")))
+            slot["order_recorded"] = bool(order_key)
+            slot["order_key"] = order_key
+            if order_key:
+                logger.info(
+                    f"Order {order_key} linked to position {trade_id} "
+                    f"({exec_result.unfilled_shares} shares still working); "
+                    f"further fills will grow this position")
+
+        # Forecast, tied to the venue and the trade so settlement can
+        # find it and close the position when the market resolves.
+        try:
+            self.calibration_engine.record_forecast(
+                market_id=opp.market.id,
+                question=opp.market.question[:200],
+                forecast_prob=opp.estimated_fair,
+                confidence=opp.confidence,
+                market_price=opp.market_price,
+                category=opp.category,
+                venue_id=venue_id,
+                trade_id=trade_id,
+            )
+        except Exception as e:
+            learning_problems.append(f"forecast not recorded: {type(e).__name__}: {e}")
+            logger.error(
+                f"FORECAST NOT RECORDED for {opp.market.id}: {e}. The "
+                f"probability behind this trade will not be calibrated.")
+
+        # Venue/strategy/category performance, for allocation later.
+        try:
+            # The fields this tracker actually needs. It used to
+            # receive confidence/data_mode/trust_tier and none of
+            # trade_id/category/forecast_prob/market_price/side, so
+            # every call raised TypeError and no venue or strategy
+            # outcome was ever recorded.
+            self.trade_outcome_tracker.record_trade(
+                trade_id=trade_id,
+                market_id=opp.market.id,
+                venue_id=venue_id,
+                strategy=strategy_name,
+                category=opp.category,
+                forecast_prob=opp.estimated_fair,
+                market_price=(exec_result.filled_price
+                              or opp.market_price),
+                edge=opp.effective_edge,
+                side=opp.side,
+                confidence=opp.confidence,
+                # PAPER or LIVE - the money, not the data.
+                execution_mode=execution_mode,
+                # The expected net EV computed BEFORE the trade was
+                # taken, so qualification can weigh what was actually
+                # predicted instead of the average edge.
+                #
+                # Read from THIS opportunity, not from a local: `expected_ev`
+                # belongs to the sizing loop, and on the exploration path
+                # it was never assigned at all - passing it raised
+                # UnboundLocalError, which refused the whole learning
+                # record. An outcome that is not written teaches nothing.
+                # None when this trade was never scored, which the gate
+                # treats as unmeasured rather than as zero.
+                expected_net_ev=getattr(
+                    getattr(opp, "_expected_ev", None), "net_ev_usd", None),
+                expected_net_ev_pct=getattr(
+                    getattr(opp, "_expected_ev", None), "net_ev_pct", None),
+                # The market data mode, kept for context. The
+                # paper/live split reads execution_mode, above.
+                data_mode=str(data_mode_for_calib),
+                # What the trade actually cost. Recorded so the
+                # qualification gate can MEASURE fees, slippage and
+                # execution quality instead of reading the placeholders
+                # it used to hold - a constant that happened to equal the
+                # execution-quality threshold, so every venue passed it.
+                fees_usd=getattr(exec_result, "fees_usd", None),
+                slippage_bps=(
+                    (getattr(exec_result, "paper_fill", None) or {})
+                    .get("slippage_bps")),
+                execution_quality=self._execution_quality(exec_result),
+                # WHICH BOOK this fill was priced against, from the
+                # broker that walked it. A paper fill can be perfectly
+                # simulated and still be evidence about nothing; the
+                # qualification gate refuses a sample that is mostly
+                # priced against an assumed book, and it can only do
+                # that if the label reaches the outcome row.
+                # THE SAME EV, REPRICED AT THE FILL THAT HAPPENED.
+                #
+                # `expected_net_ev` above is the prediction, made at the
+                # price the book showed when the opportunity was found.
+                # These are that quantity recomputed at the price the
+                # order actually paid and the fees it actually incurred,
+                # so the qualification gate can judge what the fills were
+                # worth instead of trusting a model of execution. The
+                # slippage is already inside `filled_price` - the ladder
+                # walk is how the order got there - so it is not
+                # deducted a second time here.
+                **self._executable_ev_fields(
+                    opp=opp,
+                    exec_result=exec_result,
+                    # Read from THIS opportunity, never from a local:
+                    # `expected_ev` belongs to the sizing loop and on the
+                    # exploration path it is never assigned, so passing
+                    # it raises UnboundLocalError inside the record call
+                    # and the whole outcome - score, costs, forecast and
+                    # all - is lost. Reading it here rather than the
+                    # local is what stopped that happening before.
+                    modelled=getattr(opp, "_expected_ev", None),
+                    amount_usd=amount_usd,
+                ),
+                book_source=(
+                    (getattr(exec_result, "paper_fill", None) or {})
+                    .get("book_source")
+                    # A live fill is its own evidence: real money,
+                    # real book, no simulation involved.
+                    or ("venue_fill" if execution_mode == "live" else "")),
+                gas_usd=getattr(exec_result, "gas_usd", None),
+                amount_usd=(exec_result.filled_usd
+                            if exec_result.committed_capital
+                            else amount_usd),
+            )
+        except Exception as e:
+            learning_problems.append(f"venue/strategy outcome not recorded: {type(e).__name__}: {e}")
+            logger.error(
+                f"VENUE OUTCOME NOT RECORDED for {opp.market.id}: {e}. "
+                f"Allocation will keep treating this venue as untested.")
+
+        if learning_problems:
+            logger.error(
+                f"LEARNING GAPS on {opp.market.id}: " + "; ".join(learning_problems))
+            slot["learning_problems"] = learning_problems
+            slot["learning_complete"] = False
+        else:
+            slot["learning_complete"] = True
+        return free_capital
+        
 
     @staticmethod
     def _executable_ev_fields(opp, exec_result, modelled,

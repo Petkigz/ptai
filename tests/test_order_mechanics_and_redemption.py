@@ -43,6 +43,7 @@ from src.ptai.markets.mechanics import (
     tick_rounding_cost,
 )
 from src.ptai.storage.db import Storage
+from tests.execution_source import execution_path_source
 
 
 # ==========================================================================
@@ -638,7 +639,7 @@ class TestTheLedgerLearnsWhatTheVenueDid:
         """
         import src.ptai.agent.v3_loop as v3
 
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "await self._reconcile_working_orders()" in source
         assert "await self._redeem_settled_wins()" in source
         assert "self.redeemer = Redeemer(" in inspect.getsource(v3.TradingAgentV3.__init__)
@@ -654,7 +655,7 @@ class TestTheLedgerLearnsWhatTheVenueDid:
         both, no order is ever tracked and nothing can be reconciled.
         """
         import src.ptai.agent.v3_loop as v3
-        source = inspect.getsource(v3.TradingAgentV3.run_cycle)
+        source = execution_path_source()
         assert "self.order_manager.record_submission(" in source
         reconcile_source = inspect.getsource(
             v3.TradingAgentV3._reconcile_working_orders)
