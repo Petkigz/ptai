@@ -155,6 +155,28 @@ class ExecutionResult:
         return 0.0
 
     @property
+    def filled_shares(self) -> float:
+        """
+        How many SHARES this execution actually bought.
+
+        Dollars are not a position: $3.00 buys 5 shares at 0.60 and 4 shares at
+        0.75. A hedge has to close SHARES, so matching dollars leaves the
+        difference naked when the opposite side is dearer and buys a
+        directional bet when it is cheaper - and either way a dollars-matched
+        log line says the exposure was closed.
+
+        The venue's own `size_matched` is used when it reported one. Otherwise
+        the shares are derived from the fill it did report, because a fill that
+        cannot be counted in shares cannot be hedged against.
+        """
+        matched = _num(self.size_matched)
+        if matched is not None and matched > 0:
+            return float(matched)
+        if self.filled_usd > 0 and self.filled_price > 0:
+            return float(self.filled_usd) / float(self.filled_price)
+        return 0.0
+
+    @property
     def should_record_position(self) -> bool:
         """
         Should a POSITION row be written?
@@ -185,6 +207,7 @@ class ExecutionResult:
             "requested_usd": self.amount_usd,
             "filled_usd": self.filled_usd,
             "filled_price": self.filled_price,
+            "filled_shares": self.filled_shares,
             "fees_usd": self.fees_usd,
             "gas_usd": self.gas_usd,
             "order_id": self.order_id,
@@ -263,7 +286,64 @@ def _coerce_venue_type(value):
     return VenueType.PREDICTION
 
 
-def _side_aware_cap(opportunity, slippage: float = 0.02) -> float:
+# PRICE units - 2 cents of room on the price of one share. It is not a
+# fraction of the stake, and confusing the two is how the unit error happened
+# in the first place.
+_PRICE_SLIPPAGE = 0.02
+
+# Shares. A fraction of a share is a fraction of a dollar of payoff; a tenth of
+# a share at 6-decimal tick size is a rounding artefact, not exposure.
+_SHARE_TOLERANCE = 0.01
+
+
+def _token_price(opportunity) -> float:
+    """
+    What one share of the side being bought costs at the modelled price.
+
+    A NO position is a BUY of the NO token, so its modelled price is
+    1 - the YES price. Sizing a NO leg off the YES price is the same defect as
+    capping it off the YES price, one step further down the pipe.
+    """
+    price = float(getattr(opportunity, "market_price", 0.0) or 0.0)
+    side = str(getattr(opportunity, "side", "YES") or "YES").upper()
+    if side in ("NO", "SELL", "SHORT", "0"):
+        return max(0.0, 1.0 - price)
+    return price
+
+
+def _best_quote(book, side):
+    """
+    What one share of `side` costs to BUY from this book, and the note for it.
+
+    YES buys the ask. NO is the other token of the same binary market, so it
+    buys at 1 - the YES bid, and quoting a NO order off the YES ask is how a
+    NO limit ends up on a price that token never trades at. Shared so the pair
+    recheck and the hedge cannot drift apart.
+    """
+    best_ask = None
+    best_bid = None
+    for level in (book.get("asks") or []):
+        try:
+            best_ask = float(level.get("price"))
+            break
+        except (TypeError, ValueError, AttributeError):
+            continue
+    for level in (book.get("bids") or []):
+        try:
+            best_bid = float(level.get("price"))
+            break
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if str(side).upper() in ("NO", "SELL", "SHORT", "0"):
+        if best_bid is None:
+            return None, "no bid to price NO"
+        return 1.0 - best_bid, f"NO at {1.0 - best_bid:.3f} (1 - bid {best_bid:.3f})"
+    if best_ask is None:
+        return None, "no ask to price YES"
+    return best_ask, f"YES at {best_ask:.3f}"
+
+
+def _side_aware_cap(opportunity, slippage: float = _PRICE_SLIPPAGE) -> float:
     """
     The most this order may pay per share, on the token it is buying.
 
@@ -618,11 +698,13 @@ class MultiVenueExecutor:
           PRECHECK      the spread survives the fee model
           RESERVE       both legs fit inside the bankroll cap
           VERIFY_BOOKS  both books are readable and not too wide
-          SUBMIT_A      only this may open exposure
-          size_B to     the amount A ACTUALLY FILLED, not the amount requested,
+          SUBMIT_A      only this may open exposure, and sized so that a
+                        SHARE-MATCHED second leg fits the reserve
+          size_B to     the SHARES A ACTUALLY FILLED, not the amount requested,
           SUBMIT_B      so a partial A cannot be "balanced" by a full B
-          HEDGE         the UNMATCHED remainder - if B underfills, or if the
-                        price moved while A was filling - sized on the real gap
+          HEDGE         the UNMATCHED SHARES - if B underfills, or if the price
+                        moved while A was filling - bought on the side that
+                        closes them, at the price the book now shows
 
         Two things this deliberately does not do. It does not submit both legs
         concurrently: with no cross-venue primitive, concurrent submits double
@@ -708,12 +790,32 @@ class MultiVenueExecutor:
         )
         
         state = "SUBMIT_A"
+        # The pair is sized in SHARES, and leg A is sized so the pair can still
+        # be completed inside the capital the risk check above reserved.
+        #
+        # The riskless construction is n shares of each leg: one share of YES
+        # plus one share of NO pays exactly $1. Two equal DOLLAR legs buy
+        # n_a = D/p_a and n_b = D/p_b shares, so the pair only pays
+        # min(n_a, n_b) - the spread is handed back as directional risk. The
+        # budgets are therefore split in the ratio of the two token prices, and
+        # sized on the CAP prices so the completion cannot exceed the reserve.
+        slippage = _PRICE_SLIPPAGE
+        token_a = _token_price(opp_a)
+        token_b = _token_price(opp_b)
+        pair_price = token_a + token_b
+        if pair_price > 0:
+            shares_target = total_needed / (pair_price + 2 * slippage)
+            leg_a_budget = min(amount_per_leg,
+                               shares_target * (token_a + slippage))
+        else:
+            shares_target = 0.0
+            leg_a_budget = amount_per_leg
         # The side-aware cap, same rule as the single-opportunity path. A flat
         # `market_price + 0.02` caps the YES price, which for a NO leg is a cap
         # on a number that token never reaches - so the NO order was either
         # rejected or admitted at a price it could not fill at.
         result_a = await self.execute_single(
-            opp_a, max_spend_usd=amount_per_leg,
+            opp_a, max_spend_usd=leg_a_budget,
             max_price=_side_aware_cap(opp_a))
         
         if result_a.status in ["error", "rejected", "rate_limited", "blocked", "aborted"]:
@@ -731,6 +833,7 @@ class MultiVenueExecutor:
         # machine exists to prevent.
         # ------------------------------------------------------------------
         leg_a_fill = float(getattr(result_a, "filled_usd", 0.0) or 0.0)
+        leg_a_shares = float(getattr(result_a, "filled_shares", 0.0) or 0.0)
         resting_a = float(getattr(result_a, "resting_usd", 0.0) or 0.0)
         if not result_a.committed_capital or leg_a_fill <= 0:
             # A bought nothing, so there is nothing to balance and no reason to
@@ -745,12 +848,30 @@ class MultiVenueExecutor:
                 "would have been a one-sided position")
             return [result_a]
 
+        if leg_a_shares <= 0:
+            # A bought something and the venue did not say how much of it, or
+            # said zero. Either way the position cannot be balanced by a
+            # number, and a hedge sized on a guess is not a hedge.
+            logger.warning(
+                f"Arb SUBMIT_A filled ${leg_a_fill:.2f} but reported no share "
+                f"count - leg B not submitted: what to balance it with is "
+                f"unknown")
+            result_a.reasoning += (
+                f" | PAIR NOT ATTEMPTED: leg A filled ${leg_a_fill:.2f} with no "
+                f"quantifiable share count, so leg B would have been sized on "
+                f"a guess")
+            return [result_a]
+
         # Recheck the price B would actually have to pay. `_side_aware_cap` was
         # computed from the spread DISCOVERED earlier; by the time A has filled,
         # that number is history. A pair admitted at the old cap can fill B at a
         # price where the arb no longer exists - paying to close a spread that
         # is no longer open.
-        cap_b, price_recheck = await self._arb_leg_cap(arb, opp_a, opp_b, adapter_b)
+        # ...against the price A ACTUALLY paid. `opp_a.market_price` is the
+        # price the opportunity was discovered at, which is history by now.
+        cap_b, price_recheck = await self._arb_leg_cap(
+            arb, opp_a, opp_b, adapter_b,
+            a_price=float(getattr(result_a, "filled_price", 0.0) or 0.0) or None)
         if cap_b is None:
             logger.warning(
                 f"Arb RECHECK: leg B edge is gone by the time A filled "
@@ -760,40 +881,65 @@ class MultiVenueExecutor:
                 amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0,
                 reasoning=f"RECHECK failed: {price_recheck}")
             return await self._hedge_naked_leg(
-                arb, opp_a, result_a, result_b, leg_a_fill,
+                arb, opp_a, result_a, result_b, leg_a_shares,
                 f"leg B no longer priced ({price_recheck})")
 
         state = "SUBMIT_B"
+        # What completing the pair costs is the SAME NUMBER OF SHARES on the
+        # other side, which is not the same number of dollars. A half-filled
+        # second leg is neither a pair nor a hedge: if the share-matched order
+        # does not fit inside what is left of the pair budget, leg B is not
+        # sent and A is hedged instead.
+        pair_budget_left = max(0.0, total_needed - leg_a_fill)
+        needed_b = leg_a_shares * cap_b
+        if needed_b > pair_budget_left + 1e-9:
+            logger.warning(
+                f"Arb COMPLETE FAIL: balancing {leg_a_shares:.4f} shares costs "
+                f"${needed_b:.2f} at the {cap_b:.3f} cap but only "
+                f"${pair_budget_left:.2f} of the pair budget is left - not "
+                f"sending a half-leg B, hedging A instead")
+            result_b = ExecutionResult(
+                venue_id=venue_b, market_id=arb.market_b.id, status="aborted",
+                amount_usd=0, price=0, fees_usd=0, gas_usd=0, latency_ms=0,
+                reasoning=(f"COMPLETE FAIL: {leg_a_shares:.4f} shares at "
+                           f"{cap_b:.3f} costs ${needed_b:.2f} against "
+                           f"${pair_budget_left:.2f} of budget left"))
+            return await self._hedge_naked_leg(
+                arb, opp_a, result_a, result_b, leg_a_shares,
+                f"balancing costs ${needed_b:.2f}, ${pair_budget_left:.2f} left")
         result_b = await self.execute_single(
-            opp_b, max_spend_usd=leg_a_fill, max_price=cap_b)
+            opp_b, max_spend_usd=needed_b, max_price=cap_b)
 
         if result_b.status in ["error", "rejected", "rate_limited", "blocked", "aborted"]:
             logger.error(f"Arb {state} FAIL: leg A FILLED ${leg_a_fill:.2f} ({result_a.status}) but leg B FAIL {result_b.status} - NAKED EXPOSURE - hedging A")
             return await self._hedge_naked_leg(
-                arb, opp_a, result_a, result_b, leg_a_fill,
+                arb, opp_a, result_a, result_b, leg_a_shares,
                 f"leg B {result_b.status}")
         
         # Both legs are in - but "filled" is not a boolean. Whatever B did not
         # take is still A's exposure, and the hedge closes THAT, not the request.
         leg_b_fill = float(getattr(result_b, "filled_usd", 0.0) or 0.0)
-        unmatched = leg_a_fill - leg_b_fill
-        if unmatched > 0.01:
+        leg_b_shares = float(getattr(result_b, "filled_shares", 0.0) or 0.0)
+        unmatched_shares = leg_a_shares - leg_b_shares
+        if unmatched_shares > _SHARE_TOLERANCE:
             logger.warning(
-                f"Arb PARTIAL PAIR: A filled ${leg_a_fill:.2f}, B filled "
-                f"${leg_b_fill:.2f} - ${unmatched:.2f} of A is unmatched - hedging")
+                f"Arb PARTIAL PAIR: A filled {leg_a_shares:.4f} shares, B "
+                f"filled {leg_b_shares:.4f} - {unmatched_shares:.4f} shares of "
+                f"A are unmatched - hedging")
             hedged = await self._hedge_naked_leg(
-                arb, opp_a, result_a, result_b, unmatched,
-                f"B filled ${leg_b_fill:.2f} of ${leg_a_fill:.2f}")
+                arb, opp_a, result_a, result_b, unmatched_shares,
+                f"B filled {leg_b_shares:.4f} of {leg_a_shares:.4f} shares")
             return hedged
 
         state = "BOTH_FILLED"
         result_a.reasoning += (
-            f" | PAIR MATCHED: A ${leg_a_fill:.2f}, B ${leg_b_fill:.2f} "
+            f" | PAIR MATCHED: A {leg_a_shares:.4f} / B {leg_b_shares:.4f} "
+            f"shares (${leg_a_fill:.2f} / ${leg_b_fill:.2f}) "
             f"({price_recheck})")
         logger.success(f"Arb {state}: both legs filled A {result_a.status} B {result_b.status} spread {arb.spread*100:.1f}% - DONE")
         return [result_a, result_b]
 
-    async def _arb_leg_cap(self, arb, opp_a, opp_b, adapter_b):
+    async def _arb_leg_cap(self, arb, opp_a, opp_b, adapter_b, a_price=None):
         """
         The cap for leg B, recomputed from the book as it is NOW.
 
@@ -819,52 +965,38 @@ class MultiVenueExecutor:
             return stale_cap, "cap from the discovered spread (book not real)"
 
         # The side B is buying: YES buys the ask, NO buys 1 - bid.
-        best_ask = None
-        best_bid = None
-        for level in (book.get("asks") or []):
-            try:
-                best_ask = float(level.get("price"))
-                break
-            except (TypeError, ValueError):
-                continue
-        for level in (book.get("bids") or []):
-            try:
-                best_bid = float(level.get("price"))
-                break
-            except (TypeError, ValueError):
-                continue
-        if str(opp_b.side).upper() == "NO":
-            if best_bid is None:
-                return stale_cap, "cap from the discovered spread (no bid to price NO)"
-            live_price = 1.0 - best_bid
-        else:
-            if best_ask is None:
-                return stale_cap, "cap from the discovered spread (no ask to price YES)"
-            live_price = best_ask
+        live_price, quote_note = _best_quote(book, opp_b.side)
+        if live_price is None:
+            return stale_cap, f"cap from the discovered spread ({quote_note})"
 
-        # What B would cost now, against what A actually paid. The pair is worth
-        # completing while the two prices still sum to less than a dollar; the
-        # moment they do not, B is a loss and hedging A is the cheaper mistake.
-        a_price = float(getattr(opp_a, "market_price", 0.0) or 0.0)
+        # What a share of B would cost now, against what A actually PAID for
+        # its share. One share of each pays $1, so the pair is worth completing
+        # while the two prices still sum to less than a dollar; the moment they
+        # do not, B is a loss and hedging A is the cheaper mistake.
+        a_price = float(a_price or 0.0) or float(
+            getattr(opp_a, "market_price", 0.0) or 0.0)
         if a_price > 0 and (live_price + a_price) >= 1.0:
             return None, (f"B would cost {live_price:.3f} against A's {a_price:.3f} "
                           f"- the pair costs {live_price + a_price:.3f} for a $1 "
                           f"payoff, so the spread is gone")
-        return min(stale_cap, live_price + 0.02), (
-            f"cap re-read: B {live_price:.3f} against A {a_price:.3f}")
+        return min(stale_cap, live_price + _PRICE_SLIPPAGE), (
+            f"cap re-read: {quote_note} against A's fill {a_price:.3f}")
 
     async def _hedge_naked_leg(self, arb, opp_a, result_a, result_b,
-                               naked_usd: float, why: str) -> List[ExecutionResult]:
+                               naked_shares: float,
+                               why: str) -> List[ExecutionResult]:
         """
-        Close the exposure that exists, measured - not the exposure requested.
+        Close the exposure that exists, measured - in SHARES.
 
-        `naked_usd` is the unmatched capital in leg A. The previous version
-        hedged `amount_per_leg`: on a partial fill it bought more of the
-        opposite side than the position it was closing, which does not remove
-        exposure, it flips it.
+        `naked_shares` is leg A's unmatched share count. Two earlier versions
+        were both wrong in this unit: the first hedged `amount_per_leg`, and the
+        second hedged the unmatched DOLLARS - which on a partial fill still
+        swapped the position for a different one, and reported the exposure as
+        closed while shares remained. One share of YES plus one share of NO pays
+        exactly $1, so the hedge buys the shares it has to close.
         """
-        naked_usd = float(naked_usd or 0.0)
-        if naked_usd <= 0.01:
+        naked_shares = float(naked_shares or 0.0)
+        if naked_shares <= _SHARE_TOLERANCE:
             result_a.reasoning += f" | NOTHING TO HEDGE: {why}"
             return [result_a, result_b]
 
@@ -881,29 +1013,70 @@ class MultiVenueExecutor:
             confidence=0.5,
             should_trade=False,
         )
+        cap, cap_note = await self._hedge_cap(arb, hedge_side, hedge_opp)
         try:
+            # The order is sized so it can buy `naked_shares` AT THE CAP: the
+            # dollars are an output of the share count and the price, never the
+            # input.
             hedge_result = await self.execute_single(
-                hedge_opp, max_spend_usd=naked_usd,
-                max_price=_side_aware_cap(hedge_opp))
-            closed = (float(getattr(hedge_result, "filled_usd", 0.0) or 0.0)
-                      if getattr(hedge_result, "committed_capital", False) else 0.0)
-            remaining = max(0.0, naked_usd - closed)
+                hedge_opp, max_spend_usd=naked_shares * cap, max_price=cap)
+            closed_shares = (
+                float(getattr(hedge_result, "filled_shares", 0.0) or 0.0)
+                if getattr(hedge_result, "committed_capital", False) else 0.0)
+            remaining = max(0.0, naked_shares - closed_shares)
             logger.info(
-                f"Arb HEDGE: {why} - ${naked_usd:.2f} naked, hedged "
-                f"${closed:.2f} ({hedge_result.status}), ${remaining:.2f} exposed")
+                f"Arb HEDGE: {why} - {naked_shares:.4f} shares naked, "
+                f"{closed_shares:.4f} hedged ({hedge_result.status}) at "
+                f"{float(getattr(hedge_result, 'filled_price', 0.0) or 0.0):.3f}, "
+                f"{remaining:.4f} shares exposed")
             result_a.reasoning += (
-                f" | HEDGE ({why}): ${naked_usd:.2f} naked, ${closed:.2f} "
-                f"hedged ({hedge_result.status}), ${remaining:.2f} exposure "
-                f"remains")
-            if remaining > 0.01:
+                f" | HEDGE ({why}): {naked_shares:.4f} shares naked, "
+                f"{closed_shares:.4f} hedged ({hedge_result.status}) at "
+                f"${float(getattr(hedge_result, 'filled_price', 0.0) or 0.0):.3f}"
+                f" ({cap_note}), {remaining:.4f} shares exposed")
+            if remaining > _SHARE_TOLERANCE:
                 # The honest label. A failed hedge is not "attempted".
                 result_a.reasoning += " | NAKED EXPOSURE REMAINS - reconcile"
         except Exception as e:
-            logger.error(f"Arb HEDGE failed: {e} - ${naked_usd:.2f} naked exposure remains!")
+            logger.error(
+                f"Arb HEDGE failed: {e} - {naked_shares:.4f} shares naked "
+                f"exposure remains!")
             result_a.reasoning += (
                 f" | HEDGE FAILED ({why}): {type(e).__name__}: {e} - "
-                f"${naked_usd:.2f} NAKED EXPOSURE REMAINS")
+                f"{naked_shares:.4f} SHARES NAKED EXPOSURE REMAINS")
         return [result_a, result_b]
+
+    async def _hedge_cap(self, arb, hedge_side, hedge_opp):
+        """
+        The cap for the hedge, from the book A would actually face NOW.
+
+        The hedge is taken because something went wrong - a leg failed, or the
+        price moved - which is exactly when the modelled price is least
+        trustworthy. The live book is therefore the cap when it can be read, NOT
+        the tighter of the two: a hedge capped at a price the market has left
+        behind does not fill, and an unfilled insurance order leaves the
+        exposure it existed to close. Paying the moved price locks in the loss
+        the position already has; it does not add one, because the alternative
+        is staying directional. Falls back to the side-aware cap on the
+        discovered price when the book cannot be re-read, and says which one it
+        used.
+        """
+        stale = _side_aware_cap(hedge_opp)
+        adapter = (self.registry.get_adapter_for_venue_id(arb.venue_a)
+                   if hasattr(self.registry, "get_adapter_for_venue_id")
+                   else getattr(self.registry, "adapters", {}).get(arb.venue_a))
+        if adapter is None or not hasattr(adapter, "get_orderbook"):
+            return stale, "cap from the discovered price (no adapter to re-read)"
+        try:
+            book = await adapter.get_orderbook(arb.market_a)
+        except Exception as e:
+            return stale, f"cap from the discovered price (re-read failed: {e})"
+        if not isinstance(book, dict) or not book.get("is_real", False):
+            return stale, "cap from the discovered price (book not real)"
+        live, note = _best_quote(book, hedge_side)
+        if live is None:
+            return stale, f"cap from the discovered price ({note})"
+        return live + _PRICE_SLIPPAGE, f"hedge cap re-read: {note}"
 
     def get_report(self) -> Dict[str, Any]:
         return {
@@ -914,10 +1087,12 @@ class MultiVenueExecutor:
             "operational_overhead": "Each venue has own API auth model rate limits failure modes, start with one additional venue prove pipeline works then add next",
             "atomicity": ("NO cross-venue atomic primitive exists. Both legs are "
                           "separate orders at separate venues and cannot be "
-                          "submitted as one unit: leg B is sized on leg A's ACTUAL "
-                          "fill, the price is re-read before B is sent, and the "
-                          "UNMATCHED remainder is hedged. This is a sequential "
-                          "pair with an explicit hedge, and the exposure window "
-                          "is real - see execute_arbitrage_pair"),
+                          "submitted as one unit: the pair is sized in SHARES, "
+                          "leg B is sent for the SHARES leg A actually filled, "
+                          "the price is re-read before B is sent, and the "
+                          "UNMATCHED SHARES are hedged at the price the book now "
+                          "shows. This is a sequential pair with an explicit "
+                          "hedge, and the exposure window is real - see "
+                          "execute_arbitrage_pair"),
             "capital_fragmentation": "Splitting $50 across multiple venues tiny positions fixed costs gas withdrawal fees min order eat larger percentage concentrate 2-3 venues until bankroll grows"
         }

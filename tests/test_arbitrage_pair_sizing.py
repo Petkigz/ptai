@@ -104,7 +104,16 @@ class _StubVenue:
                             "max_price": max_price})
         if not self.fills:
             return {"status": "rejected", "reason": "no fill scripted"}
-        return dict(self.fills.pop(0))
+        payload = dict(self.fills.pop(0))
+        if payload.pop("fill_all", False):
+            # "The venue filled the whole order at the limit it was given."
+            # Scripting that in dollars would hardcode a number the sizing
+            # decides - and the sizing is what these tests are about.
+            payload.setdefault("status", "matched")
+            payload.setdefault("orderID", "o-auto")
+            payload["filled_usd"] = max_spend_usd
+            payload["filled_price"] = max_price
+        return payload
 
 
 class _Registry:
@@ -169,10 +178,16 @@ class TestLegBSizedOnLegAsActualFill:
         """
         The bug: B was sent for the requested $3.00 while A bought $1.20, so a
         "riskless pair" held $1.80 of one-sided position.
+
+        The corrected rule is stronger than "send what A filled in dollars": B
+        is sent for the SHARES A filled. Here A filled 2.6667 shares for $1.20,
+        and B is asked for 2.6667 shares - which at its 0.52 cap costs $1.3867,
+        NOT the $1.20 A spent. Equal dollars would have left 0.36 of a share
+        unhedged while the pair was reported matched.
         """
         venues = {
             "stub_a": _StubVenue("stub_a", [_fills(filled_usd=1.20, size=2.67)]),
-            "stub_b": _StubVenue("stub_b", [_fills(filled_usd=1.20)],
+            "stub_b": _StubVenue("stub_b", [_fills(fill_all=True)],
                                  book=dict(BOOK_B)),
         }
         ex = _executor(venues)
@@ -180,9 +195,15 @@ class TestLegBSizedOnLegAsActualFill:
 
         b_orders = venues["stub_b"].orders
         assert len(b_orders) == 1
-        assert b_orders[0]["max_spend_usd"] == pytest.approx(1.20), (
-            f"leg B was sent for ${b_orders[0]['max_spend_usd']:.2f} while leg A "
-            f"bought $1.20 - the pair is unbalanced by the difference")
+        a_shares = results[0].filled_shares
+        assert a_shares == pytest.approx(2.6667, abs=1e-3)
+        b_shares = b_orders[0]["max_spend_usd"] / b_orders[0]["max_price"]
+        assert b_shares == pytest.approx(a_shares, abs=1e-4), (
+            f"leg B was sent for {b_shares:.4f} shares while leg A filled "
+            f"{a_shares:.4f} - the pair is unbalanced by the difference")
+        assert b_orders[0]["max_spend_usd"] != pytest.approx(1.20), (
+            "B was sent for the DOLLARS A spent, which is a different share "
+            "count on the other side")
         assert len(results) == 2
         assert "PAIR MATCHED" in results[0].reasoning
 
@@ -209,34 +230,40 @@ class TestLegBSizedOnLegAsActualFill:
 class TestTheHedgeClosesTheRealGap:
     def test_the_hedge_is_the_unmatched_remainder_not_the_request(self):
         """
-        A buys $3.00, B buys nothing. The hedge must be $3.00 - and when A buys
-        $3.00 and B buys $2.00, it must be $1.00, not $3.00.
+        A fills everything it was asked for, B fills part of it. The hedge must
+        close the SHARES left over, not the request and not the dollars.
         """
         venues = {
             "stub_a": _StubVenue("stub_a", [
-                _fills(filled_usd=3.00, size=6.67),   # leg A
-                _fills(filled_usd=1.00, size=2.0),    # the hedge
+                _fills(fill_all=True),                      # leg A
+                _fills(fill_all=True),                      # the hedge
             ]),
+            # Leg B takes 2 shares where A holds ~6.1: the remainder is big
+            # enough to hedge under the venue's $1 minimum order.
             "stub_b": _StubVenue("stub_b", [
-                _fills(filled_usd=2.00, size=4.0),    # leg B, partial
+                _fills(filled_usd=1.00, filled_price=0.50),
             ], book=dict(BOOK_B)),
         }
         ex = _executor(venues)
         results = asyncio.run(ex.execute_arbitrage_pair(_arb(), amount_per_leg=3.0))
 
+        a_shares = results[0].filled_shares
+        b_shares = 1.00 / 0.50        # what the venue reported for leg B
         orders = venues["stub_a"].orders
         assert len(orders) == 2, "the unmatched remainder was not hedged"
-        assert orders[1]["max_spend_usd"] == pytest.approx(1.00), (
-            f"the hedge was sent for ${orders[1]['max_spend_usd']:.2f}: it must "
-            f"close the $1.00 unmatched remainder, not the ${3.00:.2f} requested")
+        hedge_shares = orders[1]["max_spend_usd"] / orders[1]["max_price"]
+        assert hedge_shares == pytest.approx(a_shares - b_shares, abs=1e-3), (
+            f"the hedge was sent for {hedge_shares:.4f} shares: it must close "
+            f"the {a_shares - b_shares:.4f} unmatched shares of A, not the "
+            f"{a_shares:.4f} that were requested")
         assert orders[1]["side"] == "NO", "the hedge must buy the other side"
         assert "HEDGE" in results[0].reasoning
 
     def test_a_fully_matched_pair_is_not_hedged(self):
         """The control: no gap, no hedge, no extra order."""
         venues = {
-            "stub_a": _StubVenue("stub_a", [_fills(filled_usd=3.00)]),
-            "stub_b": _StubVenue("stub_b", [_fills(filled_usd=3.00)],
+            "stub_a": _StubVenue("stub_a", [_fills(fill_all=True)]),
+            "stub_b": _StubVenue("stub_b", [_fills(fill_all=True)],
                                  book=dict(BOOK_B)),
         }
         ex = _executor(venues)
@@ -253,7 +280,7 @@ class TestTheHedgeClosesTheRealGap:
         """
         venues = {
             "stub_a": _StubVenue("stub_a", [
-                _fills(filled_usd=3.00),
+                _fills(fill_all=True),
                 {"status": "rejected", "reason": "no liquidity"},
             ]),
             "stub_b": _StubVenue("stub_b", [{"status": "rejected",
@@ -276,8 +303,8 @@ class TestThePriceIsRecheckedBeforeLegB:
         """
         venues = {
             "stub_a": _StubVenue("stub_a", [
-                _fills(filled_usd=3.00),
-                _fills(filled_usd=3.00),   # the hedge
+                _fills(fill_all=True),
+                _fills(fill_all=True),   # the hedge
             ]),
             # B now asks 0.62 against A's 0.44: 1.06 for a $1 payoff.
             # The book PTAI verified, then the book it would actually face.
@@ -297,8 +324,8 @@ class TestThePriceIsRecheckedBeforeLegB:
     def test_a_healthier_book_lets_the_pair_complete(self):
         """The other direction, so the recheck is not simply refusing everything."""
         venues = {
-            "stub_a": _StubVenue("stub_a", [_fills(filled_usd=3.00)]),
-            "stub_b": _StubVenue("stub_b", [_fills(filled_usd=3.00)],
+            "stub_a": _StubVenue("stub_a", [_fills(fill_all=True)]),
+            "stub_b": _StubVenue("stub_b", [_fills(fill_all=True)],
                                  books=[dict(BOOK_B)]),
         }
         ex = _executor(venues)
@@ -309,6 +336,113 @@ class TestThePriceIsRecheckedBeforeLegB:
         assert venues["stub_b"].orders[0]["max_price"] == pytest.approx(0.52), (
             "the cap must come from the book as it is now, not from the spread "
             "measured before leg A was sent")
+
+
+class TestTheHedgeBuysSharesNotDollars:
+    def test_the_hedge_is_sized_on_the_shares_that_are_open(self):
+        """
+        The failure the dollar-sized hedge could not survive.
+
+        Leg A bought its shares at the ask; by the time the hedge is taken, the
+        market has moved and the opposite side costs more than 1 - that ask.
+        Hedging the naked DOLLARS buys fewer shares than the position holds, so
+        part of A stays directional while the log line reports the exposure
+        closed. The order has to be sized in shares, and the price it is capped
+        at has to come from the book it will actually face.
+        """
+        venues = {
+            "stub_a": _StubVenue("stub_a", [
+                _fills(fill_all=True),          # leg A, at its cap
+                _fills(fill_all=True),          # the hedge
+            ],
+                # The book the pair was verified against, then the book that is
+                # there when the hedge is taken. A bid of 0.30 makes the NO side
+                # cost 0.70 - above the 0.58 the discovered price would allow.
+                books=[_book(0.43, 0.44), _book(0.30, 0.31)]),
+            "stub_b": _StubVenue("stub_b", [
+                {"status": "rejected", "reason": "venue closed"},
+            ], book=dict(BOOK_B)),
+        }
+        ex = _executor(venues)
+        results = asyncio.run(ex.execute_arbitrage_pair(_arb(), amount_per_leg=3.0))
+
+        orders = venues["stub_a"].orders
+        assert len(orders) == 2 and orders[1]["side"] == "NO", (
+            "A was left with a one-sided position instead of being hedged")
+        shares = results[0].filled_shares
+        assert orders[1]["max_price"] > 0.58 + 1e-9, (
+            f"the hedge was capped at {orders[1]['max_price']:.3f}, a price the "
+            f"market has left behind: an insurance order that cannot fill "
+            f"leaves the exposure it existed to close")
+        assert orders[1]["max_spend_usd"] / orders[1]["max_price"] == pytest.approx(
+            shares, abs=1e-4), (
+            "the hedge must be sized to buy the shares A is holding")
+        assert orders[1]["max_spend_usd"] > results[0].filled_usd, (
+            "hedging a position whose opposite side has become dearer costs "
+            "more dollars than the position did - sending the naked dollars "
+            "would have bought fewer shares than A holds")
+
+    def test_a_pair_that_cannot_be_completed_is_hedged_not_half_filled(self):
+        """
+        The safety net. If the share-matched second leg no longer fits inside
+        the reserved pair budget, sending what fits would leave an arbitrary
+        one-sided position - neither a pair nor a hedge. Nothing is sent, and A
+        is closed instead.
+
+        A venue that fills ABOVE the cap it was given is what makes the budget
+        run out here; the executor has to survive a fill it did not expect.
+        """
+        venues = {
+            "stub_a": _StubVenue("stub_a", [
+                _fills(filled_usd=3.20, filled_price=0.40),   # 8 shares, over the cap
+                _fills(fill_all=True),                        # the hedge
+            ]),
+            "stub_b": _StubVenue("stub_b", [_fills(fill_all=True)],
+                                 # B now asks 0.55 for the NO side: 0.40 + 0.55 is
+                                 # still under $1, so the pair is still worth
+                                 # having - it just costs more than is left.
+                                 book=_book(0.45, 0.46)),
+        }
+        ex = _executor(venues)
+        results = asyncio.run(ex.execute_arbitrage_pair(_arb(), amount_per_leg=3.0))
+
+        assert venues["stub_b"].orders == [], (
+            "a partial second leg was sent: that is a directional position "
+            "wearing the word 'pair'")
+        orders = venues["stub_a"].orders
+        assert len(orders) == 2 and orders[1]["side"] == "NO"
+        assert orders[1]["max_spend_usd"] / orders[1]["max_price"] == pytest.approx(
+            results[0].filled_shares, abs=1e-4)
+
+
+class TestFilledSharesIsMeasured:
+    """
+    `filled_shares` is the unit the rest of this file reasons in, so it is worth
+    two direct tests rather than only being exercised through the pair.
+    """
+
+    def test_the_venues_own_size_wins(self):
+        from src.ptai.execution.multi_venue_executor import ExecutionResult
+        r = ExecutionResult(venue_id="v", market_id="m", status="filled",
+                            amount_usd=3.0, price=0.60, fees_usd=0.0,
+                            gas_usd=0.0, latency_ms=1.0, reasoning="",
+                            filled_usd=3.0, filled_price=0.60, size_matched=5.0)
+        assert r.filled_shares == pytest.approx(5.0)
+
+    def test_shares_are_derived_when_the_venue_only_reported_dollars(self):
+        from src.ptai.execution.multi_venue_executor import ExecutionResult
+        r = ExecutionResult(venue_id="v", market_id="m", status="filled",
+                            amount_usd=3.0, price=0.60, fees_usd=0.0,
+                            gas_usd=0.0, latency_ms=1.0, reasoning="",
+                            filled_usd=2.25, filled_price=0.45)
+        assert r.filled_shares == pytest.approx(5.0), (
+            "$2.25 at 0.45 is 5 shares; a hedge needs the count, not the "
+            "dollars")
+        empty = ExecutionResult(venue_id="v", market_id="m", status="rejected",
+                                amount_usd=3.0, price=0.0, fees_usd=0.0,
+                                gas_usd=0.0, latency_ms=1.0, reasoning="")
+        assert empty.filled_shares == 0.0, (
+            "nothing filled is zero shares, not an unknown")
 
 
 class TestTheExecutorDoesNotClaimAtomicity:
@@ -327,3 +461,6 @@ class TestTheExecutorDoesNotClaimAtomicity:
         doc = MultiVenueExecutor.execute_arbitrage_pair.__doc__.lower()
         assert "not an atomic transaction" in doc
         assert "unmatched" in doc
+        assert "share" in doc, (
+            "the pair is sized in shares and the docstring has to say so, or "
+            "the next reader will size it in dollars again")
