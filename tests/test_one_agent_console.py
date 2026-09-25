@@ -437,6 +437,10 @@ class TestTheConsoleIsOneScreenAboutOneAgent:
         assert page.count("goTo(") >= 6
         assert "scrollIntoView" in page
         assert "showTab" not in page
+        # The page order IS the nav order. A jump link to a section further up
+        # than the one you are reading is a navigation bug with no error message.
+        assert (re.findall(r'<section id="tab-([a-z]+)"', page)
+                == re.findall(r"goTo\('([a-z]+)'\)", page))
         # And nothing loads only when a link is pressed: one loader runs them all.
         loader = page.split("async function loadAll(){")[1].split("}")[0]
         for fn in ("loadAgent", "loadStatus", "loadBrainSetup", "loadVenue",

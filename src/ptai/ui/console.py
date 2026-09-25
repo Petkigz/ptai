@@ -938,44 +938,6 @@ section[id]{scroll-margin-top:132px}
     </div>
   </section>
 
-  <!-- VENUE -->
-  <section id="tab-venue" class="section">
-    <div class="section-head">
-      <h1>Venue</h1>
-      <p>One venue holds live capital at a time, named with the reason. Every
-        other venue is still scanned and paper-traded.</p>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <h2>Which venue the agent is using</h2>
-      <div id="venueNow"></div>
-    </div>
-    <div class="grid cols-2" style="margin-top:16px">
-      <div class="card">
-        <h2>Why this one</h2>
-        <div id="venueWhy" class="note"></div>
-      </div>
-      <div class="card">
-        <h2>Ranking</h2>
-        <div id="venueRank"></div>
-        <div class="note" style="margin-top:10px">
-          Ranked on realised net P&amp;L per resolved trade, with the sample size
-          shown next to it. Below the evidence floor a venue has no score at all -
-          an unmeasured venue is not a zero, and it is not a winner either.
-        </div>
-      </div>
-    </div>
-    <div class="grid cols-2" style="margin-top:16px">
-      <div class="card">
-        <h2>Moving to another venue</h2>
-        <div id="venueSwitch"></div>
-      </div>
-      <div class="card">
-        <h2>What runs without asking</h2>
-        <div id="venueAutonomy"></div>
-      </div>
-    </div>
-  </section>
-
   <!-- MONEY -->
   <section id="tab-money" class="section">
     <div class="section-head">
@@ -1044,6 +1006,44 @@ section[id]{scroll-margin-top:132px}
       <div class="card">
         <h2>Not yet measurable</h2>
         <div id="unavailable" class="note"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- VENUE -->
+  <section id="tab-venue" class="section">
+    <div class="section-head">
+      <h1>Venue</h1>
+      <p>One venue holds live capital at a time, named with the reason. Every
+        other venue is still scanned and paper-traded.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2>Which venue the agent is using</h2>
+      <div id="venueNow"></div>
+    </div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="card">
+        <h2>Why this one</h2>
+        <div id="venueWhy" class="note"></div>
+      </div>
+      <div class="card">
+        <h2>Ranking</h2>
+        <div id="venueRank"></div>
+        <div class="note" style="margin-top:10px">
+          Ranked on realised net P&amp;L per resolved trade, with the sample size
+          shown next to it. Below the evidence floor a venue has no score at all -
+          an unmeasured venue is not a zero, and it is not a winner either.
+        </div>
+      </div>
+    </div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="card">
+        <h2>Moving to another venue</h2>
+        <div id="venueSwitch"></div>
+      </div>
+      <div class="card">
+        <h2>What runs without asking</h2>
+        <div id="venueAutonomy"></div>
       </div>
     </div>
   </section>
