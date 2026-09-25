@@ -74,12 +74,16 @@ Every 10 minutes:
 run_ptai.bat
 ```
 
-Double-click it. On first run it creates a clean `.venv`, installs
-dependencies, starts the trading agent in **paper mode** (no real money),
-and opens the dashboard in your browser (default port **8010** — change
-`PTAI_DASHBOARD_PORT` at the top of the file if that port is taken).
+Double-click it. It runs on your system Python — **no `.venv` is created**;
+the agent's memory lives in `data\` next to the file and survives restarts.
+It checks the dependencies, starts the trading agent in **paper mode** (no
+real money), and opens the dashboard in your browser (default port **8010** —
+change `PTAI_DASHBOARD_PORT` at the top of the file if that port is taken).
 It used to be four .bat files (setup / start / start_dashboard); there is
 now one, and it does all of them.
+
+If an older checkout left a `.venv` folder behind, you can delete it — the
+runner no longer uses it and nothing in `data\` depends on it.
 
 ### 1. Install PTAI
 
