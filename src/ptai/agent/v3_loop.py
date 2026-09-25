@@ -48,7 +48,7 @@ from typing import Dict, List, Optional, Any
 import asyncio
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 
 from loguru import logger
@@ -1063,6 +1063,9 @@ class TradingAgentV3:
         # can take far longer than the console's liveness window, and a cycle
         # in progress must not look like a dead agent.
         self._write_agent_heartbeat("cycle")
+        # ...and what it is DOING, so the console is not blank for the minutes
+        # a cycle spends working. Written at each step, not at the end.
+        self._set_phase("scanning")
         
         # Health check - Check capital + account health
         health = await self.check_system_health()
@@ -1077,6 +1080,7 @@ class TradingAgentV3:
             # A blocked agent is still a LIVE agent. The console's running
             # indicator must not read "refused to trade" as "process died",
             # so even a blocked cycle leaves its scan row.
+            self._set_phase("blocked", blocked["reason"])
             self._record_scan_log(blocked, markets_scanned=0,
                                   opportunities_found=0, avg_edge=0.0)
             return blocked
@@ -1188,6 +1192,10 @@ class TradingAgentV3:
                 qualified_ids=[]
             )
         total_markets = sum(len(m) for m in markets_by_venue.values())
+        self._set_phase(
+            "evaluating",
+            f"{total_markets} market(s) from {len(markets_by_venue)} venue(s); "
+            f"pricing them against fees, depth and uncertainty")
         
         if total_markets == 0:
             # Same shape as the full result. The no-markets path used to return
@@ -1242,6 +1250,10 @@ class TradingAgentV3:
             # every cycle takes this path, and without the row the console
             # would report "Not running" and "Last Scan: Never" for an agent
             # that is honestly trying to scan on every interval.
+            self._set_phase(
+                "no_markets",
+                f"asked {len(markets_by_venue)} venue(s) and none returned a "
+                f"market to price - an unavailable venue is not a quiet one")
             self._record_scan_log(no_markets_result, markets_scanned=0,
                                   opportunities_found=0, avg_edge=0.0)
             return no_markets_result
@@ -1661,6 +1673,11 @@ class TradingAgentV3:
         self.execution_guard.update_bankroll(current_bankroll)
         self.account_health_engine.bankroll = current_bankroll
         
+        self._set_phase(
+            "executing",
+            f"{len(final_trades)} opportunit"
+            f"{'y' if len(final_trades) == 1 else 'ies'} passed the hard rules; "
+            f"sizing and placing them now")
         for opp in final_trades[:max_trades]:
             try:
                 # V9 FIX #1 + V10: MOCK blocking - 4 layers
@@ -2004,6 +2021,12 @@ class TradingAgentV3:
             opportunities_found=int(scan_result.total_candidates or 0),
             avg_edge=(sum(_edges) / len(_edges)) if _edges else 0.0,
         )
+        self._set_phase(
+            "cycle_complete",
+            f"{int(scan_result.total_scanned or 0)} market(s) scanned, "
+            f"{int(scan_result.total_candidates or 0)} candidate(s), "
+            f"{len([e for e in (result.get('execution') or []) if e.get('position_recorded')])} "
+            f"position(s) recorded")
 
         # .get() throughout: a cycle that returns an unexpected shape must not
         # be able to kill the loop. A long run has to survive its own reporting.
@@ -3166,6 +3189,47 @@ class TradingAgentV3:
                 f"Could not record the scan for the console: "
                 f"{type(e).__name__}: {e}")
 
+    # What each phase is called on screen. The loop names a phase; the reading
+    # side never invents wording for it, so "what is it doing right now" is the
+    # same sentence in the console, in the CLI and in a bug report.
+    _PHASE_LABELS = {
+        "scanning": "scanning the venues for markets",
+        "evaluating": "pricing what it found",
+        "executing": "sizing and placing orders",
+        "cycle_complete": "cycle complete",
+        "no_markets": "nothing to trade from any venue",
+        "blocked": "blocked by the risk check",
+        "sleeping": "waiting for the next cycle",
+    }
+
+    def _set_phase(self, phase: str, detail: Optional[str] = None,
+                   next_cycle_at: Optional[str] = None) -> None:
+        """
+        Say what the cycle is doing WHILE it is doing it.
+
+        The heartbeat answers "alive"; a scan row answers "finished a cycle".
+        Neither answers the question the operator actually asks between cycles -
+        "what is it doing right now?" - because a cycle can run for minutes and
+        leaves no trace until it ends. This is that trace.
+
+        Never raises: a cycle must not die because a progress note could not be
+        written. The failure is logged instead, because a console that shows
+        nothing while the agent works is a bug report, not a crash.
+        """
+        label = self._PHASE_LABELS.get(phase, phase.replace("_", " "))
+        try:
+            self.storage.set_state("agent.phase", json.dumps({
+                "at": datetime.now(timezone.utc).isoformat(),
+                "phase": phase,
+                "label": label,
+                "detail": detail or label,
+                "next_cycle_at": next_cycle_at,
+            }))
+        except Exception as e:
+            logger.warning(
+                f"Could not write the agent phase '{phase}': "
+                f"{type(e).__name__}: {e}")
+
     async def run_continuous(self, interval_minutes: int = 10):
         """Run V3 loop every 10 minutes"""
         logger.info(f"Starting PTAI V3 continuous loop every {interval_minutes} minutes")
@@ -3184,7 +3248,19 @@ class TradingAgentV3:
                 logger.info(
                     f"V3 cycle result: {result.get('status', 'unknown')} "
                     f"{(result.get('opportunities') or {}).get('final_selected', 0)} trades")
-                
+
+                # Announce the wait as well, with the time the next cycle is
+                # due. "Waiting until 14:35" is the answer to the operator's
+                # next question, and without it the console goes blank for the
+                # whole interval, which is what a stalled agent looks like.
+                next_at = datetime.now(timezone.utc) + timedelta(
+                    minutes=interval_minutes)
+                self._set_phase(
+                    "sleeping",
+                    f"last cycle: {result.get('status', 'unknown')}. The next "
+                    f"cycle starts at {next_at.strftime('%H:%M')} UTC",
+                    next_cycle_at=next_at.isoformat())
+
                 # Sleep
                 await asyncio.sleep(interval_minutes * 60)
             except Exception as e:

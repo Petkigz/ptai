@@ -64,7 +64,11 @@ Every 10 minutes:
 - **Storage** (`src/ptai/storage/db.py`): SQLite local, trades, scans, bankroll history, self-preservation
 - **Tools** (`src/ptai/agent/tools.py`): web_search, terminal, browser, file — agent can research on its own
 - **Loop** (`src/ptai/agent/loop.py`): Autonomous 10-min loop, rich UI, notifier, researcher
-- **Dashboard** (`src/ptai/dashboard.py`): FastAPI local dashboard http://localhost:8000
+- **Console** (`src/ptai/ui/console.py`): the one front end — agent state, money,
+  venue, orders, activity, setup. Started by `run_ptai.bat`
+- **Diagnostic dashboard** (`src/ptai/dashboard.py`): the lab — raw logs, V2/V3
+  internals, scan history, backtest, wallet linking, API config. Not part of the
+  daily loop and deliberately not started by the runner
 
 ## Quick Start (Local Only) - LM Studio (You)
 
@@ -77,8 +81,11 @@ run_ptai.bat
 Double-click it. It runs on your system Python — **no `.venv` is created**;
 the agent's memory lives in `data\` next to the file and survives restarts.
 It checks the dependencies, starts the trading agent in **paper mode** (no
-real money), and opens the dashboard in your browser (default port **8010** —
-change `PTAI_DASHBOARD_PORT` at the top of the file if that port is taken).
+real money), and opens the **PTAI console** in your browser (default port
+**8010** — change `PTAI_DASHBOARD_PORT` at the top of the file if that port is
+taken). The console is the product: one screen about the one agent — is it
+running, what is it doing, what is the money doing, and the single next thing
+that stands between it and earning.
 It used to be four .bat files (setup / start / start_dashboard); there is
 now one, and it does all of them.
 
@@ -177,8 +184,13 @@ python main.py pay-for-yourself 50 --daily-cost 5 --interval 10 --llm lm_studio
 # Status
 python main.py status
 
-# Dashboard (local, http://localhost:8000 - set PTAI_DASHBOARD_PORT to move it)
-cd src && python -m ptai.dashboard
+# Console (the front end - http://localhost:8010, PTAI_DASHBOARD_PORT or
+# PTAI_CONSOLE_PORT to move it). run_ptai.bat starts this for you.
+set PYTHONPATH=src && python -m ptai.ui.console
+
+# Diagnostic dashboard (the lab - http://localhost:8020). Start it only when
+# something needs diagnosing; nothing in the daily loop depends on it.
+set PYTHONPATH=src && set PTAI_DASHBOARD_PORT=8020 && python -m ptai.dashboard
 
 # Manual trade
 python main.py trade "Will BTC hit 100k" --side YES --amount 5
@@ -297,7 +309,8 @@ ptai/
 │   │   └── monitor.py     # position monitor
 │   ├── storage/
 │   │   └── db.py          # SQLite local
-│   ├── dashboard.py       # FastAPI local dashboard
+│   ├── ui/console.py      # the one front end (agent, money, venue, orders)
+│   ├── dashboard.py       # diagnostic dashboard (the lab)
 │   ├── config.py          # LM Studio + Ollama config
 │   └── cli.py             # Typer CLI with LM Studio
 ├── browser/profiles/

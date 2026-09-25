@@ -214,8 +214,17 @@ def _profit(storage) -> Dict[str, Any]:
         "return_30d_pct": return_30d,
         "max_drawdown_pct": max_drawdown_pct,
         "win_rate_pct": round(float(perf.get("win_rate", 0.0) or 0.0), 1),
-        "live_resolved_trades": int(perf.get("total_trades", 0) or 0),
+        # RESOLVED, not "taken". This field was reading the trades-taken
+        # counter, so a live trade still open was reported as a resolved one -
+        # and "0 resolved trades" then turned into "1" the moment an order was
+        # filled, before its market had answered anything.
+        "live_resolved_trades": int(perf.get("resolved_trades", 0) or 0),
         "open_positions": int(perf.get("open_positions", 0) or 0),
+        # Two counters a console needs and can source from the same summary, so
+        # it does not have to call the storage layer a second time and risk
+        # reporting a different number from the CLI.
+        "total_trades": int(perf.get("total_trades", 0) or 0),
+        "resolved_trades": int(perf.get("resolved_trades", 0) or 0),
         "paper": perf.get("paper") or {},
         "series_points": len(history),
     }
@@ -411,6 +420,321 @@ def _risk(storage, last_cycle: Dict[str, Any]) -> Dict[str, Any]:
     return block
 
 
+# ----------------------------------------------------------------------
+# Is it alive, and what is it doing right now
+# ----------------------------------------------------------------------
+
+# The key the loop writes while it is WORKING, not after it finishes. "What did
+# it decide last cycle" and "what is it doing this second" are different
+# questions, and a console that can only answer the first one shows a blank
+# screen for the four minutes the agent spends scanning.
+PHASE_KEY = "agent.phase"
+HEARTBEAT_KEY = "agent.heartbeat"
+
+
+def _interval_minutes() -> int:
+    """How often the agent cycles, from the same env the runner sets."""
+    import os
+    try:
+        return max(1, int(os.environ.get("INTERVAL_MIN") or 10))
+    except (TypeError, ValueError):
+        return 10
+
+
+def live_window_seconds(interval_min: Optional[int] = None) -> float:
+    """
+    How long a heartbeat or a finished scan counts as proof the agent is alive.
+
+    One interval plus a margin. The window used to be a hard-coded 15 minutes
+    while the agent cycles every 10 and its first cycle can take longer than
+    either, so a working agent spent part of every cycle reported as dead - and
+    was reported as dead outright whenever the interval was turned up.
+    """
+    minutes = interval_min if interval_min else _interval_minutes()
+    return max(900.0, float(minutes) * 60.0 + 600.0)
+
+
+def _age_seconds(stamp: Optional[str]) -> Optional[float]:
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds()
+
+
+def _human_age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "never"
+    seconds = max(0.0, float(seconds))
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f}h"
+
+
+def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Is the agent alive, what is it doing, and when is it due to act again.
+
+    THE ONE DEFINITION, because there were two and they disagreed. The
+    dashboard decided liveness from scan rows (which the V3 loop never wrote),
+    so a running agent read as "Not running"; the old console decided it from an
+    engine object held inside the web process, so an agent running in its own
+    window read as dead too. Both were reading evidence the agent does not
+    produce. This reads the evidence the ACTIVE loop actually writes:
+
+      * `agent.phase`     - written while a cycle works, so "evaluating 214
+                            markets" is visible before the cycle ends;
+      * `agent.heartbeat` - written at cycle start and while the kill switch
+                            holds the loop, so a slow first cycle is not a death;
+      * `market_scans`    - written when a cycle COMPLETES, and on cycles that
+                            found nothing or were blocked.
+
+    A reader that cannot see the agent says so; it never guesses "healthy".
+    """
+    block: Dict[str, Any] = {
+        "available": False,
+        "source": "state keys agent.phase / agent.heartbeat + market_scans",
+        "interval_min": interval_min or _interval_minutes(),
+        "window_seconds": round(live_window_seconds(interval_min), 1),
+        "running": False,
+        "state": "unknown",
+        "evidence": None,
+        "phase": None,
+        "phase_label": None,
+        "phase_detail": None,
+        "phase_seconds": None,
+        "last_scan": None,
+        "last_scan_ago_seconds": None,
+        "heartbeat_status": None,
+        "heartbeat_ago_seconds": None,
+        "kill_switch_level": None,
+        "next_cycle_at": None,
+    }
+    if storage is None:
+        block["reason"] = "no storage to read"
+        return block
+    block["available"] = True
+
+    # 1. the last COMPLETED cycle
+    last_scan = None
+    try:
+        row = storage.conn.execute(
+            "SELECT * FROM market_scans ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        last_scan = dict(row) if row else None
+    except Exception as e:
+        block["scan_reason"] = f"market_scans unreadable: {type(e).__name__}: {e}"
+    block["last_scan"] = last_scan
+    scan_ago = _age_seconds((last_scan or {}).get("timestamp"))
+    block["last_scan_ago_seconds"] = scan_ago
+
+    # 2. the live marks - read before anything can close the connection
+    heartbeat: Dict[str, Any] = {}
+    try:
+        raw = storage.get_state(HEARTBEAT_KEY)
+        if raw:
+            heartbeat = json.loads(raw)
+    except Exception as e:
+        block["heartbeat_reason"] = f"{type(e).__name__}: {e}"
+    block["heartbeat_status"] = heartbeat.get("status")
+    block["heartbeat_ago_seconds"] = _age_seconds(heartbeat.get("at"))
+    block["kill_switch_level"] = heartbeat.get("kill_switch_level")
+
+    phase: Dict[str, Any] = {}
+    try:
+        raw = storage.get_state(PHASE_KEY)
+        if raw:
+            phase = json.loads(raw)
+    except Exception as e:
+        block["phase_reason"] = f"{type(e).__name__}: {e}"
+    if phase:
+        block["phase"] = phase.get("phase")
+        block["phase_label"] = phase.get("label") or phase.get("phase")
+        block["phase_detail"] = phase.get("detail")
+        block["phase_seconds"] = _age_seconds(phase.get("at"))
+        block["next_cycle_at"] = phase.get("next_cycle_at")
+
+    # 3. the verdict, from the two kinds of evidence
+    window = block["window_seconds"]
+    beat_ago = block["heartbeat_ago_seconds"]
+    fresh_scan = scan_ago is not None and scan_ago < window
+    fresh_beat = beat_ago is not None and beat_ago < window
+    block["running"] = bool(fresh_scan or fresh_beat)
+    status = str(block["heartbeat_status"] or "")
+    block["blocked_by_kill_switch"] = status.startswith("kill_switch")
+    if not block["running"]:
+        block["state"] = "not_running"
+        if scan_ago is None and beat_ago is None:
+            block["evidence"] = ("no completed cycle and no heartbeat have ever "
+                                 "been recorded in this database")
+        else:
+            freshest = min([a for a in (scan_ago, beat_ago) if a is not None])
+            block["evidence"] = (
+                f"the last sign of life was {_human_age(freshest)} ago, outside "
+                f"the {window / 60:.0f} min window for a {block['interval_min']} "
+                f"min interval")
+    elif block["blocked_by_kill_switch"]:
+        block["state"] = "blocked"
+        block["evidence"] = (f"alive and refusing to trade: {status} "
+                             f"({_human_age(beat_ago)} ago)")
+    elif fresh_scan:
+        block["state"] = "running"
+        block["evidence"] = f"last completed cycle {_human_age(scan_ago)} ago"
+    else:
+        # Alive, mid-cycle, nothing finished yet. Not the same as "running and
+        # idle", and the difference is exactly what the operator is watching for.
+        block["state"] = "working"
+        block["evidence"] = (f"alive ({status or 'heartbeat'} "
+                             f"{_human_age(beat_ago)} ago), first completed "
+                             f"cycle still in progress")
+    block["doing"] = (block["phase_detail"] or block["phase_label"]
+                      or ("waiting between cycles" if block["state"] == "running"
+                          else None))
+    return block
+
+
+def build_blockers(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    What stands between this agent and earning, in the order to fix it.
+
+    Pure: it reads the snapshot and nothing else, so the console, the CLI and a
+    test all get the same list from the same state. Every entry is a refusal the
+    system itself would make, paired with the action that clears it - the
+    console is not allowed to invent advice, and it is not allowed to imply the
+    agent is earning before anything has settled.
+
+    Ordered by how completely each one stops the mission, not by severity label:
+    a dead process outranks an unfunded venue, and an unfunded venue outranks a
+    venue that simply has not accumulated evidence yet.
+    """
+    blockers: List[Dict[str, Any]] = []
+    agent = snapshot.get("agent") or {}
+    capital = snapshot.get("capital") or {}
+    venues = snapshot.get("venues") or {}
+    risk = snapshot.get("risk") or {}
+    profit = snapshot.get("profit") or {}
+    matrix = venues.get("matrix") or {}
+
+    def add(blocker_id, severity, what, evidence, clear):
+        blockers.append({"id": blocker_id, "severity": severity, "what": what,
+                         "evidence": evidence, "clear": clear})
+
+    # 1. Nothing happens at all.
+    if agent.get("available") and not agent.get("running"):
+        add("agent_not_running", "critical",
+            "The agent is not running, so nothing is being scanned or traded.",
+            agent.get("evidence") or "no evidence of a live agent",
+            "Start it with run_ptai.bat on the machine that runs the agent. "
+            "For a single paper cycle, use Run one cycle.")
+
+    # 2. Alive but refusing.
+    if agent.get("running") and agent.get("blocked_by_kill_switch"):
+        add("kill_switch", "critical",
+            "The kill switch is holding the agent, so it is alive and not trading.",
+            f"heartbeat {agent.get('heartbeat_status')}, level "
+            f"{agent.get('kill_switch_level')}",
+            "Read the risk state on this screen: the switch lifts on its own "
+            "when the condition that raised it clears. It is not meant to be "
+            "bypassed.")
+    elif risk.get("trading_halted"):
+        add("trading_halted", "critical",
+            "The self-preservation check has halted trading.",
+            risk.get("halt_reason") or "halted by the self-preservation check",
+            "This is a stop, not a bug: review what the resolved trades did "
+            "before restarting it.")
+
+    # 3. No real money is deployed, so the mission cannot be measured yet.
+    if not venues.get("live_venue"):
+        candidate = (snapshot.get("last_cycle") or {}).get("venue_to_fund")
+        add("no_live_venue", "next_step",
+            "No venue holds live capital: the agent can only paper-trade.",
+            (f"live venue: none" +
+             (f"; the agent ranked {candidate} first for funding"
+              if candidate else "; no venue is ranked for funding yet")),
+            "Fund the venue the agent ranks first (Money -> How capital gets in) "
+            "and authorise a budget for it. Trade with real money until then.")
+
+    # 4. No validated venue, so live capital would be a guess.
+    if not venues.get("best_validated_venue"):
+        add("no_validated_venue", "gate",
+            "No venue has passed the qualification gate, so the agent will not "
+            "put real money on any of them.",
+            (f"{int(matrix.get('cells_with_enough_evidence') or 0)} combination(s) "
+             f"have enough evidence of {int(matrix.get('cells') or 0)} seen; the "
+             f"gate needs real fills and resolved outcomes, not a score"),
+            "Keep it running. Every paper cycle records an outcome, and the "
+            "evidence is what eventually opens the gate.")
+
+    # 5. Nothing has settled, so there is no result to report yet.
+    paper = profit.get("paper") or {}
+    settled = int(profit.get("live_resolved_trades") or 0)
+    if not settled and not int(paper.get("settled_trades") or 0):
+        add("nothing_settled", "waiting",
+            "No position has settled yet, so there is no result either way.",
+            "resolved trades: 0 live, 0 paper",
+            "Nothing to do. A market that has not resolved has not answered.")
+
+    # 6. There are results, and they are negative. Say so.
+    net = profit.get("net_pnl_usd")
+    if settled and isinstance(net, (int, float)) and net < 0:
+        add("losing", "loss",
+            "The resolved live trades are net negative so far.",
+            f"realised P&L ${net:+.2f} over {settled} resolved live trade(s)",
+            "Do not add capital to a losing account. Leave it running and read "
+            "the calibration: the numbers it must beat are on this screen.")
+
+    if not blockers:
+        add("none", "ok",
+            "Nothing is blocking the agent.",
+            "a live agent, a funded venue and a passing gate",
+            "Nothing to do. It runs on its own.")
+    return blockers
+
+
+def _headline(snapshot: Dict[str, Any]) -> str:
+    """
+    The whole state of the agent in one honest sentence.
+
+    Written as a sentence rather than a colour because the operator runs this
+    unattended: "Running" on its own has already been read as "earning", and it
+    does not mean that. This says what is true, in the same words in the CLI and
+    on the console.
+    """
+    agent = snapshot.get("agent") or {}
+    capital = snapshot.get("capital") or {}
+    profit = snapshot.get("profit") or {}
+    state = agent.get("state")
+    if state == "unknown":
+        return "The agent state could not be read."
+    if state == "not_running":
+        return f"Stopped - {agent.get('evidence') or 'nothing is running'}."
+    deployed = capital.get("deployment_pct")
+    settled = int(profit.get("live_resolved_trades") or 0)
+    paper = profit.get("paper") or {}
+    paper_settled = int(paper.get("settled_trades") or 0)
+    if state == "blocked":
+        return f"Running but refusing to trade - {agent.get('evidence')}."
+    work = agent.get("doing")
+    where = f", {work}" if work else ""
+    if settled:
+        return (f"Running{where} - ${float(profit.get('net_pnl_usd') or 0.0):+.2f} "
+                f"realised on {settled} resolved live trade(s).")
+    if capital.get("account") == "paper" and paper_settled:
+        return (f"Running{where} - paper account "
+                f"${float(paper.get('net_pnl') or 0.0):+.2f} on {paper_settled} "
+                f"settled simulated trade(s); no real money is at stake yet.")
+    deployed_note = (f", {float(deployed):.0f}% deployed"
+                     if isinstance(deployed, (int, float)) else "")
+    return (f"Running{where}{deployed_note} - nothing has settled yet, so there "
+            f"is no money result to report.")
+
+
 def operator_snapshot(storage=None) -> Dict[str, Any]:
     """
     Everything the operator asked to be able to see, in one payload.
@@ -428,8 +752,7 @@ def operator_snapshot(storage=None) -> Dict[str, Any]:
     venues = _venue_evidence(storage)
     strategies = _strategy_evidence(storage)
     risk = _risk(storage, last_cycle)
-
-    return {
+    snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": _operator_mode(storage),
         "capital": capital,
@@ -439,7 +762,14 @@ def operator_snapshot(storage=None) -> Dict[str, Any]:
         "strategies": strategies,
         "risk": risk,
         "last_cycle": last_cycle,
+        # The two blocks that answer "is it working, and what should I do":
+        # both derived from the blocks above, so they cannot disagree with them.
+        "agent": agent_state(storage),
     }
+    snapshot["blockers"] = build_blockers(snapshot)
+    snapshot["next_action"] = snapshot["blockers"][0]["clear"]
+    snapshot["headline"] = _headline(snapshot)
+    return snapshot
 
 
 def _operator_mode(storage) -> str:
@@ -548,4 +878,23 @@ def describe_snapshot(snapshot: Dict[str, Any]) -> List[str]:
             lines.append(f"  why: {cycle['why']}")
     else:
         lines.append(f"Last cycle: {cycle.get('note')}")
+
+    # Appended, never prepended: the first line of this list is the live-venue
+    # answer the CLI panel leads with, and the dashboard's operator payload is
+    # asserted against it.
+    agent = snapshot.get("agent") or {}
+    if agent.get("available"):
+        work = agent.get("doing")
+        lines.append(
+            f"Agent: {str(agent.get('state') or 'unknown').replace('_', ' ')}"
+            + (f" - {agent['evidence']}" if agent.get("evidence") else "")
+            + (f" - now: {work}" if work else "")
+            + (f" - next cycle {str(agent.get('next_cycle_at'))[:19]}"
+               if agent.get("next_cycle_at") else ""))
+    if snapshot.get("headline"):
+        lines.append(f"Verdict: {snapshot['headline']}")
+    for blocker in (snapshot.get("blockers") or [])[:2]:
+        if blocker.get("id") == "none":
+            continue
+        lines.append(f"Next: {blocker['clear']}")
     return lines

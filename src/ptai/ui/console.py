@@ -284,6 +284,156 @@ def _agent():
     return _agent_cache.get("agent")
 
 
+# A short cache for the local model check, for the same reason the balances
+# have one: the console polls, and every poll must not become a fresh HTTP
+# request to LM Studio. The model list changes when the operator changes it,
+# not between two refreshes.
+_BRAIN_CACHE: Dict[str, Any] = {"at": 0.0, "value": {}}
+_BRAIN_TTL_SECONDS = 15.0
+
+
+def _brain_status(force: bool = False) -> Dict[str, Any]:
+    """
+    The local model the agent reasons with.
+
+    Read through the SAME detector the dashboard uses, so the two screens cannot
+    disagree about which model is loaded, which one the agent will call, and
+    whether it is an R1-style model that would make a cycle take hours.
+
+    Deliberately NOT part of the operator snapshot: the snapshot is storage
+    facts that the CLI prints, and it must not start requiring LM Studio to be
+    running in order to describe the account.
+    """
+    import time as _time
+
+    now = _time.monotonic()
+    if not force and _BRAIN_CACHE["value"] and \
+            now - _BRAIN_CACHE["at"] < _BRAIN_TTL_SECONDS:
+        return dict(_BRAIN_CACHE["value"])
+    try:
+        from ..dashboard import check_lm_studio, read_env_file
+        env = read_env_file()
+        value = check_lm_studio(env.get("LM_STUDIO_HOST", "http://localhost:1234"),
+                                configured_model=env.get("LM_STUDIO_MODEL"))
+        value["env_model"] = env.get("LM_STUDIO_MODEL", "local-model")
+        value["pinned"] = bool(value["env_model"] and
+                               value["env_model"] not in ("local-model", "", "auto"))
+        value["available"] = True
+    except Exception as e:
+        value = {"available": False, "connected": False, "models": [],
+                 "active_model": None, "error": f"{type(e).__name__}: {e}"}
+    _BRAIN_CACHE["at"] = _time.monotonic()
+    _BRAIN_CACHE["value"] = dict(value)
+    return value
+
+
+@app.get("/api/console/agent")
+async def api_agent() -> JSONResponse:
+    """
+    The agent, in one payload: what it is, what it is doing, what the money is
+    doing, and the one thing to do next.
+
+    This is the front page's data. It is the operator snapshot - the same
+    payload `ptai status` prints - plus the two things only a local console can
+    read: the model on this machine, and (through the copy above) nothing else.
+    A blocker list is not duplicated here: the snapshot computes it, and this
+    route only adds the one blocker the snapshot cannot see, which is a local
+    model that is not answering.
+    """
+    from ..operator_view import operator_snapshot
+
+    storage = get_storage()
+    try:
+        snapshot = operator_snapshot(storage)
+    finally:
+        storage.close()
+
+    blockers = list(snapshot.get("blockers") or [])
+    brain = _brain_status()
+    if brain.get("available") and not brain.get("connected"):
+        entry = {
+            "id": "brain_offline", "severity": "critical",
+            "what": "The agent's local model server is not answering, so it "
+                    "cannot reason about fair value.",
+            "evidence": f"{brain.get('host', 'http://localhost:1234')}: "
+                        f"{brain.get('error') or 'no response'}",
+            "clear": "Start LM Studio and load a model with the server on "
+                     "(Developer -> Start Server), then refresh this page.",
+        }
+        # Right behind a dead process: a live agent that cannot think is still
+        # not earning.
+        at = 1 if blockers and blockers[0].get("id") == "agent_not_running" else 0
+        blockers.insert(at, entry)
+    elif brain.get("available") and brain.get("is_r1"):
+        blockers.append({
+            "id": "brain_slow", "severity": "warning",
+            "what": "The model the agent will call is an R1-style reasoning "
+                    "model, so a cycle takes minutes per market.",
+            "evidence": f"active model: {brain.get('active_model')}",
+            "clear": "Pin a fast model below, or in Setup -> Brain. The agent "
+                     "uses it from its next start.",
+        })
+
+    return JSONResponse({
+        "generated_at": snapshot.get("generated_at"),
+        "mode": snapshot.get("mode"),
+        "headline": snapshot.get("headline"),
+        "agent": snapshot.get("agent"),
+        "capital": snapshot.get("capital"),
+        "profit": snapshot.get("profit"),
+        "positions": snapshot.get("positions"),
+        "venues": snapshot.get("venues"),
+        "strategies": snapshot.get("strategies"),
+        "risk": snapshot.get("risk"),
+        "last_cycle": snapshot.get("last_cycle"),
+        "blockers": blockers,
+        "next_action": (blockers[0].get("clear") if blockers else None),
+        "brain": brain,
+    })
+
+
+@app.post("/api/console/brain")
+async def api_pin_brain(request: Request) -> JSONResponse:
+    """
+    Pin the model the agent will call, from the screen.
+
+    The operator asked not to edit .env for this, and they should not have to:
+    the model the agent calls is a product decision, not a config file. Only a
+    model the server actually reports may be pinned - pinning a name that is not
+    loaded would make the agent fall back to "first loaded model" while the
+    screen claimed otherwise, which is the exact confusion this endpoint exists
+    to end.
+    """
+    body = await request.json() if await request.body() else {}
+    model = str(body.get("model") or "").strip()
+    if not model:
+        return JSONResponse(status_code=400,
+                            content={"error": "no model was named"})
+    status = _brain_status(force=True)
+    if not status.get("connected"):
+        return JSONResponse(status_code=409, content={
+            "error": "LM Studio is not answering, so there is nothing to pin.",
+            "reason": status.get("error"),
+            "note": "Start the server in LM Studio, refresh, and pin again.",
+        })
+    loaded = list(status.get("models") or [])
+    if model not in loaded:
+        return JSONResponse(status_code=409, content={
+            "error": f"{model} is not one of the models this server has loaded.",
+            "models": loaded,
+            "note": "Pin one of the models in the list, so the agent calls what "
+                    "this screen says it calls.",
+        })
+    from ..dashboard import write_env_file
+    write_env_file({"LM_STUDIO_MODEL": model})
+    _BRAIN_CACHE["at"] = 0.0
+    return JSONResponse({
+        "pinned": model,
+        "note": ("Pinned. The agent calls exactly this model from its next "
+                 "start; a cycle already in flight is using the old one."),
+    })
+
+
 @app.get("/api/console/status")
 async def api_status() -> JSONResponse:
     """
@@ -291,8 +441,12 @@ async def api_status() -> JSONResponse:
 
     Each step reports its own state rather than a single green tick, because
     "configured" is not "ready to trade" and the difference is exactly the step
-    that is missing.
+    that is missing. The steps are read from the operator snapshot - the payload
+    the CLI prints - so the console cannot describe the agent differently from
+    the agent's own report.
     """
+    from ..operator_view import operator_snapshot
+
     storage = get_storage()
     state = ConsoleState(storage)
     agent = _agent()
@@ -303,33 +457,44 @@ async def api_status() -> JSONResponse:
         "steps": [],
         "storage": {},
     }
-    try:
-        perf = storage.get_performance_summary()
-        out["storage"] = {
-            "bankroll": perf.get("bankroll"),
-            "total_trades": perf.get("total_trades"),
-            "resolved_trades": perf.get("resolved_trades"),
-            "win_rate": perf.get("win_rate"),
-            "open_positions": storage.count_open_positions(),
-        }
-    except Exception as e:
-        out["storage"] = {"error": f"{type(e).__name__}: {e}"}
-
     balances = await _venue_balances(agent)
     plan = _build_plan(state, storage, balances)
+    try:
+        snapshot = operator_snapshot(storage)
+    except Exception as e:
+        snapshot = {}
+        out["snapshot_error"] = f"{type(e).__name__}: {e}"
     answering = sum(1 for b in balances.values() if b.get("available"))
 
+    agt = snapshot.get("agent") or {}
+    profit = snapshot.get("profit") or {}
+    venues = snapshot.get("venues") or {}
+    matrix = venues.get("matrix") or {}
+    paper = profit.get("paper") or {}
+    out["storage"] = {
+        "bankroll": profit.get("bankroll_usd"),
+        "total_trades": profit.get("total_trades"),
+        "resolved_trades": profit.get("live_resolved_trades"),
+        "win_rate": profit.get("win_rate_pct"),
+        "open_positions": (snapshot.get("positions") or {}).get("live_count"),
+    }
+    try:
+        storage.close()
+    except Exception:
+        pass
+
     out["steps"] = [
+        {"step": "agent", "label": "Agent running",
+         "ok": bool(agt.get("running")),
+         "detail": (f"{agt.get('state', 'unknown').replace('_', ' ')} - "
+                    f"{agt.get('evidence')}" if agt.get("evidence")
+                    else "the agent has not been seen in this database yet")},
         {"step": "capital", "label": "Capital authorised",
          "ok": bool(plan["live_venues"]),
          "detail": (f"${plan['total_available_usd']:.2f} available across "
                     f"{len(plan['live_venues'])} venue(s)"
                     if plan["live_venues"] else
                     "no funded, authorised venue: paper only")},
-        {"step": "account", "label": "Account verified (auth, funds, permission)",
-         "ok": False,
-         "detail": ("not verified this session - the order probe needs a real "
-                    "account, and it has not been run since startup")},
         {"step": "data", "label": "Market data",
          "ok": answering > 0,
          "detail": ((f"{answering} of {len(balances)} venue(s) reported a balance"
@@ -338,15 +503,22 @@ async def api_status() -> JSONResponse:
                        " - asked, but none answered. A venue that does not answer "
                        "is not a venue with a zero balance."))},
         {"step": "qualification", "label": "Venue qualified",
-         "ok": False,
-         "detail": ("needs 100+ resolved trades per venue: win rate, Brier, "
-                    "profit factor. Nothing is qualified on a fresh install, and "
-                    "that is the gate working.")},
-        {"step": "paper", "label": "Paper evidence",
-         "ok": bool(out["storage"].get("total_trades")),
-         "detail": (f"{out['storage'].get('total_trades')} simulated trade(s) "
-                    f"recorded" if out["storage"].get("total_trades")
-                    else "no simulated trades yet")},
+         "ok": bool(venues.get("best_validated_venue")),
+         "detail": (f"{venues.get('best_validated_venue')} passed the gate on "
+                    f"real resolved trades"
+                    if venues.get("best_validated_venue") else
+                    (f"{int(matrix.get('cells_with_enough_evidence') or 0)} of "
+                     f"{int(matrix.get('cells') or 0)} venue x strategy x market "
+                     f"combination(s) have enough evidence; the gate needs real "
+                     f"fills and resolved outcomes, not a score. Nothing is "
+                     f"qualified on a fresh install, and that is the gate "
+                     f"working."))},
+        {"step": "evidence", "label": "Paper evidence",
+         "ok": bool(int(paper.get("settled_trades") or 0)),
+         "detail": (f"{int(paper.get('settled_trades') or 0)} settled simulated "
+                    f"trade(s), ${float(paper.get('net_pnl') or 0.0):+.2f}"
+                    if int(paper.get("settled_trades") or 0)
+                    else "no simulated trade has settled yet")},
     ]
     out["capital"] = plan
     return JSONResponse(out)
@@ -682,14 +854,25 @@ details{margin-top:10px} summary{cursor:pointer;color:var(--blue);font-size:13px
   border:1px solid transparent}
 .tab.on{background:var(--panel);border-color:var(--line);color:var(--text);font-weight:600}
 .hide{display:none}
+.hero-pill{display:inline-block;font-size:12px;font-weight:700;letter-spacing:1.2px;
+  padding:4px 11px;border-radius:999px;background:var(--panel2);color:var(--dim);
+  border:1px solid var(--line);margin-bottom:9px}
+.hero-pill.ok{background:var(--green-dim);color:var(--green);border-color:rgba(46,204,113,.4)}
+.hero-pill.wait{background:var(--amber-dim);color:var(--amber);border-color:rgba(245,165,36,.35)}
+.hero-pill.no{background:var(--red-dim);color:#ff9b9b;border-color:rgba(239,68,68,.4)}
+.headline{font-size:19px;font-weight:650;line-height:1.35;letter-spacing:-.2px}
+.blocker{padding:11px 0;border-bottom:1px solid rgba(36,48,64,.5)}
+.blocker:last-child{border-bottom:none}
+.blocker .clear{color:var(--blue);font-size:12.5px;line-height:1.5}
 code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5px}
 .foot{color:var(--dimmer);font-size:11.5px;text-align:center;padding:26px 0 12px}
 </style>
 </head>
 <body>
 <header>
-  <div class="brand">PTAI</div>
+  <div class="brand">PTAI <span style="color:var(--dim);font-weight:500">&middot; one agent, trading your money</span></div>
   <div id="modeBadge" class="mode paper"><span class="dot"></span><span id="modeText">PAPER</span></div>
+  <div id="agentPill" class="pill dim">checking&hellip;</div>
   <div class="mono" style="font-size:12.5px;color:var(--dim)" id="hdrCapital"></div>
   <div class="spacer"></div>
   <button onclick="loadAll()">Refresh</button>
@@ -698,46 +881,47 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
 
 <main>
   <div class="tabs">
-    <div class="tab on" data-tab="overview" onclick="showTab('overview')">Overview</div>
+    <div class="tab on" data-tab="agent" onclick="showTab('agent')">Agent</div>
+    <div class="tab" data-tab="money" onclick="showTab('money')">Money</div>
     <div class="tab" data-tab="venue" onclick="showTab('venue')">Venue</div>
-    <div class="tab" data-tab="capital" onclick="showTab('capital')">Capital &amp; Funding</div>
     <div class="tab" data-tab="orders" onclick="showTab('orders')">Orders</div>
     <div class="tab" data-tab="activity" onclick="showTab('activity')">Activity</div>
+    <div class="tab" data-tab="setup" onclick="showTab('setup')">Setup</div>
   </div>
 
-  <!-- OVERVIEW -->
-  <section id="tab-overview">
-    <div class="grid cols-4" id="kpis"></div>
+  <!-- AGENT: the state of the one agent, in the order the operator asks -->
+  <section id="tab-agent">
+    <div class="card">
+      <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:280px">
+          <div id="agentState" class="hero-pill">reading the agent&hellip;</div>
+          <div id="agentHeadline" class="headline">&nbsp;</div>
+          <div id="agentDoing" class="note" style="margin-top:9px"></div>
+        </div>
+        <div id="agentVitals" class="note mono"
+             style="font-size:12px;min-width:210px;text-align:right"></div>
+      </div>
+    </div>
+    <div class="grid cols-4" id="agentKpis" style="margin-top:16px"></div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="card">
+        <h2>What stands in the way</h2>
+        <div id="blockers"></div>
+      </div>
+      <div class="card">
+        <h2>Last cycle</h2>
+        <div id="lastCycle"></div>
+      </div>
+    </div>
     <div class="grid cols-2" style="margin-top:16px">
       <div class="card">
         <h2>The loop, step by step</h2>
         <div id="steps"></div>
       </div>
       <div class="card">
-        <h2>Mode</h2>
-        <div class="modebox">
-          <div class="modeopt" id="modePaper" onclick="setMode('paper')">
-            <div class="t">Paper</div>
-            <div class="d">Simulates the whole system against the real orderbook.
-              No order is sent, no money moves. Needs no capital and no
-              credentials.</div>
-          </div>
-          <div class="modeopt" id="modeLive" onclick="setMode('live')">
-            <div class="t">Live</div>
-            <div class="d">Places real orders with real money on venues that are
-              funded and authorised. Refused unless a venue is actually ready.</div>
-          </div>
-        </div>
-        <div id="modeMsg"></div>
-        <div class="note" style="margin-top:12px">
-          The switch is refused, not merely warned about, when nothing is ready:
-          an armed system that cannot fire reads as progress when it is not.
-        </div>
+        <h2>Brain &mdash; the model it reasons with</h2>
+        <div id="brainBox"></div>
       </div>
-    </div>
-    <div class="card" style="margin-top:16px">
-      <h2>Not yet measurable</h2>
-      <div id="unavailable" class="note"></div>
     </div>
   </section>
 
@@ -774,8 +958,8 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
     </div>
   </section>
 
-  <!-- CAPITAL -->
-  <section id="tab-capital" class="hide">
+  <!-- MONEY -->
+  <section id="tab-money" class="hide">
     <div class="grid cols-2">
       <div class="card">
         <h2>Where the money is</h2>
@@ -812,6 +996,33 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
       <h2>What a limited budget will not buy</h2>
       <div id="unfundable"></div>
     </div>
+    <div class="grid cols-2" style="margin-top:16px">
+      <div class="card">
+        <h2>Mode</h2>
+        <div class="modebox">
+          <div class="modeopt" id="modePaper" onclick="setMode('paper')">
+            <div class="t">Paper</div>
+            <div class="d">Simulates the whole system against the real orderbook.
+              No order is sent, no money moves. Needs no capital and no
+              credentials.</div>
+          </div>
+          <div class="modeopt" id="modeLive" onclick="setMode('live')">
+            <div class="t">Live</div>
+            <div class="d">Places real orders with real money on venues that are
+              funded and authorised. Refused unless a venue is actually ready.</div>
+          </div>
+        </div>
+        <div id="modeMsg"></div>
+        <div class="note" style="margin-top:12px">
+          The switch is refused, not merely warned about, when nothing is ready:
+          an armed system that cannot fire reads as progress when it is not.
+        </div>
+      </div>
+      <div class="card">
+        <h2>Not yet measurable</h2>
+        <div id="unavailable" class="note"></div>
+      </div>
+    </div>
   </section>
 
   <!-- ORDERS -->
@@ -839,6 +1050,45 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
     </div>
   </section>
 
+  <!-- SETUP -->
+  <section id="tab-setup" class="hide">
+    <div class="card">
+      <h2>How it runs</h2>
+      <div class="note">
+        <p style="margin-bottom:9px">One runner starts everything:
+          <code>run_ptai.bat</code>. It opens the agent window (the loop that
+          trades), this console, and nothing else. The agent cycles every
+          <span id="setupInterval">10</span> minutes on its own; closing its
+          window stops the trading, and closing this page changes nothing.</p>
+        <p style="margin-bottom:9px">There is no approval step and no button you
+          must press between cycles. The buttons here exist to look and to test,
+          not to keep it alive: <b>Run one cycle</b> runs a single paper cycle in
+          this process, which is why it refuses to run live.</p>
+        <p>Everything the agent decides is written to the database as it goes, so
+          this screen can be closed and reopened without losing the story.</p>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Brain &mdash; pin the model the agent calls</h2>
+      <div id="brainSetup"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Advanced tools (diagnostics)</h2>
+      <div class="note">
+        <p style="margin-bottom:9px">This console is deliberately one screen
+          about one agent. The older diagnostic dashboard &mdash; raw logs, the
+          V2/V3 internals, the scan history, backtests, wallet linking, the API
+          config &mdash; is still on disk and is not part of the daily loop. It
+          is a second process, started on purpose:</p>
+        <p class="mono" style="margin-bottom:9px">&#62; set PYTHONPATH=src<br>
+           &#62; set PTAI_DASHBOARD_PORT=8020<br>
+           &#62; python -m ptai.dashboard</p>
+        <p>Use it when something needs diagnosing. Nothing on the Agent tab
+          depends on it.</p>
+      </div>
+    </div>
+  </section>
+
   <div class="foot">
     Local only. No cloud. The agent trades the accounts you fund and never holds
     your seed phrase.
@@ -856,12 +1106,14 @@ const esc = v => String(v===null||v===undefined?'':v)
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on', t.dataset.tab===name));
-  ['overview','venue','capital','orders','activity'].forEach(n=>
+  ['agent','money','venue','orders','activity','setup'].forEach(n=>
     $('tab-'+n).classList.toggle('hide', n!==name));
+  if(name==='agent') loadAgent();
+  if(name==='money'){ loadCapital(); loadFunding(); loadStatus(); loadResults(); }
   if(name==='venue') loadVenue();
-  if(name==='capital'){ loadCapital(); loadFunding(); }
   if(name==='orders') loadOrders();
-  if(name==='activity') loadResults();
+  if(name==='activity'){ loadResults(); loadStatus(); }
+  if(name==='setup'){ loadBrainSetup(); loadStatus(); }
 }
 
 async function api(path, opts){
@@ -891,18 +1143,9 @@ async function loadStatus(){
   $('hdrCapital').textContent = money(cap.total_available_usd) + ' available \u00b7 '
     + money(cap.total_reserved_usd) + ' reserved';
 
-  const kpi = [];
-  kpi.push(['Equity', money(st.bankroll), (st.bankroll==null?'no bankroll recorded':'')]);
-  kpi.push(['Free capital', money(cap.total_available_usd),
-            'money not committed anywhere']);
-  kpi.push(['Reserved', money(cap.total_reserved_usd),
-            'locked behind working orders']);
-  kpi.push(['In positions', money(cap.total_in_positions_usd),
-            (st.open_positions||0) + ' open']);
-  $('kpis').innerHTML = kpi.map(([k,v,s])=>`
-    <div class="card kpi"><div class="k">${k}</div>
-      <div class="v">${v}</div><div class="sub">${s||''}</div></div>`).join('');
-
+  // The KPI row lives on the Agent tab, fed by /api/console/agent - which reads
+  // the same snapshot these steps do. Rendering it twice is how two screens end
+  // up disagreeing about the same number.
   $('steps').innerHTML = (body.steps||[]).map(s=>`
     <div class="step">
       <div class="mark ${s.ok?'ok':'no'}">${s.ok?'\u2713':'\u2022'}</div>
@@ -931,7 +1174,7 @@ async function setMode(mode){
   }
   setBadge(body.mode);
   $('modeMsg').innerHTML = `<div class="note">${body.note||''}</div>`;
-  loadStatus();
+  loadStatus(); loadAgent();
 }
 
 // ---- capital ----
@@ -1215,13 +1458,209 @@ async function runCycle(){
       reconciliation: ${JSON.stringify(body.reconciliation||null)} &middot;
       redemption: ${JSON.stringify(body.redemption||null)}
     </div>`;
-  loadStatus();
+  // The cycle just wrote its own phase, heartbeat and scan row: show them, so
+  // the front page cannot lag behind a cycle the operator just ran by hand.
+  loadStatus(); loadAgent();
 }
 
-async function loadAll(){ await loadStatus(); }
+// ---- the agent: the front page, and the only question that matters ----
+
+const SEVERITY_PILL = {critical:'no', loss:'no', next_action:'wait',
+                       next_step:'wait', gate:'wait', warning:'wait',
+                       waiting:'dim', ok:'ok'};
+const STATE_PILL = {running:'ok', working:'wait', blocked:'wait',
+                    not_running:'no', unknown:'dim'};
+const STATE_WORD = {running:'RUNNING', working:'WORKING', blocked:'BLOCKED',
+                    not_running:'STOPPED', unknown:'UNKNOWN'};
+
+function ageText(seconds){
+  if(seconds===null || seconds===undefined) return 'never';
+  seconds = Math.max(0, Number(seconds));
+  if(seconds < 90) return Math.round(seconds) + 's';
+  if(seconds < 5400) return Math.round(seconds/60) + ' min';
+  return (seconds/3600).toFixed(1) + 'h';
+}
+
+async function loadAgent(){
+  const {body} = await api('/api/console/agent');
+  if(!body || body.headline===undefined){
+    $('agentHeadline').textContent = 'The agent state could not be read.';
+    return;
+  }
+  const agt = body.agent || {};
+  const cap = body.capital || {};
+  const prof = body.profit || {};
+  const paper = prof.paper || {};
+  const risk = body.risk || {};
+  const ven = body.venues || {};
+  const st = body.strategies || {};
+
+  STATE.mode = body.mode || STATE.mode;
+  setBadge(STATE.mode);
+
+  // header pill
+  const pill = $('agentPill');
+  pill.className = 'pill ' + (STATE_PILL[agt.state] || 'dim');
+  pill.textContent = STATE_WORD[agt.state] || String(agt.state||'unknown').toUpperCase();
+
+  // hero
+  const heroPill = $('agentState');
+  heroPill.className = 'hero-pill ' + (STATE_PILL[agt.state] || 'dim');
+  heroPill.textContent = (STATE_WORD[agt.state] || 'UNKNOWN')
+    + (agt.state==='running' && agt.last_scan_ago_seconds!=null
+       ? ' \u00b7 LAST CYCLE ' + ageText(agt.last_scan_ago_seconds) + ' AGO'
+       : agt.evidence ? ' \u00b7 ' + ageText(agt.phase_seconds || agt.heartbeat_ago_seconds || agt.last_scan_ago_seconds) + ' AGO' : '');
+  $('agentHeadline').textContent = body.headline || '';
+  $('agentDoing').innerHTML = agt.running
+    ? '<b>Right now:</b> ' + esc(agt.doing || 'between cycles')
+      + (agt.next_cycle_at ? ' \u00b7 next cycle ' + esc(String(agt.next_cycle_at).slice(11,16)) + ' UTC' : '')
+    : '<b>Nothing is running.</b> ' + esc(agt.evidence || 'No agent process has left a mark in this database.')
+      + ' Start <code>run_ptai.bat</code> on the machine that trades.';
+
+  // vitals, in the operator's words
+  const validated = ven.best_validated_venue
+    ? esc(ven.best_validated_venue) + ' (' + esc(ven.best_validated_on||'') + ')'
+    : 'none yet';
+  const bestStrat = st.best_validated_strategy ? esc(st.best_validated_strategy) : 'none yet';
+  $('agentVitals').innerHTML =
+      'cycle every ' + esc(String(agt.interval_min||10)) + ' min<br>'
+    + 'liveness window ' + Math.round((agt.window_seconds||900)/60) + ' min<br>'
+    + 'heartbeat: ' + esc(agt.heartbeat_status || '\u2014') + ' ' + ageText(agt.heartbeat_ago_seconds) + '<br>'
+    + 'last completed cycle: ' + ageText(agt.last_scan_ago_seconds) + '<br>'
+    + 'validated venue: ' + validated + '<br>'
+    + 'validated strategy: ' + bestStrat + '<br>'
+    + 'risk: ' + (risk.trading_halted ? '<span class="neg">halted</span>'
+        : 'kill switch ' + esc(String(risk.kill_switch_level==null?'none':risk.kill_switch_level)));
+
+  // the money
+  const pnl = cap.realised_pnl_usd;
+  const pnlCls = (typeof pnl==='number') ? (pnl>=0?'pos':'neg') : '';
+  const kpis = [
+    ['Equity', money(cap.equity_usd), (cap.account==='paper'?'paper account':(cap.account||'')+' account')],
+    ['Realised P&amp;L', money(pnl), (prof.live_resolved_trades||0) + ' resolved live trade(s), class:pnlCls'],
+    ['Free capital', money(cap.free_cash_usd), 'not committed anywhere'],
+    ['Reserved', money(cap.reserved_capital_usd), 'locked behind working orders'],
+    ['Deployed', (cap.deployment_pct==null?'\u2014':Number(cap.deployment_pct).toFixed(1)+'%'),
+      money(cap.deployed_usd) + ' working'],
+    ['30-day net return', (prof.return_30d_pct==null?'\u2014':Number(prof.return_30d_pct).toFixed(2)+'%'),
+      (prof.return_30d_pct==null?'undefined until a resolved history exists':'on the live account')],
+    ['Max drawdown', (prof.max_drawdown_pct==null?'\u2014':Number(prof.max_drawdown_pct).toFixed(2)+'%'),
+      (prof.max_drawdown_pct==null?'no equity curve to draw down yet':'worst peak-to-trough')],
+    ['Paper (kept apart)', money(paper.net_pnl),
+      (paper.settled_trades||0) + ' settled simulated trade(s)'],
+  ];
+  $('agentKpis').innerHTML = kpis.map(([k,v,s])=>{
+    const cls = (s||'').indexOf('class:pnlCls')>=0 ? ' '+pnlCls : '';
+    return `<div class="card kpi"><div class="k">${k}</div>
+      <div class="v${cls}">${v}</div>
+      <div class="sub">${(s||'').replace(' class:pnlCls','')}</div></div>`;
+  }).join('');
+
+  // what stands in the way - the reason this screen exists
+  $('blockers').innerHTML = (body.blockers||[]).length
+    ? body.blockers.map(b=>`
+      <div class="blocker">
+        <div><span class="pill ${SEVERITY_PILL[b.severity]||'dim'}">${esc(String(b.severity||'').replace('_',' '))}</span>
+             <b style="margin-left:8px">${esc(b.what)}</b></div>
+        <div class="note" style="margin-top:5px">${esc(b.evidence||'')}</div>
+        <div class="clear" style="margin-top:6px">&#8594; ${esc(b.clear)}</div>
+      </div>`).join('')
+    : '<div class="empty">No blockers were computed.</div>';
+
+  // last cycle
+  const lc = body.last_cycle || {};
+  if(!lc.available){
+    $('lastCycle').innerHTML = `<div class="empty">${esc(lc.note||'No completed cycle is recorded.')}</div>`;
+  } else {
+    const dec = lc.decided || {};
+    const orders = lc.orders || {};
+    $('lastCycle').innerHTML = `
+      <div><span class="pill ${lc.verdict==='DEPLOYED'?'ok':'dim'}">${esc(lc.verdict||'')}</span>
+        <span class="note" style="margin-left:9px">${esc(String(lc.at||'').replace('T',' ').slice(0,19))} UTC
+        &middot; took ${esc(String(lc.cycle_seconds||'?'))}s</span></div>
+      <table style="margin-top:10px">
+        <tr><td style="color:var(--dim)">Markets scanned</td>
+            <td class="mono">${esc(String(lc.markets_scanned||0))} across ${esc(String(lc.venues_searched||0))} venue(s)</td></tr>
+        <tr><td style="color:var(--dim)">Candidates</td>
+            <td class="mono">${esc(String(lc.candidates||0))}</td></tr>
+        <tr><td style="color:var(--dim)">Positions recorded</td>
+            <td class="mono">${esc(String(orders.positions_recorded||0))}</td></tr>
+        <tr><td style="color:var(--dim)">Blocked by capital boundary</td>
+            <td class="mono">${esc(String(orders.blocked_live_capital||0))}${orders.blocked_reason?` <span style="color:var(--dim)">&mdash; ${esc(orders.blocked_reason)}</span>`:''}</td></tr>
+        <tr><td style="color:var(--dim)">Best it found</td>
+            <td class="mono">${dec.venue?esc(dec.venue)+' &middot; '+esc(dec.strategy||''):'&mdash;'}</td></tr>
+        <tr><td style="color:var(--dim)">Edge on it</td>
+            <td class="mono">${dec.edge!=null?esc(String(dec.edge)):'&mdash;'}</td></tr>
+      </table>
+      ${lc.why?`<div class="note" style="margin-top:10px"><b>Why:</b> ${esc(lc.why)}</div>`:''}`;
+  }
+
+  renderBrain($('brainBox'), body.brain||{}, false);
+  window.__BRAIN = body.brain || {};
+  window.__INTERVAL = agt.interval_min || 10;
+}
+
+function renderBrain(el, b, withPicker){
+  if(!el) return;
+  const active = b.active_model;
+  const pinNote = b.pinned
+    ? 'pinned in .env &mdash; this is the model the agent calls'
+    : 'auto: whichever model LM Studio lists first';
+  const head = b.connected
+    ? `<div class="pill ok">CONNECTED</div>
+       <span class="note" style="margin-left:9px">${esc(String(b.models.length))} model(s) loaded${b.latency_ms!=null?' &middot; '+esc(String(b.latency_ms))+' ms':''}</span>`
+    : `<div class="pill no">NO ANSWER</div>
+       <span class="note" style="margin-left:9px">${esc(b.host||'http://localhost:1234')}: ${esc(b.error||'not reachable')}</span>`;
+  const table = `
+    <table style="margin-top:11px">
+      <tr><td style="color:var(--dim);width:170px">Agent will use</td>
+          <td class="mono ${active?'pos':''}">${active?esc(active):'nothing - no model is loaded'}</td></tr>
+      <tr><td style="color:var(--dim)">How it was chosen</td>
+          <td class="note">${pinNote}</td></tr>
+      <tr><td style="color:var(--dim)">Speed</td>
+          <td class="mono">${b.is_r1?'<span class="neg">SLOW - minutes per market (R1-style)</span>'
+              :(b.connected?'<span class="pos">full speed - no long thinking phase</span>':'&mdash;')}</td></tr>
+    </table>`;
+  const picker = (withPicker && b.connected && b.models.length) ? `
+    <div style="margin-top:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <select id="modelSelect" style="max-width:340px;width:auto">${
+        b.models.map(m=>`<option value="${esc(m)}"${m===active?' selected':''}>${esc(m)}</option>`).join('')}</select>
+      <button class="primary" onclick="pinModel()">Pin this model</button>
+    </div>
+    <div id="pinMsg" class="note" style="margin-top:9px"></div>
+    <div class="note" style="margin-top:9px">Pinning writes <code>LM_STUDIO_MODEL</code> to
+      <code>.env</code> so the agent stops taking whichever model is listed first.
+      The running agent picks it up on its <b>next start</b>.</div>`
+    : (withPicker ? `<div class="note" style="margin-top:11px">Start LM Studio and load a
+        model with the local server on, then refresh, to pin one from here.</div>` : '');
+  el.innerHTML = head + table + picker;
+}
+
+async function pinModel(){
+  const sel = $('modelSelect');
+  if(!sel){ return; }
+  const {ok, body} = await api('/api/console/brain', {method:'POST',
+    body:JSON.stringify({model: sel.value})});
+  $('pinMsg').innerHTML = ok
+    ? `<span class="pos">${esc(body.note||'pinned')}</span>`
+    : `<span class="neg">${esc(body.error||'could not pin')}</span> ${esc(body.note||'')}`;
+  if(ok){ loadBrainSetup(); loadAgent(); }
+}
+
+async function loadBrainSetup(){
+  const {body} = await api('/api/console/agent');
+  window.__BRAIN = body.brain || {};
+  renderBrain($('brainSetup'), body.brain||{}, true);
+  const iv = $('setupInterval');
+  if(iv && body.agent) iv.textContent = String(body.agent.interval_min||10);
+}
+
+async function loadAll(){
+  await Promise.all([loadAgent(), loadStatus(), loadBrainSetup()]);
+}
 
 loadAll();
-setInterval(loadStatus, 15000);
+setInterval(()=>{ loadAgent(); loadStatus(); }, 15000);
 </script>
 </body>
 </html>
@@ -1229,8 +1668,23 @@ setInterval(loadStatus, 15000);
 
 
 def main(host: str = "0.0.0.0", port: int = 8101) -> None:
+    """
+    Serve the console - the one screen the product has.
+
+    The port comes from the environment first, because the runner sets it in one
+    place (`PTAI_DASHBOARD_PORT`, the name already in the operator's .bat and in
+    the docs) and every process the runner starts has to agree on it. PTAI is
+    local-only either way: this binds on the machine that runs it.
+    """
+    import os
+    chosen = (os.environ.get("PTAI_CONSOLE_PORT")
+              or os.environ.get("PTAI_DASHBOARD_PORT") or port)
+    try:
+        port = int(chosen)
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring unusable port {chosen!r}; using {port}")
     import uvicorn
-    logger.info(f"PTAI Console on http://{host}:{port}")
+    logger.info(f"PTAI Console on http://localhost:{port}")
     logger.info("Paper mode is the default and needs no capital or credentials.")
     uvicorn.run(app, host=host, port=port)
 

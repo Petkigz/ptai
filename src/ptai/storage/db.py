@@ -893,6 +893,13 @@ class Storage:
             "total_pnl": total_pnl,
             "total_pnl_pct": (total_pnl / initial * 100) if initial else 0,
             "total_trades": total_trades,
+            # How many of them actually resolved. `total_trades` is a counter of
+            # trades TAKEN, and consumers have been reading it as "resolved" -
+            # the dashboard's "resolved trades" tile and the operator view's
+            # `live_resolved_trades` both did. The row above already counts them,
+            # so report it rather than leaving a key that never existed.
+            "resolved_trades": int(row["total"] or 0) if row else 0,
+            "wins": int(row["wins"] or 0) if row else 0,
             "win_rate": win_rate,
             "avg_pnl": row["avg_pnl"] if row else 0,
             "history": history,
