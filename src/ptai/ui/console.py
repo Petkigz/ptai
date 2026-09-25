@@ -849,11 +849,10 @@ ol{margin:9px 0 0 18px} ol li{margin-bottom:7px;font-size:13px;line-height:1.5}
 details{margin-top:10px} summary{cursor:pointer;color:var(--blue);font-size:13px}
 .bar{height:7px;border-radius:4px;background:var(--panel2);overflow:hidden;margin-top:9px;display:flex}
 .bar i{display:block;height:100%}
-.tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+.tabs{display:flex;gap:6px;margin-top:11px;flex-wrap:wrap}
 .tab{padding:7px 15px;border-radius:8px;font-size:13px;cursor:pointer;color:var(--dim);
   border:1px solid transparent}
 .tab.on{background:var(--panel);border-color:var(--line);color:var(--text);font-weight:600}
-.hide{display:none}
 .hero-pill{display:inline-block;font-size:12px;font-weight:700;letter-spacing:1.2px;
   padding:4px 11px;border-radius:999px;background:var(--panel2);color:var(--dim);
   border:1px solid var(--line);margin-bottom:9px}
@@ -866,6 +865,11 @@ details{margin-top:10px} summary{cursor:pointer;color:var(--blue);font-size:13px
 .blocker .clear{color:var(--blue);font-size:12.5px;line-height:1.5}
 code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5px}
 .foot{color:var(--dimmer);font-size:11.5px;text-align:center;padding:26px 0 12px}
+.section{margin-top:26px}
+.section-head{padding:16px 0 2px;border-top:1px solid var(--line)}
+.section-head h1{font-size:15px;font-weight:700;letter-spacing:.2px}
+.section-head p{color:var(--dim);font-size:12.5px;margin-top:3px}
+section[id]{scroll-margin-top:132px}
 </style>
 </head>
 <body>
@@ -877,21 +881,30 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
   <div class="spacer"></div>
   <button onclick="loadAll()">Refresh</button>
   <button id="runBtn" onclick="runCycle()">Run one cycle</button>
+  <!--
+    One page, jump links. The sections are all on this page and all visible;
+    these only scroll to them, so nothing can be hidden from the operator by a
+    navigation state they forgot they set. The active one is highlighted as the
+    page scrolls.
+  -->
+  <nav class="tabs" style="flex-basis:100%">
+    <div class="tab on" data-tab="agent" onclick="goTo('agent')">Agent</div>
+    <div class="tab" data-tab="money" onclick="goTo('money')">Money</div>
+    <div class="tab" data-tab="venue" onclick="goTo('venue')">Venue</div>
+    <div class="tab" data-tab="orders" onclick="goTo('orders')">Orders</div>
+    <div class="tab" data-tab="activity" onclick="goTo('activity')">Activity</div>
+    <div class="tab" data-tab="setup" onclick="goTo('setup')">Setup</div>
+  </nav>
 </header>
 
 <main>
-  <div class="tabs">
-    <div class="tab on" data-tab="agent" onclick="showTab('agent')">Agent</div>
-    <div class="tab" data-tab="money" onclick="showTab('money')">Money</div>
-    <div class="tab" data-tab="venue" onclick="showTab('venue')">Venue</div>
-    <div class="tab" data-tab="orders" onclick="showTab('orders')">Orders</div>
-    <div class="tab" data-tab="activity" onclick="showTab('activity')">Activity</div>
-    <div class="tab" data-tab="setup" onclick="showTab('setup')">Setup</div>
-  </div>
-
   <!-- AGENT: the state of the one agent, in the order the operator asks -->
   <section id="tab-agent">
-    <div class="card">
+    <div class="section-head">
+      <h1>Agent</h1>
+      <p>Is it running, what is it doing right now, and what is the money doing.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
       <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
         <div style="flex:1;min-width:280px">
           <div id="agentState" class="hero-pill">reading the agent&hellip;</div>
@@ -926,8 +939,13 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
   </section>
 
   <!-- VENUE -->
-  <section id="tab-venue" class="hide">
-    <div class="card">
+  <section id="tab-venue" class="section">
+    <div class="section-head">
+      <h1>Venue</h1>
+      <p>One venue holds live capital at a time, named with the reason. Every
+        other venue is still scanned and paper-traded.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
       <h2>Which venue the agent is using</h2>
       <div id="venueNow"></div>
     </div>
@@ -959,8 +977,13 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
   </section>
 
   <!-- MONEY -->
-  <section id="tab-money" class="hide">
-    <div class="grid cols-2">
+  <section id="tab-money" class="section">
+    <div class="section-head">
+      <h1>Money</h1>
+      <p>Where it is, what it will buy, and how it gets in. A budget is
+        permission to use money already in a venue account.</p>
+    </div>
+    <div class="grid cols-2" style="margin-top:14px">
       <div class="card">
         <h2>Where the money is</h2>
         <div id="accounts"></div>
@@ -1026,8 +1049,12 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
   </section>
 
   <!-- ORDERS -->
-  <section id="tab-orders" class="hide">
-    <div class="grid cols-4" id="orderKpis"></div>
+  <section id="tab-orders" class="section">
+    <div class="section-head">
+      <h1>Orders</h1>
+      <p>What is working, what it is holding, and whether the venue agrees.</p>
+    </div>
+    <div class="grid cols-4" id="orderKpis" style="margin-top:14px"></div>
     <div class="card" style="margin-top:16px">
       <h2>Working orders</h2>
       <div id="orders"></div>
@@ -1039,8 +1066,12 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
   </section>
 
   <!-- ACTIVITY -->
-  <section id="tab-activity" class="hide">
-    <div class="card">
+  <section id="tab-activity" class="section">
+    <div class="section-head">
+      <h1>Activity</h1>
+      <p>Every trade the agent has taken, and the full result of the last cycle.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
       <h2>Recent trades</h2>
       <div id="trades"></div>
     </div>
@@ -1051,8 +1082,12 @@ code{background:var(--panel2);padding:1.5px 6px;border-radius:5px;font-size:12.5
   </section>
 
   <!-- SETUP -->
-  <section id="tab-setup" class="hide">
-    <div class="card">
+  <section id="tab-setup" class="section">
+    <div class="section-head">
+      <h1>Setup</h1>
+      <p>How it runs, the model it thinks with, and where the diagnostics live.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
       <h2>How it runs</h2>
       <div class="note">
         <p style="margin-bottom:9px">One runner starts everything:
@@ -1104,17 +1139,31 @@ const pct = v => (v===null||v===undefined) ? '&mdash;' : Number(v).toFixed(1) + 
 const esc = v => String(v===null||v===undefined?'':v)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
-function showTab(name){
+// The sections, in the order they are stacked on the page. Every one is loaded
+// when the page opens and refreshed on the timer: "always visible" and "only
+// loaded when you click" are the same bug in different clothes.
+const SECTIONS = ['agent','money','venue','orders','activity','setup'];
+
+function goTo(name){
+  const el = $('tab-'+name);
+  if(el) el.scrollIntoView({behavior:'smooth', block:'start'});
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on', t.dataset.tab===name));
-  ['agent','money','venue','orders','activity','setup'].forEach(n=>
-    $('tab-'+n).classList.toggle('hide', n!==name));
-  if(name==='agent') loadAgent();
-  if(name==='money'){ loadCapital(); loadFunding(); loadStatus(); loadResults(); }
-  if(name==='venue') loadVenue();
-  if(name==='orders') loadOrders();
-  if(name==='activity'){ loadResults(); loadStatus(); }
-  if(name==='setup'){ loadBrainSetup(); loadStatus(); }
 }
+
+// Which section is on screen, so the link the operator is looking at is the one
+// highlighted. Read from scroll position rather than a state variable, because
+// the page can be scrolled without ever pressing a link.
+function spyScroll(){
+  const line = 150;
+  let current = SECTIONS[0];
+  SECTIONS.forEach(n=>{
+    const el = $('tab-'+n);
+    if(el && el.getBoundingClientRect().top <= line) current = n;
+  });
+  document.querySelectorAll('.tab').forEach(t=>
+    t.classList.toggle('on', t.dataset.tab===current));
+}
+window.addEventListener('scroll', spyScroll, {passive:true});
 
 async function api(path, opts){
   const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}));
@@ -1656,11 +1705,18 @@ async function loadBrainSetup(){
 }
 
 async function loadAll(){
-  await Promise.all([loadAgent(), loadStatus(), loadBrainSetup()]);
+  await Promise.all([
+    loadAgent(), loadStatus(), loadBrainSetup(),
+    loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
+  ]);
+  spyScroll();
 }
 
+// Everything, on open and on the timer. The panels are read-only views of the
+// database; the only writable thing on the page is the budget box, and its
+// input is never re-rendered by a refresh.
 loadAll();
-setInterval(()=>{ loadAgent(); loadStatus(); }, 15000);
+setInterval(loadAll, 15000);
 </script>
 </body>
 </html>

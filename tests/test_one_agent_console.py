@@ -422,6 +422,27 @@ class TestTheConsoleIsOneScreenAboutOneAgent:
         # The diagnostics lab is still reachable, by name, from Setup.
         assert "ptai.dashboard" in page
 
+    def test_everything_is_on_the_one_page(self, console_client):
+        """
+        The operator asked for the sections stacked instead of hidden behind
+        tabs: a page you scroll cannot hide a panel from you because of a
+        navigation state you forgot you set.
+        """
+        page = console_client.get("/").text
+        # No section is hidden by a class on load.
+        for name in ("agent", "money", "venue", "orders", "activity", "setup"):
+            assert re.search(rf'<section id="tab-{name}"(?![^>]*\bhide\b)', page), (
+                f"section {name} is hidden on load")
+        # The links are jump links, and every one of them has a target.
+        assert page.count("goTo(") >= 6
+        assert "scrollIntoView" in page
+        assert "showTab" not in page
+        # And nothing loads only when a link is pressed: one loader runs them all.
+        loader = page.split("async function loadAll(){")[1].split("}")[0]
+        for fn in ("loadAgent", "loadStatus", "loadBrainSetup", "loadVenue",
+                   "loadCapital", "loadFunding", "loadOrders", "loadResults"):
+            assert fn in loader, f"{fn} is not loaded when the page opens"
+
     def test_every_element_the_script_touches_exists(self, console_client):
         """
         A renamed id used to kill every handler on the page silently, because an
