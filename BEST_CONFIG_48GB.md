@@ -1,5 +1,7 @@
 # BEST CONFIG FOR 48GB RAM - PTAI - ULTIMATE + X + R1 FIX (2024+)
 
+> **Note:** the entry point is now a single file: `run_ptai.bat` (the `setup.bat` / `start.bat` / `start_dashboard.bat` files are removed).
+
 You have 48GB RAM - you can run **70B models** now. This is the ultimate tier for local trading.
 
 ## ⚠️ CRITICAL FIXES APPLIED (2026-05) - YOU MUST PULL

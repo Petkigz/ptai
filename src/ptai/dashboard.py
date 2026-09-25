@@ -460,7 +460,7 @@ async def api_system_health():
     if env.get("DRY_RUN", "true").lower() == "true" and onboarding["wallet_linked"]:
         issues.append("DRY_RUN=true - testing mode, no real trades. Set false in Wallet tab to go live")
     if not agent_running:
-        issues.append("Agent not running - run start.bat or click Run Cycle")
+        issues.append("Agent not running - run run_ptai.bat or click Run Cycle")
 
     status = "healthy" if len(issues) == 0 else "needs_attention" if len(issues) <= 2 else "error"
 
@@ -498,7 +498,7 @@ async def api_logs_tail(request: Request, lines: int = 100):
         return JSONResponse(status_code=400, content={"error": "Invalid log path"})
     
     if not log_path.exists():
-        return {"logs": "No logs yet - run start.bat", "exists": False}
+        return {"logs": "No logs yet - run run_ptai.bat", "exists": False}
     try:
         with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
             all_lines = f.readlines()
@@ -4237,7 +4237,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                             <button class="btn btn-secondary" onclick="exportTrades()">📤 Export Report</button>
                         </div>
                         <div style="margin-top: 16px; font-size: 13px;">
-                            <div>Agent runs every 10 min via <code>start.bat</code> (separate terminal)</div>
+                            <div>Agent runs every 10 min via <code>run_ptai.bat</code> (separate terminal)</div>
                             <div style="margin-top: 8px; color: var(--text2);">Or click Run Cycle to trigger one cycle from dashboard (background task)</div>
                             <div id="run-cycle-result" style="margin-top: 8px;"></div>
                         </div>
@@ -4346,14 +4346,14 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 
                 <div class="card">
                     <div class="card-title">Environment Variables (.env)</div>
-                    <div class="card-desc" style="margin-bottom: 16px;">Managed via UI, saved to .env file. Restart start.bat after changing.</div>
+                    <div class="card-desc" style="margin-bottom: 16px;">Managed via UI, saved to .env file. Restart run_ptai.bat after changing.</div>
                     <div id="env-display" class="mono" style="font-size: 11px; background: var(--bg); padding: 12px; border-radius: 8px; border: 1px solid var(--border); max-height: 300px; overflow-y: auto;">Loading...</div>
                 </div>
                 
                 <div class="card">
                     <div class="card-title">Danger Zone</div>
                     <div style="display: flex; gap: 8px; margin-top: 12px;">
-                        <button class="btn btn-danger btn-small" onclick="if(confirm('Reset bankroll to $50?')) { fetch('/api/auth/token').then(r=>r.json()).then(d=>fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json','X-PTAI-Token':d.token},body:JSON.stringify({BANKROLL:'50'})})).then(()=>alert('Reset to $50 - restart start.bat')) }">🔄 Reset Bankroll $50</button>
+                        <button class="btn btn-danger btn-small" onclick="if(confirm('Reset bankroll to $50?')) { fetch('/api/auth/token').then(r=>r.json()).then(d=>fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json','X-PTAI-Token':d.token},body:JSON.stringify({BANKROLL:'50'})})).then(()=>alert('Reset to $50 - restart run_ptai.bat')) }">🔄 Reset Bankroll $50</button>
                         <button class="btn btn-secondary btn-small" onclick="window.open('/api/status','_blank')">📊 View API Status JSON</button>
                         <button class="btn btn-secondary btn-small" onclick="window.open('/health','_blank')">❤️ Health Check</button>
                     </div>
@@ -4487,7 +4487,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 const trades = await tradesRes.json();
                 let html = '<tr><th>Time</th><th>Question</th><th>Edge</th><th>Size</th><th>Status</th></tr>';
                 if (trades.length === 0) {
-                    html += '<tr><td colspan=5 style="color: var(--text3);">No trades yet - run start.bat or click Run Cycle. Start with DRY_RUN=true to test.</td></tr>';
+                    html += '<tr><td colspan=5 style="color: var(--text3);">No trades yet - run run_ptai.bat or click Run Cycle. Start with DRY_RUN=true to test.</td></tr>';
                 } else {
                     trades.forEach(t => {
                         const edgeColor = Math.abs(t.edge) >= 0.08 ? 'positive' : '';
@@ -4501,7 +4501,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 const scans = await scansRes.json();
                 let shtml = '<tr><th>Time</th><th>Scanned</th><th>Opps</th><th>Avg Edge</th><th>Time s</th><th>Bankroll</th></tr>';
                 if (scans.length === 0) {
-                    shtml += '<tr><td colspan=6 style="color: var(--text3);">No scans yet - run start.bat (autonomous every 10 min) or Run Cycle button</td></tr>';
+                    shtml += '<tr><td colspan=6 style="color: var(--text3);">No scans yet - run run_ptai.bat (autonomous every 10 min) or Run Cycle button</td></tr>';
                 } else {
                     scans.forEach(s => {
                         shtml += `<tr><td class="mono">${(s.timestamp||'').slice(0,16)}</td><td class="mono">${s.markets_scanned}</td><td class="mono">${s.opportunities_found}</td><td class="mono">${(s.avg_edge*100).toFixed(1)}%</td><td class="mono">${s.execution_time_seconds.toFixed(1)}</td><td class="mono">$${s.bankroll.toFixed(2)}</td></tr>`;
@@ -4548,7 +4548,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 // Health details
                 const details = document.getElementById('system-health-details');
                 details.innerHTML = `
-                    <div>🤖 Agent: ${data.agent_running ? '<span class="positive">Running (last scan ' + Math.round(data.last_scan_ago_seconds/60) + ' min ago)</span>' : '<span class="negative">Not running - run start.bat</span>'}</div>
+                    <div>🤖 Agent: ${data.agent_running ? '<span class="positive">Running (last scan ' + Math.round(data.last_scan_ago_seconds/60) + ' min ago)</span>' : '<span class="negative">Not running - run run_ptai.bat</span>'}</div>
                     <div>🧠 LLM: ${data.lm_studio.connected ? '<span class="positive">Connected - ' + data.lm_studio.models.length + ' models</span>' : '<span class="negative">Not connected</span>'} ${data.lm_studio.is_r1 ? '<span style="color: var(--red);">R1 SLOW!</span>' : ''}</div>
                     <div>🐦 X Sentiment: ${data.x_sentiment.status}</div>
                     <div>💰 Dry Run: ${data.config.dry_run === 'true' ? 'ON (testing)' : 'OFF (live trading)'}</div>
@@ -4568,9 +4568,9 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                     { key: 'model_loaded', title: '2. Model Loaded', desc: 'Load qwen/qwen3-32b (fast 3s) not R1 (slow 8 min). You have: ' + (data.lm_studio.models.join(', ') || 'none'), done: data.onboarding.model_loaded },
                     { key: 'is_fast_model', title: '3. Fast Model Selected', desc: 'Use qwen/qwen3-32b for 10-min cycle (50 deep = 2.5 min). R1 is 8 min per market, needs 5 deep + hourly.', done: data.onboarding.is_fast_model, warn: data.lm_studio.is_r1 },
                     { key: 'wallet_linked', title: '4. Wallet Linked', desc: 'Go to Wallet tab, enter private key (0x...) and funder address (0x...). Keys stay local.', done: data.onboarding.wallet_linked },
-                    { key: 'first_scan_done', title: '5. First Scan Done', desc: 'Run start.bat or click Run Cycle. Should scan 500 markets in 1.2s', done: data.onboarding.first_scan_done },
+                    { key: 'first_scan_done', title: '5. First Scan Done', desc: 'Run run_ptai.bat or click Run Cycle. Should scan 500 markets in 1.2s', done: data.onboarding.first_scan_done },
                     { key: 'dry_run_tested', title: '6. Dry Run Tested', desc: 'Test with DRY_RUN=true (safe, no real money). Should see "Would place order" logs and trades with dry_run status', done: data.onboarding.dry_run_tested },
-                    { key: 'agent_running', title: '7. Agent Running', desc: 'Agent runs every 10 min autonomously. Last scan should be <15 min ago. For product, keep start.bat running.', done: data.onboarding.agent_running },
+                    { key: 'agent_running', title: '7. Agent Running', desc: 'Agent runs every 10 min autonomously. Last scan should be <15 min ago. For product, keep run_ptai.bat running.', done: data.onboarding.agent_running },
                 ];
                 
                 stepsDiv.innerHTML = steps.map((s, i) => `
@@ -4716,7 +4716,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
             try {
                 const res = await fetch('/api/config', { method: 'POST', headers: authHeaders(), body: JSON.stringify(payload) });
                 const data = await res.json();
-                document.getElementById('wallet-test-result').innerHTML = `<div class="alert alert-success">✅ Saved: ${escapeHTML(data.updated.join(', '))}. Restart start.bat to apply.</div>`;
+                document.getElementById('wallet-test-result').innerHTML = `<div class="alert alert-success">✅ Saved: ${escapeHTML(data.updated.join(', '))}. Restart run_ptai.bat to apply.</div>`;
                 loadWalletStatus();
                 loadHealth();
             } catch (e) {
@@ -4764,7 +4764,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
             try {
                 const res = await fetch('/api/config', { method: 'POST', headers: authHeaders(), body: JSON.stringify(payload) });
                 const data = await res.json();
-                document.getElementById('trading-save-result').innerHTML = `<div class="alert alert-success">✅ Saved: ${escapeHTML(data.updated.join(', '))}. Restart start.bat.</div>`;
+                document.getElementById('trading-save-result').innerHTML = `<div class="alert alert-success">✅ Saved: ${escapeHTML(data.updated.join(', '))}. Restart run_ptai.bat.</div>`;
             } catch (e) {
                 document.getElementById('trading-save-result').innerHTML = `<div class="alert alert-error">❌ Save failed: ${e}</div>`;
             }

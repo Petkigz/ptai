@@ -1,10 +1,10 @@
 @echo off
 REM ============================================================================
-REM  PTAI - run on your PC (Windows)
+REM  PTAI - run on your PC (Windows)  -  THE ONE FILE TO RUN
 REM
 REM  Double-click to:
 REM    1. create a clean Python environment (.venv) on first run
-REM    2. install dependencies
+REM    2. install dependencies (only slow on the first run)
 REM    3. start the trading agent in PAPER mode (no real money is spent)
 REM    4. open the product dashboard in your browser
 REM
@@ -13,6 +13,9 @@ REM  and close this window.
 REM
 REM  Ports: this PC already uses 3000 and 8000 for another project, so the
 REM  dashboard runs on 8010 by default. Change it below if 8010 is taken.
+REM
+REM  There used to be several .bat files (setup / start / start_dashboard).
+REM  They are gone - this file is the only one, and it does all of them.
 REM ============================================================================
 setlocal
 cd /d "%~dp0"
@@ -63,6 +66,17 @@ if errorlevel 1 (
   echo [ERROR] Installing dependencies failed. Read the messages above.
   pause
   exit /b 1
+)
+
+REM ---------------- folders + optional browser --------------------------------
+if not exist data mkdir data
+if not exist logs mkdir logs
+REM Chromium is only needed if a venue ever asks for a browser login; the
+REM paper Polymarket run works without it. Best effort, never blocks startup.
+python -m playwright install chromium >nul 2>nul
+if errorlevel 1 (
+  echo Note: browser (Chromium) not installed - fine for paper trading;
+  echo       it is only needed later for browser-based venue logins.
 )
 
 REM ---------------- start the agent (paper mode, own window) ------------------

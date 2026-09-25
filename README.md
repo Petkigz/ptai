@@ -68,6 +68,19 @@ Every 10 minutes:
 
 ## Quick Start (Local Only) - LM Studio (You)
 
+### 0. Windows: one file, that's it
+
+```bat
+run_ptai.bat
+```
+
+Double-click it. On first run it creates a clean `.venv`, installs
+dependencies, starts the trading agent in **paper mode** (no real money),
+and opens the dashboard in your browser (default port **8010** — change
+`PTAI_DASHBOARD_PORT` at the top of the file if that port is taken).
+It used to be four .bat files (setup / start / start_dashboard); there is
+now one, and it does all of them.
+
 ### 1. Install PTAI
 
 ```bash
@@ -160,8 +173,8 @@ python main.py pay-for-yourself 50 --daily-cost 5 --interval 10 --llm lm_studio
 # Status
 python main.py status
 
-# Dashboard (local, http://localhost:8000)
-python run_dashboard.py
+# Dashboard (local, http://localhost:8000 - set PTAI_DASHBOARD_PORT to move it)
+cd src && python -m ptai.dashboard
 
 # Manual trade
 python main.py trade "Will BTC hit 100k" --side YES --amount 5

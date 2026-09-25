@@ -1,5 +1,7 @@
 # BEST CONFIG FOR 32GB RAM - PTAI
 
+> **Note:** the entry point is now a single file: `run_ptai.bat` (the `setup.bat` / `start.bat` / `start_dashboard.bat` files are removed).
+
 You have 32GB RAM - this is the sweet spot for local trading agent. Here's the best possible setup.
 
 ## Best Model for 32GB RAM

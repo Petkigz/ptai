@@ -1,5 +1,7 @@
 # PTAI Completeness Check - Are we 100% done?
 
+> **Note:** the entry point is now a single file: `run_ptai.bat` (the `setup.bat` / `start.bat` / `start_dashboard.bat` files are removed).
+
 User asked: "are you 100% sure that this is it nothing more to add or nothing left"
 
 Answer: **Now yes, after adding LM Studio support and missing components.**

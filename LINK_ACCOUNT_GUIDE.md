@@ -1,5 +1,7 @@
 # How to Link Polymarket Account & Check If PTAI Is Working
 
+> **Note:** the entry point is now a single file: `run_ptai.bat` (the `setup.bat` / `start.bat` / `start_dashboard.bat` files are removed).
+
 ## PART 1: Link Your Polymarket Account
 
 ### Step 1: Create Polymarket Account (if you don't have)
