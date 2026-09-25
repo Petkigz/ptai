@@ -5713,6 +5713,9 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting PTAI Product Dashboard at http://localhost:8000")
+    # The port is an operator choice: another app on the same machine may
+    # already hold 8000. PTAI_DASHBOARD_PORT overrides, 8000 is the default.
+    _port = int(os.environ.get("PTAI_DASHBOARD_PORT", "8000"))
+    print(f"Starting PTAI Product Dashboard at http://localhost:{_port}")
     print("Product UI: Wallet linking, LLM setup, health checks, onboarding")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=_port)
