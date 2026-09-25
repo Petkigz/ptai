@@ -420,19 +420,57 @@ async def api_system_health():
         last_scan_dict = dict(last_scan) if last_scan else None
     except:
         last_scan_dict = None
+    # The agent's heartbeat: read it BEFORE the connection closes - a query
+    # on a closed connection raises, and a live agent would then read as dead.
+    try:
+        heartbeat_raw = storage.get_state("agent.heartbeat")
+    except Exception:
+        heartbeat_raw = None
     storage.close()
 
-    # Check if agent running (recent scan within 15 min)
-    agent_running = False
+    # Check if the agent is alive, from TWO kinds of evidence, because
+    # "completed a scan" and "the process is alive" are different facts:
+    #   1. a market_scans row - written by the agent after EVERY cycle
+    #      (a cycle the kill switch blocked is a row too: alive, refusing)
+    #   2. the agent.heartbeat state - written at cycle start, so a first
+    #      cycle that outlasts the window below (a slow local LLM makes that
+    #      realistic) does not look like a dead agent
+    # The window is the configured interval plus margin: a healthy agent
+    # completes a cycle every INTERVAL_MIN minutes and must not read as dead
+    # just because the gap between its scans is longer than a hard-coded 15.
+    try:
+        interval_min = int(os.environ.get("INTERVAL_MIN")
+                           or env.get("INTERVAL_MIN") or 10)
+    except (TypeError, ValueError):
+        interval_min = 10
+    live_window = max(900.0, interval_min * 60.0 + 600.0)
+
     last_scan_ago = None
     if last_scan_dict:
         try:
             ts = datetime.fromisoformat(last_scan_dict["timestamp"].replace("Z", "+00:00"))
-            ago = (datetime.now(timezone.utc) - ts).total_seconds()
-            last_scan_ago = ago
-            agent_running = ago < 900  # 15 min
+            last_scan_ago = (datetime.now(timezone.utc) - ts).total_seconds()
         except:
             pass
+
+    heartbeat_ago = None
+    heartbeat_status = None
+    try:
+        if heartbeat_raw:
+            hb = json.loads(heartbeat_raw)
+            heartbeat_status = hb.get("status")
+            hb_at = hb.get("at")
+            if hb_at:
+                hb_ts = datetime.fromisoformat(hb_at.replace("Z", "+00:00"))
+                heartbeat_ago = (datetime.now(timezone.utc) - hb_ts).total_seconds()
+    except Exception:
+        heartbeat_ago = None
+        heartbeat_status = None
+
+    agent_running = (
+        (last_scan_ago is not None and last_scan_ago < live_window)
+        or (heartbeat_ago is not None and heartbeat_ago < live_window)
+    )
 
     # Onboarding checklist
     onboarding = {
@@ -472,6 +510,8 @@ async def api_system_health():
         "last_scan": last_scan_dict,
         "last_scan_ago_seconds": last_scan_ago,
         "agent_running": agent_running,
+        "agent_heartbeat_ago_seconds": heartbeat_ago,
+        "agent_heartbeat_status": heartbeat_status,
         "onboarding": onboarding,
         "config": {
             "dry_run": env.get("DRY_RUN", "true"),
@@ -4548,7 +4588,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 // Health details
                 const details = document.getElementById('system-health-details');
                 details.innerHTML = `
-                    <div>🤖 Agent: ${data.agent_running ? '<span class="positive">Running (last scan ' + Math.round(data.last_scan_ago_seconds/60) + ' min ago)</span>' : '<span class="negative">Not running - run run_ptai.bat</span>'}</div>
+                    <div>🤖 Agent: ${data.agent_running ? '<span class="positive">Running' + (data.last_scan_ago_seconds != null ? ' (last scan ' + Math.round(data.last_scan_ago_seconds/60) + ' min ago)' : ' (first cycle in progress)') + '</span>' : '<span class="negative">Not running - run run_ptai.bat</span>'}</div>
                     <div>🧠 LLM: ${data.lm_studio.connected ? '<span class="positive">Connected - ' + data.lm_studio.models.length + ' models</span>' : '<span class="negative">Not connected</span>'} ${data.lm_studio.is_r1 ? '<span style="color: var(--red);">R1 SLOW!</span>' : ''}</div>
                     <div>🐦 X Sentiment: ${data.x_sentiment.status}</div>
                     <div>💰 Dry Run: ${data.config.dry_run === 'true' ? 'ON (testing)' : 'OFF (live trading)'}</div>
@@ -4570,7 +4610,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                     { key: 'wallet_linked', title: '4. Wallet Linked', desc: 'Go to Wallet tab, enter private key (0x...) and funder address (0x...). Keys stay local.', done: data.onboarding.wallet_linked },
                     { key: 'first_scan_done', title: '5. First Scan Done', desc: 'Run run_ptai.bat or click Run Cycle. Should scan 500 markets in 1.2s', done: data.onboarding.first_scan_done },
                     { key: 'dry_run_tested', title: '6. Dry Run Tested', desc: 'Test with DRY_RUN=true (safe, no real money). Should see "Would place order" logs and trades with dry_run status', done: data.onboarding.dry_run_tested },
-                    { key: 'agent_running', title: '7. Agent Running', desc: 'Agent runs every 10 min autonomously. Last scan should be <15 min ago. For product, keep run_ptai.bat running.', done: data.onboarding.agent_running },
+                    { key: 'agent_running', title: '7. Agent Running', desc: 'Agent runs every 10 min autonomously. A live agent records a scan (or heartbeat) each cycle, so the age stays within one interval. For product, keep run_ptai.bat running.', done: data.onboarding.agent_running },
                 ];
                 
                 stepsDiv.innerHTML = steps.map((s, i) => `

@@ -189,6 +189,11 @@ class TradingAgentV3:
         
         # Storage
         self.storage = Storage(db_path="./data/ptai.db")
+        # The bankroll is loaded here, not lazily: every cycle path (the
+        # blocked one included) reports it to the console, and a first
+        # cycle must not crash on an attribute that appears only after a
+        # settlement or redemption happens to run.
+        self.bankroll = self.storage.get_bankroll()
         self.vault = Vault()
         self.memory = Memory()
         
@@ -1054,17 +1059,27 @@ class TradingAgentV3:
         """
         start = time.time()
         logger.info("=== PTAI V3 Cycle Start: Multi-Venue × Multi-Strategy WITH Qualification Engine V8 ===")
+        # Prove the process is alive BEFORE the work starts: the first cycle
+        # can take far longer than the console's liveness window, and a cycle
+        # in progress must not look like a dead agent.
+        self._write_agent_heartbeat("cycle")
         
         # Health check - Check capital + account health
         health = await self.check_system_health()
         if not health["can_trade"]:
-            return {
+            blocked = {
                 "status": "blocked",
                 "reason": f"Kill switch L{health['kill_switch_level']}",
                 "health": health,
                 "mission": self.mission,
                 "execution_time": time.time() - start
             }
+            # A blocked agent is still a LIVE agent. The console's running
+            # indicator must not read "refused to trade" as "process died",
+            # so even a blocked cycle leaves its scan row.
+            self._record_scan_log(blocked, markets_scanned=0,
+                                  opportunities_found=0, avg_edge=0.0)
+            return blocked
         
         # Settlement - close positions whose markets have resolved.
         #
@@ -1180,7 +1195,7 @@ class TradingAgentV3:
             # "nothing to trade" - and the honest empty case is the common one
             # whenever a venue is down or unconfigured.
             empty_venues = {vid: 0 for vid in markets_by_venue} or {}
-            return {
+            no_markets_result = {
                 "status": "no_markets",
                 "reason": "No markets discovered from any venue",
                 "health": health,
@@ -1222,7 +1237,15 @@ class TradingAgentV3:
                               "evaluated. This is not a signal to hold: a venue that fails to "
                               "return markets is unavailable, not quiet."),
             }
-        
+            # A cycle that discovered nothing is still a cycle that RAN. On a
+            # fresh deployment - no venue credentials yet, or a venue down -
+            # every cycle takes this path, and without the row the console
+            # would report "Not running" and "Last Scan: Never" for an agent
+            # that is honestly trying to scan on every interval.
+            self._record_scan_log(no_markets_result, markets_scanned=0,
+                                  opportunities_found=0, avg_edge=0.0)
+            return no_markets_result
+
         # Alpha scan - all additional alpha ideas (Top 5 + queue)
         all_markets_flat = [m for markets in markets_by_venue.values() for m in markets]
         try:
@@ -1968,6 +1991,20 @@ class TradingAgentV3:
             "do_nothing_success": len(final_trades) == 0
         }
         
+        # Record the scan row the console's System Health reads ("Last Scan",
+        # "Agent: Running") and the /api/scans history is built from. Every
+        # legacy loop wrote this row; the V3 loop - the one `ptai run`
+        # actually executes - never did, so a live agent read as "Not
+        # running" and "Last Scan: Never" on the dashboard.
+        _edges = [o.effective_edge for o in (scan_result.all_opportunities or [])
+                  if getattr(o, "effective_edge", None) is not None]
+        self._record_scan_log(
+            result,
+            markets_scanned=int(scan_result.total_scanned or 0),
+            opportunities_found=int(scan_result.total_candidates or 0),
+            avg_edge=(sum(_edges) / len(_edges)) if _edges else 0.0,
+        )
+
         # .get() throughout: a cycle that returns an unexpected shape must not
         # be able to kill the loop. A long run has to survive its own reporting.
         _n_trades = (result.get("opportunities") or {}).get("final_selected", 0)
@@ -3082,6 +3119,53 @@ class TradingAgentV3:
             logger.error(f"Venue selection failed: {type(e).__name__}: {e}")
             return {"error": f"{type(e).__name__}: {e}"}
 
+    def _write_agent_heartbeat(self, status: str) -> None:
+        """
+        Leave the "the agent process is alive" mark the dashboard reads.
+
+        The console decides "running" from evidence, not faith. A completed
+        scan row is the strongest evidence, but the first cycle can take far
+        longer than the freshness window (a slow local LLM makes that worse),
+        and while the kill switch blocks, the loop completes no cycle at all.
+        So the agent ALSO leaves a heartbeat at cycle start and while
+        blocked: "alive" and "a scan has completed" are two different facts,
+        and the console must be able to tell them apart.
+        """
+        try:
+            self.storage.set_state("agent.heartbeat", json.dumps({
+                "at": datetime.now(timezone.utc).isoformat(),
+                "status": status,
+                "kill_switch_level": int(self.kill_switch.current_level),
+            }))
+        except Exception as e:
+            logger.warning(
+                f"Could not write the agent heartbeat: {type(e).__name__}: {e}")
+
+    def _record_scan_log(self, result: Dict[str, Any], *, markets_scanned: int,
+                         opportunities_found: int, avg_edge: float) -> None:
+        """
+        Write the market_scans row the console's System Health reads.
+
+        Written once per cycle - including a cycle the kill switch blocked -
+        so the dashboard's "Agent: Running" and "Last Scan" reflect what the
+        agent actually did instead of what a loop that nobody wired ever did.
+        """
+        try:
+            bankroll = getattr(self, "bankroll", None)
+            if bankroll is None:
+                bankroll = self.storage.get_bankroll()
+            self.storage.log_scan(
+                markets_scanned=markets_scanned,
+                opportunities_found=opportunities_found,
+                avg_edge=avg_edge,
+                execution_time=float(result.get("execution_time") or 0.0),
+                bankroll=float(bankroll or 0.0),
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not record the scan for the console: "
+                f"{type(e).__name__}: {e}")
+
     async def run_continuous(self, interval_minutes: int = 10):
         """Run V3 loop every 10 minutes"""
         logger.info(f"Starting PTAI V3 continuous loop every {interval_minutes} minutes")
@@ -3089,6 +3173,10 @@ class TradingAgentV3:
             try:
                 if not self.kill_switch.can_trade():
                     logger.warning(f"Kill switch L{self.kill_switch.current_level} blocks trading, sleeping")
+                    # The agent is REFUSING, not dead: keep the heartbeat
+                    # fresh while the kill switch holds the loop.
+                    self._write_agent_heartbeat(
+                        f"kill_switch_L{self.kill_switch.current_level}")
                     await asyncio.sleep(60)
                     continue
                 
