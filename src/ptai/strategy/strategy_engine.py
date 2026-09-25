@@ -67,6 +67,30 @@ class MultiVenueScanResult:
     best_opportunity: Optional[VenueOpportunity] = None
 
 
+def _slippage_from_book(orderbook, market_price: float):
+    """
+    Slippage implied by the book in front of us, or None if there is not one.
+
+    A measured number here is what lets the EV stage tell a measured cost from
+    an assumed one. Returning 0.0 for "no book" would be the same lie as the
+    old default, one level up: it would present an unmeasured cost as a measured
+    zero, and zero slippage is the most favourable assumption available.
+    """
+    if not isinstance(orderbook, dict) or not orderbook.get("is_real", False):
+        return None
+    try:
+        from ..markets.orderbook import read_depth, execution_quality_from_book
+
+        quality = execution_quality_from_book(orderbook, market_price)
+        # Execution quality is 1.0 on a deep, tight book and falls with spread
+        # and thin depth. Turned back into a cost so the same measurement drives
+        # both the opportunity score and the EV, instead of two different models.
+        return max(0.0, min(0.05, (1.0 - float(quality)) * 0.02))
+    except Exception as e:
+        logger.debug(f"Slippage could not be measured from the book: {e}")
+        return None
+
+
 def _execution_quality_from_book(orderbook, market) -> float:
     """Kept as the name this module's tests import; see the shared implementation."""
     from ..markets.orderbook import execution_quality_from_book
@@ -166,6 +190,14 @@ class StrategyEngineV3:
                     execution_quality=_execution_quality_from_book(
                         context.get("orderbook"), market),
                     category=context.get("category", "mispricing"),
+                    # What this trade will actually cost, from the venue that
+                    # will charge it and the book it will trade against. None
+                    # where neither exists, which the EV stage reports as an
+                    # assumption rather than silently costing at a default.
+                    fees_pct=context.get("fee_taker_pct"),
+                    slippage_pct=_slippage_from_book(context.get("orderbook"),
+                                                     market.best_price),
+                    order_gas_usd=context.get("order_gas_usd"),
                     sources=fv_result.forecast_result.sources if fv_result.forecast_result else ["fair_value"],
                     reasoning=fv_result.reasoning,
                     bull_case=fv_result.contradiction_report.bull_case if fv_result.contradiction_report else "",

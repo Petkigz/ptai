@@ -619,6 +619,20 @@ class TradingAgentV3:
                 orderbook = await adapter.get_orderbook(market)
                 context["orderbook"] = orderbook
                 context["orderbook_venue"] = adapter.venue_id
+                # The venue's OWN declared taker fee, carried to the stage that
+                # costs the trade. Without this the EV stage fell back to its
+                # 2% default for every venue - overcharging Manifold and Kalshi
+                # (which charge nothing) and WhiteBIT (0.1%), and hiding the
+                # difference between venues entirely.
+                try:
+                    caps_fee = getattr(adapter.capabilities, "fee_taker_pct", None)
+                    if caps_fee is not None:
+                        context["fee_taker_pct"] = float(caps_fee)
+                    caps_gas = getattr(adapter.capabilities, "order_gas_usd", None)
+                    if caps_gas is not None:
+                        context["order_gas_usd"] = float(caps_gas)
+                except Exception as e:
+                    logger.debug(f"Could not read the fee schedule for {market.id}: {e}")
                 # ALSO attached to the market, because the expected-EV stage
                 # reads `opp.market.raw["orderbook"]` and nothing ever put it
                 # there. The result was two different cost estimates for the same

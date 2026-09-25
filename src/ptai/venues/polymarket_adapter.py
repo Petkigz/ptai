@@ -52,6 +52,10 @@ class PolymarketAdapter(MarketAdapter):
             fee_taker_pct=0.02,
             fee_maker_pct=0.0,
             min_order_usd=1.0,
+            # Orders are relayed: the operator pays no gas to trade here. Gas is
+            # spent on funding the account and on redeeming a settled position,
+            # which are different operations and are costed where they happen.
+            order_gas_usd=0.0,
             # This adapter can prove order permission: it can place a
             # minimum-size order and cancel it. Declaring it is what lets
             # AccountHealthEngine reach TRADE_PERMITTED for Polymarket.

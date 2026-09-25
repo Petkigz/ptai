@@ -50,6 +50,15 @@ class AdapterCapability:
     supports_order_probe: bool = False
     supports_browser_fallback: bool = False
     fee_taker_pct: float = 0.0  # e.g. 0.02 = 2%
+    # Gas the OPERATOR pays to place one order, per the venue's own mechanism.
+    #
+    # None means unknown, and the cost model estimates it. 0.0 means placing an
+    # order does not touch the chain - which is a fact about the venue, not a
+    # hopeful zero: Polymarket relays orders, so an operator pays gas on
+    # deposits, withdrawals and redemptions but not on trades. Charging a
+    # per-trade gas constant to a venue like that is not conservatism, it is a
+    # 1.7% fiction on a $3 position, and it refuses marginal real edges.
+    order_gas_usd: Optional[float] = None
     fee_maker_pct: float = 0.0
     min_order_usd: float = 1.0
     # Which of the above are actually true. An adapter that has never issued an
@@ -83,9 +92,17 @@ class VenueOpportunity:
     liquidity_score: float = 0.5
     execution_quality: float = 0.5
     time_to_resolution_hours: Optional[float] = None
-    fees_pct: float = 0.0
-    spread_pct: float = 0.0
-    slippage_pct: float = 0.0
+    # None means NOT KNOWN; 0.0 means the venue charges nothing.
+    #
+    # These were `0.0`, which made "we never looked" and "this venue is free"
+    # the same value - and every consumer that wrote `x or 0.02` charged a
+    # fabricated 2% to venues that charge nothing at all (Manifold, Kalshi).
+    # The distinction is the whole basis of costing a trade.
+    fees_pct: Optional[float] = None
+    spread_pct: Optional[float] = None
+    slippage_pct: Optional[float] = None
+    # Gas to place this order, as the venue declares it (see AdapterCapability).
+    order_gas_usd: Optional[float] = None
     correlation_group: str = ""  # For portfolio correlation cap
     category: str = ""  # politics, sports, crypto, etc
     sources: List[str] = field(default_factory=list)
@@ -128,6 +145,11 @@ class VenueOpportunity:
         if self.data_mode == "mock":
             self.is_mock = True
 
+    @staticmethod
+    def _cost_or_default(value: Optional[float], default: float) -> float:
+        """A cost that was never measured is costed at the conservative default."""
+        return float(default) if value is None else float(value)
+
     def calculate_common_score(self) -> float:
         """
         Common score:
@@ -141,10 +163,13 @@ class VenueOpportunity:
             self.execution_quality *
             (1.0 / max(1.0, (self.time_to_resolution_hours or 24) / 24))  # time efficiency
         )
+        # An unknown cost is charged as an unknown, not as zero: treating it as
+        # zero would let a trade score well on costs nobody measured. The same
+        # default the EV engine uses, so the score and the EV agree.
         denominator = (
-            self.fees_pct +
-            self.slippage_pct +
-            self.spread_pct +
+            self._cost_or_default(self.fees_pct, 0.02) +
+            self._cost_or_default(self.slippage_pct, 0.01) +
+            self._cost_or_default(self.spread_pct, 0.02) +
             self.uncertainty +
             0.01  # avoid div0
         )
