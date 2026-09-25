@@ -336,6 +336,65 @@ class StrategyEngineV3:
             avg_score=avg_score
         ), all_opps
 
+    def price_opportunity(self, opp: VenueOpportunity,
+                          amount_usd: float = 3.0):
+        """
+        Price one opportunity and set its score to the capital-efficiency ratio.
+
+        ONE score, set in one place: NET EV / (CAPITAL x TIME x EXECUTION RISK).
+
+        This used to compute `net_ev_usd * ev_per_dollar * ev_per_risk` here
+        while `rank_and_select` computed a different five-term product, so an
+        opportunity's rank depended on which stage wrote to `score` last, and
+        neither formula let capital-time be more than a nudge.
+
+        Returns the EV result, or None when it could not be computed - an
+        opportunity whose EV cannot be priced is not a candidate, and its score
+        stays at zero rather than inheriting whatever it had.
+        """
+        orderbook = (opp.market.raw.get("orderbook", {})
+                     if hasattr(opp.market, "raw")
+                     and isinstance(opp.market.raw, dict) else {})
+        try:
+            ev = self.expected_ev_engine.calculate(opp, amount_usd, orderbook)
+        except Exception as e:
+            logger.debug(f"EV calc failed for {opp.market.id}: {e}")
+            opp._expected_ev = None
+            return None
+        opp._expected_ev = ev
+        opp.score = (ev.ev_per_capital_time_risk if ev.net_ev_usd > 0 else 0.0)
+        if isinstance(opp.market.raw, dict):
+            # Recorded beside the score so the console can show what the decision
+            # was made on, not just what it came out as.
+            opp.raw["capital_efficiency"] = {
+                "net_ev_usd": round(ev.net_ev_usd, 4),
+                "stressed_net_ev_usd": round(ev.stressed_net_ev_usd, 4),
+                "capital_days_usd": round(ev.capital_days_usd, 4),
+                "execution_risk": round(ev.execution_risk, 4),
+                "ev_per_capital_time_risk": round(
+                    ev.ev_per_capital_time_risk, 6),
+                "costs_are_measured": ev.costs_are_measured,
+            }
+        return ev
+
+    @staticmethod
+    def capital_efficiency_key(opp: VenueOpportunity) -> float:
+        """
+        The ranking key: net EV per dollar-day of locked capital per unit of
+        execution risk. Falls back to the opportunity's score, which for a
+        priced opportunity IS this number.
+        """
+        ev = getattr(opp, "_expected_ev", None)
+        if ev is not None:
+            return float(getattr(ev, "ev_per_capital_time_risk", 0.0) or 0.0)
+        return float(getattr(opp, "score", 0.0) or 0.0)
+
+    @classmethod
+    def rank_by_capital_efficiency(cls, opportunities):
+        """Rank candidates on the economic question, not on headline profit."""
+        priced = [o for o in opportunities if o is not None]
+        return sorted(priced, key=cls.capital_efficiency_key, reverse=True)
+
     async def scan_all_venues(self, markets_by_venue: Dict[str, List[Market]], context_provider=None, max_final_trades: int = 3) -> MultiVenueScanResult:
         """
         Main V3 entry: scan all venues, evaluate all strategies, rank on common basis
@@ -394,22 +453,18 @@ class StrategyEngineV3:
         # New: Σ prob×payoff − fees − spread − slippage − funding − gas − execution_loss − uncertainty_penalty
         # Then per dollar, per risk, per capital-time
         for opp in all_opportunities:
-            try:
-                ev = self.expected_ev_engine.calculate(opp, amount_usd=3.0, orderbook=opp.market.raw.get("orderbook", {}) if hasattr(opp.market, 'raw') and isinstance(opp.market.raw, dict) else {})
-                opp._expected_ev = ev
-                # Update score to be economically meaningful
-                opp.score = ev.net_ev_usd * ev.ev_per_dollar * ev.ev_per_risk if ev.net_ev_usd > 0 else 0
-            except Exception as e:
-                logger.debug(f"EV calc failed for {opp.market.id}: {e}")
-                opp._expected_ev = None
+            self.price_opportunity(opp, amount_usd=3.0)
         
-        # Rank by net EV first, then by old score
+        # Rank on the capital-efficiency ratio: net EV per dollar-day of locked
+        # capital per unit of execution risk. This used to sort on net_ev_usd
+        # FIRST, which is how a thirty-day trade with a big headline profit
+        # outranked an hourly one earning several times as much per day of
+        # capital - the comparison the seventh report is about.
         if self.venue_registry:
             ranked = self.venue_registry.rank_opportunities(all_opportunities)
-            # Re-rank by expected net EV where available
-            ranked = sorted(ranked, key=lambda x: (getattr(x, '_expected_ev', None).net_ev_usd if hasattr(x, '_expected_ev') and x._expected_ev else 0, x.score), reverse=True)
         else:
-            ranked = sorted(all_opportunities, key=lambda x: (getattr(x, '_expected_ev', None).net_ev_usd if hasattr(x, '_expected_ev') and x._expected_ev else 0, x.score), reverse=True)
+            ranked = list(all_opportunities)
+        ranked = self.rank_by_capital_efficiency(ranked)
         
         # Filter to tradeable - now also requires net EV >0.
         #

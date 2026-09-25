@@ -431,21 +431,70 @@ class OpportunityEngine:
         logger.info(f"Ensemble filter: {len(researched)} -> {len(filtered)} opportunities | venue_id immutable validated")
         return filtered
 
-    def rank_and_select(self, opportunities: List[VenueOpportunity], max_trades: int = 3, bankroll: float = 50.0, current_positions: List[Dict] = None) -> List[VenueOpportunity]:
+    def rank_and_select(self, opportunities: List[VenueOpportunity], max_trades: int = 3, bankroll: float = 50.0, current_positions: List[Dict] = None, context: Dict = None) -> List[VenueOpportunity]:
         if not opportunities:
             return []
         
         current_positions = current_positions or []
+        # The alpha signals were wired into this ranking and could never fire:
+        # `context` was not a parameter of this method, so every call raised
+        # NameError into a bare `except`, logged a warning, and left the ranking
+        # exactly as it was. Alpha was "applied" for rounds without moving
+        # anything.
+        alpha_context = context if isinstance(context, dict) else {}
         
         if self.venue_registry:
             ranked = self.venue_registry.rank_opportunities(opportunities)
         else:
             ranked = sorted(opportunities, key=lambda x: x.score, reverse=True)
         
+        # THE ORDER THAT DECIDES WHAT IS EVEN CONSIDERED.
+        #
+        # `ranked` arrives ordered by whatever score the opportunity carried
+        # BEFORE its EV was computed, and the loop below stops at `max_trades`.
+        # So the capital-efficiency ratio could only ever reorder the
+        # candidates that the OLD ordering had already let through the cut: a
+        # trade locking up $3 for thirty days with a 24% edge was admitted, and
+        # one earning more per dollar-day at 3.9x its efficiency was never
+        # looked at. The measure has to order the candidates before the cut for
+        # it to be the decision variable rather than a tiebreak.
+        #
+        # The EV is computed once here and reused by the gates below, so the
+        # number that ordered the list is the same number that was judged.
+        prepared = []
+        for opp in ranked:
+            orderbook = (opp.market.raw.get("orderbook", {})
+                         if hasattr(opp.market, "raw") and isinstance(opp.market.raw, dict)
+                         else {})
+            amount_usd = min(bankroll * 0.06, 3.0)
+            try:
+                ev_result = self.expected_ev_engine.calculate(opp, amount_usd, orderbook)
+            except Exception as e:
+                logger.error(f"EV could not be computed for {opp.market.id} "
+                             f"({type(e).__name__}: {e}); it is not a candidate")
+                continue
+            opp._expected_ev = ev_result
+            # Recorded for EVERY candidate, not only the ones that survive the
+            # gates: "why was this trade not taken" is answerable only if the
+            # number that ranked it was written down before the decision.
+            opp.raw["capital_efficiency"] = {
+                "net_ev_usd": round(ev_result.net_ev_usd, 4),
+                "stressed_net_ev_usd": round(ev_result.stressed_net_ev_usd, 4),
+                "capital_days_usd": round(ev_result.capital_days_usd, 4),
+                "execution_risk": round(ev_result.execution_risk, 4),
+                "ev_per_capital_time_risk": round(
+                    ev_result.ev_per_capital_time_risk, 6),
+                "costs_are_measured": ev_result.costs_are_measured,
+            }
+            prepared.append((opp, ev_result))
+
+        prepared.sort(
+            key=lambda pair: pair[1].ev_per_capital_time_risk, reverse=True)
+
         selected = []
         total_allocated = sum(p.get("amount_usd", 0) for p in current_positions)
         
-        for opp in ranked:
+        for opp, ev_result in prepared:
             if len(selected) >= max_trades:
                 break
 
@@ -488,9 +537,9 @@ class OpportunityEngine:
                 continue
             
             amount_usd = min(bankroll * 0.06, 3.0)
-            # V10 FIX #9: Use Expected Net EV engine for economically meaningful scoring
-            orderbook = opp.market.raw.get("orderbook", {}) if hasattr(opp.market, 'raw') and isinstance(opp.market.raw, dict) else {}
-            ev_result = self.expected_ev_engine.calculate(opp, amount_usd, orderbook)
+            orderbook = (opp.market.raw.get("orderbook", {})
+                         if hasattr(opp.market, "raw") and isinstance(opp.market.raw, dict)
+                         else {})
             
             # The old edge-minus-fees scoring used to be computed here "for
             # comparison" and then never compared: `risk_adjusted_ev` was
@@ -525,17 +574,30 @@ class OpportunityEngine:
                 logger.info(f"Total exposure would exceed 50%: allocated ${total_allocated:.2f} + new ${amount_usd:.2f} > ${bankroll*0.5:.2f} max, skip {opp.market.id}")
                 continue
             
-            time_efficiency = 1.0
-            if opp.time_to_resolution_hours:
-                if opp.time_to_resolution_hours < 24:
-                    time_efficiency = 1.2
-                elif opp.time_to_resolution_hours > 720:
-                    time_efficiency = 0.7
-            
-            # V10 FIX #9: Final score now economically meaningful: net EV per dollar per risk per capital-time
-            final_score = ev_result.net_ev_usd * ev_result.ev_per_dollar * liquidity_score * opp.execution_quality * time_efficiency * ev_result.ev_per_risk / max(0.01, opp.uncertainty)
-            # Also incorporate capital efficiency
-            final_score *= (1 + ev_result.ev_per_capital_time)
+            # THE DOMINANT TERM: NET EV / (CAPITAL x TIME x EXECUTION RISK).
+            #
+            # The score this replaces was a product of five terms -
+            # net_ev x ev_per_dollar x liquidity x quality x time_efficiency x
+            # ev_per_risk / uncertainty - and then multiplied by
+            # (1 + ev_per_capital_time), which is how a term that ranges over
+            # "one hour" and "one month" became a 20% bonus on the end of it.
+            # It also counted the same things several times: net_ev twice,
+            # execution quality twice (once directly and once through
+            # ev_per_risk), uncertainty twice. A ranking whose factors are
+            # redundant is a ranking you cannot argue with.
+            #
+            # This is one ratio, and it is the whole economic question: what does
+            # a dollar of capital earn per day it is locked up, per unit of risk
+            # that the fill this assumes will not happen. It uses the STRESSED
+            # net EV when a cost had to be assumed, so an opportunity is ranked
+            # on what it earns if its guesses are wrong.
+            #
+            # The factors below only discount it. None of them can substitute for
+            # it: a book that cannot absorb the order cannot reach the EV, and
+            # alpha the model has that the ratio does not belong to the model.
+            final_score = ev_result.ev_per_capital_time_risk * liquidity_score
+            opp.raw["capital_efficiency"]["score_before_alpha"] = round(
+                final_score, 6)
 
             # Alpha adjustment. This was dead code for the whole life of the
             # project: calculate_alpha_adjusted_score existed but nothing in
@@ -547,7 +609,7 @@ class OpportunityEngine:
             if self.alpha_engine is not None:
                 try:
                     adjustment = self.alpha_engine.calculate_alpha_adjustment(
-                        opp.market, side=opp.side, context=context)
+                        opp.market, side=opp.side, context=alpha_context)
                     final_score *= adjustment.multiplier
                     opp.raw["alpha_adjustment"] = {
                         "multiplier": adjustment.multiplier,
@@ -562,12 +624,19 @@ class OpportunityEngine:
 
             opp.score = final_score
             
-            logger.info(f"Selected {opp.market.id} venue {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} liq {liquidity_score:.2f} exec {opp.execution_quality:.2f} netEV ${ev_result.net_ev_usd:.2f} ({ev_result.net_ev_pct*100:.1f}%) per$ {ev_result.ev_per_dollar*100:.1f}% perRisk {ev_result.ev_per_risk:.2f} final_score {final_score:.3f} - V10 FIX #9 Expected Net EV | venue_id immutable {opp.venue_id}")
+            logger.info(f"Selected {opp.market.id} venue {opp.venue_id} edge {opp.effective_edge*100:.1f}% conf {opp.confidence:.2f} liq {liquidity_score:.2f} exec {opp.execution_quality:.2f} netEV ${ev_result.net_ev_usd:.2f} ({ev_result.net_ev_pct*100:.1f}%) capital_efficiency ${ev_result.ev_per_capital_time_risk*100:.4f}/$100-day-risk on {ev_result.capital_days_usd:.1f} capital-days final_score {final_score:.5f} | venue_id immutable {opp.venue_id}")
             
             selected.append(opp)
             total_allocated += amount_usd
         
-        selected = sorted(selected, key=lambda x: x.score, reverse=True)
+        # The score already IS this ratio (times bounded discounts), so this
+        # sort is by capital efficiency - stated explicitly so that a later
+        # change to the composite cannot quietly reorder the deployment order.
+        selected = sorted(
+            selected,
+            key=lambda x: getattr(getattr(x, "_expected_ev", None),
+                                  "ev_per_capital_time_risk", 0.0),
+            reverse=True)
         
         logger.info(f"Final selection: {len(opportunities)} -> {len(selected)} trades (max {max_trades}) | Total allocated ${total_allocated:.2f}/{bankroll*0.5:.2f} max | venue_id immutable validated")
         return selected

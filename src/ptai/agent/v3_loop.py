@@ -2124,7 +2124,14 @@ class TradingAgentV3:
                     "edge": scan_result.best_opportunity.effective_edge if scan_result.best_opportunity else 0,
                     "score": scan_result.best_opportunity.score if scan_result.best_opportunity else 0,
                     "side": scan_result.best_opportunity.side if scan_result.best_opportunity else None,
-                    "reasoning": scan_result.best_opportunity.reasoning[:200] if scan_result.best_opportunity else "No edge found - DO NOTHING is successful"
+                    "reasoning": scan_result.best_opportunity.reasoning[:200] if scan_result.best_opportunity else "No edge found - DO NOTHING is successful",
+                    # The number the choice was actually made on: NET EV per
+                    # dollar-day of locked capital per unit of execution risk,
+                    # with the denominator kept so the figure can be argued
+                    # with rather than just believed.
+                    "capital_efficiency": (
+                        (scan_result.best_opportunity.raw or {}).get("capital_efficiency")
+                        if scan_result.best_opportunity else None),
                 }
             },
             "alpha": alpha_results,
@@ -2184,6 +2191,7 @@ class TradingAgentV3:
                 "candidates": scan_result.total_candidates,
                 "qualified_venues": list(qualified_venue_ids),
                 "decided": {
+                    "capital_efficiency": best.get("capital_efficiency"),
                     "venue": best.get("venue"),
                     "strategy": best.get("strategy"),
                     "question": best.get("question"),

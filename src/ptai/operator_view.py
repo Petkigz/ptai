@@ -447,6 +447,20 @@ def describe_snapshot(snapshot: Dict[str, Any]) -> List[str]:
             + (f", {orders.get('blocked_live_capital')} blocked by the live "
                f"capital boundary ({orders.get('blocked_reason')})"
                if orders.get("blocked_live_capital") else ""))
+        decided = cycle.get("decided") or {}
+        efficiency = decided.get("capital_efficiency")
+        if isinstance(efficiency, dict):
+            ratio = efficiency.get("ev_per_capital_time_risk")
+            if ratio is not None:
+                assumed = efficiency.get("stressed_net_ev_usd") != \
+                    efficiency.get("net_ev_usd")
+                lines.append(
+                    f"  capital efficiency: ${float(ratio) * 100:.4f} of net EV "
+                    f"per $100 per day locked up per unit of execution risk "
+                    f"({efficiency.get('capital_days_usd', 0.0):.1f} capital-days"
+                    + (", ranked on the STRESSED EV because a cost was assumed"
+                       if assumed else ", on measured costs")
+                    + ") - this is the number it ranks on")
         if cycle.get("why"):
             lines.append(f"  why: {cycle['why']}")
     else:

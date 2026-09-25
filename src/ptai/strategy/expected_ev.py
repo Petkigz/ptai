@@ -27,12 +27,29 @@ class ExpectedEVResult:
     net_ev_pct: float  # Net return %
     ev_per_dollar: float  # Net EV per dollar invested
     ev_per_risk: float  # Net EV per unit risk
-    ev_per_capital_time: float  # Net EV per dollar per hour
+    ev_per_capital_time: float  # Net EV per dollar per day
+    # NET EV / (CAPITAL x TIME x EXECUTION RISK) - the dominant economic
+    # decision variable, as one number.
+    #
+    # The score used to be a product of five terms of which capital-time was a
+    # 1+x multiplier on the end: an opportunity that tied up $3 for a month and
+    # one that tied it up for an hour differ by 700x in what the capital could
+    # have done instead, and a multiplier cannot express that. Here the dollar-days
+    # of locked capital ARE the denominator.
+    #
+    # Units: net dollars per dollar-day, per unit of risk. It is a RANKING
+    # measure - the divisor is a risk weight in (0, 1], not a probability - so
+    # compare it, do not read it as a return.
+    ev_per_capital_time_risk: float
     fees_usd: float
     spread_usd: float
     slippage_usd: float
     gas_usd: float
     uncertainty_penalty_usd: float
+    # The denominator, kept explicitly: dollar-days of capital at risk, and the
+    # risk weight that divides the ratio.
+    capital_days_usd: float
+    execution_risk: float
     execution_loss_usd: float
     funding_usd: float
     reasoning: str
@@ -88,6 +105,9 @@ class ExpectedEVResult:
             "ev_per_dollar": round(self.ev_per_dollar, 4),
             "ev_per_risk": round(self.ev_per_risk, 4),
             "ev_per_capital_time": round(self.ev_per_capital_time, 6),
+            "ev_per_capital_time_risk": round(self.ev_per_capital_time_risk, 6),
+            "capital_days_usd": round(self.capital_days_usd, 6),
+            "execution_risk": round(self.execution_risk, 4),
             "fees_usd": round(self.fees_usd, 4),
             "spread_usd": round(self.spread_usd, 4),
             "slippage_usd": round(self.slippage_usd, 4),
@@ -303,10 +323,10 @@ class ExpectedNetEVEngine:
         ev_per_dollar = net_ev_pct  # net return per dollar
         ev_per_risk = net_ev_usd / max(0.01, uncertainty * amount_usd)  # per unit risk
         
-        # Capital-time: per dollar per hour
+        # Capital-time: per dollar per day
         hours = opportunity.time_to_resolution_hours or 24
         ev_per_capital_time = net_ev_usd / max(1, amount_usd * hours) * 24  # per dollar per day
-        
+
         # The >8% hunt criterion is a MISPRICING threshold, so it is measured on
         # the RAW edge. Applying it to the effective edge charges every cost
         # twice: once when the costs push the edge back under 8%, and again in
@@ -338,6 +358,27 @@ class ExpectedNetEVEngine:
             if assumed_cost_usd > 0 else net_ev_usd
         )
 
+        # NET EV / (CAPITAL x TIME x EXECUTION RISK).
+        #
+        # Capital x time is the dollar-days the position locks up - the real
+        # opportunity cost of choosing this trade over the next one, and of
+        # choosing it at all when DO NOTHING is free. Execution risk is what is
+        # still uncertain about GETTING the fill that was modelled: the model's
+        # own uncertainty plus how far the execution quality is from perfect,
+        # floored so one very good execution number cannot divide the ranking by
+        # almost nothing.
+        #
+        # Uses the STRESSED net EV when any cost was assumed - a trade that only
+        # looks efficient because a cost was guessed must be ranked on what it
+        # earns if the guess is wrong, which is the whole point of measuring it.
+        _ratio_ev = stressed_net_ev_usd if assumed_cost_usd > 0 else net_ev_usd
+        capital_days_usd = max(amount_usd, 0.0) * max(hours, 1.0) / 24.0
+        _exec_risk = (float(uncertainty or 0.0)
+                      + max(0.0, 1.0 - float(execution_quality or 0.0)))
+        execution_risk = min(1.0, max(0.05, _exec_risk))
+        ev_per_capital_time_risk = (
+            _ratio_ev / max(1e-6, capital_days_usd * execution_risk))
+        
         # Should trade if net EV >0 and meets thresholds
         should_trade = (
             net_ev_usd > 0 and
@@ -353,6 +394,8 @@ class ExpectedNetEVEngine:
             f"Costs: fees ${fees_usd:.2f} ({fee_pct*100:.1f}%) spread ${spread_usd:.2f} ({spread_pct*100:.1f}%) slippage ${slippage_usd:.2f} ({slippage_pct*100:.1f}%) "
             f"gas ${gas_usd:.2f} funding ${funding_usd:.2f} exec_loss ${execution_loss_usd:.2f} unc_penalty ${uncertainty_penalty_usd:.2f} = total ${total_costs:.2f} | "
             f"Net EV ${net_ev_usd:.2f} ({net_ev_pct*100:.1f}%) per $ {ev_per_dollar*100:.1f}% per risk {ev_per_risk:.2f} per $/day {ev_per_capital_time*100:.2f}% | "
+            f"capital efficiency ${ev_per_capital_time_risk*100:.4f} per $100-day per unit risk "
+            f"({capital_days_usd:.1f} capital-days at risk weight {execution_risk:.2f}) | "
             f"Cost provenance: {', '.join(f'{k}={v}' for k, v in provenance.items())} | "
             f"Assumed ${assumed_cost_usd:.2f} of ${total_costs:.2f} total "
             f"({', '.join(assumed) if assumed else 'nothing assumed'}) - "
@@ -371,6 +414,9 @@ class ExpectedNetEVEngine:
             ev_per_dollar=ev_per_dollar,
             ev_per_risk=ev_per_risk,
             ev_per_capital_time=ev_per_capital_time,
+            ev_per_capital_time_risk=ev_per_capital_time_risk,
+            capital_days_usd=capital_days_usd,
+            execution_risk=execution_risk,
             fees_usd=fees_usd,
             spread_usd=spread_usd,
             slippage_usd=slippage_usd,
