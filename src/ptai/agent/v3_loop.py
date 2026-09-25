@@ -121,7 +121,7 @@ from ..execution.multi_venue_executor import MultiVenueExecutor
 from ..execution.account_health import AccountHealthEngine
 from ..execution.settlement import SettlementEngine
 from ..execution.position_ledger import PositionLedgerBuilder
-from ..strategy.expected_ev import ExpectedNetEVEngine
+from ..strategy.expected_ev import ExpectedNetEVEngine, executable_net_ev
 
 from ..learning.calibration_db import CalibrationDB
 from ..learning.trade_outcomes import TradeOutcomeTracker
@@ -1990,6 +1990,30 @@ class TradingAgentV3:
                         # qualification gate refuses a sample that is mostly
                         # priced against an assumed book, and it can only do
                         # that if the label reaches the outcome row.
+                        # THE SAME EV, REPRICED AT THE FILL THAT HAPPENED.
+                        #
+                        # `expected_net_ev` above is the prediction, made at the
+                        # price the book showed when the opportunity was found.
+                        # These are that quantity recomputed at the price the
+                        # order actually paid and the fees it actually incurred,
+                        # so the qualification gate can judge what the fills were
+                        # worth instead of trusting a model of execution. The
+                        # slippage is already inside `filled_price` - the ladder
+                        # walk is how the order got there - so it is not
+                        # deducted a second time here.
+                        **self._executable_ev_fields(
+                            opp=opp,
+                            exec_result=exec_result,
+                            # Read from THIS opportunity, never from a local:
+                            # `expected_ev` belongs to the sizing loop and on the
+                            # exploration path it is never assigned, so passing
+                            # it raises UnboundLocalError inside the record call
+                            # and the whole outcome - score, costs, forecast and
+                            # all - is lost. Reading it here rather than the
+                            # local is what stopped that happening before.
+                            modelled=getattr(opp, "_expected_ev", None),
+                            amount_usd=amount_usd,
+                        ),
                         book_source=(
                             (getattr(exec_result, "paper_fill", None) or {})
                             .get("book_source")
@@ -2431,6 +2455,64 @@ class TradingAgentV3:
             return False, f"execution_quality {opp.execution_quality:.2f} < 0.3"
         return True, (f"mispricing {mispricing*100:.1f}% effective "
                       f"{opp.effective_edge*100:.1f}% conf {opp.confidence:.2f}")
+
+    @staticmethod
+    def _executable_ev_fields(opp, exec_result, modelled,
+                              amount_usd: float) -> dict:
+        """
+        The executable-EV columns for one outcome row, or an empty dict.
+
+        Empty is a deliberate outcome: a trade that never filled has no fill to
+        reprice at, and the columns stay NULL so the gate reads "not measured"
+        rather than a zero that looks like a break-even execution.
+        """
+        filled_usd = getattr(exec_result, "filled_usd", None)
+        filled_price = getattr(exec_result, "filled_price", None)
+        if not filled_usd or not filled_price:
+            return {}
+
+        modelled_pct = getattr(modelled, "net_ev_pct", None)
+        # The price the DECISION was made at, in the same token space as the
+        # fill, so `fill_price_vs_modelled` compares like with like. A NO
+        # position models the NO token; the venue reports the NO price.
+        modelled_price = None
+        try:
+            if str(getattr(opp, "side", "YES")).upper() == "YES":
+                modelled_price = float(opp.market_price)
+            else:
+                modelled_price = 1.0 - float(opp.market_price)
+        except (TypeError, ValueError):
+            modelled_price = None
+
+        try:
+            result = executable_net_ev(
+                opportunity=opp,
+                filled_usd=float(filled_usd),
+                filled_price=float(filled_price),
+                fees_usd=float(getattr(exec_result, "fees_usd", 0.0) or 0.0),
+                gas_usd=float(getattr(exec_result, "gas_usd", 0.0) or 0.0),
+                modelled_net_ev_pct=modelled_pct,
+                modelled_price=modelled_price,
+            )
+        except Exception as e:
+            # An unpriceable fill must not cost the whole learning record - the
+            # outcome row is worth more than these four columns, and a lost row
+            # teaches nothing. The columns stay NULL, which the gate reads as
+            # "not measured" and fails closed on, and the failure is logged
+            # rather than swallowed.
+            logger.error(
+                f"Could not reprice {getattr(opp, 'market_id', 'unknown')} at "
+                f"its fill ({type(e).__name__}: {e}); the outcome is recorded "
+                f"WITHOUT an executable EV, and the qualification gate will "
+                f"treat it as unmeasured")
+            return {}
+        if result is None:
+            return {}
+        return {
+            "executable_net_ev": result.net_ev_usd,
+            "executable_net_ev_pct": result.net_ev_pct,
+            "fill_price_vs_modelled": result.price_paid_vs_modelled,
+        }
 
     @staticmethod
     def _execution_quality(exec_result) -> Optional[float]:

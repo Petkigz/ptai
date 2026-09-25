@@ -91,7 +91,14 @@ def _record(storage, tracker, venue, n, *, win_prob, forecast, win_pnl, loss_pnl
             # The book the paper run walked. Passed the way the loop passes it
             # from the fill: without it the gate treats every one of these
             # trades as unpriced evidence, which is asserted separately below.
-            book_source="ladder")
+            book_source="ladder",
+            # ...and what the trade was worth AT ITS FILL. The gate judges the
+            # executable EV, not the prediction, so a fixture that records only
+            # the prediction is describing a system that never ran.
+            executable_net_ev_pct=(pnl / 3.0),
+            executable_net_ev=(pnl,),
+            # The fill landed at the price the decision was made at.
+            fill_price_vs_modelled=0.0)
         tracker.record_resolution(str(tid), actual_outcome=1.0 if won else 0.0,
                                   pnl=pnl)
         if won:

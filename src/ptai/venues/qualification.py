@@ -17,7 +17,7 @@ Now includes:
 Not just win rate
 """
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loguru import logger
 from datetime import datetime, timezone
 import json
@@ -60,7 +60,15 @@ class QualificationResult:
     ev_source: str = ""
     real_evidence_coverage: float = 0.0
     ev_bias: Optional[float] = None
+    executable_value: Optional[float] = None
+    executable_value_coverage: float = 0.0
+    fill_price_vs_modelled: Optional[float] = None
     ev_coverage: float = 0.0
+    # Every bar, pass or fail, by name. The reasoning line says the same thing
+    # in prose, but an operator - or the console - asking WHICH bar refused a
+    # venue should not have to parse a sentence, and a test asserting "the fill
+    # price check refused this" must not be able to pass on a different check.
+    checks: Dict[str, bool] = field(default_factory=dict)
 
 class VenueQualificationEngine:
     """
@@ -109,6 +117,27 @@ class VenueQualificationEngine:
             # zero times, and the simulation's own arithmetic is what would have
             # qualified it.
             "min_real_evidence_coverage": 0.5,
+            # THE EXECUTABLE EV, which is what "profitable" actually means.
+            #
+            # `min_ev` judges the mean PREDICTION. A prediction is a model of
+            # execution, computed at the price the book showed when the
+            # opportunity was found - and a venue whose orders fill worse than
+            # that on every trade passes `min_ev` while losing the difference.
+            # This check judges the same EV recomputed at the price each order
+            # actually paid and the fees it actually incurred. Same bar as the
+            # prediction claims to clear, because that is the claim being tested.
+            "min_executable_ev": 0.01,
+            "min_executable_ev_coverage": 0.5,
+            # ...and WHERE THE FILLS LANDED against the prices the decisions
+            # were made at. Positive means paid more than modelled.
+            #
+            # This is the realized execution performance, in price units, with
+            # no risk penalty and no forecast luck in it: either the venue fills
+            # at the prices the agent models, or it does not. A venue that fills
+            # 2% above the price its EV was computed at has lost 2% of the stake
+            # on every trade, which on a 1-3% net-EV bar is the whole edge.
+            # Fails closed when unmeasured.
+            "max_fill_price_penalty": 0.01,
             "min_sample_size": 100,
             "max_fees_pct": 0.05,  # fees <5% of profit
         }
@@ -122,7 +151,7 @@ class VenueQualificationEngine:
                         if qual_data.get("qualification_date"):
                             qual_data["qualification_date"] = datetime.fromisoformat(qual_data["qualification_date"])
                         # Handle old format without new fields
-                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage", "real_evidence_coverage"]:
+                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage", "real_evidence_coverage", "executable_value_coverage"]:
                             if field not in qual_data:
                                 qual_data[field] = 0.0
                         self.qualifications[venue_id] = QualificationResult(**qual_data)
@@ -165,6 +194,9 @@ class VenueQualificationEngine:
                     "ev_coverage": qual.ev_coverage,
                     "real_evidence_coverage": qual.real_evidence_coverage,
                     "ev_bias": qual.ev_bias,
+                    "executable_value": qual.executable_value,
+                    "executable_value_coverage": qual.executable_value_coverage,
+                    "fill_price_vs_modelled": qual.fill_price_vs_modelled,
                 }
             with open(self.qualification_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -237,6 +269,13 @@ class VenueQualificationEngine:
             performance_stats.get("real_evidence_samples") or 0)
         ev_bias = performance_stats.get("ev_bias")
         ev_bias_samples = int(performance_stats.get("ev_bias_samples") or 0)
+        executable_value = performance_stats.get("executable_value")
+        executable_samples = int(
+            performance_stats.get("executable_value_samples") or 0)
+        executable_coverage = float(
+            performance_stats.get("executable_value_coverage") or 0.0)
+        fill_price_vs_modelled = performance_stats.get("fill_price_vs_modelled")
+        price_paid_samples = int(performance_stats.get("price_paid_samples") or 0)
         quality_coverage = float(
             performance_stats.get("execution_quality_coverage") or 0.0)
         skill = performance_stats.get("forecast_skill", 0.5)
@@ -282,6 +321,21 @@ class VenueQualificationEngine:
             "ev_bias_within_bar": (
                 ev_bias is not None and ev_bias_samples > 0
                 and ev_bias >= -self.requirements["min_expected_value"]),
+            # The EV the fills actually had, on its own coverage. Fails closed
+            # with none: a venue whose trades were never repriced at their fills
+            # has not shown that its edge survives execution.
+            "min_executable_ev": (
+                executable_samples > 0
+                and executable_coverage >= self.requirements["min_executable_ev_coverage"]
+                and executable_value is not None
+                and float(executable_value) >= self.requirements["min_executable_ev"]),
+            # The fills must land where the agent modelled them. Fails closed
+            # when no fill was ever compared with the price its decision was made
+            # at - an unmeasured execution is not a good one.
+            "fills_at_modelled_price": (
+                fill_price_vs_modelled is not None and price_paid_samples > 0
+                and float(fill_price_vs_modelled)
+                <= self.requirements["max_fill_price_penalty"]),
             "min_execution": (execution_quality >= self.requirements["min_execution_quality"]
                               and min(cost_coverage, quality_coverage)
                               >= self.requirements["min_cost_coverage"]),
@@ -303,6 +357,16 @@ class VenueQualificationEngine:
             f"{('%+.2f%%' % (ev_bias * 100)) if ev_bias is not None else 'unmeasured'} "
             f">= -{self.requirements['min_expected_value']*100:.1f}% over "
             f"{ev_bias_samples} predicted/realised pair(s)? {checks['ev_bias_within_bar']} | "
+            f"EXECUTABLE net EV "
+            f"{('%+.2f%%' % (float(executable_value)*100)) if executable_value is not None else 'unmeasured'} "
+            f">= {self.requirements['min_executable_ev']*100:.1f}% on >= "
+            f"{self.requirements['min_executable_ev_coverage']*100:.0f}% of trades? "
+            f"{checks['min_executable_ev']} (over {executable_samples}/{total}, "
+            f"{executable_coverage*100:.0f}% coverage) | "
+            f"fills at the modelled price: paid "
+            f"{('%+.2f%%' % (float(fill_price_vs_modelled)*100)) if fill_price_vs_modelled is not None else 'unmeasured'} "
+            f"against it, <= {self.requirements['max_fill_price_penalty']*100:.1f}% over "
+            f"{price_paid_samples} priced fill(s)? {checks['fills_at_modelled_price']} | "
             f"profit_factor {profit_factor:.2f} >= {self.requirements['min_profit_factor']}? {checks['min_profit_factor']} | "
             f"brier {brier:.3f} <= {self.requirements['max_brier']}? {checks['max_brier']} | "
             f"log_loss {log_loss:.3f} <= {self.requirements['max_log_loss']}? {checks['max_log_loss']} | "
@@ -335,6 +399,7 @@ class VenueQualificationEngine:
             qualification_date=datetime.now(timezone.utc) if is_qualified else None,
             requirements=self.requirements,
             reasoning=reasoning,
+            checks=dict(checks),
             net_pnl=net_pnl,
             expected_value=expected_value,
             fees_total=fees_total,
@@ -349,6 +414,9 @@ class VenueQualificationEngine:
             ev_coverage=ev_coverage,
             real_evidence_coverage=real_evidence_coverage,
             ev_bias=ev_bias,
+            executable_value=executable_value,
+            executable_value_coverage=executable_coverage,
+            fill_price_vs_modelled=fill_price_vs_modelled,
         )
 
         self.qualifications[venue_id] = result

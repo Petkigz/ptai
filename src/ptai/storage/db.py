@@ -340,6 +340,18 @@ class Storage:
         # Gas charged on THIS fill, separate from the venue's fee, so the cost
         # of a trade in the outcome log is the cost it actually incurred.
         ("trade_outcomes", "gas_usd", "REAL"),
+        # WHAT THE TRADE WAS WORTH AT THE FILL IT GOT.
+        #
+        # `expected_net_ev_pct` is the prediction, made at the price the book
+        # showed when the opportunity was discovered - a model of execution.
+        # These are the same quantity recomputed at the price the order actually
+        # paid and the fees it actually incurred. The difference between them is
+        # the execution gap, and it contains no forecast luck: a venue whose
+        # orders consistently fill worse than modelled passes every EV threshold
+        # ever written while losing exactly that amount on every trade.
+        ("trade_outcomes", "executable_net_ev", "REAL"),
+        ("trade_outcomes", "executable_net_ev_pct", "REAL"),
+        ("trade_outcomes", "fill_price_vs_modelled", "REAL"),
     )
 
     def _migrate(self):

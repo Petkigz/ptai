@@ -19,6 +19,160 @@ from ..venues.adapter import VenueOpportunity
 from ..markets.orderbook import read_spread
 from .edge import HUNT_MISPRICING_MIN, hunted_mispricing
 
+def gross_ev_at_price(side: str, fair_prob: float, entry_price: float,
+                      amount_usd: float) -> float:
+    """
+    Expected gross profit of a binary position entered at `entry_price`.
+
+    ONE definition, used both for the decision (priced at the market price the
+    opportunity was discovered at) and for the fill (priced at the price that
+    was actually paid). Two copies of this formula would eventually disagree,
+    and the difference between them is exactly the number qualification now
+    measures - the execution gap - so it must not be an artefact of the algebra.
+
+    `entry_price` is the price of the TOKEN being bought: the YES price for a
+    YES side, the NO price for a NO side.
+    """
+    price = float(entry_price or 0.0)
+    side_const = str(side or "YES").upper()
+    if side_const != "YES":
+        # The NO token's own price. The caller passes it in token space, so a
+        # NO priced at 0.30 is entered at 0.30 - not re-derived from a YES price
+        # that may itself have moved.
+        pass
+    if price <= 0:
+        return 0.0
+    fair_of_this_token = (float(fair_prob) if side_const == "YES"
+                          else 1.0 - float(fair_prob))
+    profit_if_win = amount_usd * (1 - price) / price
+    loss_if_lose = -amount_usd
+    return (fair_of_this_token * profit_if_win
+            + (1 - fair_of_this_token) * loss_if_lose)
+
+
+@dataclass
+class ExecutableEV:
+    """
+    What this trade's net EV was, given the fill it ACTUALLY got.
+
+    The distinction the seventh report is after: an EV computed at the price the
+    book showed when the opportunity was discovered is a model of execution. An
+    EV computed at the price the order actually paid, minus the fees it actually
+    incurred, is the number the trade really had - and the difference between
+    the two is pure execution, with no forecast luck in it.
+
+    WHY THERE IS NO "GAP" NUMBER HERE.
+
+    Subtracting the model's net EV from this one looks like it would isolate
+    execution, and it does not: the model's net EV also deducts an uncertainty
+    penalty and an execution-loss penalty, which are deliberate conservatism
+    rather than cash, and their size depends on how uncertain the agent felt
+    that day. A difference that absorbs the risk penalty would move when the
+    agent's confidence moved, and nobody could say what it measured.
+
+    What is unambiguous is the PRICE: what was paid, against the price the
+    decision was made at. That is `price_paid_vs_modelled`, in price units, and
+    it is what tells you whether this venue fills at the prices the agent
+    models. The EV consequence of that price is `net_ev_pct`, which the gate
+    judges directly.
+    """
+
+    amount_usd: float            # capital actually committed (not requested)
+    entry_price: float           # price actually paid, in token space
+    gross_ev_usd: float
+    fees_usd: float
+    gas_usd: float
+    net_ev_usd: float
+    net_ev_pct: float
+    modelled_net_ev_pct: Optional[float] = None
+    price_paid_vs_modelled: Optional[float] = None
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "amount_usd": round(self.amount_usd, 4),
+            "entry_price": round(self.entry_price, 6),
+            "gross_ev_usd": round(self.gross_ev_usd, 4),
+            "fees_usd": round(self.fees_usd, 4),
+            "gas_usd": round(self.gas_usd, 4),
+            "net_ev_usd": round(self.net_ev_usd, 4),
+            "net_ev_pct": round(self.net_ev_pct, 5),
+            "modelled_net_ev_pct": (None if self.modelled_net_ev_pct is None
+                                    else round(self.modelled_net_ev_pct, 5)),
+            "price_paid_vs_modelled": self.price_paid_vs_modelled,
+            "reason": self.reason,
+        }
+
+
+def executable_net_ev(opportunity, filled_usd: float, filled_price: float,
+                      fees_usd: float = 0.0, gas_usd: float = 0.0,
+                      modelled_net_ev_pct: Optional[float] = None,
+                      modelled_price: Optional[float] = None):
+    """
+    Price the trade at the fill it got.
+
+    `filled_price` is the price of the TOKEN bought, which is what a venue
+    reports. SLIPPAGE IS ALREADY IN IT: the achieved price is the average of the
+    ladder the order walked, so deducting a separate slippage term here would
+    charge the same cost twice - the double-charge this project has already made
+    once. What is deducted is what the venue charged on top: its fee, and gas.
+
+    Returns None when the fill cannot be priced at all (no capital committed, or
+    a price outside (0, 1)), because a trade that cannot be priced must not be
+    reported as one that earned nothing.
+    """
+    amount = float(filled_usd or 0.0)
+    price = float(filled_price or 0.0)
+    if amount <= 0 or not (0.0 < price < 1.0):
+        return None
+    fair = getattr(opportunity, "estimated_fair", None)
+    if fair is None:
+        return None
+
+    # The token space the fill is in has to match the side being priced. A NO
+    # position is a BUY of the NO token, and the venue reports the NO price.
+    side = str(getattr(opportunity, "side", "YES") or "YES").upper()
+    token_price = price
+    if side != "YES" and modelled_price is not None and float(modelled_price) < 0.5:
+        # The caller passed a YES-space price for a NO side; the token price is
+        # what the venue reported, so keep it and say so rather than re-deriving.
+        token_price = price
+
+    gross = gross_ev_at_price(side=side, fair_prob=float(fair),
+                              entry_price=token_price, amount_usd=amount)
+    fees = float(fees_usd or 0.0)
+    gas = float(gas_usd or 0.0)
+    net = gross - fees - gas
+    net_pct = net / amount
+
+    paid_vs_modelled = None
+    if modelled_price is not None and float(modelled_price) > 0:
+        # Positive means the fill cost MORE than the price the decision was made
+        # at - which is the direction that destroys an edge.
+        paid_vs_modelled = ((token_price - float(modelled_price))
+                            / float(modelled_price))
+
+    return ExecutableEV(
+        amount_usd=amount,
+        entry_price=token_price,
+        gross_ev_usd=gross,
+        fees_usd=fees,
+        gas_usd=gas,
+        net_ev_usd=net,
+        net_ev_pct=net_pct,
+        modelled_net_ev_pct=(None if modelled_net_ev_pct is None
+                             else float(modelled_net_ev_pct)),
+        price_paid_vs_modelled=paid_vs_modelled,
+        reason=(f"priced at the fill: ${amount:.2f} at {token_price:.4f} "
+                f"({side}), gross ${gross:.4f} - fees ${fees:.4f} - gas "
+                f"${gas:.4f} = net ${net:.4f} ({net_pct*100:.2f}%)"
+                + (f"; the decision was made at "
+                   f"{float(modelled_price):.4f}, so the price paid was "
+                   f"{paid_vs_modelled*100:+.2f}% against it"
+                   if paid_vs_modelled is not None else "")),
+    )
+
+
 @dataclass
 class ExpectedEVResult:
     gross_ev_usd: float  # Expected gross profit
@@ -289,25 +443,16 @@ class ExpectedNetEVEngine:
         # = amount_usd * [fair_prob*(1-market_price)/market_price - (1-fair_prob)]
         # Simplified for small edge: gross EV ≈ amount_usd * edge * confidence
         
-        if opportunity.side.upper() == "YES":
-            # YES side
-            if market_price > 0:
-                profit_if_win = amount_usd * (1 - market_price) / market_price
-            else:
-                profit_if_win = amount_usd
-            loss_if_lose = -amount_usd
-            gross_ev_usd = fair_prob * profit_if_win + (1 - fair_prob) * loss_if_lose
-        else:
-            # NO side - similar but for NO
-            no_price = 1 - market_price
-            if no_price > 0:
-                profit_if_win = amount_usd * (1 - no_price) / no_price
-            else:
-                profit_if_win = amount_usd
-            loss_if_lose = -amount_usd
-            # For NO, fair prob of NO = 1 - fair_prob(YES)
-            fair_prob_no = 1 - fair_prob
-            gross_ev_usd = fair_prob_no * profit_if_win + (1 - fair_prob_no) * loss_if_lose
+        # The TOKEN price, which is what `gross_ev_at_price` takes: a NO side
+        # buys the NO token, and `market_price` is the YES price. Passing the
+        # YES price for a NO side inflates the payoff and turns a losing NO
+        # trade into a winning one - the unit error this project has made
+        # before, caught here by a test that compares NO against the edge engine.
+        entry_price = (market_price if str(opportunity.side).upper() == "YES"
+                       else 1.0 - market_price)
+        gross_ev_usd = gross_ev_at_price(
+            side=opportunity.side, fair_prob=fair_prob,
+            entry_price=entry_price, amount_usd=amount_usd)
         
         # For financial venues (crypto/stocks), EV is edge * amount * confidence
         if opportunity.venue_type.value == "financial" or "crypto" in opportunity.venue_id or "stock" in opportunity.venue_id:

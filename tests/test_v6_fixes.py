@@ -329,6 +329,13 @@ def test_venue_qualification_robust():
         # was on average what the trades realised.
         "real_evidence_samples": 120, "real_evidence_coverage": 1.0,
         "ev_bias": 0.0, "ev_bias_samples": 120,
+        # ...and what the fills were actually worth. The gate judges the
+        # executable EV, not the prediction: a venue whose orders fill worse
+        # than modelled passes every prediction-based threshold ever written.
+        "executable_value": 0.05, "executable_value_samples": 120,
+        "executable_value_coverage": 1.0,
+        "fill_price_vs_modelled": 0.0, "price_paid_samples": 120,
+        "price_paid_coverage": 1.0,
     }
     result2 = engine.evaluate_qualification("kalshi", perf_qualified)
     assert result2.is_qualified

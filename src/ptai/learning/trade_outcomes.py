@@ -64,6 +64,15 @@ class TradeOutcome:
     book_source: str = ""
     fill_is_real: bool = False
     gas_usd: Optional[float] = None
+    # The same EV recomputed at the fill that actually happened. None means the
+    # trade was never repriced at its fill - which is NOT the same as a fill
+    # that cost nothing, and the gate fails on it rather than reading it as zero.
+    executable_net_ev: Optional[float] = None
+    executable_net_ev_pct: Optional[float] = None
+    # The price PAID against the price the decision was made at, in price units.
+    # Unambiguous, and the thing that says whether this venue fills where the
+    # agent thinks it does.
+    fill_price_vs_modelled: Optional[float] = None
 
 
 # Book labels that describe a book that actually existed. Everything else -
@@ -210,8 +219,11 @@ class TradeOutcomeTracker:
                     "brier_score, was_correct, recorded_at, fees_usd, "
                     "slippage_bps, execution_quality, data_mode, "
                     "execution_mode, expected_net_ev, expected_net_ev_pct, "
-                    "book_source, fill_is_real, gas_usd) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "book_source, fill_is_real, gas_usd, "
+                    "executable_net_ev, executable_net_ev_pct, "
+                    "fill_price_vs_modelled) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "?,?,?)",
                     (outcome.trade_id, outcome.market_id, outcome.venue_id,
                      outcome.strategy, outcome.category, outcome.forecast_prob,
                      outcome.market_price, outcome.edge, outcome.side,
@@ -224,7 +236,9 @@ class TradeOutcomeTracker:
                      outcome.execution_mode or None,
                      outcome.expected_net_ev, outcome.expected_net_ev_pct,
                      outcome.book_source or None, int(bool(outcome.fill_is_real)),
-                     outcome.gas_usd))
+                     outcome.gas_usd, outcome.executable_net_ev,
+                     outcome.executable_net_ev_pct,
+                     outcome.fill_price_vs_modelled))
             self.storage.conn.commit()
             return True
         except Exception as e:
@@ -310,6 +324,11 @@ class TradeOutcomeTracker:
                 extra.get("fill_is_real"), extra.get("book_source"),
                 _mode_from(execution_mode or extra.get("execution_mode"))),
             gas_usd=_optional_float(extra.get("gas_usd")),
+            executable_net_ev=_optional_float(extra.get("executable_net_ev")),
+            executable_net_ev_pct=_optional_float(
+                extra.get("executable_net_ev_pct")),
+            fill_price_vs_modelled=_optional_float(
+                extra.get("fill_price_vs_modelled")),
         )
         self.outcomes.append(outcome)
         self._persist(outcome)
@@ -484,6 +503,12 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         # coverage check rather than inheriting a pass.
         "real_evidence_samples": 0, "real_evidence_coverage": 0.0,
         "realised_net_ev_pct": None, "ev_bias": None, "ev_abs_error": None,
+        # The executable figures. None - not zero - so a venue nobody has
+        # repriced at a fill cannot pass an executable-EV threshold.
+        "executable_value": None, "executable_value_samples": 0,
+        "executable_value_coverage": 0.0,
+        "fill_price_vs_modelled": None, "price_paid_samples": 0,
+        "price_paid_coverage": 0.0,
         "gas_total": 0.0,
         "source": "no recorded outcomes",
     }
@@ -496,7 +521,9 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
                    was_correct, amount_usd, fees_usd, slippage_bps,
                    execution_quality, data_mode, execution_mode,
                    expected_net_ev, expected_net_ev_pct,
-                   book_source, fill_is_real, gas_usd
+                   book_source, fill_is_real, gas_usd,
+                   executable_net_ev, executable_net_ev_pct,
+                   fill_price_vs_modelled
             FROM trade_outcomes
             WHERE venue_id = ? AND actual_outcome IS NOT NULL
             ORDER BY COALESCE(resolved_at, recorded_at)
@@ -680,6 +707,18 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
     else:
         predicted = realised = ev_bias = ev_abs_error = None
 
+    # ---------------------------------------------------------------
+    # What the trades were worth AT THEIR FILLS
+    # ---------------------------------------------------------------
+    #
+    # The prediction says what the model thought. This says what the fills made
+    # it worth. Only trades carrying both can produce a gap, and the gap is the
+    # one execution number in this record that contains no forecast luck.
+    executable_only = [float(r["executable_net_ev_pct"]) for r in rows
+                       if r["executable_net_ev_pct"] is not None]
+    fill_vs_modelled = [float(r["fill_price_vs_modelled"]) for r in rows
+                        if r["fill_price_vs_modelled"] is not None]
+
     return {
         # THE QUALIFICATION CONTRACT, stated rather than implied.
         #
@@ -742,6 +781,21 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "ev_bias": ev_bias,
         "ev_abs_error": ev_abs_error,
         "ev_bias_samples": len(pairs),
+        # The EXECUTABLE EV: what the fills were worth, not what the model
+        # hoped. Its own coverage, because a mean over 3 of 150 trades is not a
+        # measurement of a venue.
+        "executable_value": (sum(executable_only) / len(executable_only)
+                             if executable_only else None),
+        "executable_value_samples": len(executable_only),
+        "executable_value_coverage": (len(executable_only) / n) if n else 0.0,
+        # ...and where the fills landed against the prices the decisions were
+        # made at. Positive means paid MORE than modelled.
+        "fill_price_vs_modelled": (sum(fill_vs_modelled) / len(fill_vs_modelled)
+                                   if fill_vs_modelled else None),
+        "fill_price_worst": (max(fill_vs_modelled)
+                             if fill_vs_modelled else None),
+        "price_paid_samples": len(fill_vs_modelled),
+        "price_paid_coverage": (len(fill_vs_modelled) / n) if n else 0.0,
         "gas_total": sum(float(r["gas_usd"]) for r in rows
                          if r["gas_usd"] is not None),
         "gas_measured": sum(1 for r in rows if r["gas_usd"] is not None),
