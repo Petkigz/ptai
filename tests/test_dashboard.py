@@ -326,3 +326,122 @@ class TestDashboardHTML:
         # Check XSS protection - escapeHTML function exists
         assert "escapeHTML" in response.text
         assert "X-PTAI-Token" in response.text or "authToken" in response.text
+
+class TestThePageScriptActuallyRuns:
+    """
+    The dashboard's JavaScript is one inline block, so ONE bad literal kills
+    every function on the page: the data fetch, the tab switching, the buttons.
+    The page still returns HTTP 200 and renders, which is why this went
+    unnoticed - it looked healthy while being completely inert.
+
+    The specific failure it caught: a `\n` inside a JS string written as a
+    single backslash in the Python source, so Python turned it into a real
+    newline and the JS parser saw an unterminated string.
+    """
+
+    @staticmethod
+    def _newline_in_js_string(js: str):
+        """First line where a JS string literal spans a newline, or None."""
+        state = "code"
+        prev = ""
+        start_line = None
+        line = 1
+        i = 0
+        while i < len(js):
+            c = js[i]
+            nxt = js[i + 1] if i + 1 < len(js) else ""
+            if c == "\n":
+                if state in ("'", '"'):
+                    return start_line, line
+                if state == "//":
+                    state = "code"
+                line += 1
+            elif state == "code":
+                if c == "/" and nxt == "/":
+                    state = "//"
+                    i += 1
+                elif c == "/" and nxt == "*":
+                    state = "/*"
+                    i += 1
+                elif c == "/" and (prev == "" or prev in "(,=:[!&|?{};+-*\n"):
+                    # A regex literal, not a division: skip to its unescaped end.
+                    i += 1
+                    while i < len(js):
+                        if js[i] == "\\":
+                            i += 1
+                        elif js[i] == "/":
+                            break
+                        elif js[i] == "\n":
+                            line += 1
+                        i += 1
+                elif c in ("'", '"', "`"):
+                    state = c
+                    start_line = line
+                if not c.isspace():
+                    prev = c
+            elif state in ("'", '"'):
+                if c == "\\":
+                    i += 1
+                elif c == state:
+                    state = "code"
+            elif state == "`":
+                if c == "\\":
+                    i += 1
+                elif c == "`":
+                    state = "code"
+            elif state == "/*":
+                if c == "*" and nxt == "/":
+                    state = "code"
+                    i += 1
+            i += 1
+        return None
+
+    def test_no_string_literal_spans_a_newline(self):
+        """A real newline inside a JS string is a fatal syntax error."""
+        import re
+
+        page = client.get("/").text
+        blocks = re.findall(r"<script>(.*?)</script>", page, re.S)
+        assert blocks, "the dashboard serves no script at all"
+        for block in blocks:
+            found = self._newline_in_js_string(block)
+            assert found is None, (
+                f"a JS string literal opened on line {found[0]} and met a real "
+                f"newline on line {found[1]} - the whole page script will fail "
+                f"to parse and every button and fetch on it is dead"
+            )
+
+    def test_the_operator_view_card_is_served(self):
+        """The card the operator reads is in the page, not just in the repo."""
+        page = client.get("/").text
+        assert "Operator View" in page
+        assert "operator-lines" in page
+        assert "fetchOperatorView" in page
+
+    def test_the_page_parses_as_javascript_when_the_interpreter_is_available(self):
+        """
+        The strongest check available locally: hand the block to a real JS
+        parser. Skipped rather than failed where node is not installed - the
+        newline check above is the version that always runs.
+        """
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed")
+        page = client.get("/").text
+        block = max(re.findall(r"<script>(.*?)</script>", page, re.S), key=len)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(block)
+            path = fh.name
+        try:
+            result = subprocess.run([node, "--check", path],
+                                    capture_output=True, text=True, timeout=60)
+            assert result.returncode == 0, (
+                f"the dashboard script does not parse: {result.stderr[:600]}")
+        finally:
+            import os
+            os.unlink(path)

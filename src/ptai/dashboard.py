@@ -5521,10 +5521,10 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                     '<div>Needs more data: ' + (data.needs_more_data ? 'Yes' : 'No') + '</div>' +
                     '<div>Is degrading: ' + (data.is_degrading ? 'Yes - review models' : 'No') + '</div>';
                 
-                let curveHtml = 'Calibration curve (forecast vs actual):\n';
+                let curveHtml = 'Calibration curve (forecast vs actual):\\n';
                 if (data.calibration_curve && data.calibration_curve.length > 0) {
                     data.calibration_curve.forEach(b => {
-                        curveHtml += b.bucket + ': forecast ' + b.forecast.toFixed(2) + ' actual ' + b.actual.toFixed(2) + ' count ' + b.count + (b.overconfident ? ' OVERCONFIDENT' : '') + '\n';
+                        curveHtml += b.bucket + ': forecast ' + b.forecast.toFixed(2) + ' actual ' + b.actual.toFixed(2) + ' count ' + b.count + (b.overconfident ? ' OVERCONFIDENT' : '') + '\\n';
                     });
                 } else {
                     curveHtml += 'No resolved forecasts yet - need 50+ to assess calibration';
