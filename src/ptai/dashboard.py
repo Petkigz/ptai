@@ -159,8 +159,40 @@ def write_env_file(updates: Dict[str, str]):
             f.write(f"{k}={v}\n")
     return env_dict
 
-def check_lm_studio(host: str = "http://localhost:1234") -> Dict[str, Any]:
-    result = {"connected": False, "models": [], "error": None, "host": host, "latency_ms": None}
+# The model the agent will actually call, judged the SAME WAY the agent
+# picks it (llm/provider.py): the LM_STUDIO_MODEL from .env when it names a
+# loaded model, otherwise the FIRST loaded model - the provider auto-detects
+# models[0] when the env value is the "local-model" placeholder.
+# Judging speed from the whole downloaded list is how a fast qwen3.8-27b
+# session got reported as "R1 SLOW" simply because deepseek-r1 was also
+# sitting in LM Studio's model list.
+def _active_lm_model(models, configured):
+    if not models:
+        return None
+    if configured and configured not in ("local-model", "", "auto", None) \
+            and configured in models:
+        return configured
+    return models[0]
+
+
+def _is_slow_reasoning_model(model_id) -> bool:
+    """
+    Is this SPECIFIC model an R1-style reasoning model (long thinking phase,
+    minutes per market)? "r1" is matched as a name segment, so
+    deepseek-r1 and deepseek-r1-distill-qwen-32b count, while qwen3.8-27b,
+    qwen/qwen3-32b and the like do not.
+    """
+    if not model_id:
+        return False
+    segments = set(re.split(r"[-/._\s]+", model_id.lower()))
+    return "r1" in segments
+
+
+def check_lm_studio(host: str = "http://localhost:1234",
+                    configured_model: Optional[str] = None) -> Dict[str, Any]:
+    result = {"connected": False, "models": [], "error": None, "host": host,
+              "latency_ms": None, "active_model": None, "is_r1": False,
+              "model_not_loaded": False}
     try:
         start = time.time()
         resp = requests.get(f"{host.rstrip('/')}/v1/models", timeout=5, headers={"Authorization": "Bearer lm-studio"})
@@ -171,10 +203,15 @@ def check_lm_studio(host: str = "http://localhost:1234") -> Dict[str, Any]:
             models = [m["id"] for m in data.get("data", [])]
             result["connected"] = True
             result["models"] = models
-            # Detect R1
-            is_r1 = any("r1" in m.lower() or "distill" in m.lower() for m in models)
-            result["is_r1"] = is_r1
-            result["recommended"] = "qwen/qwen3-32b" if not models else ("Use qwen/qwen3-32b (fast 3s) not R1 (8 min slow)" if is_r1 else models[0])
+            active = _active_lm_model(models, configured_model)
+            result["active_model"] = active
+            # R1 detection is about the model PTAI will actually CALL, not
+            # about whether a reasoning model happens to be downloaded.
+            result["is_r1"] = _is_slow_reasoning_model(active)
+            if configured_model and configured_model not in ("local-model", "", "auto", None) \
+                    and configured_model not in models:
+                result["model_not_loaded"] = True
+            result["recommended"] = "qwen/qwen3-32b" if result["is_r1"] else active
         else:
             result["error"] = f"HTTP {resp.status_code}"
     except Exception as e:
@@ -392,15 +429,23 @@ async def api_update_config(request: Request):
 async def api_llm_status():
     env = read_env_file()
     host = env.get("LM_STUDIO_HOST", "http://localhost:1234")
-    result = check_lm_studio(host)
+    result = check_lm_studio(host, configured_model=env.get("LM_STUDIO_MODEL"))
     # Add current model from env
     result["env_model"] = env.get("LM_STUDIO_MODEL", "local-model")
     result["env_host"] = host
-    # Speed warning
+    # Speed warning - judged on the model the agent will actually CALL,
+    # not on whatever else is downloaded.
     if result["connected"] and result.get("is_r1"):
-        result["warning"] = "R1 model detected - 7-8 MIN per market SLOW! Use qwen/qwen3-32b (3 sec FAST) for trading. 30 deep * 8 min = 4 HOURS breaks 10 min interval."
+        result["warning"] = (f"{result['active_model']} is an R1-style reasoning model - "
+                             "7-8 MIN per market SLOW! Use qwen/qwen3-32b (3 sec FAST) for trading. "
+                             "30 deep * 8 min = 4 HOURS breaks 10 min interval.")
         result["speed"] = "SLOW - 8 min per market"
         result["recommendation_action"] = "In LM Studio: unload R1, load qwen/qwen3-32b, then set MAX_DEEP_ANALYZE=50"
+    elif result["connected"] and result.get("model_not_loaded"):
+        loaded = ", ".join(result["models"][:3])
+        result["warning"] = (f"Model {result['env_model']} from .env is not loaded in LM Studio. "
+                             f"Load it there, or set LM_STUDIO_MODEL to one of: {loaded}.")
+        result["speed"] = "UNKNOWN - configured model not loaded"
     elif result["connected"]:
         result["speed"] = "FAST - 2-3 sec per market"
         result["warning"] = None
@@ -409,7 +454,8 @@ async def api_llm_status():
 @app.get("/api/system/health")
 async def api_system_health():
     env = read_env_file()
-    lm = check_lm_studio(env.get("LM_STUDIO_HOST", "http://localhost:1234"))
+    lm = check_lm_studio(env.get("LM_STUDIO_HOST", "http://localhost:1234"),
+                         configured_model=env.get("LM_STUDIO_MODEL"))
     x = check_x_status()
     storage = get_storage()
     perf = storage.get_performance_summary()
@@ -492,7 +538,7 @@ async def api_system_health():
     if not lm["connected"]:
         issues.append("LM Studio not running - start LM Studio Developer -> Start Server")
     if lm.get("is_r1"):
-        issues.append("R1 slow model - switch to qwen/qwen3-32b for 10-min cycle (8 min vs 3 sec)")
+        issues.append(f"{lm.get('active_model')} is an R1-style model - switch to qwen/qwen3-32b for 10-min cycle (8 min vs 3 sec)")
     if not onboarding["wallet_linked"]:
         issues.append("Wallet not linked - go to Wallet tab to link")
     if env.get("DRY_RUN", "true").lower() == "true" and onboarding["wallet_linked"]:
@@ -3478,6 +3524,7 @@ async def dashboard():
                                 <div>Connected: <span id="llm-connected" class="mono">Checking...</span></div>
                                 <div>Models: <span id="llm-models" class="mono">-</span></div>
                                 <div>Current .env model: <span id="llm-env-model" class="mono">local-model</span></div>
+                                <div>Agent will use: <span id="llm-active-model" class="mono" style="color: var(--green);">-</span></div>
                                 <div>Speed: <span id="llm-speed" class="mono">-</span></div>
                                 <div>Latency: <span id="llm-latency" class="mono">- ms</span></div>
                             </div>
@@ -4589,7 +4636,7 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 const details = document.getElementById('system-health-details');
                 details.innerHTML = `
                     <div>🤖 Agent: ${data.agent_running ? '<span class="positive">Running' + (data.last_scan_ago_seconds != null ? ' (last scan ' + Math.round(data.last_scan_ago_seconds/60) + ' min ago)' : ' (first cycle in progress)') + '</span>' : '<span class="negative">Not running - run run_ptai.bat</span>'}</div>
-                    <div>🧠 LLM: ${data.lm_studio.connected ? '<span class="positive">Connected - ' + data.lm_studio.models.length + ' models</span>' : '<span class="negative">Not connected</span>'} ${data.lm_studio.is_r1 ? '<span style="color: var(--red);">R1 SLOW!</span>' : ''}</div>
+                    <div>🧠 LLM: ${data.lm_studio.connected ? '<span class="positive">Connected - ' + (data.lm_studio.active_model || 'no model loaded') + ' <span style="opacity:0.6;">(agent uses this, of ' + data.lm_studio.models.length + ' loaded)</span></span>' : '<span class="negative">Not connected</span>'} ${data.lm_studio.is_r1 ? '<span style="color: var(--red);">R1 SLOW!</span>' : ''}</div>
                     <div>🐦 X Sentiment: ${data.x_sentiment.status}</div>
                     <div>💰 Dry Run: ${data.config.dry_run === 'true' ? 'ON (testing)' : 'OFF (live trading)'}</div>
                     <div>📊 Last Scan: ${data.last_scan ? data.last_scan.markets_scanned + ' markets, ' + data.last_scan.opportunities_found + ' opps' : 'Never'}</div>
@@ -4691,6 +4738,8 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 document.getElementById('llm-connected').textContent = data.connected ? 'Yes ✅' : 'No ❌ - Start LM Studio';
                 document.getElementById('llm-models').textContent = data.models.length > 0 ? data.models.join(', ') : 'None';
                 document.getElementById('llm-env-model').textContent = data.env_model;
+                document.getElementById('llm-active-model').textContent =
+                    data.active_model || (data.models.length ? data.models[0] + ' (auto-detected, first loaded)' : 'none');
                 document.getElementById('llm-host-display').textContent = data.host;
                 document.getElementById('llm-speed').textContent = data.speed || '-';
                 document.getElementById('llm-latency').textContent = data.latency_ms ? data.latency_ms + ' ms' : '-';
