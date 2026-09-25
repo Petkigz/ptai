@@ -323,6 +323,13 @@ def test_venue_qualification_robust():
         # Same rule for the EV: a caller claiming "EV >1% per trade" must say how
         # many trades that figure was actually recorded from. 120 of 120 here.
         "expected_value_samples": 120, "expected_value_coverage": 1.0,
+        # ...and WHERE those trades were priced. 120 paper fills against an
+        # assumed book are a statement about the simulator, so a caller claiming
+        # a qualification record must say how much of it happened against a real
+        # book. All 120 here, all against a ladder, and the EV the model claimed
+        # was on average what the trades realised.
+        "real_evidence_samples": 120, "real_evidence_coverage": 1.0,
+        "ev_bias": 0.0, "ev_bias_samples": 120,
     }
     result2 = engine.evaluate_qualification("kalshi", perf_qualified)
     assert result2.is_qualified

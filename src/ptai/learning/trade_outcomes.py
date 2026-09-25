@@ -55,6 +55,46 @@ class TradeOutcome:
     # predates this measurement and must not be averaged in as if it were zero.
     expected_net_ev: Optional[float] = None
     expected_net_ev_pct: Optional[float] = None
+    # Which book this fill was priced against, and whether that book was real.
+    #
+    # None is NOT REAL. A paper fill against an assumed default spread is a
+    # statement about the simulator, not about the venue, and the gate has to be
+    # able to say so. Live fills are real by construction: real money crossed a
+    # real book.
+    book_source: str = ""
+    fill_is_real: bool = False
+    gas_usd: Optional[float] = None
+
+
+# Book labels that describe a book that actually existed. Everything else -
+# including None, "", "unknown" and "assumed_default" - is not evidence.
+REAL_BOOK_SOURCES = frozenset({
+    "orderbook", "ladder", "clob", "book", "api", "live", "venue_fill",
+})
+
+
+def _book_source(extra: Dict[str, Any]) -> str:
+    return str(extra.get("book_source") or "").strip().lower()
+
+
+def _fill_is_real(explicit, book_source, execution_mode: str) -> bool:
+    """
+    Was this fill's evidence about a real market?
+
+    A live fill is real by construction - whatever happened, it happened to real
+    money against a real book. A simulated fill is real only when the caller
+    says which book it walked and that book was one. Unlabelled is not real.
+
+    An explicit False is honoured: a caller that knows its own evidence is
+    fabricated must be able to say so, and it overrides everything else.
+    """
+    if explicit is False:
+        return False
+    if str(execution_mode or "").lower() == "live":
+        return True
+    if explicit is True:
+        return True
+    return _book_source({"book_source": book_source}) in REAL_BOOK_SOURCES
 
 
 def _mode_from(value) -> str:
@@ -169,8 +209,9 @@ class TradeOutcomeTracker:
                     "edge, side, amount_usd, actual_outcome, pnl, resolved_at, "
                     "brier_score, was_correct, recorded_at, fees_usd, "
                     "slippage_bps, execution_quality, data_mode, "
-                    "execution_mode, expected_net_ev, expected_net_ev_pct) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "execution_mode, expected_net_ev, expected_net_ev_pct, "
+                    "book_source, fill_is_real, gas_usd) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (outcome.trade_id, outcome.market_id, outcome.venue_id,
                      outcome.strategy, outcome.category, outcome.forecast_prob,
                      outcome.market_price, outcome.edge, outcome.side,
@@ -181,7 +222,9 @@ class TradeOutcomeTracker:
                      outcome.fees_usd, outcome.slippage_bps,
                      outcome.execution_quality, outcome.data_mode or None,
                      outcome.execution_mode or None,
-                     outcome.expected_net_ev, outcome.expected_net_ev_pct))
+                     outcome.expected_net_ev, outcome.expected_net_ev_pct,
+                     outcome.book_source or None, int(bool(outcome.fill_is_real)),
+                     outcome.gas_usd))
             self.storage.conn.commit()
             return True
         except Exception as e:
@@ -262,6 +305,11 @@ class TradeOutcomeTracker:
             expected_net_ev_pct=_optional_float(
                 expected_net_ev_pct if expected_net_ev_pct is not None
                 else extra.get("expected_net_ev_pct")),
+            book_source=_book_source(extra),
+            fill_is_real=_fill_is_real(
+                extra.get("fill_is_real"), extra.get("book_source"),
+                _mode_from(execution_mode or extra.get("execution_mode"))),
+            gas_usd=_optional_float(extra.get("gas_usd")),
         )
         self.outcomes.append(outcome)
         self._persist(outcome)
@@ -432,6 +480,11 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         # having predicted no profit. The gate fails on None.
         "expected_value": None, "expected_value_usd": None,
         "expected_value_samples": 0, "expected_value_coverage": 0.0,
+        # Evidence about a real market. Zero, so an unmeasured venue fails the
+        # coverage check rather than inheriting a pass.
+        "real_evidence_samples": 0, "real_evidence_coverage": 0.0,
+        "realised_net_ev_pct": None, "ev_bias": None, "ev_abs_error": None,
+        "gas_total": 0.0,
         "source": "no recorded outcomes",
     }
     if storage is None:
@@ -442,7 +495,8 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
             SELECT forecast_prob, edge, actual_outcome, pnl, brier_score,
                    was_correct, amount_usd, fees_usd, slippage_bps,
                    execution_quality, data_mode, execution_mode,
-                   expected_net_ev, expected_net_ev_pct
+                   expected_net_ev, expected_net_ev_pct,
+                   book_source, fill_is_real, gas_usd
             FROM trade_outcomes
             WHERE venue_id = ? AND actual_outcome IS NOT NULL
             ORDER BY COALESCE(resolved_at, recorded_at)
@@ -589,6 +643,43 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         if peak > 0:
             drawdown = max(drawdown, (peak - equity) / peak)
 
+    # ---------------------------------------------------------------
+    # Was the evidence about a market that existed?
+    # ---------------------------------------------------------------
+    #
+    # A fill walked against an assumed default spread is a statement about the
+    # simulator, not about the venue, and until now it was indistinguishable in
+    # this table from a fill walked down a live ladder. Coverage is reported so
+    # the gate can require the sample to be mostly real before it trusts it.
+    real_evidence = sum(1 for r in rows if r["fill_is_real"])
+    real_evidence_coverage = real_evidence / n if n else 0.0
+
+    # ---------------------------------------------------------------
+    # What the EV model predicted, against what the trades realised.
+    # ---------------------------------------------------------------
+    #
+    # This is the only place the agent's own error is measured: predicted net EV
+    # per trade at entry versus the realised net return per trade. A venue whose
+    # trades were predicted at +14% and realised +2% is not a profitable venue
+    # with bad luck, it is a venue whose EV model is wrong BY 12 POINTS, and
+    # nothing in the gate could see that before because the prediction and the
+    # result were never compared.
+    #
+    # Only trades that carry BOTH a prediction and a stake can be compared.
+    pairs = [(float(r["expected_net_ev_pct"]), float(r["pnl"]) / float(r["amount_usd"]))
+             for r in rows
+             if r["expected_net_ev_pct"] is not None
+             and r["pnl"] is not None
+             and r["amount_usd"]]
+    if pairs:
+        predicted = sum(p for p, _ in pairs) / len(pairs)
+        realised = sum(a for _, a in pairs) / len(pairs)
+        # Signed: positive means the trades did better than predicted.
+        ev_bias = realised - predicted
+        ev_abs_error = sum(abs(a - p) for p, a in pairs) / len(pairs)
+    else:
+        predicted = realised = ev_bias = ev_abs_error = None
+
     return {
         # THE QUALIFICATION CONTRACT, stated rather than implied.
         #
@@ -641,5 +732,18 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "expected_value_usd": expected_value_usd,
         "expected_value_samples": len(ev_pct_values),
         "expected_value_coverage": (len(ev_pct_values) / n) if n else 0.0,
+        # Evidence about a real book, and how much of the sample it is.
+        "real_evidence_samples": real_evidence,
+        "real_evidence_coverage": real_evidence_coverage,
+        # The prediction-versus-realisation pair. None when no trade carries
+        # both, which the gate fails on rather than reading as zero bias.
+        "predicted_net_ev_pct": predicted,
+        "realised_net_ev_pct": realised,
+        "ev_bias": ev_bias,
+        "ev_abs_error": ev_abs_error,
+        "ev_bias_samples": len(pairs),
+        "gas_total": sum(float(r["gas_usd"]) for r in rows
+                         if r["gas_usd"] is not None),
+        "gas_measured": sum(1 for r in rows if r["gas_usd"] is not None),
         "source": f"{n} recorded outcomes",
     }

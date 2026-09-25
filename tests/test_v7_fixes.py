@@ -253,6 +253,12 @@ def test_qualification_beyond_win_rate():
         # And the EV figure has to cover the record it is claimed from.
         "expected_value_samples": 120,
         "expected_value_coverage": 1.0,
+        # ...and it has to be evidence about a real market, and the model's own
+        # error has to be within the bar it is claiming to clear.
+        "real_evidence_samples": 120,
+        "real_evidence_coverage": 1.0,
+        "ev_bias": 0.0,
+        "ev_bias_samples": 120,
     }
     
     result2 = engine.evaluate_qualification("test_venue_winning", perf_winning)

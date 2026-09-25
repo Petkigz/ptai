@@ -193,6 +193,25 @@ def check_x_status() -> Dict[str, Any]:
         "recommendation": "Set SENTIMENT_USE_X=false for fastest (you have R1 slow model)" if use_x else "Good - fastest mode"
     }
 
+def _venue_qualification_state(venue_id: str) -> Optional[bool]:
+    """
+    Is this venue qualified, per the one authority that decides it?
+
+    Returns None when the question has not been asked yet - a venue nobody has
+    evaluated is not an unqualified venue, and the console should say so rather
+    than print a verdict it does not have.
+    """
+    try:
+        from .venues.qualification import VenueQualificationEngine
+        engine = VenueQualificationEngine()
+        result = engine.qualifications.get(venue_id)
+        return None if result is None else bool(result.is_qualified)
+    except Exception as e:
+        print(f"Could not read qualification state for {venue_id}: "
+              f"{type(e).__name__}: {e}")
+        return None
+
+
 @app.get("/health")
 async def health():
     storage = get_storage()

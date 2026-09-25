@@ -321,6 +321,25 @@ class Storage:
         ("orders", "token_price", "REAL"),
         ("orders", "expected_net_ev", "REAL"),
         ("orders", "expected_net_ev_pct", "REAL"),
+        # WHERE THE EVIDENCE CAME FROM.
+        #
+        # A paper fill is only evidence if the book it was priced against
+        # existed. `PaperBroker` already refused to call a fill real when it was
+        # walked against an assumed book, and computes `PaperFill.is_real` for
+        # exactly that reason - but the flag stopped at the broker: every
+        # outcome row looked identical, so the qualification gate could not tell
+        # 150 trades priced off live ladders from 150 trades priced off a
+        # default spread. That is the difference between evidence and arithmetic.
+        #
+        # `book_source` is the label ("orderbook", "ladder", "assumed_default",
+        # ...) kept for diagnosis; `fill_is_real` is the boolean the gate
+        # reads. NULL means the row predates this measurement and is treated as
+        # NOT real, because an unlabelled fill is not evidence about a venue.
+        ("trade_outcomes", "book_source", "TEXT"),
+        ("trade_outcomes", "fill_is_real", "INTEGER"),
+        # Gas charged on THIS fill, separate from the venue's fee, so the cost
+        # of a trade in the outcome log is the cost it actually incurred.
+        ("trade_outcomes", "gas_usd", "REAL"),
     )
 
     def _migrate(self):

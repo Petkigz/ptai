@@ -22,6 +22,31 @@ NO_POSITION_STATUSES = frozenset({
 })
 
 
+def _order_gas_usd(adapter, venue_id: str, amount_usd: float = 0.0) -> float:
+    """
+    Gas to place one order, from the venue's own declared mechanism.
+
+    `order_gas_usd` on the adapter's capabilities is the venue's answer:
+    0.0 for a venue that relays orders, a number for one that charges, None
+    when the venue does not say - and then the cost model estimates it. The
+    estimate is the model's, not a constant here, because a constant here
+    cannot know which venue it is pricing.
+    """
+    declared = getattr(getattr(adapter, "capabilities", None), "order_gas_usd", None)
+    if declared is not None:
+        return max(0.0, float(declared))
+    try:
+        from ..execution.gas import GasModel
+        return float(GasModel().calculate_gas(
+            operation="place_order", amount_usd=float(amount_usd or 0.0),
+            venue_id=venue_id).gas_usd)
+    except Exception as e:
+        logger.warning(
+            f"No gas estimate for {venue_id} ({type(e).__name__}: {e}); "
+            f"charging nothing and labelling the execution with it")
+        return 0.0
+
+
 @dataclass
 class ExecutionResult:
     venue_id: str
@@ -384,8 +409,15 @@ class MultiVenueExecutor:
             result = await adapter.place_order(opportunity=opportunity, max_spend_usd=max_spend_usd, max_price=max_price)
             latency = (time.time() - start) * 1000
             fees = adapter.calculate_fees(opportunity.market, max_spend_usd)
-            # Gas for on-chain venues
-            gas = 0.05 if venue_id in ["polymarket", "afx_dex"] else 0.0
+            # Gas, the same way the EV engine costs it: what the venue declares,
+            # or an estimate if it declares nothing.
+            #
+            # This was `0.05 if venue_id in ["polymarket", "afx_dex"] else 0.0` -
+            # a literal charged to a venue that relays its orders and pays no
+            # gas to trade, and a free pass to every other venue including ones
+            # that do settle on-chain. Both halves were wrong in the direction
+            # that decides trades.
+            gas = _order_gas_usd(adapter, venue_id, max_spend_usd)
 
             fill = self._read_fill(result, max_spend_usd, max_price)
 

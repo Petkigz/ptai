@@ -87,7 +87,11 @@ def _record(storage, tracker, venue, n, *, win_prob, forecast, win_pnl, loss_pnl
             expected_net_ev_pct=(expected_ev_pct
                                  if expected_ev_pct is not None and i % ev_every == 0
                                  else None),
-            data_mode="live", execution_mode="paper")
+            data_mode="live", execution_mode="paper",
+            # The book the paper run walked. Passed the way the loop passes it
+            # from the fill: without it the gate treats every one of these
+            # trades as unpriced evidence, which is asserted separately below.
+            book_source="ladder")
         tracker.record_resolution(str(tid), actual_outcome=1.0 if won else 0.0,
                                   pnl=pnl)
         if won:
@@ -109,6 +113,58 @@ def test_no_outcomes_means_no_evidence(storage):
     assert stats["brier_score"] == 1.0, "an absent forecast cannot look skilful"
     assert stats["profit_factor"] == 0.0
     assert stats["source"] == "no recorded outcomes"
+
+
+def test_evidence_priced_against_an_assumed_book_does_not_qualify(storage):
+    """
+    The point of the whole coverage check.
+
+    Identical trades, identical P&L, identical calibration - the only
+    difference is that the fills were walked against an assumed book instead of
+    a real one. A venue must not be able to qualify on the simulator's own
+    arithmetic.
+    """
+    tracker = TradeOutcomeTracker(storage=storage)
+    _record(storage, tracker, VENUE, 150, win_prob=0.8, forecast=0.75,
+            win_pnl=2.0, loss_pnl=-1.0)
+    stats = qualification_stats_from_outcomes(storage, VENUE)
+    assert stats["real_evidence_coverage"] == 1.0, "the ladder walk is evidence"
+
+    # Now the same venue, with every fill labelled as an assumed book.
+    storage.conn.execute("UPDATE trade_outcomes SET fill_is_real = 0, "
+                         "book_source = 'assumed_default'")
+    storage.conn.commit()
+    simulated = qualification_stats_from_outcomes(storage, VENUE)
+    assert simulated["real_evidence_coverage"] == 0.0
+
+    result = VenueQualificationEngine().evaluate_qualification(VENUE, simulated)
+    assert not result.is_qualified, (
+        "a venue was qualified on fills priced against a book that never "
+        "existed")
+    assert result.real_evidence_coverage == 0.0
+
+
+def test_the_ev_model_is_told_when_it_was_wrong(storage):
+    """
+    The chain the seventh report asks for ends here: predicted EV, realised
+    return, and the error between them.
+
+    A venue predicted at +14% a trade and realising -2% has an EV model that is
+    wrong by 16 points, and no threshold on chart-reading would say so.
+    """
+    tracker = TradeOutcomeTracker(storage=storage)
+    _record(storage, tracker, VENUE, 150, win_prob=0.8, forecast=0.75,
+            win_pnl=0.3, loss_pnl=-1.0, expected_ev_pct=0.14)
+    stats = qualification_stats_from_outcomes(storage, VENUE)
+    assert stats["ev_bias_samples"] == 150
+    assert stats["predicted_net_ev_pct"] == pytest.approx(0.14)
+    assert stats["ev_bias"] < -0.10, (
+        f"the model claimed +14% and got {stats['realised_net_ev_pct']:.3f}")
+    assert stats["ev_abs_error"] > 0
+
+    result = VenueQualificationEngine().evaluate_qualification(VENUE, stats)
+    assert not result.is_qualified
+    assert "EV bias" in result.reasoning
 
 
 def test_the_sample_size_comes_from_the_outcome_log(storage):

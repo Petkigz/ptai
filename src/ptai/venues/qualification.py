@@ -58,6 +58,8 @@ class QualificationResult:
     # console can read: a substituted mean edge must not be displayed like a
     # measured expected net EV.
     ev_source: str = ""
+    real_evidence_coverage: float = 0.0
+    ev_bias: Optional[float] = None
     ev_coverage: float = 0.0
 
 class VenueQualificationEngine:
@@ -99,6 +101,14 @@ class VenueQualificationEngine:
             # trade" then describes a venue on the strength of a single entry
             # nobody repeated. Same rule as the measured costs above.
             "min_ev_coverage": 0.5,
+            # THE QUALITY OF THE EVIDENCE, not one more bar to clear.
+            #
+            # At least half of the sample must be real: a live fill, or a
+            # simulated fill walked down a ladder that existed. A venue
+            # "observed" 150 times against an assumed spread has been observed
+            # zero times, and the simulation's own arithmetic is what would have
+            # qualified it.
+            "min_real_evidence_coverage": 0.5,
             "min_sample_size": 100,
             "max_fees_pct": 0.05,  # fees <5% of profit
         }
@@ -112,7 +122,7 @@ class VenueQualificationEngine:
                         if qual_data.get("qualification_date"):
                             qual_data["qualification_date"] = datetime.fromisoformat(qual_data["qualification_date"])
                         # Handle old format without new fields
-                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage"]:
+                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage", "real_evidence_coverage"]:
                             if field not in qual_data:
                                 qual_data[field] = 0.0
                         self.qualifications[venue_id] = QualificationResult(**qual_data)
@@ -153,6 +163,8 @@ class VenueQualificationEngine:
                     # measured or substituted.
                     "ev_source": qual.ev_source,
                     "ev_coverage": qual.ev_coverage,
+                    "real_evidence_coverage": qual.real_evidence_coverage,
+                    "ev_bias": qual.ev_bias,
                 }
             with open(self.qualification_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -219,6 +231,12 @@ class VenueQualificationEngine:
         profit_factor = performance_stats.get("profit_factor", 0)
         execution_quality = performance_stats.get("execution_quality_avg", 0.5)
         cost_coverage = float(performance_stats.get("cost_coverage") or 0.0)
+        real_evidence_coverage = float(
+            performance_stats.get("real_evidence_coverage") or 0.0)
+        real_evidence_samples = int(
+            performance_stats.get("real_evidence_samples") or 0)
+        ev_bias = performance_stats.get("ev_bias")
+        ev_bias_samples = int(performance_stats.get("ev_bias_samples") or 0)
         quality_coverage = float(
             performance_stats.get("execution_quality_coverage") or 0.0)
         skill = performance_stats.get("forecast_skill", 0.5)
@@ -250,6 +268,20 @@ class VenueQualificationEngine:
             "min_edge": avg_edge >= self.requirements["min_avg_edge"],
             "max_drawdown": drawdown_max <= self.requirements["max_drawdown"],
             "min_profit_factor": profit_factor >= self.requirements["min_profit_factor"],
+            # Fails closed with no real evidence at all: an unmeasured venue is
+            # not a venue whose evidence happened to be simulated, it is a venue
+            # nobody has looked at.
+            "min_real_evidence": (
+                real_evidence_samples > 0
+                and real_evidence_coverage
+                >= self.requirements["min_real_evidence_coverage"]),
+            # The EV model's own error, judged against the bar it is claiming to
+            # clear. If the venue's trades were predicted at +1% net EV and
+            # realised more than a point below that, the prediction is not a
+            # measurement of anything and must not be the number the gate trusts.
+            "ev_bias_within_bar": (
+                ev_bias is not None and ev_bias_samples > 0
+                and ev_bias >= -self.requirements["min_expected_value"]),
             "min_execution": (execution_quality >= self.requirements["min_execution_quality"]
                               and min(cost_coverage, quality_coverage)
                               >= self.requirements["min_cost_coverage"]),
@@ -264,6 +296,13 @@ class VenueQualificationEngine:
             f"win_rate {win_rate:.2f} >= {self.requirements['min_win_rate']}? {checks['min_win_rate']} BUT win rate alone NOT profitability - example 90% wins +$0.01 10% losses -$1.00 fantastic win rate still lose money | "
             f"net_pnl ${net_pnl:.2f} >= ${self.requirements['min_net_pnl']}? {checks['min_net_pnl']} | "
             f"expected_value {expected_value*100:.2f}% >= {self.requirements['min_expected_value']*100:.1f}%? {checks['min_ev']} ({ev_source}) on >= {self.requirements['min_ev_coverage']*100:.0f}% of trades? {checks['min_ev_coverage']} | "
+            f"evidence from a real book {real_evidence_coverage*100:.0f}% >= "
+            f"{self.requirements['min_real_evidence_coverage']*100:.0f}% "
+            f"({real_evidence_samples}/{total})? {checks['min_real_evidence']} | "
+            f"EV bias "
+            f"{('%+.2f%%' % (ev_bias * 100)) if ev_bias is not None else 'unmeasured'} "
+            f">= -{self.requirements['min_expected_value']*100:.1f}% over "
+            f"{ev_bias_samples} predicted/realised pair(s)? {checks['ev_bias_within_bar']} | "
             f"profit_factor {profit_factor:.2f} >= {self.requirements['min_profit_factor']}? {checks['min_profit_factor']} | "
             f"brier {brier:.3f} <= {self.requirements['max_brier']}? {checks['max_brier']} | "
             f"log_loss {log_loss:.3f} <= {self.requirements['max_log_loss']}? {checks['max_log_loss']} | "
@@ -308,6 +347,8 @@ class VenueQualificationEngine:
             sample_size=total,
             ev_source=ev_source,
             ev_coverage=ev_coverage,
+            real_evidence_coverage=real_evidence_coverage,
+            ev_bias=ev_bias,
         )
 
         self.qualifications[venue_id] = result

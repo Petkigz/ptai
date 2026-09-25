@@ -1984,6 +1984,19 @@ class TradingAgentV3:
                             (getattr(exec_result, "paper_fill", None) or {})
                             .get("slippage_bps")),
                         execution_quality=self._execution_quality(exec_result),
+                        # WHICH BOOK this fill was priced against, from the
+                        # broker that walked it. A paper fill can be perfectly
+                        # simulated and still be evidence about nothing; the
+                        # qualification gate refuses a sample that is mostly
+                        # priced against an assumed book, and it can only do
+                        # that if the label reaches the outcome row.
+                        book_source=(
+                            (getattr(exec_result, "paper_fill", None) or {})
+                            .get("book_source")
+                            # A live fill is its own evidence: real money,
+                            # real book, no simulation involved.
+                            or ("venue_fill" if execution_mode == "live" else "")),
+                        gas_usd=getattr(exec_result, "gas_usd", None),
                         amount_usd=(exec_result.filled_usd
                                     if exec_result.committed_capital
                                     else amount_usd),
