@@ -1,0 +1,3 @@
+# Batch files must keep Windows line endings on every checkout - cmd.exe
+# silently breaks on LF-only .bat files (the window pops and closes).
+*.bat text eol=crlf
