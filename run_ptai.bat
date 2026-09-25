@@ -51,7 +51,7 @@ if not exist ".venv\Scripts\python.exe" (
   %PYTHON% -m venv .venv
   if errorlevel 1 (
     echo [ERROR] Could not create .venv. Check that "venv" is available
-    echo         (on Windows: python.org installers include it).
+    echo         On Windows, python.org installers include it.
     goto fail
   )
 )
@@ -76,7 +76,7 @@ REM Chromium is only needed if a venue ever asks for a browser login; the
 REM paper Polymarket run works without it. Best effort, never blocks startup.
 python -m playwright install chromium >nul 2>nul
 if errorlevel 1 (
-  echo Note: browser (Chromium) not installed - fine for paper trading;
+  echo Note: the Chromium browser was not installed - fine for paper trading;
   echo       it is only needed later for browser-based venue logins.
 )
 
