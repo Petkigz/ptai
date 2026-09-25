@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import requests
 from typing import Dict, Any, Optional
 
+from .llm.provider import choose_loaded_model, is_slow_reasoning_model
 from .storage.db import Storage
 from .config import get_settings
 from .security import (
@@ -167,25 +168,27 @@ def write_env_file(updates: Dict[str, str]):
 # session got reported as "R1 SLOW" simply because deepseek-r1 was also
 # sitting in LM Studio's model list.
 def _active_lm_model(models, configured):
-    if not models:
-        return None
-    if configured and configured not in ("local-model", "", "auto", None) \
-            and configured in models:
-        return configured
-    return models[0]
+    """
+    The model the agent will actually call, chosen by the provider's own rule.
+
+    NOT a second copy of that decision: `choose_loaded_model` is what
+    `LMStudioProvider.chat` uses when it picks a model to call, so the console
+    and the call cannot disagree about which model is in use. It also refuses to
+    auto-pick an R1-style model when a loaded fast one exists, which is the
+    ~9-minutes-per-market trap the operator hit.
+    """
+    model, _reason = choose_loaded_model(list(models or []), configured)
+    return model
+
+
+def _active_lm_choice(models, configured):
+    """The same decision, with the reason - so the screen can explain itself."""
+    return choose_loaded_model(list(models or []), configured)
 
 
 def _is_slow_reasoning_model(model_id) -> bool:
-    """
-    Is this SPECIFIC model an R1-style reasoning model (long thinking phase,
-    minutes per market)? "r1" is matched as a name segment, so
-    deepseek-r1 and deepseek-r1-distill-qwen-32b count, while qwen3.8-27b,
-    qwen/qwen3-32b and the like do not.
-    """
-    if not model_id:
-        return False
-    segments = set(re.split(r"[-/._:\s]+", model_id.lower()))
-    return "r1" in segments
+    """Is this SPECIFIC model an R1-style reasoning model (minutes per market)."""
+    return is_slow_reasoning_model(model_id)
 
 
 def check_lm_studio(host: str = "http://localhost:1234",
@@ -203,15 +206,22 @@ def check_lm_studio(host: str = "http://localhost:1234",
             models = [m["id"] for m in data.get("data", [])]
             result["connected"] = True
             result["models"] = models
-            active = _active_lm_model(models, configured_model)
+            active, reason = _active_lm_choice(models, configured_model)
             result["active_model"] = active
+            result["model_reason"] = reason
             # R1 detection is about the model PTAI will actually CALL, not
             # about whether a reasoning model happens to be downloaded.
             result["is_r1"] = _is_slow_reasoning_model(active)
             if configured_model and configured_model not in ("local-model", "", "auto", None) \
                     and configured_model not in models:
                 result["model_not_loaded"] = True
-            result["recommended"] = "qwen/qwen3-32b" if result["is_r1"] else active
+            # The first loaded model is what LM Studio would use if nothing
+            # were pinned. When it is an R1 model and the pick avoided it, that
+            # is worth showing: it is the list order the operator noticed.
+            result["first_loaded_model"] = models[0] if models else None
+            result["fast_alternative"] = next(
+                (m for m in models if not _is_slow_reasoning_model(m)), None)
+            result["recommended"] = ("qwen/qwen3-32b" if result["is_r1"] else active)
         else:
             result["error"] = f"HTTP {resp.status_code}"
     except Exception as e:

@@ -103,7 +103,9 @@ class TradingAgentV2:
             preferred=getattr(self.settings, 'llm_provider', 'auto'),
             ollama_host=self.settings.ollama_host,
             lm_studio_host=self.settings.lm_studio_host,
-            model=self.settings.lm_studio_model
+            model=self.settings.lm_studio_model,
+            timeout_seconds=getattr(self.settings, "llm_timeout_seconds",
+                                    180.0),
         )
         
         # Intelligence

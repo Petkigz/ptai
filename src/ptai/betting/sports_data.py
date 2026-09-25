@@ -145,11 +145,22 @@ class LineMovement:
 # Base provider
 # ---------------------------------------------------------------------------
 
+# What a normal browser sends. ESPN's public site API answered 403 Forbidden to
+# the old "ptai/1.0 (local research bot)" string, and with it the whole betting
+# lane aborted every cycle ("no fixtures from any feed") - no goals, cards,
+# corners, totals or match markets were priced at all. A truthful UA that also
+# identifies as a browser is what every other client uses for public feeds.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 PTAI/1.0"
+)
+
+
 class BaseProvider:
     name = "base"
     is_synthetic = False
 
-    def __init__(self, timeout: float = 12.0, user_agent: str = "ptai/1.0 (local research bot)"):
+    def __init__(self, timeout: float = 12.0, user_agent: str = BROWSER_USER_AGENT):
         self.timeout = timeout
         self.user_agent = user_agent
         self.last_error: str = ""

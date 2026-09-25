@@ -318,6 +318,11 @@ def _brain_status(force: bool = False) -> Dict[str, Any]:
         value["env_model"] = env.get("LM_STUDIO_MODEL", "local-model")
         value["pinned"] = bool(value["env_model"] and
                                value["env_model"] not in ("local-model", "", "auto"))
+        try:
+            value["timeout_seconds"] = float(
+                env.get("LLM_TIMEOUT_SECONDS") or 180.0)
+        except (TypeError, ValueError):
+            value["timeout_seconds"] = 180.0
         value["available"] = True
     except Exception as e:
         value = {"available": False, "connected": False, "models": [],
@@ -405,6 +410,34 @@ async def api_pin_brain(request: Request) -> JSONResponse:
     to end.
     """
     body = await request.json() if await request.body() else {}
+    from ..dashboard import write_env_file
+
+    # The agent's wait for ONE model call. Editable here for the same reason the
+    # model is: it is a product setting, not a config file. A call that takes
+    # nine minutes is what made a 10-minute cycle unable to finish, and the
+    # operator should be able to bound it without opening .env.
+    if body.get("timeout_seconds") is not None:
+        try:
+            seconds = float(body["timeout_seconds"])
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={
+                "error": "the model call limit has to be a number of seconds"})
+        if not (10 <= seconds <= 3600):
+            return JSONResponse(status_code=400, content={
+                "error": "the model call limit has to be between 10 and 3600 "
+                         "seconds",
+                "note": "Below 10s no local model finishes a forecast; above an "
+                        "hour it can hold a cycle past its interval."})
+        write_env_file({"LLM_TIMEOUT_SECONDS": str(int(seconds))})
+        _BRAIN_CACHE["at"] = 0.0
+        return JSONResponse({
+            "timeout_seconds": int(seconds),
+            "note": (f"The agent will wait at most {int(seconds)}s for one "
+                     f"market's forecast from its next start. A slower model then "
+                     f"produces no forecast for that market - which it says in the "
+                     f"log - instead of stalling the cycle."),
+        })
+
     model = str(body.get("model") or "").strip()
     if not model:
         return JSONResponse(status_code=400,
@@ -424,7 +457,6 @@ async def api_pin_brain(request: Request) -> JSONResponse:
             "note": "Pin one of the models in the list, so the agent calls what "
                     "this screen says it calls.",
         })
-    from ..dashboard import write_env_file
     write_env_file({"LM_STUDIO_MODEL": model})
     _BRAIN_CACHE["at"] = 0.0
     return JSONResponse({
@@ -1665,16 +1697,24 @@ function renderBrain(el, b, withPicker){
       <tr><td style="color:var(--dim);width:170px">Agent will use</td>
           <td class="mono ${active?'pos':''}">${active?esc(active):'nothing - no model is loaded'}</td></tr>
       <tr><td style="color:var(--dim)">How it was chosen</td>
-          <td class="note">${pinNote}</td></tr>
+          <td class="note">${esc(b.model_reason || pinNote)}</td></tr>
       <tr><td style="color:var(--dim)">Speed</td>
           <td class="mono">${b.is_r1?'<span class="neg">SLOW - minutes per market (R1-style)</span>'
               :(b.connected?'<span class="pos">full speed - no long thinking phase</span>':'&mdash;')}</td></tr>
+      <tr><td style="color:var(--dim)">One call waits at most</td>
+          <td class="mono">${b.timeout_seconds?Number(b.timeout_seconds).toFixed(0)+'s':'&mdash;'}
+            <span class="note"> - a slower model then gives no forecast for that market instead of holding the cycle</span></td></tr>
     </table>`;
   const picker = (withPicker && b.connected && b.models.length) ? `
     <div style="margin-top:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <select id="modelSelect" style="max-width:340px;width:auto">${
         b.models.map(m=>`<option value="${esc(m)}"${m===active?' selected':''}>${esc(m)}</option>`).join('')}</select>
       <button class="primary" onclick="pinModel()">Pin this model</button>
+      <label style="margin:0 0 0 8px;color:var(--dim);font-size:12px">Model call limit (s)</label>
+      <input id="timeoutSeconds" type="number" min="10" max="3600" step="10"
+             value="${b.timeout_seconds?Number(b.timeout_seconds).toFixed(0):180}"
+             style="width:90px">
+      <button onclick="saveTimeout()">Save</button>
     </div>
     <div id="pinMsg" class="note" style="margin-top:9px"></div>
     <div class="note" style="margin-top:9px">Pinning writes <code>LM_STUDIO_MODEL</code> to
@@ -1694,6 +1734,16 @@ async function pinModel(){
     ? `<span class="pos">${esc(body.note||'pinned')}</span>`
     : `<span class="neg">${esc(body.error||'could not pin')}</span> ${esc(body.note||'')}`;
   if(ok){ loadBrainSetup(); loadAgent(); }
+}
+
+async function saveTimeout(){
+  const raw = $('timeoutSeconds').value;
+  const {ok, body} = await api('/api/console/brain', {method:'POST',
+    body:JSON.stringify({timeout_seconds: Number(raw)})});
+  $('pinMsg').innerHTML = ok
+    ? `<span class="pos">${esc(body.note||'saved')}</span>`
+    : `<span class="neg">${esc(body.error||'could not save')}</span> ${esc(body.note||'')}`;
+  if(ok) loadBrainSetup();
 }
 
 async function loadBrainSetup(){

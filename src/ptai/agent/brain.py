@@ -129,7 +129,10 @@ class Brain:
                 lm_studio_host=self.llm_config.lm_studio_host,
                 model=self.llm_config.model,
                 temperature=self.llm_config.temperature,
-                max_tokens=max_toks
+                max_tokens=max_toks,
+                # Bounded: a slow model must produce NO forecast rather than
+                # hold the cycle. See config.llm_timeout_seconds.
+                timeout_seconds=getattr(self.settings, "llm_timeout_seconds", 180.0),
             )
             logger.info(f"Brain LLM Router: provider={self.llm_router.get_provider_name()} model={self.llm_config.model} lm_studio={self.llm_config.lm_studio_host} ollama={self.llm_config.ollama_host} max_tokens={max_toks} is_r1={is_r1_model}")
         except Exception as e:

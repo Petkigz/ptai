@@ -3,6 +3,7 @@ X Engine - X as information source, NOT truth
 Credibility analysis, independent corroboration, information novelty, time decay, model input
 Detects bot bursts, duplicates, engagement farming, old info, fake accounts, coordinated narratives, source credibility
 """
+import asyncio
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -197,8 +198,14 @@ class XEngine:
                 is_blocked = getattr(self.x_scraper, 'is_blocked', False) or getattr(self.x_scraper, 'circuit_open', False)
                 if is_blocked:
                     logger.debug(f"X scraper circuit open for {market.id} - skipping, 40 sec breaker")
-                else:
-                    tweets = await self.x_scraper.search(market.question, limit=20) if hasattr(self.x_scraper, 'search') else []
+                elif hasattr(self.x_scraper, 'search'):
+                    # The scraper's search is a small circuit-breakered call that
+                    # returns a list - it is not a coroutine. Awaiting it raised
+                    # "object list can't be used in 'await' expression" on EVERY
+                    # market, so the sentiment lane was dead before it scraped
+                    # anything. Await only if it really is awaitable.
+                    found = self.x_scraper.search(market.question, limit=20)
+                    tweets = await found if asyncio.iscoroutine(found) else (found or [])
             except Exception as e:
                 logger.warning(f"X scrape failed: {e} - circuit breaker 40 sec")
                 # Record failure for circuit breaker

@@ -63,7 +63,7 @@ def init(
     # Check LLM providers
     try:
         from .llm.provider import LLMRouter
-        router = LLMRouter(preferred=llm_provider, ollama_host=settings.ollama_host, lm_studio_host=settings.lm_studio_host, model=model)
+        router = LLMRouter(preferred=llm_provider, ollama_host=settings.ollama_host, lm_studio_host=settings.lm_studio_host, model=model, timeout_seconds=getattr(settings, 'llm_timeout_seconds', 180.0))
         console.print(f"[bold]LLM Router: {router.get_provider_name()}[/bold]")
         if router.is_available():
             console.print(f"[green]LLM available: {router.get_provider_name()}[/green]")
@@ -110,7 +110,8 @@ def check_llm(
         preferred=provider,
         ollama_host=settings.ollama_host,
         lm_studio_host=lm_host,
-        model=settings.lm_studio_model
+        model=settings.lm_studio_model,
+        timeout_seconds=getattr(settings, "llm_timeout_seconds", 180.0),
     )
 
     table = Table(title="LLM Status")

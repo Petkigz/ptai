@@ -202,7 +202,9 @@ class TradingAgentV3:
             preferred=getattr(self.settings, 'llm_provider', 'auto'),
             ollama_host=self.settings.ollama_host,
             lm_studio_host=self.settings.lm_studio_host,
-            model=self.settings.lm_studio_model
+            model=self.settings.lm_studio_model,
+            timeout_seconds=getattr(self.settings, "llm_timeout_seconds",
+                                    180.0),
         )
         
         # Intelligence
@@ -625,6 +627,29 @@ class TradingAgentV3:
         Kept as an alias rather than a rename so any existing caller that does use
         the longer name keeps working.
         """
+        # Per-market progress, written as it happens.
+        #
+        # This is the seam every market passes through, and the operator's log
+        # showed why it matters: one model call took 524 seconds (21:11:05 ->
+        # 21:20:20), and between those two lines the console had nothing to show
+        # but a stale heartbeat. Counting the markets - and naming how long the
+        # previous one took - turns "is it stuck?" into a number that moves.
+        self._cycle_market_index = int(getattr(self, "_cycle_market_index", 0)) + 1
+        _elapsed = time.time() - float(getattr(self, "_cycle_market_started", time.time()))
+        self._cycle_last_market_seconds = round(_elapsed, 1)
+        self._cycle_market_started = time.time()
+        if _elapsed > float(getattr(self, "_slowest_model_call_seconds", 0.0) or 0.0) \
+                and self._cycle_market_index > 1:
+            self._slowest_model_call_seconds = _elapsed
+        _total = getattr(self, "_cycle_markets_total", None)
+        _question = (getattr(market, "question", "") or "")[:70]
+        self._set_phase(
+            "evaluating",
+            f"market {self._cycle_market_index}"
+            + (f" of {_total}" if _total else "")
+            + f": {_question}"
+            + (f" (previous market took {_elapsed:.0f}s)" if self._cycle_market_index > 1
+               else ""))
         return await self.get_context_for_market(market)
 
     async def get_context_for_market(self, market: Market) -> Dict[str, Any]:
@@ -1192,6 +1217,12 @@ class TradingAgentV3:
                 qualified_ids=[]
             )
         total_markets = sum(len(m) for m in markets_by_venue.values())
+        # Counters the per-market progress line reads. Reset per cycle, so the
+        # screen never shows one cycle's progress during another.
+        self._cycle_market_index = 0
+        self._cycle_markets_total = total_markets
+        self._cycle_market_started = time.time()
+        self._cycle_last_market_seconds = None
         self._set_phase(
             "evaluating",
             f"{total_markets} market(s) from {len(markets_by_venue)} venue(s); "
@@ -2021,12 +2052,15 @@ class TradingAgentV3:
             opportunities_found=int(scan_result.total_candidates or 0),
             avg_edge=(sum(_edges) / len(_edges)) if _edges else 0.0,
         )
+        _slowest = getattr(self, "_slowest_model_call_seconds", None)
         self._set_phase(
             "cycle_complete",
             f"{int(scan_result.total_scanned or 0)} market(s) scanned, "
             f"{int(scan_result.total_candidates or 0)} candidate(s), "
             f"{len([e for e in (result.get('execution') or []) if e.get('position_recorded')])} "
-            f"position(s) recorded")
+            f"position(s) recorded"
+            + (f"; slowest single market took {_slowest:.0f}s"
+               if isinstance(_slowest, (int, float)) else ""))
 
         # .get() throughout: a cycle that returns an unexpected shape must not
         # be able to kill the loop. A long run has to survive its own reporting.

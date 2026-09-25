@@ -16,12 +16,90 @@ class LLMResponse:
     provider: str
     parsed_json: Optional[Dict] = None
 
+
+# The placeholder values that mean "no model was pinned". Kept in one place
+# because three parts of the system ask the same question: the provider that
+# makes the call, the console that reports which model is in use, and the
+# diagnostics dashboard.
+UNPINNED_MODELS = ("local-model", "", "auto", None)
+
+
+def is_slow_reasoning_model(model_id: Optional[str]) -> bool:
+    """
+    Is this SPECIFIC model an R1-style reasoning model?
+
+    They think for thousands of tokens before answering - measured on the
+    operator's own machine at ~9 minutes for ONE market - so a 10-minute cycle
+    cannot use one. "r1" is matched as a name SEGMENT, so deepseek-r1,
+    deepseek-r1-distill-qwen-32b and similar count, while qwen3.8-27b,
+    qwen/qwen3-32b and the like do not.
+
+    Judging the whole downloaded list is how a fast model got reported as slow;
+    judging only the name of the model actually being called is the rule here
+    and everywhere else.
+    """
+    if not model_id:
+        return False
+    segments = set(re.split(r"[-/._:\s]+", str(model_id).lower()))
+    return "r1" in segments
+
+
+def choose_loaded_model(models: List[str], configured: Optional[str] = None):
+    """
+    Which loaded model the agent will actually call. THE ONE DECISION.
+
+    Returns ``(model, reason)`` where reason is written for the operator.
+
+    Rules, in order:
+
+    1. a PINNED model that is loaded wins - the operator asked for it;
+    2. otherwise the first loaded model that is not R1-style;
+    3. only if every loaded model is R1-style does it take one, and it says so.
+
+    Rule 2 is the fix for what happened on the operator's PC: LM Studio listed
+    a reasoning model first, `local-model` meant "auto", and the auto pick took
+    it - so every market cost ~9 minutes and a cycle that should take minutes
+    could never finish. Whatever the list order happens to be, a 10-minute cycle
+    cannot be spent on a model that needs 9 minutes per market, and the operator
+    should never have to discover that from a timestamp gap in a log.
+    """
+    models = [m for m in (models or []) if m]
+    if not models:
+        return None, "no model is loaded in LM Studio"
+    if configured and configured not in UNPINNED_MODELS:
+        if configured in models:
+            return configured, f"pinned: {configured} is loaded"
+        return (models[0],
+                f"pinned model {configured} is NOT loaded, so this fell back "
+                f"to the first loaded model ({models[0]})")
+    fast = [m for m in models if not is_slow_reasoning_model(m)]
+    if fast:
+        if fast[0] != models[0]:
+            return fast[0], (
+                f"auto: picked {fast[0]} because it is a fast model, and "
+                f"{models[0]} is R1-style (~minutes per market). Pin a model in "
+                f"Setup if you want a different one.")
+        return fast[0], f"auto: first loaded model is {fast[0]}"
+    return models[0], (
+        f"auto: EVERY loaded model is R1-style; using {models[0]}, which is "
+        f"slow enough that a cycle may not finish in its interval")
+
+
+# The longest the agent will wait for ONE market's forecast. Not 600 s, which
+# is what the OpenAI client does by default and which let a single slow model
+# call run for ~9 minutes inside a 10-minute cycle.
+DEFAULT_LLM_TIMEOUT_SECONDS = 180.0
+
+
 class BaseLLMProvider:
-    def __init__(self, model: str, host: str, temperature: float = 0.2, max_tokens: int = 1200):
+    def __init__(self, model: str, host: str, temperature: float = 0.2,
+                 max_tokens: int = 1200,
+                 timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
         self.model = model or "local-model"
         self.host = (host or "http://localhost:1234").rstrip("/")
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout_seconds = float(timeout_seconds or DEFAULT_LLM_TIMEOUT_SECONDS)
 
     def is_available(self) -> bool:
         raise NotImplementedError
@@ -101,8 +179,8 @@ class OllamaProvider(BaseLLMProvider):
 
 class LMStudioProvider(BaseLLMProvider):
     """LM Studio - OpenAI compatible at http://localhost:1234/v1 (default)"""
-    def __init__(self, model: str = "local-model", host: str = "http://localhost:1234", temperature: float = 0.2, max_tokens: int = 1200, api_key: str = "lm-studio"):
-        super().__init__(model, host, temperature, max_tokens)
+    def __init__(self, model: str = "local-model", host: str = "http://localhost:1234", temperature: float = 0.2, max_tokens: int = 1200, api_key: str = "lm-studio", timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
+        super().__init__(model, host, temperature, max_tokens, timeout_seconds)
         self.api_key = api_key or "lm-studio"
         if not self.host.endswith("/v1"):
             self.base_url = f"{self.host}/v1"
@@ -134,18 +212,21 @@ class LMStudioProvider(BaseLLMProvider):
     def chat(self, prompt: str, system: str = "") -> Optional[LLMResponse]:
         try:
             from openai import OpenAI
-            client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            # A bounded wait. Without it the client's own 600 s default applies
+            # and one market can hold the whole cycle.
+            client = OpenAI(api_key=self.api_key, base_url=self.base_url,
+                            timeout=self.timeout_seconds)
             messages = []
             if system:
                 messages.append({"role": "system", "content": system})
             messages.append({"role": "user", "content": prompt})
             
             model_to_use = self.model
-            if model_to_use in ["local-model", "", "auto", None]:
+            if model_to_use in UNPINNED_MODELS:
                 models = self.list_models()
                 if models:
-                    model_to_use = models[0]
-                    logger.info(f"LM Studio auto-detected model: {model_to_use}")
+                    model_to_use, reason = choose_loaded_model(models, self.model)
+                    logger.info(f"LM Studio model choice: {reason}")
             
             response = client.chat.completions.create(
                 model=model_to_use,
@@ -209,7 +290,8 @@ class LLMRouter:
     3. Any OpenAI compatible
     4. Fallback heuristic
     """
-    def __init__(self, preferred: str = "auto", ollama_host: str = "http://localhost:11434", lm_studio_host: str = "http://localhost:1234", model: str = "local-model", temperature: float = 0.2, max_tokens: int = 1200):
+    def __init__(self, preferred: str = "auto", ollama_host: str = "http://localhost:11434", lm_studio_host: str = "http://localhost:1234", model: str = "local-model", temperature: float = 0.2, max_tokens: int = 1200, timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
+        self.timeout_seconds = float(timeout_seconds or DEFAULT_LLM_TIMEOUT_SECONDS)
         self.preferred = preferred or "auto"
         self.ollama_host = ollama_host or "http://localhost:11434"
         self.lm_studio_host = lm_studio_host or "http://localhost:1234"
@@ -224,7 +306,7 @@ class LLMRouter:
         logger.info(f"LLM Router detecting, preferred={self.preferred}, lm_studio={self.lm_studio_host}, ollama={self.ollama_host}, model={self.model}")
 
         if self.preferred in ["auto", "lm_studio", "lmstudio"]:
-            lm = LMStudioProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens)
+            lm = LMStudioProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens, timeout_seconds=self.timeout_seconds)
             if lm.is_available():
                 models = lm.list_models()
                 self._last_detected_models = models

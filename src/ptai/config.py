@@ -107,6 +107,15 @@ class Settings(BaseSettings):
     lm_studio_api_key: str = Field(default="lm-studio", alias="LM_STUDIO_API_KEY")
 
     # LLM - Generic
+    # How long the agent waits for ONE model call.
+    #
+    # The OpenAI client's default is 600 s. The operator's machine showed what
+    # that costs: one market took ~9 minutes with an R1 model, the whole cycle
+    # overran its 10-minute interval, and nothing on screen said why. A bounded
+    # wait means a slow model produces NO forecast (and says so) instead of
+    # stalling the loop, and every reader agrees on the bound because it is one
+    # setting.
+    llm_timeout_seconds: float = Field(default=180.0, alias="LLM_TIMEOUT_SECONDS")
     llm_provider: str = Field(default="auto", alias="LLM_PROVIDER")  # auto, ollama, lm_studio, openai_compatible
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="http://localhost:1234/v1", alias="OPENAI_BASE_URL")

@@ -114,8 +114,27 @@ class TestStatusDetection:
         assert result["is_r1"] is True
         assert result["recommended"] == "qwen/qwen3-32b"
 
-    def test_r1_first_loaded_is_flagged(self, monkeypatch):
+    def test_a_first_loaded_r1_is_avoided_when_a_fast_model_is_loaded(
+            self, monkeypatch):
+        """
+        The operator's machine, 2026-09-25: LM Studio listed
+        deepseek-r1-distill-qwen-32b first, `local-model` meant auto, and the
+        auto pick took it - ~9 minutes for ONE market against a 10-minute cycle,
+        so a cycle could not finish. When a fast model is loaded, "auto" must
+        mean the fast one; the R1 is only ever a warning, never the pick.
+        """
         _patch_models(monkeypatch, ["deepseek-r1", "qwen/qwen3-32b"])
+        result = dashboard.check_lm_studio("http://localhost:1234",
+                                           configured_model=None)
+        assert result["active_model"] == "qwen/qwen3-32b"
+        assert result["is_r1"] is False
+        # ...and the screen can explain the pick rather than just assert it.
+        assert result["first_loaded_model"] == "deepseek-r1"
+        assert "R1-style" in result["model_reason"]
+
+    def test_an_r1_that_is_the_only_choice_is_still_flagged(self, monkeypatch):
+        """The warning must survive for the case it exists for."""
+        _patch_models(monkeypatch, ["deepseek-r1"])
         result = dashboard.check_lm_studio("http://localhost:1234",
                                            configured_model=None)
         assert result["active_model"] == "deepseek-r1"

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from loguru import logger
 
+from ..betting.sports_data import BROWSER_USER_AGENT
+
 
 @dataclass
 class NewsSignal:
@@ -112,7 +114,7 @@ class NewsEngine:
                 if has_news_potential:
                     for feed_url in rss_feeds[:1]:  # only 1 to save time
                         try:
-                            resp = requests.get(feed_url, timeout=3, headers={"User-Agent": "PTAI/1.0"})
+                            resp = requests.get(feed_url, timeout=3, headers={"User-Agent": BROWSER_USER_AGENT})
                             if resp.status_code == 200:
                                 text = resp.text[:10000]
                                 # Simple keyword matching

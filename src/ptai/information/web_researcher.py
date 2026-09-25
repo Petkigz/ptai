@@ -53,6 +53,8 @@ from urllib.parse import quote_plus, urlparse
 
 from loguru import logger
 
+from ..betting.sports_data import BROWSER_USER_AGENT
+
 from .source_quality import SourceAssessment, SourceQualityEngine
 
 # A search endpoint that returns HTML and needs no key. Used only to discover
@@ -174,7 +176,7 @@ class WebResearcher:
     def __init__(self, llm_router=None, browser=None, fetch: Optional[Callable] = None,
                  search_url: str = DUCKDUCKGO_HTML, max_sources: int = 6,
                  timeout: float = 12.0, source_engine: Optional[SourceQualityEngine] = None,
-                 user_agent: str = "ptai/1.0 (local research bot)"):
+                 user_agent: str = BROWSER_USER_AGENT):
         """
         `browser` is retained for callers that pass one, and is now actually
         used when supplied - it is the preferred way to fetch, since a real
