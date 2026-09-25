@@ -309,20 +309,23 @@ class TestPaperPartialEndToEnd:
         assert len(positions) == 1
         assert positions[0]["position_size_usd"] == pytest.approx(1.12, abs=0.01)
 
-        # The order holds the rest, and the capital ledger sees it. Before
-        # this fix the remainder was invisible: the same request would have
-        # left free cash $1.88 higher than the live venue leaves it.
+        # The order holds the rest, and the capital ledger sees it - in the
+        # pool that owns it. The resting order is PAPER, so it reserves paper
+        # cash; the live pool is untouched by a paper reservation.
         #
-        # (Paper POSITIONS are an evidence pool the ledger deliberately does
-        # not charge against live free cash - the separate paper bankroll is
-        # part of the capital-allocation layer, not this one. The working
-        # order is not paper decoration: it is cash promised to an order, and
-        # it counts.)
+        # (Paper POSITIONS are charged to the paper pool the same way live
+        # positions are charged to the live one - V30. Before that split the
+        # paper position sat outside every pool and paper could over-commit.)
         assert agent.storage.resting_capital_usd() == pytest.approx(1.88, abs=0.01)
         ledger = PositionLedgerBuilder(storage=agent.storage).build()
-        assert ledger.resting_order_cost == pytest.approx(1.88, abs=0.01)
+        assert ledger.resting_order_cost == 0.0
+        assert ledger.paper_resting_order_cost == pytest.approx(1.88, abs=0.01)
         assert ledger.paper_position_count == 1
-        assert ledger.free_cash == pytest.approx(50.0 - 1.88, abs=0.02)
+        assert ledger.free_cash == pytest.approx(50.0, abs=0.02)
+        # The paper pool charged the way the live pool would be:
+        # bankroll - position - resting.
+        assert ledger.paper_free_cash == pytest.approx(
+            50.0 - 1.12 - 1.88, abs=0.02)
 
 
 # -------------------------------------------------- the token of the side

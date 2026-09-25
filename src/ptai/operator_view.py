@@ -93,12 +93,56 @@ def _capital(storage) -> Dict[str, Any]:
         return {"available": False, "source": "position_ledger",
                 "reason": f"{type(e).__name__}: {e}"}
 
+    # The account the operator is running. In paper, the account on screen is
+    # the PAPER account - its bankroll, its positions, its free cash - because
+    # that is the capital the operator is watching grow. Showing the live
+    # account's $50 flat while the paper account does the work would hide the
+    # very trial the operator is running.
+    mode = _operator_mode(storage)
+    live_positions = int(getattr(ledger, "live_position_count", 0) or 0)
+    paper_positions = int(getattr(ledger, "paper_position_count", 0) or 0)
+    if mode == "paper":
+        equity = float(getattr(ledger, "paper_equity", 0.0) or 0.0)
+        free = float(getattr(ledger, "paper_free_cash", 0.0) or 0.0)
+        reserved = float(getattr(ledger, "paper_position_cost", 0.0) or 0.0)
+        position_value = float(getattr(ledger, "paper_position_value", 0.0) or 0.0)
+        resting = float(getattr(ledger, "paper_resting_order_cost", 0.0) or 0.0)
+        committed = position_value + resting
+        try:
+            row = storage.conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) AS total FROM trades "
+                "WHERE resolved = 1 AND COALESCE(execution_mode,'live')='paper'"
+            ).fetchone()
+            realised = float(row["total"] or 0.0) if row else 0.0
+        except Exception:
+            realised = 0.0
+        return {
+            "available": True,
+            "source": "position_ledger",
+            "account": "paper",
+            "equity_usd": round(equity, 2),
+            "free_cash_usd": round(free, 2),
+            "reserved_capital_usd": round(reserved, 2),
+            "open_position_value_usd": round(position_value, 2),
+            "resting_order_cost_usd": round(resting, 2),
+            "realised_pnl_usd": round(realised, 2),
+            "unrealised_pnl_usd": 0.0,
+            "deployment_pct": (round(committed / equity * 100, 1) if equity else 0.0),
+            "deployed_usd": round(committed, 2),
+            # The live account is still reported by its counts - the
+            # operator's paper trial must not make real positions invisible.
+            "live_positions": live_positions,
+            "paper_positions": paper_positions,
+            "warnings": list(getattr(ledger, "warnings", []) or []),
+        }
+
     equity = float(getattr(ledger, "equity", 0.0) or 0.0)
     committed = (float(getattr(ledger, "open_position_value", 0.0) or 0.0)
                  + float(getattr(ledger, "resting_order_cost", 0.0) or 0.0))
     return {
         "available": True,
         "source": "position_ledger",
+        "account": "live",
         "equity_usd": round(equity, 2),
         "free_cash_usd": round(float(getattr(ledger, "free_cash", 0.0) or 0.0), 2),
         "reserved_capital_usd": round(

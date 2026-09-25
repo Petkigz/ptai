@@ -647,16 +647,28 @@ class Storage:
             "SELECT * FROM orders WHERE id = ?", (str(order_id),)).fetchone()
         return self._order_row(row) if row else None
 
-    def resting_capital_usd(self, venue_id: Optional[str] = None) -> float:
+    def resting_capital_usd(self, venue_id: Optional[str] = None,
+                            execution_mode: Optional[str] = None) -> float:
         """
         Cash locked behind orders that have not filled.
 
         For each working order, the unfilled share of the request. Booked
         positions are NOT included here - their cost is already in the trades
         table - so there is no double count between the two.
+
+        `execution_mode` splits the reservation between the accounts that own
+        it: "paper" counts the paper orders, "live" everything else (a row
+        with no mode is a live row - the conservative reading, because an
+        unlabelled reservation is one the live account cannot assume away).
         """
         total = 0.0
         for order in self.get_open_orders(venue_id=venue_id):
+            if execution_mode == "paper" and \
+                    str(order.get("execution_mode") or "").lower() != "paper":
+                continue
+            if execution_mode == "live" and \
+                    str(order.get("execution_mode") or "").lower() == "paper":
+                continue
             requested = float(order.get("requested_usd") or 0.0)
             matched = float(order.get("matched_usd") or 0.0)
             if order.get("status") == "unconfirmed_send":

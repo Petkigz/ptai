@@ -1346,13 +1346,25 @@ class TradingAgentV3:
             self._resolve_live_capital(
                 portfolio=portfolio,
                 free_cash=ledger.free_cash)
+        # Two pools, and a trade draws only from the one it will spend.
+        # free_capital is the operator's live account; free_capital_paper is
+        # its shadow, carrying the same rules. Sizing a paper trade against
+        # the live pool would let a paper run trade capital it does not have,
+        # and the evidence would measure a bankroll the strategy never had.
         free_capital = ledger.free_cash
+        free_capital_paper = ledger.paper_free_cash
         self.last_ledger = ledger
         logger.info(
             f"Capital: equity ${ledger.equity:.2f} = free ${ledger.free_cash:.2f} "
             f"+ reserved ${ledger.reserved_capital:.2f} "
             f"({ledger.live_position_count} live, {ledger.paper_position_count} paper); "
             f"realised ${ledger.realised_pnl:+.2f}, unrealised ${ledger.unrealised_pnl:+.2f}")
+        logger.info(
+            f"Capital (paper): equity ${ledger.paper_equity:.2f} = free "
+            f"${ledger.paper_free_cash:.2f} + positions "
+            f"${ledger.paper_position_cost:.2f} + resting "
+            f"${ledger.paper_resting_order_cost:.2f} "
+            f"({ledger.paper_position_count} paper positions)")
         for _warning in ledger.warnings:
             logger.warning(f"Ledger: {_warning}")
         
@@ -1415,10 +1427,18 @@ class TradingAgentV3:
             #
             # Sizing against free_capital, not equity, so positions in one batch
             # cannot each claim 6% of the same dollars.
+            # The pool this trade will draw from. `_adapter_is_paper` is THE
+            # predicate for "will this order spend real money" - the venue-cap
+            # clamp below already reads it, so sizing and the clamp cannot
+            # disagree about which account the trade comes out of.
+            is_paper_trade = self._adapter_is_paper(opp)
+            pool_free = free_capital_paper if is_paper_trade else free_capital
+            pool_bankroll = (ledger.paper_bankroll if is_paper_trade
+                             else bankroll)
             kelly_result = self.kelly_calculator.calculate(
                 market_price=opp.market_price,
                 fair_prob=opp.estimated_fair,
-                bankroll=free_capital,
+                bankroll=pool_free,
             )
             if not kelly_result.should_bet:
                 logger.info(
@@ -1429,8 +1449,9 @@ class TradingAgentV3:
             # kelly_fraction_adj is already half-Kelly and already capped at 6%
             # of the bankroll it was given; the min() below is a second cap
             # against equity, not against the free cash we just used.
-            proposed_amount = free_capital * kelly_result.kelly_fraction_adj
-            proposed_amount = min(proposed_amount, bankroll * 0.06)  # Cap 6% of equity
+            proposed_amount = pool_free * kelly_result.kelly_fraction_adj
+            proposed_amount = min(proposed_amount, pool_bankroll * 0.06)
+            opp._is_paper_trade = is_paper_trade
 
             # ...and by the capital THIS VENUE may actually spend.
             #
@@ -1664,6 +1685,12 @@ class TradingAgentV3:
                     logger.warning(f"Account health: {venue_id} paper trading only (no live credentials/funds): {account_health.reason} - allowing paper execution only")
                 
                 # V10 FIX #2: Use SAME amount calculated earlier (no recalculation)
+                # Same pool rule as sizing: a trade that will only simulate
+                # draws the paper pool, one that can spend real money draws
+                # the live one.
+                is_paper_trade = (getattr(opp, "_is_paper_trade", False)
+                                  or self._adapter_is_paper(opp))
+                pool_free = free_capital_paper if is_paper_trade else free_capital
                 amount_usd = getattr(opp, '_proposed_amount', None)
                 if amount_usd is None:
                     # Fallback if not set (should not happen). Same corrected
@@ -1671,15 +1698,18 @@ class TradingAgentV3:
                     _kr = self.kelly_calculator.calculate(
                         market_price=opp.market_price,
                         fair_prob=opp.estimated_fair,
-                        bankroll=current_bankroll,
+                        bankroll=pool_free,
                     )
                     if not _kr.should_bet:
                         logger.info(
                             f"Kelly declines {opp.market.id} at the execution "
                             f"gate: {_kr.reason}")
                         continue
-                    amount_usd = current_bankroll * _kr.kelly_fraction_adj
-                    amount_usd = min(amount_usd, current_bankroll * 0.06)
+                    amount_usd = pool_free * _kr.kelly_fraction_adj
+                    amount_usd = min(
+                        amount_usd,
+                        (ledger.paper_bankroll if is_paper_trade
+                         else current_bankroll) * 0.06)
                 
                 if amount_usd < 1.0:
                     logger.info(f"Position size ${amount_usd:.2f} < $1 min - skip {opp.market.id}")
@@ -1769,10 +1799,21 @@ class TradingAgentV3:
                     "account_health": account_health.to_dict()
                 })
                 
-                free_capital = self._record_execution(
-                    opp, exec_result, execution_results[-1],
-                    venue_id=venue_id, amount_usd=amount_usd,
-                    current_bankroll=current_bankroll, free_capital=free_capital)
+                # Draw down the pool the trade actually drew from. A simulated
+                # fill spends paper capital; subtracting it from the live pool
+                # would let a paper run spend a number it must never touch.
+                if getattr(exec_result, "is_simulated", False):
+                    free_capital_paper = self._record_execution(
+                        opp, exec_result, execution_results[-1],
+                        venue_id=venue_id, amount_usd=amount_usd,
+                        current_bankroll=current_bankroll,
+                        free_capital=free_capital_paper)
+                else:
+                    free_capital = self._record_execution(
+                        opp, exec_result, execution_results[-1],
+                        venue_id=venue_id, amount_usd=amount_usd,
+                        current_bankroll=current_bankroll,
+                        free_capital=free_capital)
             except Exception as e:
                 logger.error(f"Execution failed for {opp.market.id}: {e}")
                 import traceback
@@ -1785,9 +1826,10 @@ class TradingAgentV3:
         # --- the arbitrage lane -------------------------------------------
         # Discovered, reported, and until now never traded. Same executor, same
         # recorder, same gates as the path above.
-        free_capital = await self._execute_arbitrage_lane(
+        free_capital, free_capital_paper = await self._execute_arbitrage_lane(
             scan_result, execution_results,
-            current_bankroll=current_bankroll, free_capital=free_capital)
+            current_bankroll=current_bankroll, free_capital=free_capital,
+            free_capital_paper=free_capital_paper)
 
         # V10 FIX #8: Log exploration lane results (shadow only, no capital)
         if exploration_trades:
@@ -2222,7 +2264,8 @@ class TradingAgentV3:
 
     async def _execute_arbitrage_lane(self, scan_result, execution_results, *,
                                       current_bankroll, free_capital,
-                                      max_pairs: int = 1) -> float:
+                                      free_capital_paper: float = 0.0,
+                                      max_pairs: int = 1):
         """
         Execute the arbitrage the scan found, and record both legs.
 
@@ -2256,7 +2299,7 @@ class TradingAgentV3:
                    "attempted": 0, "legs_filled": 0, "hedged": 0, "results": []}
         self._last_arb_execution = summary
         if not candidates:
-            return free_capital
+            return free_capital, free_capital_paper
 
         for arb in candidates[:max_pairs]:
             try:
@@ -2278,7 +2321,14 @@ class TradingAgentV3:
                     "position_recorded": False})
                 continue
 
-            pair_budget = min(current_bankroll * 0.06, free_capital)
+            # A pair cannot straddle the pools: with one venue holding the
+            # live capital at a time, either both legs simulate or the pair
+            # is refused. Budget the pool the legs will actually draw.
+            legs_paper = all(self._adapter_is_paper(o) for o in (opp_a, opp_b))
+            pool = free_capital_paper if legs_paper else free_capital
+            pool_bankroll = (self.storage.get_paper_bankroll() if legs_paper
+                             else current_bankroll)
+            pair_budget = min(pool_bankroll * 0.06, pool)
             amount_per_leg = pair_budget / 2.0
             summary["attempted"] += 1
             try:
@@ -2323,21 +2373,87 @@ class TradingAgentV3:
                 # The SAME recorder the single path uses. A leg is a position
                 # like any other: it has to be recorded, settled, and learned
                 # from, or the pair's P&L is folklore.
-                free_capital = self._record_execution(
-                    opp, result, slot, venue_id=opp.venue_id,
-                    amount_usd=amount_per_leg, current_bankroll=current_bankroll,
-                    free_capital=free_capital)
+                if legs_paper:
+                    free_capital_paper = self._record_execution(
+                        opp, result, slot, venue_id=opp.venue_id,
+                        amount_usd=amount_per_leg,
+                        current_bankroll=current_bankroll,
+                        free_capital=free_capital_paper)
+                else:
+                    free_capital = self._record_execution(
+                        opp, result, slot, venue_id=opp.venue_id,
+                        amount_usd=amount_per_leg,
+                        current_bankroll=current_bankroll,
+                        free_capital=free_capital)
                 if result.bought_something:
                     summary["legs_filled"] += 1
                 if "HEDGE" in str(result.reasoning):
                     summary["hedged"] += 1
+                # The hedge is sized in SHARES on the filled part. Any
+                # remainder still resting would fill later as a one-sided
+                # position - exactly the exposure the pair exists to avoid.
+                # Leg A's remainder is unhedged A; leg B's remainder is
+                # over-hedged B. Both are cancelled, not left to drift.
+                if result.unfilled_shares > 0 and slot.get("order_key"):
+                    await self._cancel_arb_remainder(opp, slot)
                 summary["results"].append({
                     "venue": opp.venue_id, "market_id": opp.market.id,
                     "side": opp.side, "status": result.status,
                     "filled_usd": result.filled_usd,
                     "filled_shares": result.filled_shares,
+                    "remainder_cancelled": slot.get("remainder_cancelled"),
                     "reasoning": result.reasoning[:200]})
-        return free_capital
+        return free_capital, free_capital_paper
+
+    async def _cancel_arb_remainder(self, opp, slot) -> None:
+        """
+        Cancel the resting remainder of an arbitrage leg, at the venue first
+        where there is a venue order, then in the local record.
+
+        The hedge is sized in shares on what FILLED. A remainder that is left
+        resting fills later as a one-sided position - precisely the exposure
+        the pair exists to avoid - so it is cancelled rather than reconciled
+        into the portfolio. A venue cancel that is not confirmed leaves the
+        local row open: the reservation stays, and reconciliation verifies
+        the order is gone before it is released.
+        """
+        order_key = slot.get("order_key")
+        reason = ("arbitrage leg hedged on the filled shares; the resting "
+                  "remainder would become one-sided exposure")
+        row = None
+        try:
+            row = self.storage.get_order_row(order_key)
+        except Exception:
+            row = None
+        order_id = str((row or {}).get("order_id") or order_key or "")
+        venue_cancelled = None
+        if order_id and not order_id.startswith("local-"):
+            adapter = None
+            try:
+                adapter = self.venue_registry.get_adapter(
+                    str((row or {}).get("venue_id") or opp.venue_id))
+            except Exception:
+                adapter = None
+            cancel = getattr(adapter, "cancel_order", None) if adapter else None
+            if cancel is not None:
+                try:
+                    out = await cancel(order_id)
+                    venue_cancelled = bool(
+                        isinstance(out, dict)
+                        and out.get("status") == "cancelled")
+                except Exception as e:
+                    logger.warning(
+                        f"Venue cancel of arb remainder {order_id} failed: "
+                        f"{type(e).__name__}: {e}")
+        if order_id.startswith("local-") or venue_cancelled:
+            slot["remainder_cancelled"] = bool(
+                self.order_manager.cancel_order(order_key, reason=reason))
+        else:
+            slot["remainder_cancelled"] = False
+            logger.warning(
+                f"Arb remainder {order_id}: the venue did not confirm the "
+                f"cancel, so the reservation stays open until reconciliation "
+                f"proves the order is gone")
 
     async def _arbitrage_blocked(self, arb, opp_a, opp_b, free_capital) -> str:
         """

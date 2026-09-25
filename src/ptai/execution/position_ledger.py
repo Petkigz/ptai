@@ -53,6 +53,16 @@ class PositionLedger:
     realised_pnl: float = 0.0
     live_position_count: int = 0
     paper_position_count: int = 0
+    # The paper account: real capital's shadow, with its own bankroll, its own
+    # positions and its own reservations - the same arithmetic, so a paper run
+    # trades the capital it actually has instead of sizing against a pool it
+    # will never spend.
+    paper_bankroll: float = 0.0
+    paper_position_cost: float = 0.0
+    paper_position_value: float = 0.0
+    paper_resting_order_cost: float = 0.0
+    paper_free_cash: float = 0.0
+    paper_equity: float = 0.0
     initial_bankroll: float = 50.0
     warnings: List[str] = field(default_factory=list)
 
@@ -88,6 +98,12 @@ class PositionLedger:
             "reserved_pct": round(self.reserved_pct, 2),
             "live_position_count": self.live_position_count,
             "paper_position_count": self.paper_position_count,
+            "paper_bankroll": round(self.paper_bankroll, 2),
+            "paper_position_cost": round(self.paper_position_cost, 2),
+            "paper_position_value": round(self.paper_position_value, 2),
+            "paper_resting_order_cost": round(self.paper_resting_order_cost, 2),
+            "paper_free_cash": round(self.paper_free_cash, 2),
+            "paper_equity": round(self.paper_equity, 2),
             "initial_bankroll": round(self.initial_bankroll, 2),
             "can_open_new": self.can_open_new,
             "warnings": self.warnings,
@@ -143,6 +159,14 @@ class PositionLedgerBuilder:
 
         ledger.initial_bankroll = float(summary.get("initial_bankroll", 50.0) or 50.0)
         bankroll = float(summary.get("bankroll", ledger.initial_bankroll) or 0.0)
+        # The shadow account. It starts at the same figure the real account
+        # started with (storage falls back to the initial bankroll), and it
+        # moves only with paper settlements - so the two accounts diverge
+        # exactly as far as the simulation says they should.
+        try:
+            paper_bankroll = float(self.storage.get_paper_bankroll() or 0.0)
+        except Exception:
+            paper_bankroll = ledger.initial_bankroll
 
         try:
             open_trades = self.storage.get_open_positions()
@@ -204,8 +228,14 @@ class PositionLedgerBuilder:
 
             if status == "paper":
                 # Paper capital is not real capital and must never reduce the
-                # free cash available for live positions.
+                # free cash available for live positions - and it must reduce
+                # the PAPER free cash exactly the way a live position reduces
+                # the live free cash, or a paper run sizes trades against
+                # capital it does not have. Carried at cost, like an unmarked
+                # live position.
                 ledger.paper_position_count += 1
+                ledger.paper_position_cost += size
+                ledger.paper_position_value += size
                 continue
 
             ledger.live_position_count += 1
@@ -251,21 +281,30 @@ class PositionLedgerBuilder:
         # next cycle then sized against money that was already promised to an
         # earlier order, and the venue rejected one of them - or worse, both
         # filled and the agent held more exposure than it had authorised.
-        resting_usd = 0.0
+        # Split by the account that owns the reservation: a paper order
+        # promises paper cash, a live order promises live cash, and mixing
+        # the two is how one account funds a promise the other made.
+        resting_live = resting_paper = 0.0
         try:
-            resting_usd = float(self.storage.resting_capital_usd() or 0.0)
+            resting_live = float(self.storage.resting_capital_usd(
+                execution_mode="live") or 0.0)
+            resting_paper = float(self.storage.resting_capital_usd(
+                execution_mode="paper") or 0.0)
         except Exception as e:
-            # An unreadable reservation is NOT zero. Treating it as zero is the
-            # exact overcommit this guards against, so refuse to size instead.
+            # An unreadable reservation is NOT zero. Treating it as zero is
+            # the exact overcommit this guards against, so refuse to size
+            # instead.
             ledger.warnings.append(
                 f"working orders could not be read ({type(e).__name__}: {e}), so "
                 f"the capital already committed to them is unknown - new "
                 f"positions cannot be sized safely this cycle")
             ledger.reservations_unknown = True
-            resting_usd = bankroll  # assume fully committed: the safe end
+            resting_live = bankroll     # assume fully committed: the safe end
+            resting_paper = paper_bankroll
 
         ledger.reserved_capital = ledger.open_position_cost
-        ledger.resting_order_cost = resting_usd
+        ledger.resting_order_cost = resting_live
+        ledger.paper_resting_order_cost = resting_paper
         ledger.unrealised_pnl = ledger.open_position_value - ledger.open_position_cost
 
         # Free cash = the recorded bankroll minus everything already committed.
@@ -295,6 +334,23 @@ class PositionLedgerBuilder:
         # happen.
         ledger.equity = (ledger.free_cash + ledger.open_position_value
                          + ledger.resting_order_cost)
+
+        # The same arithmetic on the shadow account: its bankroll, its
+        # positions, its reservations.
+        ledger.paper_bankroll = paper_bankroll
+        committed_paper = (ledger.paper_position_cost
+                           + ledger.paper_resting_order_cost)
+        ledger.paper_free_cash = max(0.0, paper_bankroll - committed_paper)
+        if paper_bankroll < committed_paper:
+            ledger.warnings.append(
+                f"paper committed capital ${committed_paper:.2f} (positions "
+                f"${ledger.paper_position_cost:.2f} + working orders "
+                f"${ledger.paper_resting_order_cost:.2f}) exceeds the paper "
+                f"bankroll ${paper_bankroll:.2f} - the paper ledger and "
+                f"storage disagree and one of them is wrong")
+        ledger.paper_equity = (ledger.paper_free_cash
+                               + ledger.paper_position_value
+                               + ledger.paper_resting_order_cost)
 
         return ledger
 

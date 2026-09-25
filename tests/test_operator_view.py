@@ -151,17 +151,32 @@ class TestTheSevenQuestions:
 
     def test_a_paper_position_does_not_full_the_deployment_meter(self, storage):
         """
-        Deployment is about the operator's money. A $1 shadow position must not
-        move the meter that decides how much real capital is at work.
+        Deployment is about the operator's money. A $1 paper position must not
+        move the meter for the LIVE account - the one that decides how much
+        real capital is at work. In paper mode the account on screen is the
+        PAPER account, and its meter shows the paper deployment - that is the
+        trial the operator is running, and hiding it would hide the evidence.
         """
+        from src.ptai.execution.capital import set_operator_mode
+
         storage.log_trade({
             "market_id": "PAPER-1", "venue_id": "polymarket", "side": "YES",
             "position_size_usd": 1.0, "market_price": 0.5,
             "status": "paper", "execution_mode": "paper",
         })
+        set_operator_mode(storage, "live")
         snap = operator_snapshot(storage)
+        assert snap["capital"]["account"] == "live"
         assert snap["capital"]["deployment_pct"] == 0.0, (
-            "a simulated position was counted as deployed capital")
+            "a simulated position was counted as deployed real capital")
+        assert snap["capital"]["free_cash_usd"] == pytest.approx(50.0)
+
+        set_operator_mode(storage, "paper")
+        snap = operator_snapshot(storage)
+        assert snap["capital"]["account"] == "paper"
+        # $1 of the $50 paper bankroll is working: 2%, and that is shown.
+        assert snap["capital"]["deployment_pct"] == pytest.approx(2.0, abs=0.1)
+        assert snap["capital"]["free_cash_usd"] == pytest.approx(49.0)
 
     def test_strategy_evidence_comes_from_recorded_outcomes(self, storage):
         """

@@ -100,7 +100,7 @@ def _inject_pair(agent, monkeypatch, arb) -> None:
                         scan_all_venues, raising=True)
 
 
-def _paper_venue(venue_id: str, yes_price: float):
+def _paper_venue(venue_id: str, yes_price: float, ask_size: str = "5000"):
     """
     A dry-run venue that SIMULATES its fill, the way the real adapters do.
 
@@ -129,7 +129,7 @@ def _paper_venue(venue_id: str, yes_price: float):
     yes_bid = yes_price
     yes_ask = yes_price + 0.02
     yes_book = {"bids": [{"price": f"{yes_bid:.2f}", "size": "5000"}],
-                "asks": [{"price": f"{yes_ask:.2f}", "size": "5000"}],
+                "asks": [{"price": f"{yes_ask:.2f}", "size": ask_size}],
                 "spread": round(yes_ask - yes_bid, 4), "is_real": True,
                 "source": "stub_book"}
 
@@ -147,13 +147,13 @@ def _paper_venue(venue_id: str, yes_price: float):
         # The token actually being bought: YES at its ask, NO at 1 - YES bid.
         token_ask = yes_ask if side == "YES" else round(1.0 - yes_bid, 6)
         side_book = {"bids": [{"price": f"{token_ask - 0.01:.2f}", "size": "5000"}],
-                     "asks": [{"price": f"{token_ask:.2f}", "size": "5000"}]}
+                     "asks": [{"price": f"{token_ask:.2f}", "size": ask_size}]}
         mechanics = MarketMechanics(tick_size="0.01", min_order_size=1.0,
                                     source="clob_market_info", is_real=True)
         fill = PaperBroker(taker_fee_rate=0.0).simulate(
             side_book, "BUY", float(max_spend_usd), limit_price=float(max_price),
             mechanics=mechanics, book_source="orderbook")
-        return {
+        result = {
             "status": "paper", "is_real": False, "simulated": True,
             "venue_id": venue_id, "market_id": opportunity.market.id,
             "simulated_filled_usd": fill.filled_usd,
@@ -162,6 +162,18 @@ def _paper_venue(venue_id: str, yes_price: float):
             "price": fill.avg_price or float(max_price),
             "paper_fill": fill.to_dict(),
         }
+        # The adapter's paper contract (V29): when the book cannot supply the
+        # order, report the remainder the same way a live partial does, so the
+        # lane can see the unfilled shares and cancel them after the hedge.
+        if fill.unfilled_usd > 1e-9:
+            signed = fill.filled_shares + (
+                fill.unfilled_usd / float(max_price)
+                if fill.unfilled_usd > 0 and max_price else 0.0)
+            result["size_matched"] = fill.filled_shares
+            result["original_size"] = signed
+            result["resting_usd"] = fill.unfilled_usd
+            result["resting_limit_price"] = float(max_price)
+        return result
 
     stub.get_orderbook = get_orderbook
     stub.place_order = place_order
@@ -203,7 +215,7 @@ def _live_venue(venue_id: str):
     return stub
 
 
-def _build(tmp_path, monkeypatch, arb=None, live=False):
+def _build(tmp_path, monkeypatch, arb=None, live=False, ask_sizes=None):
     """
     A real agent on a fresh database, with only the venue ADAPTERS stubbed.
 
@@ -222,9 +234,11 @@ def _build(tmp_path, monkeypatch, arb=None, live=False):
     prices = {VENUE_A: pair.price_a, VENUE_B: pair.price_b}
     venues = {}
     adapters = []
+    ask_sizes = ask_sizes or {}
     for venue_id in (VENUE_A, VENUE_B):
         stub = (_live_venue(venue_id) if live
-                else _paper_venue(venue_id, prices[venue_id]))
+                else _paper_venue(venue_id, prices[venue_id],
+                                   ask_size=ask_sizes.get(venue_id, "5000")))
         venues[venue_id] = stub
         adapters.append(stub)
     registry = base.stub_registry(*adapters)

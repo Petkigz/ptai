@@ -204,20 +204,73 @@ class OrderManager:
                                 OrderStatus.PARTIAL, OrderStatus.UNCONFIRMED]]
 
     def cancel_order(self, order_id: str, reason: str = "manual") -> bool:
+        """
+        Cancel an order in every place it exists.
+
+        The in-memory cache AND the orders table: a cancel that only touched
+        the cache was forgotten on restart, so the kill switch - which walks
+        the storage rows - could not release the reservations it was written
+        to release, and reserved capital sat locked behind an order the agent
+        had already called off.
+        """
+        cancelled = False
         if order_id in self.orders:
             order = self.orders[order_id]
             if order.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED,
                                 OrderStatus.PARTIAL, OrderStatus.UNCONFIRMED]:
                 order.status = OrderStatus.CANCELLED
                 order.raw_response["cancel_reason"] = reason
-                logger.info(f"Order {order_id} cancelled: {reason}")
-                return True
-        return False
+                cancelled = True
+        if self.storage is not None:
+            try:
+                row = self.storage.get_order_row(order_id)
+            except Exception:
+                row = None
+            if row is not None:
+                if str(row.get("status") or "") not in FINAL_STATUSES:
+                    try:
+                        self.storage.upsert_order({
+                            "order_id": order_id,
+                            "status": "cancelled",
+                            "terminal_reason": f"cancelled: {reason}",
+                            "last_synced_at":
+                                datetime.now(timezone.utc).isoformat(),
+                        })
+                        cancelled = True
+                    except Exception as e:
+                        logger.error(
+                            f"Could not record the cancel of {order_id}: "
+                            f"{type(e).__name__}: {e} - the reservation "
+                            f"stays until reconciliation proves it is gone")
+        if cancelled:
+            logger.info(f"Order {order_id} cancelled: {reason}")
+        return cancelled
 
-    def cancel_all(self, reason: str = "kill_switch"):
-        for order in self.get_open_orders():
-            self.cancel_order(order.id, reason=reason)
-        logger.warning(f"Cancelled all open orders: {reason}")
+    def cancel_all(self, reason: str = "kill_switch") -> int:
+        """
+        Cancel every working order, in memory AND in storage.
+
+        The in-memory cache is what a live process holds; the orders table is
+        what a restarted process holds. Walking only the cache is how a kill
+        switch after a restart would release nothing while the reservations
+        stayed locked behind orders the agent no longer sees.
+        """
+        cancelled = set()
+        for order in list(self.orders.values()):
+            if self.cancel_order(order.id, reason=reason):
+                cancelled.add(order.id)
+        if self.storage is not None:
+            try:
+                rows = self.storage.get_open_orders()
+            except Exception:
+                rows = []
+            for row in rows:
+                row_id = str(row.get("order_id") or "")
+                if row_id and self.cancel_order(row_id, reason=reason):
+                    cancelled.add(row_id)
+        logger.warning(
+            f"Cancelled {len(cancelled)} open order(s): {reason}")
+        return len(cancelled)
 
     def get_status_report(self) -> Dict:
         open_orders = self.get_open_orders()

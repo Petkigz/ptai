@@ -530,10 +530,18 @@ class TestPositionLedger:
         import src.ptai.agent.v3_loop as v3
 
         source = execution_path_source()
-        assert "free_capital * kelly_result.kelly_fraction_adj" in source, (
-            "sizing must use free capital"
+        # V30: the pool is whichever account the trade will actually spend -
+        # the live free cash for a live order, the paper free cash for a
+        # simulated one. Sizing against the stored bankroll is the bug this
+        # guard was written to catch, in either pool.
+        assert "pool_free = free_capital_paper if is_paper_trade else free_capital" \
+            in source, (
+            "each trade must size from the pool it will actually spend"
         )
-        assert "bankroll=free_capital" in source, (
+        assert "pool_free * kelly_result.kelly_fraction_adj" in source, (
+            "sizing must use the pool's free capital"
+        )
+        assert "bankroll=pool_free" in source, (
             "Kelly must be given free capital, not the stored bankroll"
         )
         assert "free_capital - _committed" in source, (
