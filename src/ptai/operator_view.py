@@ -228,9 +228,28 @@ def _venue_evidence(storage) -> Dict[str, Any]:
         from .strategy.venue_selection import VenueSelector
         selector = VenueSelector(storage=storage)
         stats = selector.venue_evidence()
+        # The cell-level view of the same record, so "which venue" comes with
+        # "at what" - a venue can be good at a five-minute sports market and
+        # hopeless at a thirty-day political one, and a venue total cannot say
+        # which of those the money would be going into.
+        matrix = selector.evidence_matrix()
+        cells = selector.best_cells()
     except Exception as e:
         block["reason"] = f"{type(e).__name__}: {e}"
         return block
+
+    block["matrix"] = {
+        "source": "trade_outcomes, grouped by venue x strategy x market type x execution mode",
+        "cells": len(matrix or {}),
+        "cells_with_enough_evidence": len(cells or []),
+        "min_cell_samples": VenueSelector.MIN_CELL_SAMPLES,
+        "strongest_cells": [
+            {"cell": cell["key"], "resolved": cell["resolved"],
+             "net_pnl_per_trade": round(cell["net_pnl_per_trade"], 4),
+             "real_evidence_coverage": round(cell["real_evidence_coverage"], 3)}
+            for cell in (cells or [])[:3]
+        ],
+    }
 
     ranked: List[Dict[str, Any]] = []
     for venue_id, row in (stats or {}).items():
@@ -436,6 +455,26 @@ def describe_snapshot(snapshot: Dict[str, Any]) -> List[str]:
             f"Risk: {'HALTED - ' + str(risk.get('halt_reason')) if risk.get('trading_halted') else 'trading'}"
             f", kill switch level {risk.get('kill_switch_level')}"
             f", {risk.get('unprofitable_streak', 0)} consecutive unprofitable days")
+    matrix = venues.get("matrix") or {}
+    if matrix.get("cells"):
+        strongest = matrix.get("strongest_cells") or []
+        if strongest:
+            top = strongest[0]
+            lines.append(
+                f"Evidence: {matrix.get('cells_with_enough_evidence', 0)} of "
+                f"{matrix['cells']} venue x strategy x market type x execution "
+                f"mode cells have {matrix.get('min_cell_samples', 5)}+ resolved "
+                f"trades; the strongest is {top['cell']} "
+                f"(${top['net_pnl_per_trade']:+.3f} a trade over "
+                f"{top['resolved']} trades, "
+                f"{top['real_evidence_coverage'] * 100:.0f}% priced against a "
+                f"real book)")
+        else:
+            lines.append(
+                f"Evidence: {matrix['cells']} venue x strategy x market type x "
+                f"execution mode cell(s), none yet with "
+                f"{matrix.get('min_cell_samples', 5)}+ resolved trades - no slice "
+                f"of the record is thick enough to allocate on")
     cycle = snapshot.get("last_cycle") or {}
     if cycle.get("available"):
         orders = cycle.get("orders") or {}

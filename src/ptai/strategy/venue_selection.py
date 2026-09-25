@@ -398,6 +398,231 @@ class VenueSelector:
             }
         return out
 
+    # ------------------------------------------------------------------
+    # the evidence matrix
+    # ------------------------------------------------------------------
+
+    MIN_CELL_SAMPLES = 5
+
+    def evidence_matrix(self) -> Dict[str, Dict[str, Any]]:
+        """
+        What the agent has actually learned, cell by cell.
+
+        "Venue = good/bad" is the crudest possible reading of the outcome log,
+        and it was the only one available: every statistic grouped by
+        `venue_id`. The truth the log already contains is finer - a venue can be
+        good at a five-minute sports market and hopeless at a thirty-day
+        political one, and one strategy's results are not another's. The
+        seventh report asks allocation to learn
+        VENUE x MARKET TYPE x STRATEGY x EXECUTION STYLE; these are the
+        dimensions the record can actually support, so these are the cells.
+
+        Read from `trade_outcomes`, which is the only table that carries the
+        RESOLVED result together with what was predicted, what it cost and
+        whether the fill was priced against a real book.
+
+        `execution_mode` is a dimension rather than a filter: paper and live are
+        never averaged into one cell, because a simulated win is not a live one.
+        """
+        if self.storage is None:
+            return {}
+        try:
+            rows = self.storage.conn.execute(
+                """
+                SELECT venue_id, strategy, category,
+                       COALESCE(execution_mode, 'unclassified') AS mode,
+                       COUNT(*) AS resolved,
+                       SUM(pnl) AS net_pnl,
+                       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN fill_is_real THEN 1 ELSE 0 END) AS real_evidence,
+                       AVG(expected_net_ev_pct) AS expected_ev_pct
+                FROM trade_outcomes
+                WHERE actual_outcome IS NOT NULL
+                GROUP BY venue_id, strategy, category, mode
+                """
+            ).fetchall()
+        except Exception as e:
+            logger.error(f"Could not read the evidence matrix: "
+                         f"{type(e).__name__}: {e}")
+            return {}
+
+        cells: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            resolved = int(row["resolved"] or 0)
+            wins = int(row["wins"] or 0)
+            key = "|".join(str(row[k] or "") for k in
+                           ("venue_id", "strategy", "category", "mode"))
+            cells[key] = {
+                "key": key,
+                "venue_id": str(row["venue_id"] or ""),
+                "strategy": str(row["strategy"] or ""),
+                "category": str(row["category"] or ""),
+                "execution_mode": str(row["mode"] or ""),
+                "resolved": resolved,
+                "net_pnl": float(row["net_pnl"] or 0.0),
+                "net_pnl_per_trade": (float(row["net_pnl"] or 0.0) / resolved
+                                      if resolved else 0.0),
+                "win_rate": (wins / resolved) if resolved else 0.0,
+                "real_evidence": int(row["real_evidence"] or 0),
+                "real_evidence_coverage": (
+                    int(row["real_evidence"] or 0) / resolved if resolved else 0.0),
+                "expected_net_ev_pct": (
+                    None if row["expected_ev_pct"] is None
+                    else float(row["expected_ev_pct"])),
+                "enough_evidence": resolved >= self.MIN_CELL_SAMPLES,
+            }
+        return cells
+
+    def cell_evidence(self, venue_id: str, strategy: str = "",
+                      category: str = "",
+                      execution_mode: str = "") -> Dict[str, Any]:
+        """
+        The most specific slice of the record that has ENOUGH evidence.
+
+        THE ONE RULE: RELAX DIMENSIONAL SPECIFICITY, NEVER EVIDENCE PROVENANCE.
+
+        A narrow question - "how has polymarket x value x sports done LIVE?" -
+        can legitimately be answered from a wider slice, because the wider slice
+        is the same kind of thing counted more broadly. It can never be answered
+        from a DIFFERENT KIND of evidence. Simulated trades are not live trades
+        with less detail; they are a different thing, and a live-capital decision
+        that quietly leans on 9 paper trades because only 3 live ones exist is
+        exactly the failure this matrix was built to prevent.
+
+        So the execution mode, once the caller names it, is FIXED at every level
+        of the ladder:
+
+            LIVE  ->  LIVE venue x strategy x market type
+                  ->  LIVE venue x strategy
+                  ->  LIVE venue
+                  ->  no live evidence
+
+        The answer always says which level answered it, and how many trades that
+        level is standing on. A two-trade cell that happens to hold the best
+        number in the record is not an answer, and neither is a venue total
+        presented as if it were about one strategy.
+        """
+        cells = list(self.evidence_matrix().values())
+        mode = str(execution_mode or "")
+        requested = {"venue_id": venue_id, "strategy": strategy,
+                     "category": category}
+        order = ["venue_id", "strategy", "category"]
+        # Only the dimensions the caller actually asked about: a venue-only
+        # question has one level, not three levels that all mean the same thing.
+        # venue_id is the floor and is never dropped - a level below it would be
+        # answering about OTHER venues.
+        asked = [k for k in order if requested[k]]
+        ladder = []
+        for keep in range(len(asked), 0, -1):
+            keys = asked[:keep]
+            wanted = {k: requested[k] for k in keys}
+            if mode:
+                wanted["execution_mode"] = mode
+            ladder.append((keys, wanted))
+
+        best_partial = None
+        for keys, wanted in ladder:
+            matched = [c for c in cells
+                       if all(str(c.get(field) or "") == str(value or "")
+                              for field, value in wanted.items() if value)]
+            if not matched:
+                continue
+            resolved = sum(c["resolved"] for c in matched)
+            if best_partial is None:
+                best_partial = (keys, matched, resolved, wanted)
+            if resolved >= self.MIN_CELL_SAMPLES:
+                summary = self._summarise_cells(keys, matched, wanted)
+                if len(keys) < len(asked):
+                    dropped = [k for k in asked if k not in keys]
+                    summary["reason"] = (
+                        f"no slice narrower than this reached "
+                        f"{self.MIN_CELL_SAMPLES} resolved trades, so this is "
+                        f"the {summary['level']} aggregate ({resolved} trades); "
+                        f"it does not distinguish {', '.join(dropped)}"
+                        + (f" (the execution mode is held fixed to {mode})"
+                           if mode else ""))
+                return summary
+
+        if best_partial is not None:
+            keys, matched, resolved, wanted = best_partial
+            summary = self._summarise_cells(keys, matched, wanted)
+            summary.update({
+                "level": "insufficient",
+                "reason": (f"no slice of the {mode or 'record'} evidence has "
+                           f"{self.MIN_CELL_SAMPLES} resolved trades; the widest "
+                           f"match has {resolved} across {len(matched)} cell(s)"
+                           + (f" in {mode} mode" if mode else "")),
+            })
+            return summary
+
+        # Nothing matched at all. Say WHY, because "no evidence" and "no evidence
+        # in this mode" call for different responses from the operator - the
+        # second one is a paper record that has not earned live capital yet.
+        venue_cells = [c for c in cells if c["venue_id"] == venue_id]
+        other_modes = sorted({c["execution_mode"] for c in venue_cells}) if venue_cells else []
+        return {
+            "level": "none", "venue_id": venue_id, "strategy": strategy,
+            "category": category, "execution_mode": mode,
+            "resolved": 0, "net_pnl": 0.0, "net_pnl_per_trade": 0.0,
+            "win_rate": 0.0, "real_evidence": 0,
+            "real_evidence_coverage": 0.0, "cells": 0,
+            "has_evidence": False, "enough_evidence": False,
+            "reason": (
+                (f"nothing resolved for this venue in {mode} mode; its record is "
+                 f"in {', '.join(other_modes)} - simulated evidence does not "
+                 f"answer for {'live' if mode == 'live' else mode} capital")
+                if mode and other_modes else
+                "nothing resolved for this venue"),
+        }
+
+    @staticmethod
+    def _summarise_cells(keys: List[str], matched: List[Dict[str, Any]],
+                         wanted: Dict[str, str]) -> Dict[str, Any]:
+        """
+        One answer out of the cells that matched a level of the ladder.
+
+        `keys` are the dimensions this level distinguishes; the execution mode is
+        reported separately because it is never relaxed - it is the same at every
+        level or the level would not have matched.
+        """
+        resolved = sum(c["resolved"] for c in matched)
+        net_pnl = sum(c["net_pnl"] for c in matched)
+        wins = sum(c["win_rate"] * c["resolved"] for c in matched)
+        real = sum(c["real_evidence"] for c in matched)
+        label = " x ".join("venue" if k == "venue_id" else k for k in keys)
+        if wanted.get("execution_mode"):
+            label = f"{label} (execution_mode={wanted['execution_mode']})"
+        return {
+            "level": label,
+            "venue_id": wanted.get("venue_id") or matched[0]["venue_id"],
+            "strategy": wanted.get("strategy", ""),
+            "category": wanted.get("category", ""),
+            "execution_mode": wanted.get("execution_mode", ""),
+            "resolved": resolved,
+            "net_pnl": net_pnl,
+            "net_pnl_per_trade": (net_pnl / resolved) if resolved else 0.0,
+            "win_rate": (wins / resolved) if resolved else 0.0,
+            "real_evidence": real,
+            "real_evidence_coverage": (real / resolved) if resolved else 0.0,
+            "cells": len(matched),
+            "has_evidence": resolved > 0,
+            "enough_evidence": resolved >= VenueSelector.MIN_CELL_SAMPLES,
+        }
+
+
+    def best_cells(self, minimum: int = None) -> List[Dict[str, Any]]:
+        """
+        The cells worth allocating on, best first.
+
+        Ranked on net P&L per trade rather than total: a cell with three trades
+        that made $3 each is not a better place for capital than a cell with
+        forty that made $0.50 each, and the total says it is.
+        """
+        bar = self.MIN_CELL_SAMPLES if minimum is None else int(minimum)
+        cells = [c for c in self.evidence_matrix().values()
+                 if c["resolved"] >= bar]
+        return sorted(cells, key=lambda c: c["net_pnl_per_trade"], reverse=True)
+
     def _brier_by_venue(self, tracker) -> Dict[str, float]:
         """Calibration per venue, when a tracker is available."""
         if tracker is None:
