@@ -184,7 +184,7 @@ def _is_slow_reasoning_model(model_id) -> bool:
     """
     if not model_id:
         return False
-    segments = set(re.split(r"[-/._\s]+", model_id.lower()))
+    segments = set(re.split(r"[-/._:\s]+", model_id.lower()))
     return "r1" in segments
 
 
@@ -651,13 +651,24 @@ async def api_wallet_test(request: Request):
 
 @app.post("/api/run-once")
 async def api_run_once():
+    """
+    Run one cycle of THE agent pipeline (V3) - the same pipeline the
+    "PTAI Agent (paper)" window executes.
+
+    This endpoint used to construct the legacy `TradingAgent` inside the
+    dashboard process: a second pipeline with its own scanner, its own
+    (list-based) model detection and its own fair-value path. Clicking
+    "Run Cycle Now" then produced a cycle that was NOT what the agent runs,
+    with different numbers and different warnings - and it competed with
+    the real agent for the LLM. One product, one pipeline.
+    """
     import asyncio
-    from .agent.loop import TradingAgent
+    from .agent.v3_loop import TradingAgentV3
     try:
-        agent = TradingAgent()
+        agent = TradingAgentV3(country_code="UG")
         # Run in background
         asyncio.create_task(agent.run_cycle())
-        return {"status": "triggered", "message": "Cycle started in background - check logs"}
+        return {"status": "triggered", "message": "V3 cycle started in background - check logs"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -3525,7 +3536,15 @@ async def dashboard():
                                 <div>Models: <span id="llm-models" class="mono">-</span></div>
                                 <div>Current .env model: <span id="llm-env-model" class="mono">local-model</span></div>
                                 <div>Agent will use: <span id="llm-active-model" class="mono" style="color: var(--green);">-</span></div>
-                                <div>Speed: <span id="llm-speed" class="mono">-</span></div>
+                                <div style="margin-top: 8px; display: flex; gap: 6px; align-items: center;">
+                                    <select id="llm-model-select" style="max-width: 260px; font-size: 12px; padding: 4px;"></select>
+                                    <button class="btn btn-primary btn-small" onclick="pinLLMModel()">📌 Pin this model</button>
+                                </div>
+                                <div style="color: var(--text2); font-size: 11px; margin-top: 4px;">
+                                    "Pin" writes LM_STUDIO_MODEL to .env, so the agent uses exactly that model
+                                    on its next start instead of whichever model LM Studio lists first.
+                                </div>
+                                <div style="margin-top: 6px;">Speed: <span id="llm-speed" class="mono">-</span></div>
                                 <div>Latency: <span id="llm-latency" class="mono">- ms</span></div>
                             </div>
                         </div>
@@ -4738,8 +4757,24 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 document.getElementById('llm-connected').textContent = data.connected ? 'Yes ✅' : 'No ❌ - Start LM Studio';
                 document.getElementById('llm-models').textContent = data.models.length > 0 ? data.models.join(', ') : 'None';
                 document.getElementById('llm-env-model').textContent = data.env_model;
-                document.getElementById('llm-active-model').textContent =
-                    data.active_model || (data.models.length ? data.models[0] + ' (auto-detected, first loaded)' : 'none');
+                {
+                    const pinned = data.env_model && data.env_model !== 'local-model' && data.env_model !== 'auto';
+                    const active = document.getElementById('llm-active-model');
+                    if (!data.active_model) {
+                        active.textContent = 'none';
+                    } else if (pinned) {
+                        active.textContent = data.active_model + ' (pinned in .env - what the agent calls)';
+                    } else {
+                        active.textContent = data.active_model + ' (auto: first loaded model - pin one below to lock it)';
+                    }
+                    const sel = document.getElementById('llm-model-select');
+                    if (sel) {
+                        const models = data.models || [];
+                        sel.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
+                        if (data.active_model && models.includes(data.active_model)) sel.value = data.active_model;
+                        sel.disabled = models.length === 0;
+                    }
+                }
                 document.getElementById('llm-host-display').textContent = data.host;
                 document.getElementById('llm-speed').textContent = data.speed || '-';
                 document.getElementById('llm-latency').textContent = data.latency_ms ? data.latency_ms + ' ms' : '-';
@@ -4768,6 +4803,31 @@ DO NOTHING is successful outcome. With $50, capital preservation first.
                 
             } catch (e) {
                 console.error(e);
+            }
+        }
+        
+        async function pinLLMModel() {
+            const sel = document.getElementById('llm-model-select');
+            const model = sel ? sel.value : '';
+            if (!model) { alert('No model selected - is LM Studio running with a model loaded?'); return; }
+            try {
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({ LM_STUDIO_MODEL: model })
+                });
+                const data = await res.json();
+                if (data.status === 'saved' || data.updated) {
+                    alert('Pinned: ' + model +
+                          '\\n\\nThe agent calls exactly this model on its next start.' +
+                          '\\nTo apply now: close the "PTAI Agent (paper)" window and run run_ptai.bat again.');
+                    checkLLM();
+                    loadEnvDisplay();
+                } else {
+                    alert('Could not save the model: ' + (data.error || JSON.stringify(data)));
+                }
+            } catch (e) {
+                alert('Could not save the model: ' + e);
             }
         }
         

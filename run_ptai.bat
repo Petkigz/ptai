@@ -3,10 +3,13 @@ REM ============================================================================
 REM  PTAI - run on your PC (Windows)  -  THE ONE FILE TO RUN
 REM
 REM  Double-click to:
-REM    1. create a clean Python environment (.venv) on first run
-REM    2. install dependencies (only slow on the first run)
-REM    3. start the trading agent in PAPER mode (no real money is spent)
-REM    4. open the product dashboard in your browser (only when it is ready)
+REM    1. check the Python dependencies (only slow on the first run)
+REM    2. start the trading agent in PAPER mode (no real money is spent)
+REM    3. open the product dashboard in your browser (only when it is ready)
+REM
+REM  Runs directly on your system Python - no venv is created.
+REM  The agent's memory lives in the data\ folder next to this file and
+REM  survives restarts; it is not touched by Python or dependency updates.
 REM
 REM  To stop: close the "PTAI Agent (paper)" and "PTAI Dashboard" windows
 REM  (Ctrl-C inside them), and close this window.
@@ -32,7 +35,7 @@ echo  Dashboard : http://localhost:%PTAI_DASHBOARD_PORT%
 echo  Agent     : PAPER mode (no real money), $%BANKROLL%, one cycle every %INTERVAL_MIN% minutes
 echo.
 
-REM ---------------- find python ----------------------------------------------
+REM ---------------- find python (system python, no venv) ---------------------
 set "PYTHON="
 where py >nul 2>nul && set "PYTHON=py -3"
 if not defined PYTHON (
@@ -45,25 +48,9 @@ if not defined PYTHON (
   goto fail
 )
 
-REM ---------------- environment (first run only) ------------------------------
-if not exist ".venv\Scripts\python.exe" (
-  echo First run: creating a clean Python environment in .venv ...
-  %PYTHON% -m venv .venv
-  if errorlevel 1 (
-    echo [ERROR] Could not create .venv. Check that "venv" is available
-    echo         On Windows, python.org installers include it.
-    goto fail
-  )
-)
-call ".venv\Scripts\activate.bat"
-if errorlevel 1 (
-  echo [ERROR] Could not activate .venv
-  goto fail
-)
-
-echo Installing dependencies (only slow on the first run) ...
-python -m pip install --quiet --upgrade pip
-python -m pip install --quiet -r requirements.txt
+REM ---------------- dependencies (system python, first run only slow) --------
+echo Checking dependencies (only slow on the first run) ...
+%PYTHON% -m pip install --quiet --user -r requirements.txt
 if errorlevel 1 (
   echo [ERROR] Installing dependencies failed. Read the messages above.
   goto fail
@@ -74,22 +61,22 @@ if not exist data mkdir data
 if not exist logs mkdir logs
 REM Chromium is only needed if a venue ever asks for a browser login; the
 REM paper Polymarket run works without it. Best effort, never blocks startup.
-python -m playwright install chromium >nul 2>nul
+%PYTHON% -m playwright install chromium >nul 2>nul
 if errorlevel 1 (
   echo Note: the Chromium browser was not installed - fine for paper trading;
   echo       it is only needed later for browser-based venue logins.
 )
 
 REM ---------------- start the agent (paper mode, own window) ------------------
-start "PTAI Agent (paper)" /min /d "%~dp0" cmd /k ".venv\Scripts\python.exe main.py run --bankroll %BANKROLL% --interval %INTERVAL_MIN%"
+start "PTAI Agent (paper)" /min /d "%~dp0" cmd /k "%PYTHON% main.py run --bankroll %BANKROLL% --interval %INTERVAL_MIN%"
 
-REM ---------------- dashboard (own window, then wait for it) ------------------
-start "PTAI Dashboard" /d "%~dp0" cmd /k "set PYTHONPATH=%~dp0src && .venv\Scripts\python.exe -m ptai.dashboard"
+REM ---------------- dashboard (own window, then wait for it) -------------------
+start "PTAI Dashboard" /d "%~dp0" cmd /k "set PYTHONPATH=%~dp0src && %PYTHON% -m ptai.dashboard"
 
 echo Waiting for the dashboard to come up on port %PTAI_DASHBOARD_PORT% ...
 set /a TRIES=0
 :wait_port
-python -c "import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.1',%PTAI_DASHBOARD_PORT%));s.close()" >nul 2>nul
+%PYTHON% -c "import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.1',%PTAI_DASHBOARD_PORT%));s.close()" >nul 2>nul
 if not errorlevel 1 goto port_up
 set /a TRIES+=1
 if %TRIES% geq 90 (

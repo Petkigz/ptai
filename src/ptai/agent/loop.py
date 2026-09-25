@@ -118,6 +118,48 @@ class TradingAgent:
         console.print(f"[bold green]Scanned {len(markets)} markets in {elapsed:.1f}s | Avg Vol 24h ${stats.get('avg_volume_24h',0):,.0f}[/bold green]")
         return markets
 
+    def _active_llm_model(self) -> str:
+        """
+        The single model the LLM router will actually CALL.
+
+        Judging speed from the whole downloaded model list is how a fast
+        session reads as "R1" the moment deepseek-r1 happens to be loaded
+        in LM Studio. This returns one model: the configured one when it is
+        real (LM_STUDIO_MODEL pinned in .env / dashboard), otherwise the
+        first loaded model - exactly what chat() auto-detects.
+        """
+        model = ""
+        try:
+            if hasattr(self.brain, 'llm_router') and self.brain.llm_router:
+                provider = self.brain.llm_router.get_provider() \
+                    if hasattr(self.brain.llm_router, 'get_provider') else None
+                if provider is not None and hasattr(provider, 'model'):
+                    model = provider.model or ""
+        except Exception as e:
+            logger.debug(f"Active model lookup failed: {e}")
+        if model in ("", "local-model", "auto"):
+            try:
+                if hasattr(self.brain, 'llm_router') and self.brain.llm_router \
+                        and hasattr(self.brain.llm_router, 'get_detected_models'):
+                    detected = self.brain.llm_router.get_detected_models() or []
+                    if detected:
+                        model = detected[0]
+            except Exception:
+                pass
+        return model
+
+    @staticmethod
+    def _is_r1_model(model_name: str) -> bool:
+        """
+        Is this SPECIFIC model an R1-style reasoning model? "r1"/"distill"
+        are matched as name segments, so deepseek-r1 and
+        deepseek-r1-distill-qwen-32b count, while qwen3.8-27b,
+        qwen/qwen3-32b and prism-ml/bonsai-27b do not.
+        """
+        import re
+        segments = set(re.split(r"[-/._:\s]+", (model_name or "").lower()))
+        return "r1" in segments or "distill" in segments or "reasoning" in model_name
+
     def analyze_sentiment(self, markets: List[Market], max_markets: int = 60) -> Dict[str, Any]:
         """Read live X sentiment for top markets - with circuit breaker for X blocking"""
         logger.info(f"Analyzing X sentiment for {min(len(markets), max_markets)} markets (X may be blocked - has circuit breaker)")
@@ -129,19 +171,10 @@ class TradingAgent:
             use_x = env_val.lower() == "true"
         else:
             use_x = self.settings.sentiment_use_x
-        # Auto-detect R1 for sentiment warning
-        model_check = (self.settings.lm_studio_model + " " + self.settings.ollama_model).lower()
-        try:
-            if hasattr(self.brain, 'llm_router') and self.brain.llm_router:
-                detected = getattr(self.brain.llm_router, '_last_detected_models', []) or getattr(self.brain.llm_router, 'get_detected_models', lambda: [])() or []
-                if detected:
-                    model_check = (" ".join(detected) + " " + model_check).lower()
-                provider = self.brain.llm_router.get_provider() if hasattr(self.brain.llm_router, 'get_provider') else None
-                if provider and hasattr(provider, 'model'):
-                    model_check = (provider.model + " " + model_check).lower()
-        except:
-            pass
-        is_r1_for_sent = "r1" in model_check or "distill" in model_check or "reasoning" in model_check
+        # Auto-detect R1 for sentiment warning - on the model actually in
+        # use, never on the whole downloaded list
+        model_check = self._active_llm_model().lower()
+        is_r1_for_sent = self._is_r1_model(model_check)
         if is_r1_for_sent and use_x:
             logger.warning(f"R1 model {model_check[:80]} but SENTIMENT_USE_X=true - R1 already 8 min per market, X adds 40 sec. Recommend SENTIMENT_USE_X=false")
         if not use_x:
@@ -202,8 +235,14 @@ class TradingAgent:
                         if news:
                             # Build pseudo-sentiment from news via LLM
                             news_text = " ".join([f"{n.title}: {n.snippet}" for n in news])[:1000]
-                            # Use Brain's LLM to analyze news sentiment
-                            sentiments[m.question].sentiment_summary += f" | WEB NEWS: {news_text[:300]}"
+                            # Use Brain's LLM to analyze news sentiment.
+                            # SentimentResult's field is `summary` - the old
+                            # `sentiment_summary` raised AttributeError and
+                            # killed the whole web-search fallback (the log
+                            # line "Web search fallback failed").
+                            sentiments[m.question].summary = (
+                                (sentiments[m.question].summary or "")
+                                + f" | WEB NEWS: {news_text[:300]}")
                             sentiments[m.question].confidence = max(0.3, sentiments[m.question].confidence)
             except Exception as e:
                 logger.warning(f"Web search fallback failed: {e}")
@@ -233,30 +272,26 @@ class TradingAgent:
         # 32B fast (qwen3-32b): 2-3 sec -> 50 * 3 = 2.5 min fits
         # 32B R1 slow (deepseek-r1-distill-qwen-32b): 7-8 MIN per market due to <think>! -> 5 deep max = 40 min
         # 70B/72B: 12-20 sec -> 30 * 15 = 7.5 min fits, 50 would be 12.5 min too slow
-        # Auto-detect model size from actual LM Studio detected list
+        # Auto-detect model size from the model actually IN USE. Judging from
+        # the whole downloaded list is how a fast qwen3.8-27b session reads
+        # as "R1 - 8 min per market" the moment deepseek-r1 happens to be
+        # loaded in LM Studio.
         import os
-        model_name = (self.settings.lm_studio_model + " " + self.settings.ollama_model).lower()
-        try:
-            if hasattr(self.brain, 'llm_router') and self.brain.llm_router:
-                detected = getattr(self.brain.llm_router, '_last_detected_models', []) or []
-                if hasattr(self.brain.llm_router, 'get_detected_models'):
-                    detected = self.brain.llm_router.get_detected_models() or detected
-                if detected:
-                    model_name = (" ".join(detected) + " " + model_name).lower()
-                provider = self.brain.llm_router.get_provider() if hasattr(self.brain.llm_router, 'get_provider') else None
-                if provider and hasattr(provider, 'model'):
-                    model_name = (provider.model + " " + model_name).lower()
-        except Exception as e:
-            logger.debug(f"Model detection fallback: {e}")
+        model_name = self._active_llm_model().lower()
+        if not model_name:
+            model_name = (self.settings.lm_studio_model or "").lower()
 
-        is_r1 = "r1" in model_name or "reasoning" in model_name or "distill" in model_name
+        is_r1 = self._is_r1_model(model_name)
         is_70b = "70b" in model_name or "72b" in model_name
         is_32b = "32b" in model_name
         is_14b = "14b" in model_name or "13b" in model_name
 
         if is_r1 and is_32b:
             top_n = 5
-            logger.warning(f"Detected R1 reasoning 32B ({model_name[:100]}) - VERY SLOW 7-8 min per market due to <think> chain-of-thought. Setting MAX_DEEP_ANALYZE=5 for R1. For faster trading, use qwen/qwen3-32b or qwen2.5-32b non-R1 (3 sec vs 8 min). Recommend SENTIMENT_USE_X=false and SCAN_INTERVAL=60")
+            if os.getenv("MAX_DEEP_ANALYZE"):
+                logger.warning(f"Detected R1 reasoning 32B ({model_name[:100]}) - VERY SLOW 7-8 min per market due to <think> chain-of-thought. MAX_DEEP_ANALYZE={os.getenv('MAX_DEEP_ANALYZE')} from the environment overrides the R1 reduction. For faster trading, use qwen/qwen3-32b or qwen2.5-32b non-R1 (3 sec vs 8 min)")
+            else:
+                logger.warning(f"Detected R1 reasoning 32B ({model_name[:100]}) - VERY SLOW 7-8 min per market due to <think> chain-of-thought. Setting MAX_DEEP_ANALYZE=5 for R1. For faster trading, use qwen/qwen3-32b or qwen2.5-32b non-R1 (3 sec vs 8 min). Recommend SENTIMENT_USE_X=false and SCAN_INTERVAL=60")
         elif is_r1 and is_70b:
             top_n = 3
             logger.warning(f"Detected R1 reasoning 70B model - extremely slow 15+ min per market, setting 3 deep")
