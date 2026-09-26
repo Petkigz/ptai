@@ -92,6 +92,31 @@ def init(
     storage.close()
 
 @app.command()
+def doctor(
+    network: bool = typer.Option(False, "--network",
+                                 help="Also probe the model endpoint (blocking)"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
+):
+    """
+    Pre-flight check: everything that has to be true before PTAI can run.
+
+    One screen, PASS/WARN/FAIL per check, and a non-zero exit code when
+    something FAILs - so a launcher can stop with a reason instead of opening a
+    window that closes. Read-only: it does not trade, write, or call a venue.
+    """
+    import json as _json
+    from .doctor import format_report, run_checks
+
+    checks = run_checks(network=network)
+    if json_out:
+        print(_json.dumps([c.as_dict() for c in checks], indent=2))
+    else:
+        console.print(format_report(checks))
+    if any(c.status == "FAIL" for c in checks):
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def check_llm(
     provider: str = typer.Option("auto", "--provider", help="auto, lm_studio, ollama"),
     host: str = typer.Option(None, "--host", help="Override host, e.g. http://localhost:1234"),

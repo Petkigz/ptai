@@ -18,6 +18,8 @@ Not just win rate
 """
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
+
+from ..learning.evidence import FORECAST_BEHIND_PRICE
 from loguru import logger
 from datetime import datetime, timezone
 import json
@@ -69,6 +71,37 @@ class QualificationResult:
     # venue should not have to parse a sentence, and a test asserting "the fill
     # price check refused this" must not be able to pass on a different check.
     checks: Dict[str, bool] = field(default_factory=dict)
+    # The forecast measured against the PRICE, which is the only benchmark that
+    # can say whether there is an edge at all. `forecast_skill` above is a
+    # rescaled Brier score and never saw a price; these are the comparison.
+    market_skill: Optional[float] = None
+    # The mean improvement in Brier units per trade: how much better the
+    # forecast was than the price, before any interval. Positive means better.
+    market_improvement: Optional[float] = None
+    market_skill_verdict: str = "unmeasured"
+    market_skill_ci_low: Optional[float] = None
+    market_skill_ci_high: Optional[float] = None
+    market_skill_p_value: Optional[float] = None
+    market_skill_samples: int = 0
+    market_skill_reason: str = ""
+    # The two verdicts themselves, as booleans. `checks` holds every bar, but a
+    # dict of them is not written to disk - so a screen reading a loaded record
+    # got `checks.get("beats_the_price")` as None for every venue and displayed
+    # "has not beaten the price" for a venue that had. These are persisted.
+    beats_the_price: Optional[bool] = None
+    not_drifting: Optional[bool] = None
+    recent_market_skill: Optional[float] = None
+    recent_market_skill_verdict: str = "unmeasured"
+    recent_market_skill_reason: str = ""
+    # When this judgment was made and on how much evidence. A verdict is about a
+    # record, and a record grows; the count is what lets a reader tell a fresh
+    # judgment from one written before the last hundred trades happened.
+    rows_at_evaluation: int = 0
+    # The count at the moment the venue last PASSED. Staleness is measured from
+    # here, not from the last evaluation: re-running the same bars over the same
+    # record is not new evidence, and a judgment that has not been re-earned
+    # since 150 more trades arrived should be visible as exactly that.
+    qualified_on_trades: int = 0
 
 class VenueQualificationEngine:
     """
@@ -140,6 +173,42 @@ class VenueQualificationEngine:
             "max_fill_price_penalty": 0.01,
             "min_sample_size": 100,
             "max_fees_pct": 0.05,  # fees <5% of profit
+            # ------------------------------------------------------------------
+            # THE NULL. Every bar above is absolute, and an absolute accuracy
+            # score cannot say whether the agent beat the thing it is trading
+            # against. In a market priced at 0.50, forecasting 0.50 forever
+            # scores a Brier of 0.25 and CLEARS `max_brier`. The market price at
+            # entry is the only benchmark that answers the actual question, so
+            # the gate now requires the forecasts to beat it - with a bootstrap
+            # interval that clears zero - and the entries taken to clear the
+            # odds they paid, tested against the prices rather than a coin.
+            #
+            # Borrowed from the sibling project's deployment protocol
+            # (`avt-bot`): model vs null, CI on the difference, p-value on the
+            # entries, and NO_SIGNAL as a perfectly good outcome.
+            # ------------------------------------------------------------------
+            # Two-sided 95% on the paired improvement, so the whole interval
+            # must be above zero to claim the price was beaten.
+            "min_market_skill_ci_low": 0.0,
+            # The entries' right tail: 5% chance of luck, the same bar the
+            # sibling project uses on its approved entries.
+            "max_market_skill_p_value": 0.05,
+            # Same coverage rule as the other measurements: half the sample.
+            "min_market_skill_coverage": 0.5,
+            # ...and the RECENT record, asked separately. An edge that has died
+            # is a reason to stop, not a reason to average it with the months it
+            # worked. Newest trades only.
+            "recent_window_trades": 60,
+            # A recent window entirely behind the price - the interval's upper
+            # bound below zero - means the venue is drifting and must not hold
+            # live capital, however good its history was. 30 paired trades is the
+            # same floor the whole-record test uses.
+            "min_recent_pairs": 30,
+            # A qualification is a judgment about a record, and the record ages.
+            # Once this many settled trades have accumulated since the judgment,
+            # it is stale: live capital needs a fresh evaluation, not a
+            # re-reading of a file written a hundred trades ago.
+            "max_trades_since_evaluation": 150,
         }
 
     def _load(self):
@@ -151,9 +220,20 @@ class VenueQualificationEngine:
                         if qual_data.get("qualification_date"):
                             qual_data["qualification_date"] = datetime.fromisoformat(qual_data["qualification_date"])
                         # Handle old format without new fields
-                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage", "real_evidence_coverage", "executable_value_coverage"]:
+                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage", "real_evidence_coverage", "executable_value_coverage", "market_skill", "market_skill_ci_low", "market_skill_ci_high", "market_skill_p_value", "recent_market_skill", "rows_at_evaluation", "qualified_on_trades", "market_skill_samples", "market_improvement"]:
                             if field not in qual_data:
                                 qual_data[field] = 0.0
+                        # Strings keep their own defaults, or a loaded record
+                        # would claim a verdict of 0.0.
+                        for field in ["market_skill_verdict", "market_skill_reason", "recent_market_skill_verdict", "recent_market_skill_reason"]:
+                            if field not in qual_data:
+                                qual_data[field] = ("unmeasured" if field.endswith("verdict") else "")
+                        # Booleans default to unknown, not to a number: a record
+                        # written before these existed must read "never measured"
+                        # and not "measured and failed".
+                        for field in ["beats_the_price", "not_drifting"]:
+                            if field not in qual_data:
+                                qual_data[field] = None
                         self.qualifications[venue_id] = QualificationResult(**qual_data)
             except Exception as e:
                 logger.warning(f"Qualification load failed: {e}")
@@ -197,6 +277,25 @@ class VenueQualificationEngine:
                     "executable_value": qual.executable_value,
                     "executable_value_coverage": qual.executable_value_coverage,
                     "fill_price_vs_modelled": qual.fill_price_vs_modelled,
+                    # The comparison against the price, and the freshness
+                    # stamps. Written out or the file the console and the venue
+                    # selector read would lose the only evidence that says
+                    # whether the edge was ever measured at all.
+                    "market_skill": qual.market_skill,
+                    "market_improvement": qual.market_improvement,
+                    "market_skill_verdict": qual.market_skill_verdict,
+                    "market_skill_ci_low": qual.market_skill_ci_low,
+                    "market_skill_ci_high": qual.market_skill_ci_high,
+                    "market_skill_p_value": qual.market_skill_p_value,
+                    "market_skill_samples": qual.market_skill_samples,
+                    "market_skill_reason": qual.market_skill_reason,
+                    "beats_the_price": qual.beats_the_price,
+                    "not_drifting": qual.not_drifting,
+                    "recent_market_skill": qual.recent_market_skill,
+                    "recent_market_skill_verdict": qual.recent_market_skill_verdict,
+                    "recent_market_skill_reason": qual.recent_market_skill_reason,
+                    "rows_at_evaluation": qual.rows_at_evaluation,
+                    "qualified_on_trades": qual.qualified_on_trades,
                 }
             with open(self.qualification_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -279,6 +378,26 @@ class VenueQualificationEngine:
         quality_coverage = float(
             performance_stats.get("execution_quality_coverage") or 0.0)
         skill = performance_stats.get("forecast_skill", 0.5)
+        # The comparison against the price, as the outcome log computed it.
+        market_skill_value = performance_stats.get("market_skill")
+        market_improvement = performance_stats.get("market_improvement")
+        market_verdict = str(
+            performance_stats.get("market_skill_verdict") or "unmeasured")
+        market_ci_low = performance_stats.get("market_skill_ci_low")
+        market_ci_high = performance_stats.get("market_skill_ci_high")
+        market_p_value = performance_stats.get("market_skill_p_value")
+        market_samples = int(performance_stats.get("market_skill_samples") or 0)
+        market_coverage = float(
+            performance_stats.get("market_skill_coverage") or 0.0)
+        market_beats = bool(performance_stats.get("market_skill_beats_price"))
+        market_entries_ok = bool(
+            performance_stats.get("market_skill_entries_clear_odds"))
+        market_reason = str(performance_stats.get("market_skill_reason") or "")
+        recent_verdict = str(
+            performance_stats.get("recent_market_skill_verdict") or "unmeasured")
+        recent_skill_value = performance_stats.get("recent_market_skill")
+        recent_reason = str(
+            performance_stats.get("recent_market_skill_reason") or "")
 
         # FIXED V7: Check all requirements beyond win rate
         checks = {
@@ -339,6 +458,25 @@ class VenueQualificationEngine:
             "min_execution": (execution_quality >= self.requirements["min_execution_quality"]
                               and min(cost_coverage, quality_coverage)
                               >= self.requirements["min_cost_coverage"]),
+            # THE NULL. Fail closed at every step: no paired evidence fails, an
+            # interval that still contains zero fails, entries that did not clear
+            # the odds they paid fail. `forecast_beats_price` alone is not
+            # enough - a forecast can be better calibrated than the market while
+            # every trade loses money by paying too much for the side.
+            "beats_the_price": (
+                market_samples >= self.requirements["min_trades"] // 2
+                and market_coverage >= self.requirements["min_market_skill_coverage"]
+                and market_ci_low is not None
+                and float(market_ci_low) > self.requirements["min_market_skill_ci_low"]
+                and market_p_value is not None
+                and float(market_p_value) < self.requirements["max_market_skill_p_value"]
+                and market_beats and market_entries_ok),
+            # The recent record, on its own. `forecast_behind_price` over the
+            # newest trades is drift: the edge is gone and the all-time average
+            # is a memory of it. Compared against the imported constant, not a
+            # literal - this check read `"behind_market"` while the module
+            # reported `"forecast_behind_price"`, so it passed everything.
+            "not_drifting": (recent_verdict != FORECAST_BEHIND_PRICE),
         }
 
         is_qualified = all(checks.values())
@@ -380,6 +518,11 @@ class VenueQualificationEngine:
             f"(fees measured {cost_coverage*100:.0f}%, quality measured "
             f"{quality_coverage*100:.0f}%)? {checks['min_execution']} | "
             f"fees ${fees_total:.2f} slippage ${slippage_total:.2f} | "
+            f"AGAINST THE PRICE: {market_reason or 'unmeasured'} "
+            f"[{checks['beats_the_price']}] | "
+            f"recent {self.requirements['recent_window_trades']}-trade window: "
+            f"{recent_reason or 'unmeasured'} "
+            f"({'drifting' if not checks['not_drifting'] else 'not drifting'}) | "
             f"Qualified {is_qualified} | "
             f"FIXED: now considers net P&L, EV, fees, slippage, drawdown, profit factor, calibration, Brier/log loss, sample size, execution quality not just win rate"
         )
@@ -417,7 +560,36 @@ class VenueQualificationEngine:
             executable_value=executable_value,
             executable_value_coverage=executable_coverage,
             fill_price_vs_modelled=fill_price_vs_modelled,
+            market_skill=market_skill_value,
+            market_improvement=(float(market_improvement)
+                                if market_improvement is not None else None),
+            market_skill_verdict=market_verdict,
+            market_skill_ci_low=(float(market_ci_low)
+                                 if market_ci_low is not None else None),
+            market_skill_ci_high=(float(market_ci_high)
+                                  if market_ci_high is not None else None),
+            market_skill_p_value=(float(market_p_value)
+                                  if market_p_value is not None else None),
+            market_skill_samples=market_samples,
+            market_skill_reason=market_reason,
+            beats_the_price=checks["beats_the_price"],
+            not_drifting=checks["not_drifting"],
+            recent_market_skill=recent_skill_value,
+            recent_market_skill_verdict=recent_verdict,
+            recent_market_skill_reason=recent_reason,
+            rows_at_evaluation=total,
         )
+
+        # Stamp WHEN this venue last passed, and on how much evidence. A
+        # qualification is a judgment about a record; measuring staleness from
+        # the last evaluation would always read "fresh", because the loop
+        # re-evaluates every cycle - and a stamp that can only ever say "fresh"
+        # is not a check.
+        previous = self.qualifications.get(venue_id)
+        if is_qualified:
+            result.qualified_on_trades = total
+        elif previous is not None:
+            result.qualified_on_trades = previous.qualified_on_trades
 
         self.qualifications[venue_id] = result
         self._save()
@@ -429,11 +601,64 @@ class VenueQualificationEngine:
 
         return result
 
-    def is_qualified(self, venue_id: str) -> bool:
+    def is_qualified(self, venue_id: str, settled_rows: int = None) -> bool:
+        """
+        May this venue hold live capital, as of now?
+
+        With `settled_rows` - how many outcomes the venue has TODAY, which only
+        the caller with the database can count - the answer also requires the
+        judgment not to be stale: a verdict written before the last
+        `max_trades_since_evaluation` trades is a verdict about a different
+        record. Without it, the stored verdict is returned as stored.
+
+        Nothing in the trading loop calls this: the loop re-evaluates every
+        venue every cycle through `evaluate_qualification`, and the bars it
+        applies are the same ones. This is the question a reader asks of a
+        FILE - the console, an operator, a report - and a file can be old.
+        """
         qual = self.qualifications.get(venue_id)
         if not qual:
             return False
-        return qual.is_qualified
+        if not qual.is_qualified:
+            return False
+        if settled_rows is None:
+            return True
+        return not self.staleness(venue_id, settled_rows)["stale"]
+
+    def staleness(self, venue_id: str, settled_rows: int) -> Dict[str, Any]:
+        """
+        How much of this venue's record the current judgment does NOT cover.
+
+        Not a statistical test - a statement about the evidence behind a
+        verdict. A venue that passed on 100 trades and now has 400 has been
+        judged on a quarter of what it has done, and the honest reading is
+        "re-judge it", not "it passed once".
+        """
+        qual = self.qualifications.get(venue_id)
+        limit = int(self.requirements.get("max_trades_since_evaluation", 150))
+        if qual is None:
+            return {"stale": True, "new_trades": None, "limit": limit,
+                    "reason": f"{venue_id} has never been evaluated"}
+        basis = int(qual.qualified_on_trades or qual.rows_at_evaluation or 0)
+        try:
+            current = int(settled_rows)
+        except (TypeError, ValueError):
+            return {"stale": True, "new_trades": None, "limit": limit,
+                    "reason": "the venue's settled count could not be read"}
+        new_trades = max(0, current - basis)
+        stale = new_trades > limit
+        return {
+            "stale": stale,
+            "new_trades": new_trades,
+            "limit": limit,
+            "judged_on": basis,
+            "settled_now": current,
+            "reason": (
+                f"{new_trades} settled trade(s) since it was judged on "
+                f"{basis} - more than the {limit} this judgment covers"
+                if stale else
+                f"judged on {basis} trades, {new_trades} since (limit {limit})"),
+        }
 
     def get_qualification_report(self) -> Dict[str, Any]:
         qualified = [v for v in self.qualifications.values() if v.is_qualified]

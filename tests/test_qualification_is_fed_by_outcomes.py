@@ -75,6 +75,12 @@ def _record(storage, tracker, venue, n, *, win_prob, forecast, win_pnl, loss_pnl
             trade_id=str(tid), market_id=f"{venue}-{i}", venue_id=venue,
             strategy="value", category="politics", forecast_prob=forecast,
             market_price=0.5, edge=edge, side="YES", amount_usd=3.0,
+            # THE PRICE THE DECISION WAS MADE AGAINST - the null the forecast
+            # has to beat. A fixture that omits it describes a system that never
+            # recorded what the market thought, and the gate now fails closed on
+            # exactly that: an accuracy score with nothing to compare it to is
+            # not evidence of an edge.
+            yes_price=0.5,
             fees_usd=0.06, slippage_bps=12.0, execution_quality=0.976,
             # The expected net EV per trade, recorded BEFORE the trade was taken
             # - the prediction the gate is supposed to weigh, and the coverage

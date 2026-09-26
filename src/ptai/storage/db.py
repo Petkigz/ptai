@@ -352,6 +352,23 @@ class Storage:
         ("trade_outcomes", "executable_net_ev", "REAL"),
         ("trade_outcomes", "executable_net_ev_pct", "REAL"),
         ("trade_outcomes", "fill_price_vs_modelled", "REAL"),
+        # THE NULL. What the market thought at the moment of the decision.
+        #
+        # Every accuracy number in the system was absolute - Brier, log loss,
+        # ECE, "skill" - and an absolute score cannot say whether the agent beat
+        # the thing it is trading against. In a market priced at 0.50, forever
+        # forecasting 0.50 earns a Brier of 0.25 and passes `max_brier <= 0.25`.
+        # The price at entry is the only benchmark that answers "is there an
+        # edge here", and it was not stored: `market_price` holds the SIDE's
+        # price once a fill exists (the NO price for a NO trade), and the YES
+        # price before that, so the same column meant two numbers and neither
+        # could be compared with `forecast_prob` row by row.
+        #
+        # `yes_price` is the market's price for the YES outcome at entry - the
+        # same scale as `forecast_prob` and `actual_outcome`, so the comparison
+        # needs no side arithmetic to get wrong. NULL on rows that predate it,
+        # which the skill gate reads as "not measured" and fails closed on.
+        ("trade_outcomes", "yes_price", "REAL"),
     )
 
     def _migrate(self):

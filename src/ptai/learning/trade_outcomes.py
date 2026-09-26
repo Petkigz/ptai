@@ -73,6 +73,13 @@ class TradeOutcome:
     # Unambiguous, and the thing that says whether this venue fills where the
     # agent thinks it does.
     fill_price_vs_modelled: Optional[float] = None
+    # THE MARKET'S OWN PROBABILITY for the YES outcome, at entry - the null the
+    # forecast has to beat. `market_price` holds the SIDE's price once a fill
+    # exists (the NO price for a NO trade) and the YES price before that, so the
+    # same column meant two numbers and neither could be compared with
+    # `forecast_prob` row by row. This one always means the same thing, so
+    # `forecast_prob`, `yes_price` and `actual_outcome` are on one scale.
+    yes_price: Optional[float] = None
 
 
 # Book labels that describe a book that actually existed. Everything else -
@@ -190,6 +197,11 @@ class TradeOutcomeTracker:
                 resolved_at=_dt(row["resolved_at"]),
                 brier_score=float(row["brier_score"] or 0.0),
                 was_correct=bool(row["was_correct"]),
+                # The null travels with the record: an outcome restored without
+                # the price it was decided against cannot be scored against the
+                # market later, and would quietly shrink the evidence.
+                yes_price=(float(row["yes_price"])
+                           if row["yes_price"] is not None else None),
             ))
         resolved = sum(1 for o in self.outcomes if o.actual_outcome is not None)
         if self.outcomes:
@@ -221,9 +233,9 @@ class TradeOutcomeTracker:
                     "execution_mode, expected_net_ev, expected_net_ev_pct, "
                     "book_source, fill_is_real, gas_usd, "
                     "executable_net_ev, executable_net_ev_pct, "
-                    "fill_price_vs_modelled) "
+                    "fill_price_vs_modelled, yes_price) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                    "?,?,?)",
+                    "?,?,?,?)",
                     (outcome.trade_id, outcome.market_id, outcome.venue_id,
                      outcome.strategy, outcome.category, outcome.forecast_prob,
                      outcome.market_price, outcome.edge, outcome.side,
@@ -238,7 +250,8 @@ class TradeOutcomeTracker:
                      outcome.book_source or None, int(bool(outcome.fill_is_real)),
                      outcome.gas_usd, outcome.executable_net_ev,
                      outcome.executable_net_ev_pct,
-                     outcome.fill_price_vs_modelled))
+                     outcome.fill_price_vs_modelled,
+                     outcome.yes_price))
             self.storage.conn.commit()
             return True
         except Exception as e:
@@ -252,6 +265,7 @@ class TradeOutcomeTracker:
                      strategy: str = "", category: str = "", forecast_prob: float = None,
                      market_price: float = None, edge: float = 0.0, side: str = "",
                      amount_usd: float = 0.0, execution_mode: str = "",
+                     yes_price: float = None,
                      expected_net_ev: float = None,
                      expected_net_ev_pct: float = None, **extra):
         """
@@ -313,6 +327,13 @@ class TradeOutcomeTracker:
             execution_quality=_optional_float(extra.get("execution_quality")),
             data_mode=str(extra.get("data_mode") or ""),
             execution_mode=_mode_from(execution_mode or extra.get("execution_mode")),
+            # The market's price for YES at entry, from the caller when it has
+            # it and from `extra` (the delayed-fill path stores it with the
+            # order) when it does not. None is kept as None: a guessed price
+            # would become a fabricated null to beat.
+            yes_price=_optional_float(
+                extra.get("yes_price") if extra.get("yes_price") is not None
+                else yes_price),
             expected_net_ev=_optional_float(
                 expected_net_ev if expected_net_ev is not None
                 else extra.get("expected_net_ev")),
@@ -511,6 +532,24 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "price_paid_coverage": 0.0,
         "gas_total": 0.0,
         "source": "no recorded outcomes",
+        # AGAINST THE PRICE. Absent, so the gate fails the comparison instead of
+        # reading a venue that has never been scored as one that passed.
+        "market_skill": None,
+        "market_skill_verdict": "unmeasured",
+        "market_skill_samples": 0,
+        "market_skill_coverage": 0.0,
+        "market_skill_ci_low": None,
+        "market_skill_ci_high": None,
+        "market_skill_p_value": None,
+        "market_skill_beats_price": False,
+        "market_skill_entries_clear_odds": False,
+        "market_skill_reason": "no recorded outcomes",
+        # The recent record, asked separately: an all-time average hides an
+        # edge that has died.
+        "recent_market_skill_verdict": "unmeasured",
+        "recent_market_skill_samples": 0,
+        "recent_market_skill": None,
+        "recent_market_skill_reason": "no recorded outcomes",
     }
     if storage is None:
         return empty
@@ -523,7 +562,11 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
                    expected_net_ev, expected_net_ev_pct,
                    book_source, fill_is_real, gas_usd,
                    executable_net_ev, executable_net_ev_pct,
-                   fill_price_vs_modelled
+                   fill_price_vs_modelled,
+                   -- The benchmark and the side. Without them the only
+                   -- "skill" number in the system is a rescaled Brier score,
+                   -- which cannot say whether the agent beat the price.
+                   yes_price, side, market_price
             FROM trade_outcomes
             WHERE venue_id = ? AND actual_outcome IS NOT NULL
             ORDER BY COALESCE(resolved_at, recorded_at)
@@ -719,6 +762,20 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
     fill_vs_modelled = [float(r["fill_price_vs_modelled"]) for r in rows
                         if r["fill_price_vs_modelled"] is not None]
 
+    # ------------------------------------------------------------------
+    # THE FORECAST AGAINST THE PRICE - the null every other number lacked
+    # ------------------------------------------------------------------
+    from .evidence import market_skill, recent_window, MIN_PAIRED_TRADES
+
+    skill = market_skill(rows)
+    skill_samples = skill.n
+    # The recent window is asked the same question over the newest trades. It is
+    # computed over a fixed slice of the record, not over the whole history, so
+    # an edge that has gone shows up as `behind_market` instead of being
+    # averaged into months that worked.
+    recent_rows = recent_window(list(rows), 60)
+    recent = market_skill(recent_rows)
+
     return {
         # THE QUALIFICATION CONTRACT, stated rather than implied.
         #
@@ -799,5 +856,24 @@ def qualification_stats_from_outcomes(storage, venue_id: str) -> Dict[str, Any]:
         "gas_total": sum(float(r["gas_usd"]) for r in rows
                          if r["gas_usd"] is not None),
         "gas_measured": sum(1 for r in rows if r["gas_usd"] is not None),
+        # ---- the forecast against the price --------------------------------
+        # The verdict is what the gate reads; the numbers travel with it so the
+        # console and the operator can see how close the call was, and a reason
+        # line so nobody has to reconstruct it from four floats.
+        **skill.to_dict(),
+        "market_skill": skill.skill,
+        "market_skill_samples": skill_samples,
+        "market_skill_coverage": (skill_samples / n) if n else 0.0,
+        "market_skill_beats_price": bool(skill.forecast_beats_price),
+        "market_skill_entries_clear_odds": bool(skill.entries_clear_the_odds),
+        "market_skill_reason": skill.reason,
+        "min_pair_evidence": MIN_PAIRED_TRADES,
+        # The recent window, same question, newest 60 trades.
+        "recent_market_skill": recent.skill,
+        "recent_market_skill_verdict": recent.verdict,
+        "recent_market_skill_samples": recent.n,
+        "recent_market_skill_ci_low": recent.ci_low,
+        "recent_market_skill_ci_high": recent.ci_high,
+        "recent_market_skill_reason": recent.reason,
         "source": f"{n} recorded outcomes",
     }

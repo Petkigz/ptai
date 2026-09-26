@@ -336,6 +336,21 @@ def test_venue_qualification_robust():
         "executable_value_coverage": 1.0,
         "fill_price_vs_modelled": 0.0, "price_paid_samples": 120,
         "price_paid_coverage": 1.0,
+        # AGAINST THE PRICE: the comparison that decides whether there is an
+        # edge at all. Every absolute bar above can be cleared by a forecast
+        # that is no better than the price - in a market priced 0.50, always
+        # forecasting 0.50 scores a Brier of 0.25 and passes `max_brier` - so a
+        # record claiming to be qualified must say how it did against the price
+        # it had to beat, with the interval and the entries' own tail.
+        "market_skill": 0.06, "market_improvement": 0.02,
+        "market_skill_verdict": "forecast_beats_price",
+        "market_skill_samples": 120, "market_skill_coverage": 1.0,
+        "market_skill_ci_low": 0.005, "market_skill_ci_high": 0.035,
+        "market_skill_p_value": 0.0002,
+        "market_skill_beats_price": True,
+        "market_skill_entries_clear_odds": True,
+        "market_skill_reason": "forecast beats the price on 120 trade(s)",
+        "recent_market_skill_verdict": "forecast_beats_price",
     }
     result2 = engine.evaluate_qualification("kalshi", perf_qualified)
     assert result2.is_qualified

@@ -1003,6 +1003,10 @@ class TradingAgentV3:
                 category=str(category or ""),
                 forecast_prob=float(fair_price),
                 market_price=float(price),
+                # The market's YES price at submission, kept with the order so a
+                # fill that arrives later can still be scored against the price
+                # the decision was made at.
+                yes_price=order.get("yes_price"),
                 edge=float(edge or 0.0),
                 side=side,
                 amount_usd=float(add_usd),
@@ -2901,6 +2905,11 @@ class TradingAgentV3:
                 forecast_prob=opp.estimated_fair,
                 market_price=(exec_result.filled_price
                               or opp.market_price),
+                # THE NULL, stored on the YES scale so it can be compared with
+                # `forecast_prob` and `actual_outcome` row by row. This is what
+                # the market thought when the decision was made; without it
+                # "skill" is a rescaled Brier score that never saw a price.
+                yes_price=getattr(opp, "market_price", None),
                 edge=opp.effective_edge,
                 side=opp.side,
                 confidence=opp.confidence,

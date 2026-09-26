@@ -7,6 +7,10 @@ REM    1. check the Python dependencies (only slow on the first run)
 REM    2. start the trading agent in PAPER mode (no real money is spent)
 REM    3. open the PTAI console in your browser (only when it is ready)
 REM
+REM  Want to know WHY it will not start? Run this file with the argument
+REM  check (or from a command prompt: run_ptai.bat check) and it prints one
+REM  PASS/WARN/FAIL line per requirement instead of opening windows that die.
+REM
 REM  Runs directly on your system Python - no venv is created.
 REM  The agent's memory lives in the data\ folder next to this file and
 REM  survives restarts; it is not touched by Python or dependency updates.
@@ -48,13 +52,38 @@ if not defined PYTHON (
   goto fail
 )
 
-REM ---------------- dependencies (system python, first run only slow) --------
-echo Checking dependencies (only slow on the first run) ...
+REM ---------------- what the agent imports (one folder, no venv) -------------
+set "PYTHONPATH=%~dp0src"
+
+REM ---------------- optional: run_ptai.bat check -----------------------------
+REM The pre-flight report. Nothing is started, nothing is written: it reads.
+if /i "%~1"=="check" (
+  echo Running the pre-flight check ...
+  %PYTHON% -m ptai.doctor
+  echo.
+  pause
+  exit /b 0
+)
+
+REM ---------------- dependencies (system python, installed only if missing) ---
+REM This used to run pip on every double-click, which needs the internet every
+REM time and can fail for reasons that have nothing to do with PTAI. The
+REM imports are checked first, so a machine that is already installed starts
+REM immediately and works offline.
+echo Checking what is installed ...
+%PYTHON% -c "import loguru, pydantic, pydantic_settings, httpx, rich, typer, fastapi, uvicorn, numpy, pandas, sklearn" >nul 2>nul
+if not errorlevel 1 (
+  echo All packages are present.
+  goto deps_ok
+)
+echo Some packages are missing - installing them now (first run, needs internet) ...
 %PYTHON% -m pip install --quiet --user -r requirements.txt
 if errorlevel 1 (
   echo [ERROR] Installing dependencies failed. Read the messages above.
+  echo         Check the internet connection, then run: run_ptai.bat check
   goto fail
 )
+:deps_ok
 
 REM ---------------- folders + optional browser --------------------------------
 if not exist data mkdir data
@@ -109,6 +138,8 @@ echo                  (in the minimized "PTAI Agent (paper)" window)
 echo.
 echo   To stop PTAI: close the "PTAI Agent (paper)" window and the
 echo   "PTAI Console" window (Ctrl-C inside each). Then close this.
+echo.
+echo   To see what PTAI checked before starting: run_ptai.bat check
 echo  ============================================================
 echo.
 pause

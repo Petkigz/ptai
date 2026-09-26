@@ -314,3 +314,116 @@ class TestBothFrontEndsReadOneSource:
         from src.ptai.operator_view import describe_snapshot as lines_used_by_cli
 
         assert lines_used_by_cli is describe_snapshot
+
+
+class TestTheScreenNamesTheComparisonThatDecidesTheGate:
+    """
+    A venue can pass every absolute bar and still have no edge.
+
+    `forecast_skill` is a rescaled Brier score and win rate is a count: neither
+    has ever seen a price. In a market priced 0.50, always forecasting 0.50
+    scores a Brier of 0.25 and clears `max_brier`, and a 55% win rate on 0.5
+    entries is a loss. The screen therefore has to carry the comparison against
+    the price - and read it from the gate's own saved verdict, because a screen
+    that recomputes it is a second answer waiting to disagree with the first.
+    """
+
+    # A record that has beaten the price: 120 paired trades, interval clear of
+    # zero, entries clearing the odds they paid.
+    _BEATEN = {
+        "total_paper_trades": 120, "win_rate": 0.62, "avg_edge": 0.06,
+        "brier_score": 0.20, "forecast_skill": 0.60, "net_pnl": 12.0,
+        "market_skill": 0.06, "market_improvement": 0.02,
+        "market_skill_verdict": "forecast_beats_price",
+        "market_skill_samples": 120, "market_skill_coverage": 1.0,
+        "market_skill_ci_low": 0.005, "market_skill_ci_high": 0.035,
+        "market_skill_p_value": 0.0002, "market_skill_beats_price": True,
+        "market_skill_entries_clear_odds": True,
+        "market_skill_reason": "forecast beats the price on 120 trade(s)",
+        "recent_market_skill_verdict": "forecast_beats_price",
+    }
+
+    def _evaluate(self, storage, venue, stats):
+        from src.ptai.venues.qualification import VenueQualificationEngine
+
+        engine = VenueQualificationEngine(
+            data_dir=str(__import__("pathlib").Path(storage.db_path).parent))
+        engine.evaluate_qualification(venue, dict(stats))
+        return engine
+
+    def test_the_snapshot_carries_the_comparison_per_venue(self, storage):
+        """Read back OFF DISK: the screen runs in another process to the gate."""
+        from src.ptai.operator_view import _venue_evidence
+
+        self._evaluate(storage, "polymarket", self._BEATEN)
+        row = _venue_evidence(storage)["market_skill"]["polymarket"]
+
+        assert row["verdict"] == "forecast_beats_price"
+        assert row["samples"] == 120
+        # The mean improvement per trade survives the round trip. It used to be
+        # read from a field that did not exist, so the screen showed None for
+        # every venue - "no improvement" and "improvement not recorded" are the
+        # same blank on a dashboard.
+        assert row["improvement"] == pytest.approx(0.02)
+        assert row["ci_low"] == pytest.approx(0.005)
+        assert row["ci_high"] == pytest.approx(0.035)
+        assert row["p_value"] == pytest.approx(0.0002)
+        assert row["beats_price"] is True
+        assert row["drifting"] is False
+
+    def test_the_refusal_says_what_the_evidence_found(self, storage):
+        """The gate is shut or open on a sentence an operator can act on."""
+        from src.ptai.operator_view import _below_the_gate_evidence, _venue_evidence
+
+        self._evaluate(storage, "polymarket", self._BEATEN)
+        venues = _venue_evidence(storage)
+        evidence = _below_the_gate_evidence(venues, venues["matrix"])
+
+        assert "polymarket has beaten the price" in evidence
+
+    def test_a_drifting_venue_is_shown_as_drifting(self, storage):
+        """
+        An all-time average is a memory of an edge that may be gone.
+
+        The recent window is the only thing that says whether the edge is still
+        there, so a venue whose newest trades lag the price must not read as
+        beaten on the strength of its history.
+        """
+        from src.ptai.operator_view import _venue_evidence
+
+        self._evaluate(storage, "kalshi", dict(
+            self._BEATEN,
+            id="drifting",
+            recent_market_skill=float("-0.24"),
+            recent_market_skill_verdict="forecast_behind_price",
+            recent_market_skill_reason="recent window behind the price",
+        ))
+        row = _venue_evidence(storage)["market_skill"]["kalshi"]
+
+        assert row["drifting"] is True
+        assert row["verdict"] == "forecast_beats_price", (
+            "the drift belongs to the recent window; the screen shows both it "
+            "and the all-time comparison rather than overwriting one with the "
+            "other")
+
+    def test_a_failing_comparison_is_not_shown_as_beaten(self, storage):
+        """Fail closed: half an interval that touches zero is not a win."""
+        from src.ptai.operator_view import _below_the_gate_evidence, _venue_evidence
+
+        self._evaluate(storage, "kalshi", dict(
+            self._BEATEN,
+            market_skill_ci_low=-0.004,
+            market_skill_p_value=0.31,
+            market_skill_beats_price=False,
+            market_skill_verdict="no_evidence",
+        ))
+        venues = _venue_evidence(storage)
+        row = venues["market_skill"]["kalshi"]
+
+        assert row["beats_price"] is False
+        assert row["improvement"] == pytest.approx(0.02), (
+            "the comparison is still reported - it is the verdict that fails, "
+            "and an operator has to see how close it got")
+        evidence = _below_the_gate_evidence(venues, venues["matrix"])
+        assert "has beaten the price" not in evidence
+        assert "improvement +0.0200 per trade" in evidence

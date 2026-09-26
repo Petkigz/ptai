@@ -188,6 +188,10 @@ def _record(storage, tracker, i, *, fill_price=0.60, modelled_pct=0.10,
         trade_id=str(trade_id), market_id=f"M{i}", venue_id=VENUE,
         strategy="value", category="politics", forecast_prob=forecast,
         market_price=0.60, edge=0.10, side="YES", amount_usd=3.0,
+        # The price the decision was made against - the null the forecast has to
+        # beat. Without it there is no comparison to make and the gate fails
+        # closed, which is asserted in test_evidence_beats_the_market.py.
+        yes_price=0.60,
         fees_usd=0.06, slippage_bps=10.0, execution_quality=0.9,
         execution_mode="paper", book_source="ladder",
         expected_net_ev=modelled_pct * 3.0, expected_net_ev_pct=modelled_pct,

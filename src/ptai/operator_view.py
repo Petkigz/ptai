@@ -30,6 +30,7 @@ round of rework:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -290,6 +291,50 @@ def _venue_evidence(storage) -> Dict[str, Any]:
     except Exception as e:
         block["reason"] = f"{type(e).__name__}: {e}"
         return block
+
+    # The comparison that decides whether there is an edge at all: the agent's
+    # forecasts against the price it had to beat. Absolute scores (Brier, win
+    # rate) cannot answer it, so this is read from the qualification engine's own
+    # verdicts rather than recomputed here - two computations of the same thing
+    # is how a screen and a gate come to disagree.
+    try:
+        from .venues.qualification import VenueQualificationEngine
+        # The engine keeps its verdicts beside the database it judged, so the
+        # screen reads the same file the gate writes. Built from the path, not
+        # from whatever the attribute happens to be - `db_path` has always been
+        # a Path, but a string here used to silently fall back to `./data` and
+        # report an empty record as "no comparison has been made".
+        db_path = getattr(storage, "db_path", None)
+        try:
+            data_dir = str(Path(db_path).parent)
+        except TypeError:
+            data_dir = "./data"
+        engine = VenueQualificationEngine(data_dir=data_dir)
+        block["market_skill"] = {
+            venue_id: {
+                "verdict": qual.market_skill_verdict,
+                "samples": qual.market_skill_samples,
+                # The mean improvement in Brier units per trade - read from
+                # the midpoint of the interval's inputs when the engine stored
+                # them, and None when it stored nothing.
+                "improvement": getattr(qual, "market_improvement", None),
+                "ci_low": qual.market_skill_ci_low,
+                "ci_high": qual.market_skill_ci_high,
+                "p_value": qual.market_skill_p_value,
+                # From the persisted verdict, falling back to the in-process
+                # checks dict - a record read off disk carries the boolean, and
+                # an empty checks dict must not read as "failed".
+                "beats_price": bool(
+                    qual.beats_the_price if qual.beats_the_price is not None
+                    else qual.checks.get("beats_the_price")),
+                "drifting": (qual.recent_market_skill_verdict
+                             == "forecast_behind_price"),
+                "reason": qual.market_skill_reason,
+            }
+            for venue_id, qual in engine.qualifications.items()
+        }
+    except Exception as e:
+        block["market_skill_reason"] = f"{type(e).__name__}: {e}"
 
     block["matrix"] = {
         "source": "trade_outcomes, grouped by venue x strategy x market type x execution mode",
@@ -599,6 +644,41 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
     return block
 
 
+def _below_the_gate_evidence(venues: Dict[str, Any],
+                            matrix: Dict[str, Any]) -> str:
+    """
+    Why the gate is shut, in the terms that actually decide it.
+
+    The gates are not one bar - they are many - but the one that has never been
+    measured is the one worth naming first: whether the forecasts ever beat the
+    PRICE. `forecast_skill` is a rescaled Brier score and `win rate` is a count;
+    neither says whether the agent's probabilities were better than the market's,
+    and until the market is beaten there is no edge to deploy. When the venues
+    have reported that comparison, this says what it found; when they have not,
+    it says that instead.
+    """
+    comparisons = venues.get("market_skill") or {}
+    if comparisons:
+        beats = [name for name, row in comparisons.items()
+                 if row.get("beats_price")]
+        if beats:
+            return (f"{', '.join(beats)} has beaten the price on the recorded "
+                    f"evidence; the remaining bars (drawdown, cost coverage, "
+                    f"execution) decide whether real capital follows")
+        closest = max(comparisons.items(),
+                      key=lambda kv: kv[1].get("improvement") or float("-inf"))
+        row = closest[1]
+        return (f"none of {len(comparisons)} venues has shown its forecasts "
+                f"beating the price yet; best is {closest[0]} on "
+                f"{int(row.get('samples') or 0)} paired trade(s), improvement "
+                f"{(row.get('improvement') or 0.0):+.4f} per trade "
+                f"(95% CI [{row.get('ci_low') or 0.0:+.4f}, "
+                f"{row.get('ci_high') or 0.0:+.4f}])")
+    return (f"{int(matrix.get('cells_with_enough_evidence') or 0)} combination(s) "
+            f"have enough evidence of {int(matrix.get('cells') or 0)} seen; the "
+            f"gate needs real fills and resolved outcomes, not a score")
+
+
 def build_blockers(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     What stands between this agent and earning, in the order to fix it.
@@ -693,9 +773,7 @@ def build_blockers(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
         add("no_validated_venue", "gate",
             "No venue has passed the qualification gate, so the agent will not "
             "put real money on any of them.",
-            (f"{int(matrix.get('cells_with_enough_evidence') or 0)} combination(s) "
-             f"have enough evidence of {int(matrix.get('cells') or 0)} seen; the "
-             f"gate needs real fills and resolved outcomes, not a score"),
+            _below_the_gate_evidence(venues, matrix),
             "Keep it running. Every paper cycle records an outcome, and the "
             "evidence is what eventually opens the gate.")
 
