@@ -662,11 +662,15 @@ def _validation(storage) -> Dict[str, Any]:
     Deliberately labelled: this can refuse a strategy and can never qualify one.
     """
     try:
-        from .validation.walk_forward import load_verdicts
+        # The block carries the bench as well as the verdict: what the record
+        # REFUSES is only half the answer, and the operator's question is what
+        # the agent then does about it. `validation_block` is the one place that
+        # pairs the two, so the console and this view cannot disagree.
+        from .validation.rule_bench import validation_block
 
-        return load_verdicts(storage)
+        return validation_block(storage)
     except Exception as e:  # noqa: BLE001
-        return {"available": False, "scopes": {},
+        return {"available": False, "scopes": {}, "benched": {},
                 "reason": f"{type(e).__name__}: {e}"}
 
 
@@ -1018,6 +1022,12 @@ def describe_snapshot(snapshot: Dict[str, Any]) -> List[str]:
 
         lines.append("Out-of-sample: " + verdict_line(validation)
                      .replace("out-of-sample validation - ", ""))
+        benched = validation.get("benched") or {}
+        if benched:
+            lines.append(
+                "Live money benched: " + ", ".join(sorted(benched))
+                + " - entries only these rules carry run in paper, and the "
+                  "bench says so on the trade")
     limits = snapshot.get("limits") or {}
     for lane in ("live", "paper"):
         row = limits.get(lane) or {}

@@ -386,6 +386,43 @@ def _limits_check(db_path: Path) -> Check:
                      f"guard not available: {type(e).__name__}: {e}")
 
 
+def _bench_check(db_path: Path) -> Check:
+    """
+    Which rules the out-of-sample record has benched from real money.
+
+    PTAI recorded walk-forward verdicts and acted on none of them, so "this rule
+    failed its holdout" was a line in a log rather than a fact about the order
+    path. This asks the bench the order path asks, and says so before the
+    operator funds anything.
+    """
+    try:
+        from .storage.db import Storage  # noqa: WPS433
+        from .validation.rule_bench import benched_rules  # noqa: WPS433
+
+        storage = Storage(db_path=str(db_path))
+        try:
+            benched = benched_rules(storage)
+        finally:
+            storage.close()
+        if not benched:
+            return Check(
+                "Out-of-sample bench", PASS,
+                "no rule is benched: every rule choosing trades still stands on "
+                "the record's own holdout",
+                "Run `python main.py validate` to re-test the rules on the "
+                "settled record.")
+        names = ", ".join(sorted(benched))
+        return Check(
+            "Out-of-sample bench", WARN,
+            f"benched from real money: {names} - an entry carried only by these "
+            f"rules still runs, in paper, and the trade records the refusal",
+            "This is the bench doing its job, not a fault. It lifts when fresh "
+            "settled trades re-test the rule out of sample.")
+    except Exception as e:  # noqa: BLE001
+        return Check("Out-of-sample bench", WARN,
+                     f"bench not available: {type(e).__name__}: {e}")
+
+
 def run_checks(root: Optional[Path] = None, *, port: Optional[int] = None,
                db_path: Optional[Path] = None, network: bool = False,
                include_model: bool = True) -> List[Check]:
@@ -414,6 +451,7 @@ def run_checks(root: Optional[Path] = None, *, port: Optional[int] = None,
     if include_model:
         checks.append(_model_check(network=network))
     checks.append(_limits_check(db_path))
+    checks.append(_bench_check(db_path))
     checks.append(_venues_check())
     return checks
 

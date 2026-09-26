@@ -237,6 +237,29 @@ One wrong prediction could wipe account, so:
 8. **Stop loss 50%** per position (monitored)
 9. **Position Monitor** checks exposure, stop-loss, resolution
 
+## Where The Rules Are Enforced
+
+The list above is only true of the code if something actually stops the order.
+Three things do, each consulted immediately before an order is dispatched:
+
+- **`risk/money_guard.py`** - session (30%) and daily (15%) loss limits, measured
+  from SETTLED outcomes in the trade log per lane, so a restart cannot reset them.
+  A live refusal sends the order to paper rather than dropping it; the first live
+  money at a venue is capped at 2% of capital until 10 live trades there settle.
+- **`validation/walk_forward.py`** - out-of-sample folds over the settled record:
+  consecutive in time, discovery folds then a fresh holdout, Holm-Bonferroni
+  across the rules tested, statistical lift and economic viability judged
+  separately. Run `python main.py validate` to see it. It can REFUSE a rule and
+  can never qualify a venue - `may_qualify()` returns False always, because a
+  backtest figure must never trigger live capital.
+- **`validation/rule_bench.py`** - what the agent DOES about a refusal. An entry
+  rests on the strongest rule it satisfies; if every one of those has been
+  refused out of sample, real money is withdrawn from that entry (it still runs,
+  in paper, and the trade records the reason). The bench only subtracts: it never
+  widens or rewrites the entry filters.
+
+`python main.py doctor` reports all three before you fund anything.
+
 ## Browser Execution
 
 - Persistent profile: `./browser/profiles/default` — stays logged in to Polymarket, X

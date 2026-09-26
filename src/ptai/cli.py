@@ -185,7 +185,17 @@ def validate(
                           f"{', '.join(report.refused_names())}[/red]")
         if record:
             scope_name = "-".join(x for x in (venue, strategy, lane) if x) or "all"
-            if record_verdict(storage, report, scope=scope_name):
+            stored = record_verdict(storage, report, scope=scope_name)
+            if stored and report.refused_names():
+                # Printed from THIS run's refusals, after storing them - not from
+                # the bench as it stood before, which is what a read taken above
+                # the recording would have shown.
+                console.print(
+                    f"Benched from real money: [red]"
+                    f"{', '.join(report.refused_names())}[/red] - an entry only "
+                    f"these rules carry still runs, in paper, and the trade "
+                    f"records the refusal.")
+            if stored:
                 console.print(f"[dim]Verdict stored for the console "
                               f"(scope {scope_name}).[/dim]")
     finally:

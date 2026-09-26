@@ -43,7 +43,7 @@ from ..execution.capital import (
 )
 from ..storage.db import Storage
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
-from ..validation.walk_forward import load_verdicts
+from ..validation.rule_bench import validation_block
 from ..venues.inventory import load_inventory
 
 app = FastAPI(title="PTAI Console", version="console-1")
@@ -787,7 +787,9 @@ async def api_venue() -> JSONResponse:
         "inventory": inventory,
         # What out-of-sample validation says about the rules that are choosing
         # these trades. It can refuse a rule; it can never qualify a venue.
-        "validation": load_verdicts(storage),
+        # ...together with the bench: what the agent DOES about a refused
+        # rule. A verdict the operator cannot see acted on reads as decoration.
+        "validation": validation_block(storage),
     })
 
 
@@ -1460,9 +1462,16 @@ async function loadVenue(){
   // otherwise.
   const val = body.validation || {};
   const scopes = Object.entries(val.scopes || {});
+  const benchNames = Object.keys(val.benched || {});
+  const benchHtml = benchNames.length
+    ? `<div class="warn" style="margin-top:9px">Benched from real money:
+        <b>${esc(benchNames.join(', '))}</b> - an entry only these rules carry still runs,
+        in paper, and the trade records the refusal. It changes nothing about which trades
+        are considered: the entry gates are untouched.</div>` : '';
   if(!scopes.length){
     $('validation').innerHTML = `<div class="note">${esc(val.reason
-      || 'Out-of-sample validation has not been run yet. Run: python main.py validate')}</div>`;
+      || 'Out-of-sample validation has not been run yet. Run: python main.py validate')}</div>`
+      + benchHtml;
   } else {
     $('validation').innerHTML = scopes.map(([name, rep]) => {
       const good = rep.verdict === 'confirmed_economic';
@@ -1490,7 +1499,7 @@ async function loadVenue(){
             <td class="mono">${r.holdout_entries||0} @ ${chk(r.holdout_hit_rate)}</td>
             <td class="mono">${chk(r.break_even)}</td></tr>`;
         }).join('') + '</table></div>';
-    }).join('') + `
+    }).join('') + benchHtml + `
       <div class="note" style="margin-top:11px">Tested on consecutive folds, corrected for testing
         several rules at once (Holm-Bonferroni), and judged against the break-even the entries
         actually paid. This can refuse a rule. It can never qualify a venue: only settled

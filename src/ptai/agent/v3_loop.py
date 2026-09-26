@@ -63,6 +63,7 @@ from ..markets.base import Market, DataMode
 
 from ..venues.registry import VenueRegistry
 from ..venues.inventory import inventory_line, record_inventory
+from ..validation.rule_bench import benched_rules, bench_live_authorisation
 from ..validation.walk_forward import (record_verdict, rows_from_storage,
                                         run_walk_forward)
 from ..venues.polymarket_adapter import PolymarketAdapter
@@ -410,6 +411,8 @@ class TradingAgentV3:
         # two of the kill switch's triggers were constructed or defined and never
         # called. This one is consulted immediately before every order.
         self.money_guard = default_guard(self.storage, self.settings)
+        # Rules the recorded verdicts refuse; filled at the top of every cycle.
+        self._cycle_benched: Dict[str, Any] = {}
         self.kill_switch = KillSwitch(data_dir="./data")
         self.limits_engine = LimitsEngine(
             limits=TradeLimits(
@@ -1156,6 +1159,24 @@ class TradingAgentV3:
                 logger.info(f"Out-of-sample validation: {_wf.verdict}")
         except Exception as e:  # noqa: BLE001 - a report must never stop a cycle
             logger.warning(f"Out-of-sample validation failed: "
+                           f"{type(e).__name__}: {e}")
+        # THE BENCH. The verdict above is a finding; this is what the agent does
+        # about it. Read once per cycle from the persisted verdicts - the same
+        # answer the console shows - and consulted immediately before an order
+        # would spend real money. A refused rule keeps choosing WHICH trades are
+        # candidates (that is the entry gates' job, unchanged) and loses the
+        # right to vouch for them with real capital: entries carried only by
+        # refused rules run in paper and say so.
+        try:
+            self._cycle_benched = benched_rules(self.storage)
+            if self._cycle_benched:
+                logger.warning(
+                    "Out-of-sample bench: real money is withdrawn from entries "
+                    "carried only by " + ", ".join(sorted(self._cycle_benched))
+                    + " (they still run in paper)")
+        except Exception as e:  # noqa: BLE001
+            self._cycle_benched = {}
+            logger.warning(f"Could not read the out-of-sample bench: "
                            f"{type(e).__name__}: {e}")
         
         # Health check - Check capital + account health
@@ -1907,6 +1928,21 @@ class TradingAgentV3:
                 # capital in the first place.
                 lane, lane_reason = self._money_lane(opp, amount_usd)
                 paper_because = ""
+                # ...and by what the out-of-sample record will vouch for. This is
+                # a refusal to RISK real money, so it sends the order to paper; it
+                # never widens or rewrites the entry filters, which have already
+                # had their say above.
+                if lane == "live":
+                    _bench_allowed, _bench_reason = bench_live_authorisation(
+                        opp, getattr(self, "_cycle_benched", {}) or {})
+                    if not _bench_allowed:
+                        logger.warning(
+                            f"OUT-OF-SAMPLE BENCH refuses real money for "
+                            f"{opp.market.id} @ {venue_id}: {_bench_reason} - "
+                            f"running it in paper so the trade and its outcome "
+                            f"are still recorded")
+                        lane = "paper"
+                        paper_because = f"out-of-sample bench: {_bench_reason}"
                 # THE MONEY GUARD. Session and daily loss limits, measured
                 # against settled outcomes in the trade log rather than a counter
                 # in memory, plus the stake cap for the first live money at a
@@ -1970,7 +2006,13 @@ class TradingAgentV3:
                         amount_usd = cap
                     logger.info(f"Core Objective DEPLOY via canonical executor: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} netEV ${getattr(opp, '_expected_ev', None).net_ev_usd if hasattr(opp, '_expected_ev') and opp._expected_ev else 0:.2f} - Guard PASS → MultiVenueExecutor → {venue_id} | {lane_reason}")
                 else:
-                    paper_because = lane_reason
+                    # The lane and the money guard can BOTH have refused real
+                    # money, and overwriting here recorded only the lane's
+                    # reason - the softer of the two, and never the one about
+                    # losses. Both are kept.
+                    if lane_reason and lane_reason not in (paper_because or ""):
+                        paper_because = (f"{paper_because}; {lane_reason}"
+                                         if paper_because else lane_reason)
                     logger.info(
                         f"PAPER EXECUTION {opp.market.id} @ {opp.venue_id} "
                         f"${amount_usd:.2f}: real money refused ({lane_reason}) - "

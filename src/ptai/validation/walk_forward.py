@@ -305,6 +305,10 @@ class WalkForwardReport:
             "generated_at": self.generated_at, "scope": self.scope,
             "may_qualify": False,
             "may_refuse": True,
+            # Written down rather than left to be re-derived by every reader: the
+            # bench that stops real money has to act on exactly the answer the
+            # operator was shown, not on a second implementation of it.
+            "refused": self.refused_names(),
             "rule": ("out-of-sample validation can refuse a strategy and can "
                      "never qualify one: qualification stays on settled money"),
         }
@@ -315,32 +319,50 @@ class WalkForwardReport:
         return bool(self.refused_names())
 
     def refused_names(self) -> List[str]:
-        """
-        The rules this record says NOT to size capital by.
+        """The rules this record says NOT to size capital by."""
+        return refusals_from_results(self.results, self.verdict)
 
-        Only two things earn a refusal, and "the record is quiet" is not one of
-        them:
 
-          * a rule that looked good on the discovery folds and FAILED the fresh
-            holdout - the signature of a false positive, and the one case where
-            acting on it is an error the record already caught; and
-          * a rule with a real lift whose entries still lose money at the prices
-            they paid.
+def refusals_from_results(results: Iterable[Any], verdict: str) -> List[str]:
+    """
+    The refusal policy, in ONE place.
 
-        `no_signal` - nothing beat simply taking every trade - is a statement
-        about the FILTERS, not a claim that they are harmful, and it is not a
-        reason to stop: an agent whose filters add nothing still has to trade the
-        opportunities its other gates approve. Saying "refuse everything" there
-        would be the same overstatement in the opposite direction.
-        """
-        if self.verdict == UNCONFIRMED:
-            return [r.name for r in self.results
-                    if r.name != "all" and r.significant and not r.confirmed]
-        if self.verdict == CONFIRMED_UNECONOMIC:
-            return [r.name for r in self.results
-                    if r.name != "all" and r.confirmed
-                    and not r.economically_viable]
-        return []
+    Only two things earn a refusal, and "the record is quiet" is not one of
+    them:
+
+      * a rule that looked good on the discovery folds and FAILED the fresh
+        holdout - the signature of a false positive, and the one case where
+        acting on it is an error the record already caught; and
+      * a rule with a real lift whose entries still lose money at the prices
+        they paid.
+
+    `no_signal` - nothing beat simply taking every trade - is a statement about
+    the FILTERS, not a claim that they are harmful, and it is not a reason to
+    stop: an agent whose filters add nothing still has to trade the
+    opportunities its other gates approve. Saying "refuse everything" there
+    would be the same overstatement in the opposite direction.
+
+    Accepts the report's own `CandidateVerdict` objects or the dicts it writes
+    into storage, so the bench that withdraws real money reads the same policy
+    the validator used instead of a copy of it that can drift.
+    """
+    def _get(result: Any, name: str, default: Any = False) -> Any:
+        if isinstance(result, dict):
+            return result.get(name, default)
+        return getattr(result, name, default)
+
+    refused: List[str] = []
+    for result in results or []:
+        name = str(_get(result, "name", "") or "")
+        if not name or name == "all":
+            continue
+        if verdict == UNCONFIRMED and _get(result, "significant") \
+                and not _get(result, "confirmed"):
+            refused.append(name)
+        elif verdict == CONFIRMED_UNECONOMIC and _get(result, "confirmed") \
+                and not _get(result, "economically_viable"):
+            refused.append(name)
+    return refused
 
 
 def may_qualify(_report: Optional[WalkForwardReport] = None) -> bool:
@@ -585,8 +607,13 @@ def record_verdict(storage, report: WalkForwardReport,
     try:
         payload = report.to_dict()
         payload["scope_name"] = scope
-        storage.set_state(VERDICTS_KEY,
-                          json.dumps({scope: payload}))
+        # MERGE, never replace. The agent records the whole-record scope every
+        # cycle and `ptai validate --venue X` records a narrower one; writing a
+        # single-key dict meant whichever ran last erased the other, so a venue
+        # verdict could vanish in the ten minutes after it was recorded.
+        existing = load_verdicts(storage).get("scopes") or {}
+        existing[scope] = payload
+        storage.set_state(VERDICTS_KEY, json.dumps(existing))
         return True
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Could not record the walk-forward verdict: "
