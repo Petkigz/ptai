@@ -259,7 +259,8 @@ class CapitalPlan:
     @property
     def is_deployable(self) -> bool:
         """
-        Fail closed. No funded, budgeted venue with free cash means paper only -
+        Fail closed. No funded, budgeted venue with free cash means no live
+        capital - the agent still runs, in paper, on the same data -
         the same rule the qualification gate enforces, applied to money.
         """
         return self.mode == "live" and bool(self.live_venues)
@@ -392,7 +393,8 @@ class CapitalLedger:
                 "it has money it does not have.")
         elif account.budget_usd <= 0:
             account.notes.append(
-                "no budget authorised for this venue: paper trading only here")
+                "no budget authorised for this venue: the agent runs in paper "
+                "here until the operator authorises an amount")
         elif account.budget_usd > account.reported_balance_usd + 1e-9:
             account.warnings.append(
                 f"authorised budget ${account.budget_usd:.2f} exceeds the "

@@ -193,7 +193,7 @@ def test_unfunded_means_not_live(selector, storage):
     sel = selector.select(selector.assess(
         [POLY], accounts=[], qualified_ids=[POLY], labels=_labels()))
     assert sel.live_venue is None
-    assert sel.verdict.startswith("paper only")
+    assert sel.verdict.startswith("no venue holds live capital yet")
 
 
 def test_a_venue_that_cannot_be_funded_is_unavailable(selector):

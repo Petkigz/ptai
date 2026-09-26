@@ -609,30 +609,48 @@ class TestFullCycle:
             set_authorised_budget(agent.storage, VENUE, 0.0)
         return agent, adapter
 
-    def test_a_live_order_with_no_selected_venue_is_blocked(self, tmp_path, monkeypatch):
+    def test_a_live_order_with_no_selected_venue_runs_in_paper(self, tmp_path,
+                                                               monkeypatch):
         """
-        The control boundary, in the loop: no live venue means no real order.
+        The control boundary, in the loop: no live venue means no REAL order.
 
         A venue can be qualified, the opportunity can pass every risk rule, and
         the adapter can hold credentials - if the operator has not selected a
-        live venue, the order must not be sent. This is the last gate before
+        live venue, real money must not move. This is the last gate before
         dispatch, so it is the one that decides where real money goes.
+
+        What it does NOT do is drop the trade. The boundary forbids real money,
+        not the trade: an install whose account is linked but unfunded used to
+        simulate NOTHING - every trade hit this gate and `continue`d - so paper
+        mode produced no evidence exactly on the install that needed it. The
+        order goes to the venue in dry run instead, at paper size, and the record
+        says why.
         """
         agent, adapter = self._live_agent_minus(tmp_path, monkeypatch, venue=False)
+        saw_armed = []
+        inner = _simulating_place_order(adapter)
+
+        async def place_order(opportunity, max_spend_usd, max_price):
+            saw_armed.append(bool(adapter.dry_run))
+            return await inner(opportunity, max_spend_usd, max_price)
+
+        adapter.place_order = place_order
         try:
             r = _cycle(agent)
-            assert adapter.orders_placed == 0, "an order was sent with no live venue"
+            # No real order: every call to the venue was made in dry run, so the
+            # adapter itself would have refused a live one.
+            assert saw_armed, "no order reached the venue at all - the trade was dropped"
+            assert all(saw_armed), "an order was sent with the venue armed"
             entry = r["execution"][0]
-            assert entry["status"] == "blocked_live_capital"
-            assert "no live venue is selected" in entry["reason"]
-            assert entry["position_recorded"] is False
-            # The entry keeps the shape every other execution entry has, so a
-            # consumer that reads executor_result sees a refusal, not a KeyError.
-            assert entry["executor_result"]["status"] == "blocked"
-            assert entry["executor_result"]["amount_usd"] == 0.0
-            assert entry["result"]["status"] == "blocked"
-            assert agent.storage.get_open_positions() == []
-            assert agent.trade_outcome_tracker.outcomes == []
+            assert entry["execution_mode"] == "paper"
+            assert entry["execution_lane"] == "paper"
+            assert "no live venue holds capital" in entry["paper_because"]
+            assert entry["position_recorded"] is True
+            positions = agent.storage.get_open_positions()
+            assert len(positions) == 1, positions
+            assert positions[0]["execution_mode"] == "paper", positions
+            assert agent.trade_outcome_tracker.outcomes, (
+                "the simulated trade reached the venue but taught the agent nothing")
         finally:
             agent.storage.close()
 
@@ -667,28 +685,43 @@ class TestFullCycle:
         finally:
             agent.storage.close()
 
-    def test_a_live_order_with_no_authorised_budget_is_blocked(self, tmp_path, monkeypatch):
+    def test_a_live_order_with_no_authorised_budget_runs_in_paper(self, tmp_path, monkeypatch):
         """
-        An account balance is not an authorisation.
+        An account balance is not an authorisation - and the trade is still run.
 
         `set_bankroll` says how much is in the account; the per-venue budget says
         how much of it this agent may deploy. The loop reads them separately, so
-        an operator who funded a wallet but authorised nothing keeps the agent on
-        paper - the money is theirs until they say otherwise.
+        an operator who funded a wallet but authorised nothing keeps the agent's
+        REAL money out of it - the money is theirs until they say otherwise.
+
+        The refusal names the missing authorisation rather than claiming there is
+        no live venue, and the order is simulated instead of dropped.
         """
         agent, adapter = self._live_agent_minus(tmp_path, monkeypatch, budget=False)
+        saw_armed = []
+        inner = _simulating_place_order(adapter)
+
+        async def place_order(opportunity, max_spend_usd, max_price):
+            saw_armed.append(bool(adapter.dry_run))
+            return await inner(opportunity, max_spend_usd, max_price)
+
+        adapter.place_order = place_order
         try:
             r = _cycle(agent)
-            assert adapter.orders_placed == 0, "an order was sent with no budget"
+            assert saw_armed and all(saw_armed), (
+                "an order was sent with the venue armed and no budget authorised")
             entry = r["execution"][0]
-            assert entry["status"] == "blocked_live_capital"
+            assert entry["execution_lane"] == "paper"
+            assert "no budget authorised" in entry["paper_because"], entry["paper_because"]
             # The venue is still the remembered live venue - the money is still
-            # at that account - so the refusal names the missing authorisation
-            # rather than claiming there is no live venue.
-            assert "no budget authorised" in entry["reason"], entry["reason"]
-            assert entry["live_venue"] == VENUE
-            assert entry["position_recorded"] is False
-            assert agent.storage.get_open_positions() == []
+            # at that account - which is why the reason above names the budget
+            # rather than claiming there is no venue.
+            assert agent._cycle_live_venue == VENUE
+            assert agent._cycle_live_capital[VENUE]["cap_usd"] == 0.0
+            assert entry["position_recorded"] is True
+            positions = agent.storage.get_open_positions()
+            assert len(positions) == 1, positions
+            assert positions[0]["execution_mode"] == "paper", positions
         finally:
             agent.storage.close()
 

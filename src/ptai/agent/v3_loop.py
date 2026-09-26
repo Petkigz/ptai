@@ -1502,11 +1502,12 @@ class TradingAgentV3:
             #
             # Sizing against free_capital, not equity, so positions in one batch
             # cannot each claim 6% of the same dollars.
-            # The pool this trade will draw from. `_adapter_is_paper` is THE
-            # predicate for "will this order spend real money" - the venue-cap
-            # clamp below already reads it, so sizing and the clamp cannot
-            # disagree about which account the trade comes out of.
-            is_paper_trade = self._adapter_is_paper(opp)
+            # The pool this trade will draw from. `_will_simulate` is THE
+            # predicate for "will this order spend imaginary money" - the
+            # venue-cap clamp below and the dispatch gate both read the same
+            # helper, so sizing, the clamp and the purse the fill draws down
+            # cannot disagree about which account the trade comes out of.
+            is_paper_trade = self._will_simulate(opp)
             pool_free = free_capital_paper if is_paper_trade else free_capital
             pool_bankroll = (ledger.paper_bankroll if is_paper_trade
                              else bankroll)
@@ -1542,7 +1543,7 @@ class TradingAgentV3:
             cap_detail = None
             cap_entry = (getattr(self, "_cycle_live_capital", None) or {}).get(
                 opp.venue_id)
-            if cap_entry is not None and not self._adapter_is_paper(opp):
+            if cap_entry is not None and not is_paper_trade:
                 venue_cap = float(cap_entry.get("cap_usd") or 0.0)
                 cap_detail = cap_entry.get("detail")
                 if proposed_amount > venue_cap:
@@ -1768,8 +1769,7 @@ class TradingAgentV3:
                 # Same pool rule as sizing: a trade that will only simulate
                 # draws the paper pool, one that can spend real money draws
                 # the live one.
-                is_paper_trade = (getattr(opp, "_is_paper_trade", False)
-                                  or self._adapter_is_paper(opp))
+                is_paper_trade = self._will_simulate(opp)
                 pool_free = free_capital_paper if is_paper_trade else free_capital
                 amount_usd = getattr(opp, '_proposed_amount', None)
                 if amount_usd is None:
@@ -1831,16 +1831,33 @@ class TradingAgentV3:
                 # trade, and none of it decides where real money goes: the
                 # selected live venue and the operator's authorised budget do,
                 # here, immediately before the order is placed.
-                live_ok, live_reason = self._live_execution_allowed(opp, amount_usd)
-                if not live_ok:
-                    logger.warning(
-                        f"LIVE CAPITAL BLOCKED {opp.market.id} @ {opp.venue_id} "
-                        f"${amount_usd:.2f}: {live_reason}")
-                    execution_results.append(
-                        self._blocked_live_entry(opp, amount_usd, live_reason))
-                    continue
-
-                logger.info(f"Core Objective DEPLOY via canonical executor: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} netEV ${getattr(opp, '_expected_ev', None).net_ev_usd if hasattr(opp, '_expected_ev') and opp._expected_ev else 0:.2f} - Guard PASS → MultiVenueExecutor → {venue_id} | {live_reason}")
+                #
+                # A refusal here forbids REAL money; it does not forbid the
+                # trade. The order is placed in paper instead, on the same code
+                # path, with the adapter's dry_run forced for the call so no real
+                # order can leave - because the alternative (dropping it) meant
+                # an armed-but-unfunded install simulated NOTHING, and the paper
+                # record is what earns the qualification that unlocks live
+                # capital in the first place.
+                lane, lane_reason = self._money_lane(opp, amount_usd)
+                paper_because = ""
+                if lane == "live":
+                    entry = (getattr(self, "_cycle_live_capital", None) or {}).get(
+                        venue_id) or {}
+                    cap = float(entry.get("cap_usd") or 0.0)
+                    if cap > 0 and amount_usd > cap + 1e-9:
+                        logger.info(
+                            f"Live capital cap binds at dispatch for "
+                            f"{opp.market.id}: ${amount_usd:.2f} -> ${cap:.2f}")
+                        amount_usd = cap
+                    logger.info(f"Core Objective DEPLOY via canonical executor: {opp.market.id} @ {opp.venue_id} amount ${amount_usd:.2f} netEV ${getattr(opp, '_expected_ev', None).net_ev_usd if hasattr(opp, '_expected_ev') and opp._expected_ev else 0:.2f} - Guard PASS → MultiVenueExecutor → {venue_id} | {lane_reason}")
+                else:
+                    paper_because = lane_reason
+                    logger.info(
+                        f"PAPER EXECUTION {opp.market.id} @ {opp.venue_id} "
+                        f"${amount_usd:.2f}: real money refused ({lane_reason}) - "
+                        f"placing the same order in paper so the trade and its "
+                        f"outcome are still recorded")
                 
                 # V10 FIX #1: ONE canonical path: MultiVenueExecutor.execute_single()
                 # Executor has: MOCK protection, exact routing ABORT, rate limits, min order checks, fee calc, gas
@@ -1851,7 +1868,11 @@ class TradingAgentV3:
                 # through at a price the NO token never trades at.
                 exec_result = await self._execute_with_side_aware_cap(
                     opp=opp, amount_usd=amount_usd,
-                    exploration=bool(getattr(opp, "_is_exploration", False)))
+                    # Forcing the adapter to dry_run for a paper trade is what
+                    # makes "no real money" true at the venue boundary rather
+                    # than merely intended here.
+                    exploration=bool(getattr(opp, "_is_exploration", False)
+                                     or paper_because))
                 
                 execution_results.append({
                     "market_id": opp.market.id,
@@ -1876,7 +1897,18 @@ class TradingAgentV3:
                         "message": exec_result.reasoning
                     },
                     "canonical_path": "V3 → Guard → MultiVenueExecutor → adapter → place_order()",
-                    "account_health": account_health.to_dict()
+                    "account_health": account_health.to_dict(),
+                    # Which purse paid, read from the FILL rather than from the
+                    # intent: a simulated fill is paper money even when the venue
+                    # holds credentials and could have moved real money.
+                    "execution_mode": ("paper" if getattr(
+                        exec_result, "is_simulated", False) else "live"),
+                    # Present exactly when the live-capital lane refused and the
+                    # order was simulated instead, so the operator can tell a
+                    # paper trade the boundary sent there from one it never
+                    # touched.
+                    "execution_lane": "paper" if paper_because else "live",
+                    **({"paper_because": paper_because} if paper_because else {}),
                 })
                 
                 # Draw down the pool the trade actually drew from. A simulated
@@ -2255,8 +2287,9 @@ class TradingAgentV3:
         elif authorised <= 0:
             caps[live_venue] = {
                 "cap_usd": 0.0, "parts": parts,
-                "detail": (f"no budget authorised for {live_venue}: paper only "
-                           f"until the operator sets one")}
+                "detail": (f"no budget authorised for {live_venue}: the agent "
+                           f"runs in paper there until the operator authorises "
+                           f"an amount")}
         else:
             cap = max(0.0, min(venue_balance, authorised, float(free_cash or 0.0)))
             caps[live_venue] = {
@@ -2265,52 +2298,65 @@ class TradingAgentV3:
                            f"${authorised:.2f}, free ${float(free_cash or 0.0):.2f})")}
         return live_venue, caps
 
-    def _live_execution_allowed(self, opp, amount_usd: float) -> tuple:
+    def _money_lane(self, opp, amount_usd: float) -> tuple:
         """
-        May this specific order move real money? Returns (allowed, reason).
+        Which purse this order comes out of: ("live", why) or ("paper", why).
 
-        The last gate before dispatch, and the one that makes the architecture
-        true: if the opportunity's venue is not the selected live venue, this
-        trade does not touch real capital regardless of how good it looks or how
-        qualified the venue is. Paper is not affected - an unarmed adapter has no
-        real money to move - and neither is exploration, which is forced to paper
-        before it reaches here.
+        This is the operator's question answered directly. Before it, a refusal
+        from the live-capital boundary dropped the trade on the floor:
+
+            LIVE CAPITAL BLOCKED STUB-M1 @ polymarket $3.00: no live venue is
+            selected, so real capital may not be deployed anywhere
+
+        ...so on any install where the adapter is ARMED (credentials present)
+        but the operator has not funded a venue, the agent bought nothing at all.
+        Paper stopped working the moment the account was linked - which is the
+        one moment the operator most needs the simulation, because the paper
+        record is what earns the qualification that unlocks live capital.
+
+        The rule is now: the boundary forbids REAL money, it does not forbid the
+        trade. Everything that cannot spend real money runs in paper, on the same
+        code path, at the size the paper bankroll justifies - and says so.
+
+        The AMOUNT is deliberately not part of this question: where the operator
+        has authorised LESS than the trade is worth, the order is trimmed to the
+        cap at dispatch rather than turned into a paper trade. Dropping it is the
+        bug this method exists to prevent, and paper is for money that cannot be
+        spent, not for money that will not stretch.
         """
         venue_id = str(getattr(opp, "venue_id", "") or "")
-        if not venue_id:
-            return False, "opportunity has no venue_id, so its capital is unaccountable"
-
-        # Paper executions are governed by the paper engine, not this boundary.
-        try:
-            adapter = self.venue_registry.adapters.get(venue_id)
-        except Exception:
-            adapter = None
-        armed = bool(getattr(adapter, "can_place_real_orders", False))
-        if not armed:
-            return True, "paper: the adapter cannot place real orders"
+        if self._adapter_is_paper(opp):
+            return "paper", "the adapter cannot place real orders"
         if getattr(opp, "_is_exploration", False):
-            return True, "exploration: forced to paper before dispatch"
-
+            return "paper", "exploration is paper-only"
         live_venue = getattr(self, "_cycle_live_venue", None)
         if not live_venue:
-            return False, ("no live venue is selected, so real capital may not "
-                           "be deployed anywhere")
-        if venue_id != live_venue:
-            return False, (f"{venue_id} is not the selected live venue "
-                           f"({live_venue}) - one venue holds the live capital "
-                           f"at a time")
-
+            return "paper", ("no live venue holds capital, so no real money may "
+                             "be deployed anywhere")
+        if venue_id and venue_id != live_venue:
+            return "paper", (f"{venue_id} is not the selected live venue "
+                             f"({live_venue}) - one venue holds the live capital "
+                             f"at a time")
         entry = (getattr(self, "_cycle_live_capital", None) or {}).get(venue_id)
         if not entry:
-            return False, (f"no authorised capital computed for {venue_id} this "
-                           f"cycle")
+            return "paper", f"no authorised capital computed for {venue_id} this cycle"
         cap = float(entry.get("cap_usd") or 0.0)
         if cap <= 0:
-            return False, entry.get("detail") or "no live capital available"
-        if float(amount_usd) > cap + 1e-9:
-            return False, (f"amount ${float(amount_usd):.2f} exceeds the live "
-                           f"capital cap ${cap:.2f} for {venue_id}")
-        return True, f"within {entry.get('detail')}"
+            return "paper", (entry.get("detail")
+                             or f"no live capital available at {venue_id}")
+        return "live", str(entry.get("detail") or f"cap ${cap:.2f}")
+
+    def _will_simulate(self, opp) -> bool:
+        """
+        Will this order spend imaginary money?
+
+        THE predicate, read by sizing and by dispatch, so the pool a trade is
+        sized from cannot disagree with the purse it draws down. It used to be
+        `_adapter_is_paper`, which says "can this venue take real orders" - a
+        different question from "is this particular trade live", and the two
+        answers differ for every venue that is armed but not funded.
+        """
+        return self._money_lane(opp, 0.0)[0] == "paper"
 
     def _hard_rules_pass(self, opp):
         """
@@ -2427,13 +2473,40 @@ class TradingAgentV3:
             # A pair cannot straddle the pools: with one venue holding the
             # live capital at a time, either both legs simulate or the pair
             # is refused. Budget the pool the legs will actually draw.
-            legs_paper = all(self._adapter_is_paper(o) for o in (opp_a, opp_b))
+            #
+            # The pair is simulated when real money is not allowed for BOTH
+            # legs - which, with one venue funded at a time, is every
+            # cross-venue pair. That used to end the lane: `_arbitrage_blocked`
+            # consulted the live-capital boundary and refused the whole thing,
+            # so the strategy with the cleanest economics in the system ran only
+            # while the adapter happened to hold no credentials. As soon as the
+            # operator linked an account, arbitrage stopped executing. Real money
+            # is still forbidden - the adapters are forced to dry_run for the
+            # call, exactly as an exploration trade is.
+            # The amount is not part of this decision - it is venue-level, which
+            # is why the pair's own sizing below can follow it.
+            lanes = [self._money_lane(o, 0.0) for o in (opp_a, opp_b)]
+            legs_paper = any(mode == "paper" for mode, _why in lanes)
+            if legs_paper:
+                logger.info(
+                    f"Arb pair {arb.venue_a}+{arb.venue_b} runs in PAPER: "
+                    + "; ".join(f"{o.venue_id}: {why}"
+                                for o, (_m, why) in zip((opp_a, opp_b), lanes)
+                                if _m == "paper"))
             pool = free_capital_paper if legs_paper else free_capital
             pool_bankroll = (self.storage.get_paper_bankroll() if legs_paper
                              else current_bankroll)
             pair_budget = min(pool_bankroll * 0.06, pool)
             amount_per_leg = pair_budget / 2.0
             summary["attempted"] += 1
+            _forced_dry_run = []
+            if legs_paper:
+                for _leg in (opp_a, opp_b):
+                    _adapter = self.venue_registry.adapters.get(
+                        str(getattr(_leg, "venue_id", "") or ""))
+                    if _adapter is not None and not _adapter.dry_run:
+                        _forced_dry_run.append((_adapter, _adapter.dry_run))
+                        _adapter.dry_run = True
             try:
                 results = await self.multi_venue_executor.execute_arbitrage_pair(
                     arb, amount_per_leg=amount_per_leg)
@@ -2445,6 +2518,10 @@ class TradingAgentV3:
                     "venue_a": arb.venue_a, "venue_b": arb.venue_b,
                     "attempted": True, "error": f"{type(e).__name__}: {e}"})
                 continue
+            finally:
+                # Restore the venue's own posture, whatever the pair did.
+                for _adapter, _saved in _forced_dry_run:
+                    _adapter.dry_run = _saved
 
             for opp, result in zip((opp_a, opp_b), list(results)):
                 slot = {
@@ -2583,9 +2660,6 @@ class TradingAgentV3:
             if not health.healthy and not health.paper_trading_ok:
                 return (f"{label} venue {opp.venue_id} health FAIL: "
                         f"{health.reason}")
-            allowed, why = self._live_execution_allowed(opp, free_capital / 2.0)
-            if not allowed:
-                return f"{label} {opp.venue_id}: {why}"
         return ""
 
     def _record_execution(self, opp, exec_result, slot, *, venue_id,
@@ -3031,9 +3105,12 @@ class TradingAgentV3:
             # The prices, on both scales.
             "yes_price": yes_price,
             "token_price": token_price,
-            # PAPER or LIVE. Read from the adapter rather than assumed: a
-            # dry-run venue simulates, and that is what the row must say.
-            "execution_mode": ("paper" if self._adapter_is_paper(opp)
+            # PAPER or LIVE, from the same decision that chose the purse: a
+            # venue that cannot spend real money - or that is not where the real
+            # money is - simulates, and that is what the row must say. Reading
+            # `_adapter_is_paper` alone labelled an armed-but-unfunded venue's
+            # simulated fill as LIVE.
+            "execution_mode": ("paper" if self._will_simulate(opp)
                                else "live"),
         }
 
@@ -3077,14 +3154,19 @@ class TradingAgentV3:
 
     def _adapter_is_paper(self, opp) -> bool:
         """
-        Whether the venue for this opportunity can only simulate.
+        Whether the venue for this opportunity is incapable of real orders.
 
-        THE predicate for "will this order spend real money": the sizing clamp
-        and the last gate before dispatch both read it. When they disagreed, the
-        clamp sized a PAPER order against the live venue's budget - so a venue
-        with no authorisation (or an unreadable balance) had every paper trade
-        clamped to $0 and skipped, which is how exploration stops executing and
-        a fresh install can never earn the qualification it needs.
+        This is about the ADAPTER, not about this trade: credentials absent or
+        the venue in dry run. An armed venue returns False here even when the
+        trade will be simulated anyway - because the operator funded nothing, or
+        funded somewhere else - so it is NOT the predicate for "will this order
+        spend real money". That question is `_will_simulate`, which reads this
+        and then the live-capital boundary the way dispatch does; sizing and
+        dispatch must agree, and when they disagreed the clamp sized a PAPER
+        order against the live venue's budget, so a venue with no authorisation
+        (or an unreadable balance) had every paper trade clamped to $0 and
+        skipped - which is how exploration stops executing and a fresh install
+        can never earn the qualification it needs.
         """
         try:
             adapter = self.venue_registry.adapters.get(

@@ -193,7 +193,11 @@ class VenueSelection:
 
     live_venue: Optional[str] = None
     candidate: Optional[str] = None
-    verdict: str = "paper only"
+    # Says what is missing about LIVE capital, never that paper is a
+    # consolation: paper mode is a complete way of working, and the operator
+    # chose it. The old wording ("paper only") read as a shortfall on a screen
+    # whose mode was already paper.
+    verdict: str = "no live capital yet - running in paper"
     reasons: List[str] = field(default_factory=list)
     assessments: List[VenueAssessment] = field(default_factory=list)
     switch_warranted: bool = False
@@ -927,7 +931,8 @@ class VenueSelector:
                              + (f" ({a.blockers[0]})" if a.blockers else "") + ".")
             return
 
-        selection.verdict = "paper only - no venue is ready for live capital"
+        selection.verdict = ("no venue holds live capital yet - the agent runs "
+                             "in paper, on the same live data, until one does")
         if not ranked:
             r.append("No venue can be funded from here, so there is nothing to "
                      "trade live and nothing to choose between.")

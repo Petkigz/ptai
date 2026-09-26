@@ -180,14 +180,23 @@ def _paper_venue(venue_id: str, yes_price: float, ask_size: str = "5000"):
     return stub
 
 
-def _live_venue(venue_id: str):
+def _live_venue(venue_id: str, yes_price: float = 0.48):
     """
-    A venue that CAN place real orders, and fills the request at its limit.
+    A venue that CAN place real orders, and that respects its own dry_run flag.
 
-    Used for the pair that must NOT be sent. With the operator's capital on one
+    Used for the pair that cannot be funded. With the operator's capital on one
     venue, a cross-venue pair has a leg that would move real money on a venue
-    that is not authorised - so the lane has to refuse it rather than fund it.
+    that is not authorised, so the pair must never go live.
+
+    It also behaves like a real adapter in the other direction: in dry run it
+    SIMULATES the fill rather than refusing outright, which is what Polymarket's
+    adapter does and what makes a paper execution produce evidence at all.
+    `order_log` records the dry_run state AT THE MOMENT OF THE CALL, which is the
+    only way a test can prove that no real order left.
     """
+    from src.ptai.execution.paper_broker import PaperBroker
+    from src.ptai.markets.mechanics import MarketMechanics
+
     import tests.test_full_cycle_from_discovery_to_allocation as base
 
     stub = base.StubVenue(dry_run=False, venue_id=venue_id)
@@ -200,17 +209,46 @@ def _live_venue(venue_id: str):
         "the fixture must be a venue that CAN move real money, or the "
         "one-venue rule it is testing never engages")
 
+    yes_bid = yes_price
+    yes_ask = yes_price + 0.02
+    yes_book = {"bids": [{"price": f"{yes_bid:.2f}", "size": "5000"}],
+                "asks": [{"price": f"{yes_ask:.2f}", "size": "5000"}],
+                "spread": round(yes_ask - yes_bid, 4), "is_real": True,
+                "source": "stub_book"}
+
+    async def get_orderbook(market):
+        return dict(yes_book)
+
     async def place_order(opportunity, max_spend_usd, max_price):
+        sent_while_dry = bool(stub.dry_run)
         stub.order_log.append({
             "market_id": opportunity.market.id,
             "side": opportunity.side,
             "max_spend_usd": max_spend_usd,
-            "max_price": max_price})
+            "max_price": max_price,
+            "dry_run": sent_while_dry})
         stub.orders_placed += 1
-        return {"status": "matched",
-                "orderID": f"{venue_id}-{len(stub.order_log)}",
-                "filled_usd": max_spend_usd, "filled_price": max_price}
+        if not sent_while_dry:
+            # Armed and authorised: this is what a live fill looks like.
+            return {"status": "matched",
+                    "orderID": f"{venue_id}-{len(stub.order_log)}",
+                    "filled_usd": max_spend_usd, "filled_price": max_price}
+        side = str(opportunity.side).upper()
+        token_ask = yes_ask if side == "YES" else round(1.0 - yes_bid, 6)
+        side_book = {"bids": [{"price": f"{token_ask - 0.01:.2f}", "size": "5000"}],
+                     "asks": [{"price": f"{token_ask:.2f}", "size": "5000"}]}
+        fill = PaperBroker(taker_fee_rate=0.0).simulate(
+            side_book, "BUY", float(max_spend_usd), limit_price=float(max_price),
+            mechanics=MarketMechanics(tick_size="0.01", min_order_size=1.0,
+                                      source="clob_market_info", is_real=True),
+            book_source="orderbook")
+        return {"status": "dry_run", "simulated": True, "is_real": False,
+                "venue_id": venue_id, "market_id": opportunity.market.id,
+                "filled_usd": fill.filled_usd, "filled_price": fill.avg_price,
+                "price": fill.avg_price or float(max_price),
+                "paper_fill": fill.to_dict()}
 
+    stub.get_orderbook = get_orderbook
     stub.place_order = place_order
     return stub
 
@@ -236,7 +274,7 @@ def _build(tmp_path, monkeypatch, arb=None, live=False, ask_sizes=None):
     adapters = []
     ask_sizes = ask_sizes or {}
     for venue_id in (VENUE_A, VENUE_B):
-        stub = (_live_venue(venue_id) if live
+        stub = (_live_venue(venue_id, prices[venue_id]) if live
                 else _paper_venue(venue_id, prices[venue_id],
                                    ask_size=ask_sizes.get(venue_id, "5000")))
         venues[venue_id] = stub
@@ -358,29 +396,44 @@ class TestThePairIsExecuted:
 
 
 class TestALivePairRespectsTheOneVenueRule:
-    def test_a_cross_venue_live_pair_is_refused_rather_than_funded(self, tmp_path,
-                                                                   monkeypatch):
+    def test_a_cross_venue_live_pair_runs_in_paper_and_never_live(self, tmp_path,
+                                                                  monkeypatch):
         """
         Money cannot move between venues by itself - a withdrawal and a deposit
         are the operator's actions - so exactly one venue holds the live capital.
         A cross-venue pair therefore has a leg that would move real money on a
-        venue that is NOT authorised, and it cannot be funded.
+        venue that is NOT authorised, and it cannot be funded live.
 
-        The honest outcome is the refusal, with the reason on the record. Sending
-        leg A and not leg B would leave a one-sided live position, which is the
-        worst of the available options: it is the exposure the hedge exists to
-        avoid, taken at a venue nobody chose to fund.
+        It must still be TRADED, in paper. Refusing the pair outright - which is
+        what the lane used to do - meant arbitrage stopped executing the moment
+        the operator linked an account, because that is what arms the adapters.
+        Two things have to hold at once, and this test holds both:
+
+          * no leg was sent while the venue was armed (real money could not move),
+          * both legs were sent, and recorded, as paper.
+
+        Sending leg A live and not leg B would remain the worst outcome: a
+        one-sided position is the exposure the hedge exists to avoid.
         """
         agent, venues = _build(tmp_path, monkeypatch, live=True)
         report = asyncio.run(agent.run_cycle(target_per_venue=5, max_trades=0))
 
-        assert _orders(venues[VENUE_A]) == [] and _orders(venues[VENUE_B]) == [], (
-            "a live cross-venue pair reached the venues under a one-venue rule")
+        # No real order could have left: every call saw its venue in dry run.
+        for venue_id in (VENUE_A, VENUE_B):
+            log = _orders(venues[venue_id])
+            assert log, f"the pair was dropped instead of simulated at {venue_id}"
+            assert all(entry["dry_run"] for entry in log), (
+                f"{venue_id} was sent an order while armed - real money could "
+                f"have moved: {log}")
+        # ...and the adapter's own posture is restored after the pair.
+        assert venues[VENUE_A].dry_run is False and venues[VENUE_B].dry_run is False, (
+            "forcing dry run for the pair leaked into the venue's live posture")
+
         lane = report["arbitrage"]["execution"]
-        assert lane["attempted"] == 0, lane
-        assert lane["results"], "the refusal was not reported"
-        reason = lane["results"][0]["reason"]
-        assert "not the selected live venue" in reason, reason
+        assert lane["attempted"] == 1, lane
+        positions = agent.storage.get_open_positions()
+        assert positions, "the simulated pair recorded no position"
+        assert {p["execution_mode"] for p in positions} == {"paper"}, positions
 
 
 class TestTheGatesApplyToThePair:

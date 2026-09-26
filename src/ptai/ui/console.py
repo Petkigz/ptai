@@ -546,12 +546,17 @@ async def api_status() -> JSONResponse:
          "detail": (f"{agt.get('state', 'unknown').replace('_', ' ')} - "
                     f"{agt.get('evidence')}" if agt.get("evidence")
                     else "the agent has not been seen in this database yet")},
-        {"step": "capital", "label": "Capital authorised",
-         "ok": bool(plan["live_venues"]),
-         "detail": (f"${plan['total_available_usd']:.2f} available across "
-                    f"{len(plan['live_venues'])} venue(s)"
+        {"step": "capital", "label": ("Paper bankroll" if state.mode == "paper"
+                                       else "Capital authorised"),
+         "ok": bool(plan["live_venues"]) or state.mode == "paper",
+         "detail": ((f"${plan['total_available_usd']:.2f} available across "
+                     f"{len(plan['live_venues'])} venue(s)")
                     if plan["live_venues"] else
-                    "no funded, authorised venue: paper only")},
+                    (f"paper mode: ${(_paper_bankroll(storage) or 0.0):.2f} "
+                     f"simulated bankroll, no real capital deployed and none "
+                     f"needed to keep working")
+                    if state.mode == "paper" else
+                    "no funded, authorised venue")},
         {"step": "data", "label": "Market data",
          "ok": answering > 0,
          "detail": ((f"{answering} of {len(balances)} venue(s) reported a balance"
@@ -689,6 +694,15 @@ async def api_orders() -> JSONResponse:
     return JSONResponse(out)
 
 
+def _paper_bankroll(storage) -> Optional[float]:
+    """The simulated bankroll, or None. Never a stand-in number."""
+    try:
+        value = storage.get_paper_performance().get("bankroll")
+        return round(float(value), 2) if value is not None else None
+    except Exception:
+        return None
+
+
 @app.get("/api/console/venue")
 async def api_venue() -> JSONResponse:
     """
@@ -732,6 +746,10 @@ async def api_venue() -> JSONResponse:
         # Distinguishes "every venue stayed silent" from "nothing was asked".
         # They read the same on a dashboard and mean opposite things.
         "engine_running": agent is not None,
+        # What the simulation is running on. In paper mode the money is imaginary
+        # and the bankroll is the one the operator is watching, so the panel can
+        # say what is standing in for capital instead of leaving a blank.
+        "paper_bankroll_usd": _paper_bankroll(storage),
     })
 
 
@@ -1293,21 +1311,47 @@ async function loadVenue(){
   (body.assessments||[]).forEach(a=>{ byId[a.venue_id]=a; });
 
   // ---- which venue, stated plainly ----
+  //
+  // The MODE leads, and "live" is subordinate to it. Paper mode is a complete
+  // way of working - real markets, real order books, real settlement dates,
+  // simulated capital - and it used to be announced as though no venue were
+  // live yet, which read as a missing piece rather than the chosen mode. Worse,
+  // with a venue still selected from an earlier live run, the panel claimed to
+  // be trading live while the mode was paper and no real money was moving.
+  const mode = (body.mode || 'paper');
   const liveLabel = live ? ((byId[live]||{}).label || live) : null;
   const candLabel = candidate ? ((byId[candidate]||{}).label || candidate) : null;
   let headline;
-  if(liveLabel){
+  if(mode === 'paper'){
+    headline = `<div class="pill ok" style="font-size:13px">PAPER &mdash; REAL MARKETS,
+      SIMULATED MONEY</div>`;
+  } else if(liveLabel){
     headline = `<div class="pill ok" style="font-size:13px">TRADING LIVE ON
       ${esc(liveLabel).toUpperCase()}</div>`;
   } else {
-    headline = `<div class="pill wait" style="font-size:13px">NO VENUE IS LIVE YET
-      &mdash; PAPER ONLY</div>`;
+    headline = `<div class="pill wait" style="font-size:13px">LIVE MODE
+      &mdash; NOTHING FUNDED YET</div>`;
   }
-  $('venueNow').innerHTML = headline + `
+  const paperNote = mode === 'paper' ? `
+    <div class="note" style="margin-top:10px">
+      Everything except the money is real: markets, order books, prices and
+      settlement times are read from the venues live, and every order is filled
+      through the same code path live mode uses. A ${money(body.paper_bankroll_usd)}
+      paper bankroll stands in for capital, so the agent can work the whole loop
+      without anything at risk. Nothing is missing here${
+        candLabel?` &mdash; ${esc(candLabel)} is first in line when you fund one`:''}.
+    </div>` : '';
+  $('venueNow').innerHTML = headline + paperNote + `
     <div class="note" style="margin-top:10px">${esc(sel.verdict||'')}</div>
     <table style="margin-top:12px">
-      <tr><td style="color:var(--dim);width:190px">Venue holding live capital</td>
-          <td class="mono">${liveLabel?esc(liveLabel):'<span class="warn">none</span>'}</td></tr>
+      <tr><td style="color:var(--dim);width:190px">${mode==='paper'
+              ?'Real capital deployed':'Venue holding live capital'}</td>
+          <td class="mono">${liveLabel?esc(liveLabel):(mode==='paper'
+              ?'<span>none &mdash; paper mode</span>':'<span class="warn">none</span>')}</td></tr>
+      <tr><td style="color:var(--dim)">${mode==='paper'
+              ?'Paper bankroll (simulated)':'Authorised budget'}</td>
+          <td class="mono">${mode==='paper'&&body.paper_bankroll_usd!=null
+              ?money(body.paper_bankroll_usd):'&mdash;'}</td></tr>
       <tr><td style="color:var(--dim)">Next venue to fund</td>
           <td class="mono">${candLabel?esc(candLabel):'&mdash;'}</td></tr>
       <tr><td style="color:var(--dim)">How many may hold capital</td>
@@ -1339,7 +1383,14 @@ async function loadVenue(){
                        : `<span class="${a.pnl_per_trade>=0?'pos':'neg'} mono">${money(a.pnl_per_trade)}</span>`;
       const tot = noEv ? '&mdash;'
                        : `<span class="mono ${a.net_pnl_usd>=0?'pos':'neg'}">${money(a.net_pnl_usd)}</span>`;
-      const roleTxt = a.role==='live' ? '<span class="pill ok">live</span>'
+      // The role column says what each venue is FOR. In paper mode nothing is
+      // deploying real money, so a venue the selection marks "live" must not be
+      // badged live here - the same contradiction the headline was fixed for,
+      // one table down.
+      const roleTxt = a.role==='live'
+                    ? (mode==='paper'
+                       ? '<span class="pill wait">funded &mdash; paper mode</span>'
+                       : '<span class="pill ok">live</span>')
                     : a.role==='paper' ? '<span class="pill dim">paper</span>'
                     : '<span class="pill wait">unavailable</span>';
       return `<tr>
@@ -1405,7 +1456,7 @@ async function loadCapital(){
         <span class="pill ${a.balance_is_real?'ok':'wait'}">${
           a.balance_is_real ? 'balance read' : 'balance unread'}</span>
         <span class="pill ${a.can_deploy_live?'ok':'dim'}">${
-          a.can_deploy_live ? 'live enabled' : 'paper only'}</span>
+          a.can_deploy_live ? 'live enabled' : 'no live capital'}</span>
         <span class="spacer" style="flex:1"></span>
         <span class="mono" style="color:var(--dim);font-size:12.5px">
           authorised ${money(a.budget_usd)}</span>

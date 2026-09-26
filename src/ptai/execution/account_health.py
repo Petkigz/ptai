@@ -493,7 +493,8 @@ class AccountHealthEngine:
             blockers.append("credentials_missing")
             return finish(
                 TradeReadiness.NOT_CONFIGURED,
-                f"{venue_id}: missing {', '.join(missing)} - paper only",
+                f"{venue_id}: missing {', '.join(missing)} - real orders are "
+                f"not available, so it simulates",
                 True,
             )
         checks.append(f"Credentials present ({credential_type})")

@@ -649,16 +649,44 @@ def build_blockers(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
             "This is a stop, not a bug: review what the resolved trades did "
             "before restarting it.")
 
-    # 3. No real money is deployed, so the mission cannot be measured yet.
+    # 3. Real money is not deployed.
+    #
+    # In PAPER mode that is not a blocker - it is the mode. Everything the agent
+    # does is still real work: the markets, the order books, the prices, the
+    # events and the settlement dates all come from the venues, and only the money
+    # is simulated. Reporting "no venue holds live capital: the agent can only
+    # paper-trade" as something standing in the way made an operator's deliberate
+    # choice look like a missing piece, so the entry says what paper mode is, what
+    # it is doing, and how to leave it when the evidence justifies it.
+    mode = str(snapshot.get("mode") or "unknown").lower()
     if not venues.get("live_venue"):
         candidate = (snapshot.get("last_cycle") or {}).get("venue_to_fund")
-        add("no_live_venue", "next_step",
-            "No venue holds live capital: the agent can only paper-trade.",
-            (f"live venue: none" +
-             (f"; the agent ranked {candidate} first for funding"
-              if candidate else "; no venue is ranked for funding yet")),
-            "Fund the venue the agent ranks first (Money -> How capital gets in) "
-            "and authorise a budget for it. Trade with real money until then.")
+        paper = snapshot.get("profit") or {}
+        paper_block = paper.get("paper") or {}
+        paper_bankroll = paper_block.get("bankroll")
+        if paper_bankroll is None:
+            paper_bankroll = (snapshot.get("capital") or {}).get("equity_usd")
+        if mode == "paper":
+            mirrored = candidate or venues.get("best_validated_venue") or "every venue scanned"
+            add("paper_mode", "ok",
+                "Paper mode: real markets, real order books, simulated money. "
+                "Nothing is deployed, and nothing is supposed to be yet.",
+                (f"simulating {mirrored}"
+                 + (f" with a ${float(paper_bankroll):.2f} paper bankroll"
+                    if isinstance(paper_bankroll, (int, float)) else "")
+                 + "; every price, book and settlement time is read from the "
+                   "venue, only the capital is imaginary"),
+                "When the paper evidence convinces you, switch to live and fund the "
+                "venue the agent ranks first (Money -> How capital gets in). The "
+                "agent does not need it to keep working.")
+        else:
+            add("no_live_venue", "next_step",
+                "No venue holds live capital, so no real money can be deployed.",
+                (f"live venue: none" +
+                 (f"; the agent ranked {candidate} first for funding"
+                  if candidate else "; no venue is ranked for funding yet")),
+                "Fund the venue the agent ranks first (Money -> How capital gets in) "
+                "and authorise a budget for it.")
 
     # 4. No validated venue, so live capital would be a guess.
     if not venues.get("best_validated_venue"):
