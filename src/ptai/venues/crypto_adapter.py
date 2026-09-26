@@ -31,7 +31,11 @@ class CryptoAdapter(MarketAdapter):
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
-            supports_trading=bool(api_key),
+            # Reads the exchange's public market data; never submits. The
+            # capability must say what the code does, not what an API key in
+            # settings implies.
+            supports_trading=False,
+            requires_credentials=False,
             supports_portfolio=True,
             supports_history=True,
             supports_browser_fallback=False,

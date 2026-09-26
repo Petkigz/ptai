@@ -554,6 +554,7 @@ class BetfairExchangeAdapter(MarketAdapter):
             supports_orderbook=True,
             # Order placement is not implemented - see place_order.
             supports_trading=False,
+            requires_credentials=True,
             supports_portfolio=True,
             supports_history=False,
             fee_taker_pct=0.02,   # Betfair charges commission on net winnings

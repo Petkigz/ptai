@@ -62,6 +62,7 @@ from ..llm.provider import LLMRouter
 from ..markets.base import Market, DataMode
 
 from ..venues.registry import VenueRegistry
+from ..venues.inventory import inventory_line, record_inventory
 from ..venues.polymarket_adapter import PolymarketAdapter
 from ..venues.kalshi_adapter import KalshiAdapter
 from ..venues.manifold_adapter import ManifoldAdapter
@@ -1095,6 +1096,14 @@ class TradingAgentV3:
         # ...and what it is DOING, so the console is not blank for the minutes
         # a cycle spends working. Written at each step, not at the end.
         self._set_phase("scanning")
+        # Hand the console the venue list it cannot build for itself. The .bat
+        # starts the agent and the console as two processes, so the console has
+        # no registry to read and used to fall back to "the fundable venues" -
+        # which showed an operator two of nineteen and no way to tell whether
+        # the others were broken, absent, or simply not listed.
+        _inventory = record_inventory(self.storage, self.venue_registry)
+        if _inventory:
+            logger.info("Venue inventory recorded: " + inventory_line(_inventory))
         
         # Health check - Check capital + account health
         health = await self.check_system_health()

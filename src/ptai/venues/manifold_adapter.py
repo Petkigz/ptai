@@ -29,7 +29,10 @@ class ManifoldAdapter(MarketAdapter):
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=False,  # Manifold uses AMM, not orderbook
-            supports_trading=bool(api_key),
+            # Play money. There is no real capital to deploy and no submission
+            # path in the adapter; the venue is a free fair-value test ground.
+            supports_trading=False,
+            requires_credentials=False,  # its market feed is public
             supports_portfolio=True,
             supports_history=True,
             supports_browser_fallback=True,

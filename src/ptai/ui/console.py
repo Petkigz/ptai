@@ -43,6 +43,7 @@ from ..execution.capital import (
 )
 from ..storage.db import Storage
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
+from ..venues.inventory import load_inventory
 
 app = FastAPI(title="PTAI Console", version="console-1")
 
@@ -722,10 +723,27 @@ async def api_venue() -> JSONResponse:
     labels = {v: r["label"] for v, r in FUNDING_ROUTES.items()}
     adapters = getattr(getattr(agent, "venue_registry", None), "adapters", {}) or {}
     selector = VenueSelector(storage=storage, funding_routes=FUNDING_ROUTES)
-    # With the engine running, rank everything it has registered. Without it,
-    # rank the venues that have a funding route or a trade history - the set that
-    # could actually hold money or already has evidence.
-    registered = list(adapters) or sorted(set(labels) | set(selector.known_venues()))
+    # The venue list, in order of how much this process knows:
+    #
+    #   1. the running agent's registry (same process as the console),
+    #   2. the inventory the agent recorded (the normal case - the runner starts
+    #      the agent and the console as SEPARATE processes, so this console has
+    #      no registry of its own),
+    #   3. the fundable venues plus anything that has ever traded.
+    #
+    # Step 3 is what used to be the only fallback, and it is why the panel showed
+    # two venues out of nineteen: an operator could not tell whether the other
+    # seventeen were broken, missing, or merely not listed.
+    inventory = load_inventory(storage)
+    inv_venues = inventory.get("venues") or {}
+    labels.update({vid: row["label"] for vid, row in inv_venues.items()
+                   if row.get("label")})
+    if adapters:
+        registered = sorted(adapters)
+    elif inv_venues:
+        registered = sorted(inv_venues)
+    else:
+        registered = sorted(set(labels) | set(selector.known_venues()))
     assessments = selector.assess(
         registered,
         accounts=plan.get("accounts", []),
@@ -750,6 +768,9 @@ async def api_venue() -> JSONResponse:
         # and the bankroll is the one the operator is watching, so the panel can
         # say what is standing in for capital instead of leaving a blank.
         "paper_bankroll_usd": _paper_bankroll(storage),
+        # Every venue PTAI knows about and what it can do, so "can I run this
+        # one too?" has an answer on the page rather than only in the code.
+        "inventory": inventory,
     })
 
 
@@ -1111,6 +1132,10 @@ section[id]{scroll-margin-top:132px}
         </div>
       </div>
     </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Every venue PTAI knows about</h2>
+      <div id="venueAll"></div>
+    </div>
     <div class="grid cols-2" style="margin-top:16px">
       <div class="card">
         <h2>Moving to another venue</h2>
@@ -1400,6 +1425,54 @@ async function loadVenue(){
         <td>${pnl}</td><td>${tot}</td>
       </tr>`;
     }).join('') + '</table>';
+
+  // ---- every venue, and what it can do ----
+  //
+  // The ranking above only shows venues that could hold money or already have
+  // evidence. That left an operator unable to tell whether the other adapters
+  // existed, were broken, or were silently dropped - so this lists the whole
+  // registry with one line each: can it be read now, can PTAI fill there, can
+  // it ever hold real money, and what would it need.
+  const inv = body.inventory || {};
+  const invRows = Object.values(inv.venues || {});
+  if(!invRows.length){
+    $('venueAll').innerHTML = `<div class="note">${esc(inv.reason
+      || 'The agent has not recorded its venue list yet. Start it once - every venue it knows about, and what each one can do, appears here.')}</div>`;
+  } else {
+    // The class names come from the venue inventory module, so the page cannot
+    // drift from the classifier that produced them.
+    const USE_REAL = 'real_money', USE_PAPER = 'paper_only',
+          USE_LOGIN = 'needs_login', USE_SCAN = 'scanner', USE_NONE = 'no_client';
+    const usePill = u => u===USE_REAL ? '<span class="pill ok">can hold real money</span>'
+      : u===USE_PAPER ? '<span class="pill dim">paper + live data</span>'
+      : u===USE_LOGIN ? '<span class="pill wait">needs a login</span>'
+      : u===USE_SCAN ? '<span class="pill dim">scanner only</span>'
+      : '<span class="pill wait">no client built</span>';
+    const c = inv.counts || {};
+    $('venueAll').innerHTML = `
+      <div class="note">${c.registered||invRows.length} venue(s) registered by the agent:
+        <b>${c.readable_now||0}</b> readable right now with no account,
+        <b>${c.paper_tradable||0}</b> being paper-traded,
+        <b>${c.can_place_real_orders||0}</b> armed to place a real order
+        (only ${Object.values(inv.venues||{}).filter(v=>v.real_order_path)
+                .map(v=>esc(v.label)).join(', ')||'none'} has a submission path at all),
+        <b>${c.no_client||0}</b> with no client written.</div>
+      <table style="margin-top:10px">
+        <tr><th>Venue</th><th>What PTAI can do with it</th><th>Runs today</th>
+            <th>What it needs</th></tr>` +
+      invRows.map(v=>`<tr>
+        <td><b>${esc(v.label)}</b><br><span style="color:var(--dim);font-size:11.5px">${esc(v.venue_id)}${
+            v.venue_type?` &middot; ${esc(v.venue_type)}`:''}</span></td>
+        <td>${usePill(v.use)}<div class="note" style="margin-top:5px">${esc(v.why||'')}</div></td>
+        <td class="mono ${v.can_run_today?'pos':'neg'}">${v.can_run_today?'yes':'no'}</td>
+        <td><span class="note">${esc(v.what_it_needs||'')}</span>${
+            v.fundable && v.minimum_deposit_usd!=null
+              ? `<div class="note" style="margin-top:4px">funding: ${esc(v.currency||'')},
+                 minimum ${money(v.minimum_deposit_usd)}</div>`
+              : (v.reason_unfundable
+                 ? `<div class="note" style="margin-top:4px">${esc(v.reason_unfundable)}</div>`:'')}</td>
+      </tr>`).join('') + '</table>';
+  }
 
   // ---- switching ----
   const sp = sel.switch_plan || {};

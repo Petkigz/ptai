@@ -31,7 +31,12 @@ class KalshiAdapter(MarketAdapter):
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
-            supports_trading=bool(api_key),
+            # An API key does not create an order path. This adapter's
+            # place_order returns "Live trading not implemented for Kalshi yet"
+            # with or without credentials, so claiming trading support made
+            # `can_place_real_orders` true for a venue that cannot place one.
+            supports_trading=False,
+            requires_credentials=False,  # its markets are public; orders are not
             supports_portfolio=True,
             supports_history=True,
             supports_browser_fallback=True,

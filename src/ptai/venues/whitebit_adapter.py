@@ -25,7 +25,10 @@ class WhiteBITAdapter(MarketAdapter):
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
-            supports_trading=bool(api_key and api_secret),
+            # Public ticker only: place_order returns a dry-run stub that never
+            # signs a request, so it cannot hold a real position.
+            supports_trading=False,
+            requires_credentials=False,
             supports_portfolio=True,
             supports_history=True,
             fee_taker_pct=0.001,  # 0.1% taker

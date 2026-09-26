@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from .venues.inventory import inventory_line
+
 # The key the loop writes its own decision under. One key, one meaning, so the
 # console cannot disagree with the cycle about what happened.
 LAST_CYCLE_KEY = "operator.last_cycle"
@@ -290,6 +292,9 @@ def _venue_evidence(storage) -> Dict[str, Any]:
         cells = selector.best_cells()
     except Exception as e:
         block["reason"] = f"{type(e).__name__}: {e}"
+        # The ranking failed; the venue list did not. An operator still gets to
+        # see what is registered, with the failure stated beside it.
+        block["inventory"] = _venue_inventory(storage)
         return block
 
     # The comparison that decides whether there is an edge at all: the agent's
@@ -335,6 +340,11 @@ def _venue_evidence(storage) -> Dict[str, Any]:
         }
     except Exception as e:
         block["market_skill_reason"] = f"{type(e).__name__}: {e}"
+
+    # Every registered venue, whether or not it has evidence or a funding
+    # route. Without this the panel showed the two venues that could hold
+    # money and left the rest of the registry invisible.
+    block["inventory"] = _venue_inventory(storage)
 
     block["matrix"] = {
         "source": "trade_outcomes, grouped by venue x strategy x market type x execution mode",
@@ -644,6 +654,25 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
     return block
 
 
+def _venue_inventory(storage) -> Dict[str, Any]:
+    """
+    Every venue PTAI knows about, as the agent's own registry described it.
+
+    The ranking answers "which venue should hold money". This answers the
+    different question an operator asks first - "can I run this one too?" - and
+    it is read from the record the agent writes, not rebuilt here, because a
+    console that assembles its own venue list is a second answer to what is
+    registered.
+    """
+    try:
+        from .venues.inventory import load_inventory
+
+        return load_inventory(storage)
+    except Exception as e:  # noqa: BLE001 - a screen must not break the snapshot
+        return {"available": False, "venues": {},
+                "reason": f"{type(e).__name__}: {e}"}
+
+
 def _below_the_gate_evidence(venues: Dict[str, Any],
                             matrix: Dict[str, Any]) -> str:
     """
@@ -930,6 +959,9 @@ def describe_snapshot(snapshot: Dict[str, Any]) -> List[str]:
         lines.append(
             f"Live venue: none - nothing is trading real money. Venue to fund "
             f"first: {venues.get('best_validated_venue') or 'undetermined'}")
+    inventory = venues.get("inventory") or {}
+    if inventory.get("available"):
+        lines.append("Venues: " + inventory_line(inventory))
     strategies = snapshot.get("strategies") or {}
     if strategies.get("best_validated_strategy"):
         lines.append(

@@ -60,6 +60,15 @@ class PolymarketAdapter(MarketAdapter):
             # minimum-size order and cancel it. Declaring it is what lets
             # AccountHealthEngine reach TRADE_PERMITTED for Polymarket.
             supports_order_probe=True,
+            # The only adapter whose place_order submits a signed order to a
+            # real venue. Everything about "real capital" in this codebase is
+            # about this venue or it is about nothing.
+            real_order_path=True,
+            # Markets read publicly; submitting an order needs the key and
+            # funder. The flag is about READING, so it stays false here - the
+            # panel would otherwise tell an operator that paper mode could not
+            # read Polymarket, which is the opposite of the truth.
+            requires_credentials=False,
         )
         self.restricted_countries = {"US"}
         # Evidence from the last order probe, or None if it has never run.

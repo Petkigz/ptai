@@ -315,17 +315,28 @@ def _venues_check() -> Check:
     """
     try:
         from .agent.v3_loop import TradingAgentV3  # noqa: WPS433
+        from .venues.inventory import build_inventory  # noqa: WPS433
+
         agent = TradingAgentV3(country_code="UG", dry_run=True)
-        adapters = getattr(agent.venue_registry, "adapters", {}) or {}
-        armed = [name for name, adapter in adapters.items()
-                 if getattr(adapter, "can_place_real_orders", False)]
+        inventory = build_inventory(agent.venue_registry)
+        counts = inventory["counts"]
+        # Four numbers, because they answer four different questions and the
+        # single "19 registered" answered none of them: what can be read now,
+        # what is simulated, what could hold real money at all, and what has
+        # never been built.
+        detail = (
+            f"{counts['registered']} registered: "
+            f"{counts['readable_now']} readable now with no account, "
+            f"{counts['paper_tradable']} paper-traded, "
+            f"{counts['can_place_real_orders']} armed, "
+            f"{counts['real_order_path']} with an order path at all, "
+            f"{counts['no_client']} with no client written")
+        armed = [row["label"] for row in inventory["venues"].values()
+                 if row["can_place_real_orders"]]
         if armed:
-            return Check("Venues", PASS,
-                         f"{len(adapters)} registered, {len(armed)} able to place "
-                         f"a real order ({', '.join(armed)})")
+            return Check("Venues", PASS, detail + f" (armed: {', '.join(armed)})")
         return Check(
-            "Venues", PASS,
-            f"{len(adapters)} registered, none able to place a real order",
+            "Venues", PASS, detail,
             "Expected without venue credentials: everything runs in paper "
             "against the live markets, which is what earns the qualification "
             "that unlocks real capital.")

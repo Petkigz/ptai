@@ -48,6 +48,17 @@ class AdapterCapability:
     # real capital - an unproven permission is reported as unproven rather than
     # assumed from supports_trading.
     supports_order_probe: bool = False
+    # Does this adapter's place_order actually SUBMIT to the venue when it is
+    # armed, or does it always return a dry-run/rejected stub? A capability the
+    # code does not have must not be advertised: `supports_trading` is now only
+    # ever true where a submission path exists. Reported to the UI; deliberately
+    # NOT part of `can_place_real_orders`, which keeps its two-condition
+    # contract (armed + trading-supported).
+    real_order_path: bool = False
+    # Does reading this venue need a login/API key before it returns anything?
+    # True for venues whose public feed is closed; the venue panel says so
+    # instead of listing them as if they were quietly working.
+    requires_credentials: bool = False
     supports_browser_fallback: bool = False
     fee_taker_pct: float = 0.0  # e.g. 0.02 = 2%
     # Gas the OPERATOR pays to place one order, per the venue's own mechanism.
