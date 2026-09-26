@@ -658,22 +658,47 @@ def _below_the_gate_evidence(venues: Dict[str, Any],
     it says that instead.
     """
     comparisons = venues.get("market_skill") or {}
-    if comparisons:
-        beats = [name for name, row in comparisons.items()
-                 if row.get("beats_price")]
+    # Only venues that actually measured something can be compared, called
+    # beaten, or have an interval quoted for them. A fresh record has 19 venues
+    # at 0 samples each - and "best is polymarket, improvement +0.0000 (95% CI
+    # [+0.0000, +0.0000])" reads as a measured tie when nothing was measured.
+    measured = {name: row for name, row in comparisons.items()
+                if int(row.get("samples") or 0) > 0
+                and row.get("improvement") is not None
+                and row.get("ci_low") is not None}
+    if measured:
+        beats = [name for name, row in measured.items() if row.get("beats_price")]
         if beats:
             return (f"{', '.join(beats)} has beaten the price on the recorded "
                     f"evidence; the remaining bars (drawdown, cost coverage, "
                     f"execution) decide whether real capital follows")
-        closest = max(comparisons.items(),
+        closest = max(measured.items(),
                       key=lambda kv: kv[1].get("improvement") or float("-inf"))
         row = closest[1]
-        return (f"none of {len(comparisons)} venues has shown its forecasts "
-                f"beating the price yet; best is {closest[0]} on "
+        return (f"none of {len(measured)} venue(s) with paired evidence has shown "
+                f"its forecasts beating the price yet; best is {closest[0]} on "
                 f"{int(row.get('samples') or 0)} paired trade(s), improvement "
-                f"{(row.get('improvement') or 0.0):+.4f} per trade "
-                f"(95% CI [{row.get('ci_low') or 0.0:+.4f}, "
-                f"{row.get('ci_high') or 0.0:+.4f}])")
+                f"{float(row['improvement']):+.4f} per trade "
+                f"(95% CI [{float(row['ci_low']):+.4f}, "
+                f"{float(row['ci_high']):+.4f}])")
+    if comparisons:
+        # Some rows are on file, just not enough of them to compute anything:
+        # saying "never recorded a row" about a venue with 7 of them would be
+        # the same class of overstatement in the other direction.
+        best_row = max(((name, int(row.get("samples") or 0))
+                        for name, row in comparisons.items()),
+                       key=lambda kv: kv[1])
+        if best_row[1] > 0:
+            return (f"the comparison that decides the gate - the forecast "
+                    f"against the price it had to beat - is not yet measurable: "
+                    f"{best_row[0]} has {best_row[1]} paired trade(s), below the "
+                    f"sample the gate requires. It needs resolved trades, not a "
+                    f"score.")
+        return (f"none of {len(comparisons)} venues has recorded a paired "
+                f"forecast / price / outcome row yet, so the comparison that "
+                f"decides the gate - the forecast against the price it had to "
+                f"beat - has never been made. It needs resolved trades, not a "
+                f"score.")
     return (f"{int(matrix.get('cells_with_enough_evidence') or 0)} combination(s) "
             f"have enough evidence of {int(matrix.get('cells') or 0)} seen; the "
             f"gate needs real fills and resolved outcomes, not a score")

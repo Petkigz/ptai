@@ -427,3 +427,46 @@ class TestTheScreenNamesTheComparisonThatDecidesTheGate:
         evidence = _below_the_gate_evidence(venues, venues["matrix"])
         assert "has beaten the price" not in evidence
         assert "improvement +0.0200 per trade" in evidence
+
+    def test_an_unmeasured_record_is_not_given_a_zero_interval(self):
+        """
+        No measurement must not read as a measurement of zero.
+
+        On a fresh record every venue sits at 0 paired samples, and the sentence
+        used to name the "best" one with "improvement +0.0000 per trade (95% CI
+        [+0.0000, +0.0000])" - a fabricated interval, and a claim that the
+        forecasts tied the market when nothing had been compared at all.
+        """
+        from src.ptai.operator_view import _below_the_gate_evidence
+
+        evidence = _below_the_gate_evidence(
+            {"market_skill": {
+                "polymarket": {"verdict": "unmeasured", "samples": 0,
+                               "improvement": None, "ci_low": None,
+                               "ci_high": None, "beats_price": False},
+                "kalshi": {"verdict": "unmeasured", "samples": 0,
+                           "improvement": None, "ci_low": None,
+                           "ci_high": None, "beats_price": False},
+            }},
+            {"cells_with_enough_evidence": 0, "cells": 0})
+
+        assert "has never been made" in evidence
+        assert "CI [" not in evidence, (
+            "an interval that was never computed must not be printed")
+        assert "+0.0000" not in evidence
+
+    def test_a_measured_row_without_an_interval_is_not_quoted(self):
+        """Samples without a comparison is still not a comparison."""
+        from src.ptai.operator_view import _below_the_gate_evidence
+
+        evidence = _below_the_gate_evidence(
+            {"market_skill": {
+                "polymarket": {"verdict": "insufficient", "samples": 7,
+                               "improvement": None, "ci_low": None,
+                               "ci_high": None, "beats_price": False},
+            }},
+            {})
+
+        assert "not yet measurable" in evidence
+        assert "polymarket has 7 paired trade(s)" in evidence
+        assert "CI [" not in evidence
