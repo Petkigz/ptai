@@ -345,6 +345,47 @@ def _venues_check() -> Check:
                      f"registry did not build: {type(e).__name__}: {e}")
 
 
+def _limits_check(db_path: Path) -> Check:
+    """
+    The hard limits, and whether they are enforced.
+
+    This check exists because PTAI had a configured daily loss limit, a circuit
+    breaker and a drawdown manager, and NONE of them stood in the way of an
+    order - so "the account is protected" was true of the documentation and false
+    of the code. The doctor asks the guard the order path asks.
+    """
+    try:
+        from .risk.money_guard import default_guard, guard_snapshot  # noqa: WPS433
+        from .storage.db import Storage  # noqa: WPS433
+
+        storage = Storage(db_path=str(db_path))
+        try:
+            snapshot = guard_snapshot(storage)
+        finally:
+            storage.close()
+        live = snapshot.get("live") or {}
+        paper = snapshot.get("paper") or {}
+        if live.get("unknown"):
+            return Check("Loss limits", WARN,
+                         "the settled-loss record could not be read, so real "
+                         "money is refused until it can be",
+                         "Run once, then re-check. The guard fails closed.")
+        detail = (
+            f"session {snapshot['session_loss_pct'] * 100:.0f}% / daily "
+            f"{snapshot['daily_loss_pct'] * 100:.0f}% of the capital in use, "
+            f"enforced before every order; live stopped: "
+            f"{bool(live.get('halted'))}, paper stopped: "
+            f"{bool(paper.get('halted'))}")
+        guard = default_guard()
+        return Check("Loss limits", PASS, detail,
+                     "Limits are measured from settled outcomes, so a restart "
+                     f"cannot reset them. First live money is capped at "
+                     f"{guard.micro_stake_pct * 100:.0f}% of capital.")
+    except Exception as e:  # noqa: BLE001
+        return Check("Loss limits", WARN,
+                     f"guard not available: {type(e).__name__}: {e}")
+
+
 def run_checks(root: Optional[Path] = None, *, port: Optional[int] = None,
                db_path: Optional[Path] = None, network: bool = False,
                include_model: bool = True) -> List[Check]:
@@ -372,6 +413,7 @@ def run_checks(root: Optional[Path] = None, *, port: Optional[int] = None,
     checks.append(_runner_check(root))
     if include_model:
         checks.append(_model_check(network=network))
+    checks.append(_limits_check(db_path))
     checks.append(_venues_check())
     return checks
 

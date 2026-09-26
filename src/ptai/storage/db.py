@@ -2,6 +2,7 @@
 Local SQLite storage - fully offline, no cloud
 Tracks bankroll, trades, market analysis, agent performance
 """
+import os
 import sqlite3
 import json
 from pathlib import Path
@@ -223,8 +224,14 @@ def _execution_mode(value, status=None) -> str:
 
 
 class Storage:
-    def __init__(self, db_path: str = "./data/ptai.db"):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Optional[str] = None):
+        # ONE reader of the environment, in the one place every entry point goes
+        # through. The console honoured PTAI_DB and the CLI did not, so
+        # `python main.py validate` could report on a different database than the
+        # one the page was showing - two readers, two answers, which is the class
+        # of bug this project keeps having to fix.
+        resolved = db_path or os.environ.get("PTAI_DB") or "./data/ptai.db"
+        self.db_path = Path(resolved)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row

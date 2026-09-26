@@ -654,6 +654,51 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
     return block
 
 
+def _validation(storage) -> Dict[str, Any]:
+    """
+    The out-of-sample verdict, as recorded. Read, never recomputed here - one
+    place computes it and this is a screen.
+
+    Deliberately labelled: this can refuse a strategy and can never qualify one.
+    """
+    try:
+        from .validation.walk_forward import load_verdicts
+
+        return load_verdicts(storage)
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "scopes": {},
+                "reason": f"{type(e).__name__}: {e}"}
+
+
+def _money_limits(storage) -> Dict[str, Any]:
+    """
+    What the loss limits are, how much of them is used, and whether they stopped
+    anything.
+
+    Read from the same guard the order path consults - not recomputed here - so
+    the panel cannot show headroom the dispatcher disagrees with.
+    """
+    try:
+        from .risk.money_guard import guard_snapshot
+
+        live_capital = 0.0
+        try:
+            from .execution.capital import authorised_budgets
+
+            live_capital = float(sum((authorised_budgets(storage) or {}).values()))
+        except Exception:  # noqa: BLE001 - fall through to paper-only view
+            live_capital = 0.0
+        paper = 0.0
+        try:
+            paper = float(storage.get_paper_bankroll() or 0.0)
+        except Exception:  # noqa: BLE001
+            paper = 0.0
+        return guard_snapshot(storage, live_bankroll_usd=live_capital,
+                              paper_bankroll_usd=paper)
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"{type(e).__name__}: {e}"}
+
+
 def _venue_inventory(storage) -> Dict[str, Any]:
     """
     Every venue PTAI knows about, as the agent's own registry described it.
@@ -921,6 +966,14 @@ def operator_snapshot(storage=None) -> Dict[str, Any]:
         "venues": venues,
         "strategies": strategies,
         "risk": risk,
+        # The hard limits, distinct from "risk state": a limit is a rule, the
+        # state is whether it has fired. The agent's own answer to "could this
+        # account be wiped out today" lives here.
+        "limits": _money_limits(storage),
+        # Evidence about the strategy that is NOT evidence about the money. Kept
+        # apart from `venues` on purpose: a backtest figure must never be read as
+        # a reason to deploy capital.
+        "validation": _validation(storage),
         "last_cycle": last_cycle,
         # The two blocks that answer "is it working, and what should I do":
         # both derived from the blocks above, so they cannot disagree with them.
@@ -959,6 +1012,30 @@ def describe_snapshot(snapshot: Dict[str, Any]) -> List[str]:
         lines.append(
             f"Live venue: none - nothing is trading real money. Venue to fund "
             f"first: {venues.get('best_validated_venue') or 'undetermined'}")
+    validation = snapshot.get("validation") or {}
+    if validation.get("available"):
+        from .validation.walk_forward import verdict_line
+
+        lines.append("Out-of-sample: " + verdict_line(validation)
+                     .replace("out-of-sample validation - ", ""))
+    limits = snapshot.get("limits") or {}
+    for lane in ("live", "paper"):
+        row = limits.get(lane) or {}
+        if not row:
+            continue
+        if row.get("halted"):
+            lines.append(
+                f"Loss limit: {lane.upper()} STOPPED - {row.get('halt_reason')}")
+        else:
+            daily = row.get("daily_loss_limit_usd")
+            session = row.get("session_loss_limit_usd")
+            if daily:
+                lines.append(
+                    f"Loss limit: {lane} {row.get('daily_used_pct', 0.0) * 100:.0f}% "
+                    f"of the daily ${daily:.2f} used "
+                    f"({row.get('daily_pnl_usd', 0.0):+.2f} today), "
+                    f"{row.get('session_used_pct', 0.0) * 100:.0f}% of the session "
+                    f"${session:.2f}")
     inventory = venues.get("inventory") or {}
     if inventory.get("available"):
         lines.append("Venues: " + inventory_line(inventory))

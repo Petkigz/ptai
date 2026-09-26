@@ -336,7 +336,14 @@ class TestFullCycle:
             # 2.50 shares at 0.55 = $1.375 committed, NOT the $3.00 requested.
             # The requested figure must never appear as the fill.
             assert fill["filled_usd"] == pytest.approx(1.375)
-            assert fill["requested_usd"] == pytest.approx(3.0)
+            # The first live money at a venue is capped at the MICRO stake - 2%
+            # of a $50 account - until that venue has settled live trades, so
+            # this is $1.00 and not the $3.00 (6%) the paper lane may use. The
+            # full live cap is earned by completing live cycles, which is the
+            # "very small live capital" step and not a configuration choice.
+            assert fill["requested_usd"] == pytest.approx(1.0), (
+                "the first live order must be micro-sized")
+            assert r1["execution"][0]["guard"]["tier"] == "micro"
             assert fill["filled_usd"] != pytest.approx(fill["requested_usd"])
             assert fill["filled_price"] == pytest.approx(0.55)
             assert fill["order_id"] == "stub-order-1"

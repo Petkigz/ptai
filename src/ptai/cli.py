@@ -117,6 +117,82 @@ def doctor(
 
 
 @app.command()
+def validate(
+    venue: str = typer.Option(None, "--venue", help="Only this venue's trades"),
+    strategy: str = typer.Option(None, "--strategy", help="Only this strategy"),
+    lane: str = typer.Option(None, "--lane", help="paper | live"),
+    folds: int = typer.Option(5, "--folds", help="How many consecutive folds"),
+    record: bool = typer.Option(True, "--record/--no-record",
+                                help="Store the verdict for the console"),
+):
+    """
+    Out-of-sample validation: does the record survive being judged on trades the
+    rule never saw?
+
+    The qualification gate judges realised outcomes - all of them produced by
+    rules chosen while looking at them. This splits the record into consecutive
+    folds, tests each rule on the discovery folds and then on a fresh holdout,
+    corrects for having tested several rules at once, and asks the economic
+    question separately from the statistical one.
+
+    It can REFUSE a rule. It can never qualify anything: a backtest figure must
+    not trigger live capital, and that is pinned in code, not just documented.
+    """
+    from .learning.trade_outcomes import TradeOutcomeTracker  # noqa: F401
+    from .storage.db import Storage
+    from .validation.walk_forward import (record_verdict, rows_from_storage,
+                                          run_walk_forward)
+
+    storage = Storage()
+    try:
+        rows = rows_from_storage(storage, venue_id=venue, strategy=strategy,
+                                 execution_mode=lane)
+        scope = {"venue": venue, "strategy": strategy, "lane": lane, "folds": folds}
+        report = run_walk_forward(rows, folds=folds, scope=scope)
+        console.print()
+        console.print(f"[bold]Out-of-sample validation[/bold] - {report.rows} "
+                      f"settled trade(s), {report.folds} fold(s)")
+        if report.rows == 0:
+            console.print(f"[yellow]{report.summary}[/yellow]")
+            return
+        base = report.base_rate if report.base_rate is not None else 0.0
+        console.print(f"base rate (taking every trade): {base * 100:.1f}%   "
+                      f"holdout: "
+                      f"{(report.holdout_base_rate or 0) * 100:.1f}%")
+        for result in report.results:
+            hit = "n/a" if result.hit_rate is None else f"{result.hit_rate * 100:.1f}%"
+            lift = "n/a" if result.lift is None else f"{result.lift * 100:+.1f}%"
+            p_val = "n/a" if result.p_value is None else f"{result.p_value:.4f}"
+            # Each flag is printed only when it is true of THIS rule, and the
+            # economic one only alongside confirmation: a rule can clear
+            # break-even on the discovery folds and still be noise, and a line
+            # that reads "clears break-even" next to a rule that failed the
+            # holdout is the same overstatement in a smaller font.
+            flags = []
+            if result.significant:
+                flags.append("significant")
+            if result.confirmed:
+                flags.append("held on the holdout")
+            if result.confirmed and result.economically_viable:
+                flags.append("clears break-even")
+            console.print(
+                f"  {result.name:<22} n={result.entries:<4} hit={hit:<7} "
+                f"lift={lift:<8} p={p_val:<8} " + ", ".join(flags))
+        style = "green" if report.verdict == "confirmed_economic" else "yellow"
+        console.print(f"[{style}]{report.verdict.upper()}: {report.summary}[/{style}]")
+        if report.refused_names():
+            console.print("[red]Not supported out of sample: "
+                          f"{', '.join(report.refused_names())}[/red]")
+        if record:
+            scope_name = "-".join(x for x in (venue, strategy, lane) if x) or "all"
+            if record_verdict(storage, report, scope=scope_name):
+                console.print(f"[dim]Verdict stored for the console "
+                              f"(scope {scope_name}).[/dim]")
+    finally:
+        storage.close()
+
+
+@app.command()
 def check_llm(
     provider: str = typer.Option("auto", "--provider", help="auto, lm_studio, ollama"),
     host: str = typer.Option(None, "--host", help="Override host, e.g. http://localhost:1234"),

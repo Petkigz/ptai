@@ -63,6 +63,8 @@ from ..markets.base import Market, DataMode
 
 from ..venues.registry import VenueRegistry
 from ..venues.inventory import inventory_line, record_inventory
+from ..validation.walk_forward import (record_verdict, rows_from_storage,
+                                        run_walk_forward)
 from ..venues.polymarket_adapter import PolymarketAdapter
 from ..venues.kalshi_adapter import KalshiAdapter
 from ..venues.manifold_adapter import ManifoldAdapter
@@ -111,6 +113,7 @@ from ..risk.kelly import KellyCalculator
 from ..risk.exposure import ExposureManager
 from ..risk.correlation import CorrelationEngine
 from ..risk.drawdown import DrawdownManager
+from ..risk.money_guard import LANE_LIVE, LANE_PAPER, default_guard
 from ..risk.kill_switch import KillSwitch, KillLevel
 from ..risk.limits import LimitsEngine, TradeLimits
 
@@ -402,6 +405,11 @@ class TradingAgentV3:
         self.exposure_manager = ExposureManager(bankroll=bankroll)
         self.correlation_engine = CorrelationEngine()
         self.drawdown_manager = DrawdownManager(initial_bankroll=bankroll)
+        # The limits that actually stop an order. `max_daily_loss_pct` lived in
+        # Settings and was read by nothing; CircuitBreaker, DrawdownManager and
+        # two of the kill switch's triggers were constructed or defined and never
+        # called. This one is consulted immediately before every order.
+        self.money_guard = default_guard(self.storage, self.settings)
         self.kill_switch = KillSwitch(data_dir="./data")
         self.limits_engine = LimitsEngine(
             limits=TradeLimits(
@@ -541,7 +549,34 @@ class TradingAgentV3:
         
         if self.calibration_engine.is_degrading():
             self.kill_switch.check_calibration_collapse(self.calibration_engine.calculate_brier_score())
-        
+
+        # Two of the kill switch's twelve advertised triggers were defined and
+        # never called by anything: `check_daily_loss` and `check_drawdown`. A
+        # trigger that cannot fire is decoration, so the guard's own numbers now
+        # feed them - but ONLY from the LIVE lane, because the kill switch latches
+        # until a human resets it and a simulated loss must never leave the agent
+        # stopped and waiting for somebody to notice.
+        try:
+            live_capital = sum(
+                float((entry or {}).get("cap_usd") or 0.0)
+                for entry in (getattr(self, "_cycle_live_capital", None) or {}).values())
+            live = self.money_guard.usage(LANE_LIVE, live_capital)
+            health["money_guard"] = {
+                "live": live.to_dict(),
+                "paper": self.money_guard.usage(
+                    LANE_PAPER, float(self.storage.get_paper_bankroll() or 0.0)).to_dict(),
+            }
+            # The drawdown trigger is fed a fraction of CAPITAL, in its own
+            # units. The daily-loss trigger is left unfed on purpose: the guard
+            # already stops the live lane for the day and lifts on its own, and
+            # latching the whole system - paper included - at 15% would leave the
+            # agent stopped until a human noticed, which is the opposite of
+            # running unattended. 30% of real capital is the point worth a look.
+            if live_capital > 0:
+                self.kill_switch.check_drawdown(live.loss_pct_of_bankroll)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Money guard health read failed: {type(e).__name__}: {e}")
+
         return health
 
     async def check_eligibility(self) -> Dict[str, EligibilityStatus]:
@@ -1104,6 +1139,24 @@ class TradingAgentV3:
         _inventory = record_inventory(self.storage, self.venue_registry)
         if _inventory:
             logger.info("Venue inventory recorded: " + inventory_line(_inventory))
+        # Out-of-sample validation, re-run on the record as it stands. Cheap next
+        # to a scan, and it means the console shows the verdict for the record the
+        # agent is actually trading rather than the one it had last time somebody
+        # remembered to run the command. Refusals are logged; nothing about this
+        # can open the gate - `may_qualify()` answers False always.
+        try:
+            _wf_rows = rows_from_storage(self.storage)
+            _wf = run_walk_forward(_wf_rows)
+            record_verdict(self.storage, _wf, scope="all")
+            if _wf.refused_names():
+                logger.warning(
+                    f"Out-of-sample validation does not support: "
+                    f"{', '.join(_wf.refused_names())} - {_wf.summary}")
+            else:
+                logger.info(f"Out-of-sample validation: {_wf.verdict}")
+        except Exception as e:  # noqa: BLE001 - a report must never stop a cycle
+            logger.warning(f"Out-of-sample validation failed: "
+                           f"{type(e).__name__}: {e}")
         
         # Health check - Check capital + account health
         health = await self.check_system_health()
@@ -1854,6 +1907,58 @@ class TradingAgentV3:
                 # capital in the first place.
                 lane, lane_reason = self._money_lane(opp, amount_usd)
                 paper_because = ""
+                # THE MONEY GUARD. Session and daily loss limits, measured
+                # against settled outcomes in the trade log rather than a counter
+                # in memory, plus the stake cap for the first live money at a
+                # venue. A refusal here is a refusal to RISK real money, so the
+                # order still runs in paper - on the same code path, with the
+                # adapter forced to dry_run - and the reason is recorded either
+                # way. What it must never do is put the order through anyway.
+                lane_bankroll = 0.0
+                if lane == "live":
+                    lane_bankroll = float(
+                        ((getattr(self, "_cycle_live_capital", None) or {}).get(
+                            venue_id) or {}).get("cap_usd") or 0.0)
+                else:
+                    try:
+                        lane_bankroll = float(self.storage.get_paper_bankroll())
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            f"Could not read the paper bankroll for the money "
+                            f"guard: {type(e).__name__}: {e}")
+                guard_decision = self.money_guard.check(
+                    amount_usd, lane, lane_bankroll, venue_id=venue_id)
+                self._last_guard_decision = guard_decision
+                if guard_decision.refused:
+                    if lane == "live":
+                        logger.warning(
+                            f"MONEY GUARD refuses real money for {opp.market_id} "
+                            f"@ {venue_id}: {guard_decision.reason} - running it "
+                            f"in paper so the trade and its outcome are still "
+                            f"recorded")
+                        lane = "paper"
+                        paper_because = f"money guard: {guard_decision.reason}"
+                    else:
+                        logger.warning(
+                            f"MONEY GUARD stops the {lane} lane for "
+                            f"{opp.market_id}: {guard_decision.reason}")
+                        execution_results.append({
+                            "market_id": opp.market.id,
+                            "venue": opp.venue_id,
+                            "status": "blocked_loss_limit",
+                            "reason": guard_decision.reason,
+                            "amount": amount_usd,
+                            "guard": guard_decision.to_dict(),
+                        })
+                        continue
+                elif guard_decision.approved_usd < amount_usd - 1e-9:
+                    logger.info(
+                        f"Money guard caps {opp.market_id} at "
+                        f"${guard_decision.approved_usd:.2f} (proposed "
+                        f"${amount_usd:.2f}): {guard_decision.binding}"
+                        + (f" - {guard_decision.notes[0]}"
+                           if guard_decision.notes else ""))
+                    amount_usd = guard_decision.approved_usd
                 if lane == "live":
                     entry = (getattr(self, "_cycle_live_capital", None) or {}).get(
                         venue_id) or {}
@@ -1890,6 +1995,10 @@ class TradingAgentV3:
                 execution_results.append({
                     "market_id": opp.market.id,
                     "venue": opp.venue_id,
+                    # What the money guard allowed and why, on the order itself.
+                    # A size the operator cannot trace is a size they cannot
+                    # argue with - and the guard is the one that trimmed it.
+                    "guard": guard_decision.to_dict(),
                     "strategy": opp.raw.get("strategy", "unknown") if hasattr(opp, 'raw') and isinstance(opp.raw, dict) else "unknown",
                     "side": opp.side,
                     "edge": opp.effective_edge,

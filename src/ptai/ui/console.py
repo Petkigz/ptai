@@ -43,6 +43,7 @@ from ..execution.capital import (
 )
 from ..storage.db import Storage
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
+from ..validation.walk_forward import load_verdicts
 from ..venues.inventory import load_inventory
 
 app = FastAPI(title="PTAI Console", version="console-1")
@@ -187,6 +188,19 @@ async def api_capital() -> JSONResponse:
     plan = _build_plan(state, storage, balances)
     plan["balances_read"] = {k: bool(v.get("available")) for k, v in balances.items()}
     plan["session"] = {"mode": state.mode, "budgets": state.budgets()}
+    # The hard limits, from the same guard the order path consults. A limit
+    # shown here that the dispatcher does not enforce would be worse than no
+    # panel at all.
+    try:
+        from ..risk.money_guard import guard_snapshot
+
+        plan["limits"] = guard_snapshot(
+            storage,
+            live_bankroll_usd=sum((state.budgets() or {}).values()),
+            paper_bankroll_usd=_paper_bankroll(storage))
+    except Exception as e:  # noqa: BLE001
+        plan["limits"] = {"available": False,
+                          "reason": f"{type(e).__name__}: {e}"}
     return JSONResponse(plan)
 
 
@@ -771,6 +785,9 @@ async def api_venue() -> JSONResponse:
         # Every venue PTAI knows about and what it can do, so "can I run this
         # one too?" has an answer on the page rather than only in the code.
         "inventory": inventory,
+        # What out-of-sample validation says about the rules that are choosing
+        # these trades. It can refuse a rule; it can never qualify a venue.
+        "validation": load_verdicts(storage),
     })
 
 
@@ -1070,6 +1087,10 @@ section[id]{scroll-margin-top:132px}
       </div>
     </div>
     <div class="card" style="margin-top:16px">
+      <h2>Loss limits &mdash; what stops it</h2>
+      <div id="limits"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
       <h2>How capital gets in</h2>
       <div id="funding"></div>
     </div>
@@ -1131,6 +1152,10 @@ section[id]{scroll-margin-top:132px}
           an unmeasured venue is not a zero, and it is not a winner either.
         </div>
       </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Out-of-sample validation</h2>
+      <div id="validation"></div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>Every venue PTAI knows about</h2>
@@ -1426,6 +1451,52 @@ async function loadVenue(){
       </tr>`;
     }).join('') + '</table>';
 
+  // ---- out-of-sample validation ----
+  //
+  // A verdict on the rules, not on the money. Every number here was produced by
+  // testing a rule on folds it did not choose itself, and the holdout column is
+  // the one that says whether it survived. It can REFUSE a rule and can never
+  // qualify a venue - the panel says so rather than letting a green word imply
+  // otherwise.
+  const val = body.validation || {};
+  const scopes = Object.entries(val.scopes || {});
+  if(!scopes.length){
+    $('validation').innerHTML = `<div class="note">${esc(val.reason
+      || 'Out-of-sample validation has not been run yet. Run: python main.py validate')}</div>`;
+  } else {
+    $('validation').innerHTML = scopes.map(([name, rep]) => {
+      const good = rep.verdict === 'confirmed_economic';
+      const bad = rep.verdict === 'unconfirmed' || rep.verdict === 'confirmed_uneconomic';
+      const tone = good ? 'ok' : bad ? 'neg' : 'wait';
+      const rows = (rep.results||[]).filter(r=>r.name !== 'all');
+      return `<div style="padding:10px 0;border-bottom:1px solid rgba(36,48,64,.5)">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <b>${esc(name)}</b><span class="pill ${tone}">${esc(rep.verdict||'')}</span></div>
+        <div class="note" style="margin-top:6px">${esc(rep.summary||'')}</div>
+        <div class="note" style="margin-top:6px">${rep.rows||0} settled trade(s) in
+          ${rep.folds||0} fold(s) &middot; base rate
+          ${((rep.base_rate||0)*100).toFixed(1)}% &middot; holdout
+          ${((rep.holdout_base_rate||0)*100).toFixed(1)}%</div>
+        <table style="margin-top:8px"><tr><th>Rule</th><th>Entries</th><th>Hit rate</th>
+          <th>Lift</th><th>p</th><th>Holdout</th><th>Break-even</th></tr>` +
+        rows.map(r=>{
+          const chk = v => v===null||v===undefined ? '&mdash;' : (v*100).toFixed(1)+'%';
+          return `<tr><td>${esc(r.name)}${r.confirmed?' <span class="pill ok">held</span>':''}${
+              r.significant&&!r.confirmed?' <span class="pill neg">failed holdout</span>':''}</td>
+            <td class="mono">${r.entries}</td><td class="mono">${chk(r.hit_rate)}</td>
+            <td class="mono ${(r.lift||0)>=0?'pos':'neg'}">${
+              r.lift===null||r.lift===undefined?'&mdash;':((r.lift>=0?'+':'')+(r.lift*100).toFixed(1)+'%')}</td>
+            <td class="mono">${r.p_value===null||r.p_value===undefined?'&mdash;':r.p_value.toFixed(4)}</td>
+            <td class="mono">${r.holdout_entries||0} @ ${chk(r.holdout_hit_rate)}</td>
+            <td class="mono">${chk(r.break_even)}</td></tr>`;
+        }).join('') + '</table></div>';
+    }).join('') + `
+      <div class="note" style="margin-top:11px">Tested on consecutive folds, corrected for testing
+        several rules at once (Holm-Bonferroni), and judged against the break-even the entries
+        actually paid. This can refuse a rule. It can never qualify a venue: only settled
+        money does that.</div>`;
+  }
+
   // ---- every venue, and what it can do ----
   //
   // The ranking above only shows venues that could hold money or already have
@@ -1513,6 +1584,50 @@ async function loadVenue(){
 
 async function loadCapital(){
   const {body} = await api('/api/console/capital');
+  // ---- the hard limits ----
+  //
+  // Read from the guard the dispatcher consults, not recomputed. The limits are
+  // measured against settled outcomes in the trade log, so a restart cannot
+  // reset them and this panel cannot disagree with the order path.
+  const lim = body.limits || {};
+  const laneRow = (name, row) => {
+    if(!row) return '';
+    const bar = (used, label, limit) => `
+      <div style="margin-top:7px">
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim)">
+          <span>${label}</span><span class="mono">${limit==null?'&mdash;':money(limit)}</span></div>
+        <div style="height:7px;background:rgba(36,48,64,.8);border-radius:4px;margin-top:4px;overflow:hidden">
+          <div style="height:100%;width:${Math.min(100,(used||0)*100).toFixed(1)}%;
+               background:${(used||0)>=0.8?'var(--neg, #e0555f)':(used||0)>=0.5?'#d8a13a':'var(--pos, #3fbf7f)'}"></div>
+        </div></div>`;
+    return `<div style="padding:11px 0;border-bottom:1px solid rgba(36,48,64,.5)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <b style="text-transform:capitalize">${esc(name)}</b>
+        ${row.halted ? '<span class="pill neg">stopped</span>'
+                     : `<span class="mono" style="color:var(--dim)">today ${money(row.daily_pnl_usd)}</span>`}
+      </div>
+      ${row.halted ? `<div class="errbox" style="margin-top:8px">${esc(row.halt_reason)}</div>` : ''}
+      ${bar(row.daily_used_pct, 'Daily loss limit', row.daily_loss_limit_usd)}
+      ${bar(row.session_used_pct, 'Session loss limit', row.session_loss_limit_usd)}
+      <div class="note" style="margin-top:7px">Capital this applies to: ${money(row.bankroll_usd)}
+        &middot; committed and unsettled: ${money(row.open_risk_usd)}
+        &middot; ${(row.loss_pct_of_bankroll*100).toFixed(1)}% of capital lost this session</div>
+    </div>`;
+  };
+  const unreadable = lim.available === false || (!lim.live && !lim.paper);
+  $('limits').innerHTML = unreadable
+    ? `<div class="note">${esc(lim.reason || 'The limits could not be read, so nothing '
+        + 'may risk real money until they can be.')}</div>`
+    : laneRow('live (real money)', lim.live) + laneRow('paper (simulated)', lim.paper) + `
+      <div class="note" style="margin-top:11px">Session ${(lim.session_loss_pct*100).toFixed(0)}% and daily
+        ${(lim.daily_loss_pct*100).toFixed(0)}% of the capital in use. Measured from settled
+        outcomes in the trade log, so a restart cannot reset them; they lift when the day rolls
+        or when you authorise a budget or switch mode.
+        ${lim.live_proven
+          ? 'Live sizing is at the full per-order cap.'
+          : `Live sizing is held at the ${(lim.micro_stake_pct*100).toFixed(0)}% micro cap until
+             ${lim.live_proving_trades} live trades at a venue have settled.`}</div>`;
+
   const accts = body.accounts || [];
   if(!accts.length){
     $('accounts').innerHTML = `<div class="empty">No venue has a budget yet.

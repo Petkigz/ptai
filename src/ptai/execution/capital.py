@@ -591,6 +591,18 @@ def authorised_budget(storage, venue_id: str) -> float:
 
 def set_authorised_budget(storage, venue_id: str, amount_usd: float) -> None:
     storage.set_state(f"{BUDGET_KEY_PREFIX}{venue_id}", f"{float(amount_usd):.2f}")
+    # Authorising an amount is the operator saying "start from here", so the LIVE
+    # session's loss ledger starts from here too. A limit that a restart cannot
+    # reset must have SOMETHING that resets it, or a bad week would follow the
+    # account forever - and the honest reset is a deliberate act by the operator,
+    # not a reboot.
+    try:
+        from ..risk.money_guard import LANE_LIVE, MoneyGuard
+
+        MoneyGuard(storage).start_session(
+            LANE_LIVE, reason=f"authorised ${float(amount_usd):.2f} at {venue_id}")
+    except Exception as e:  # noqa: BLE001 - a budget write must still succeed
+        logger.warning(f"Could not start a fresh live session for the guard: {e}")
 
 
 def operator_mode(storage, default: str = "paper") -> str:
@@ -606,3 +618,14 @@ def set_operator_mode(storage, mode: str) -> None:
     if mode not in ("paper", "live"):
         raise ValueError(f"mode must be paper or live, got {mode!r}")
     storage.set_state(MODE_KEY, mode)
+    # Switching mode is also a deliberate fresh start for the lane being entered.
+    # Going live after a paper run must not inherit a paper session's loss ledger,
+    # and returning to paper must not hand the simulation a day already spent.
+    try:
+        from ..risk.money_guard import LANE_LIVE, LANE_PAPER, MoneyGuard
+
+        MoneyGuard(storage).start_session(
+            LANE_PAPER if mode == "paper" else LANE_LIVE,
+            reason=f"operator switched to {mode}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not start a fresh {mode} session for the guard: {e}")
