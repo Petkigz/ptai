@@ -43,6 +43,13 @@ dependencies = [
 [project.scripts]
 ptai = "ptai.cli:app"
 
+[tool.pytest.ini_options]
+# Two import styles are in use across the suite ("src.ptai.x" from the older
+# tests and "ptai.x" from the newer ones). Both are correct; without this the
+# newer ones only pass when PYTHONPATH happens to be set, which is a test that
+# passes for the wrong reason.
+pythonpath = ["src"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -45,6 +45,8 @@ from ..storage.db import Storage
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
 from ..validation.rule_bench import validation_block
 from ..venues.inventory import load_inventory
+from ..venues import credentials as credential_store
+from ..venues import preferences as venue_switches
 
 app = FastAPI(title="PTAI Console", version="console-1")
 
@@ -793,6 +795,172 @@ async def api_venue() -> JSONResponse:
     })
 
 
+def _data_dir() -> str:
+    """The data folder this console's database lives in - where the vault is."""
+    try:
+        from pathlib import Path as _Path
+
+        return str(_Path(get_storage().db_path).parent)
+    except Exception:  # noqa: BLE001
+        return "./data"
+
+
+@app.get("/api/console/logins")
+async def api_logins() -> JSONResponse:
+    """
+    Every login PTAI can use, what each one unlocks, and where it comes from.
+
+    The operator's ask was plain - "my logins need to be saved somewhere so I
+    don't always have to log in when the system is running automatically" - and
+    before this there was no way to put a credential into the product at all.
+    Masked values only; a secret never leaves this process in the clear.
+    """
+    return JSONResponse(credential_store.describe_all(_data_dir()))
+
+
+@app.post("/api/console/logins")
+async def api_save_login(request: Request) -> JSONResponse:
+    """Save one login. A blank required field is refused, not stored."""
+    body = await request.json() if await request.body() else {}
+    tool = str(body.get("tool") or "").strip()
+    if not tool:
+        return JSONResponse(status_code=400,
+                            content={"error": "no tool was named"})
+    result = credential_store.save(tool, body.get("fields") or {}, _data_dir())
+    if not result.get("ok"):
+        return JSONResponse(status_code=400, content=result)
+    return JSONResponse(result)
+
+
+@app.post("/api/console/logins/forget")
+async def api_forget_login(request: Request) -> JSONResponse:
+    body = await request.json() if await request.body() else {}
+    tool = str(body.get("tool") or "").strip()
+    result = credential_store.forget(tool, _data_dir())
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
+def _known_venue_rows(storage, inventory: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Every venue PTAI knows about, without needing the agent to have started.
+
+    Same order of knowledge as the venue panel above: the running agent's
+    registry, then the recorded inventory, then the fundable venues plus
+    anything that has ever traded. The switch list used ONLY the recorded
+    inventory, so on a fresh install - which is exactly when an operator wants
+    to switch off the eleven venues with no client written yet - it was empty
+    and read as "there is nothing to switch". The detailed row (what it can do,
+    whether it needs a login) still comes from the inventory when it exists;
+    without it the row says so rather than guessing.
+    """
+    rows: Dict[str, Dict[str, Any]] = {}
+    inv_venues = inventory.get("venues") or {}
+    for venue_id, row in inv_venues.items():
+        rows[venue_id] = dict(row)
+
+    agent = _agent()
+    adapters = getattr(getattr(agent, "venue_registry", None), "adapters", {}) or {}
+    if adapters:
+        known = list(adapters)
+    elif inv_venues:
+        known = list(inv_venues)
+    else:
+        selector = VenueSelector(storage=storage, funding_routes=FUNDING_ROUTES)
+        known = sorted(set(FUNDING_ROUTES) | set(selector.known_venues()))
+
+    for venue_id in known:
+        if venue_id in rows:
+            continue
+        route = FUNDING_ROUTES.get(venue_id) or {}
+        rows[venue_id] = {
+            "venue_id": venue_id,
+            "label": route.get("label") or venue_id,
+            "use": None,
+            "what_it_needs": None,
+            "detail_known": False,
+            "reads_live_markets_now": None,
+            "can_hold_real_money": None,
+            "needs_credentials": None,
+        }
+    for row in rows.values():
+        row.setdefault("detail_known", True)
+    return [rows[vid] for vid in sorted(rows)]
+
+
+@app.get("/api/console/venues/enabled")
+async def api_venue_switches() -> JSONResponse:
+    """
+    Which venues the agent may use, and what each one can do.
+
+    Nineteen adapters were scanned whether the operator wanted them or not, with
+    no switch anywhere. This is that switch: an explicit choice per venue, saved,
+    and read by the agent on its next cycle.
+    """
+    storage = get_storage()
+    inventory = load_inventory(storage)
+    saved = venue_switches.load(storage)
+    disabled = set(saved["disabled"])
+    rows = [{**row, "enabled": row["venue_id"] not in disabled}
+            for row in _known_venue_rows(storage, inventory)]
+    return JSONResponse({
+        "venues": rows, "disabled": sorted(disabled),
+        "updated_at": saved.get("updated_at", ""),
+        "note": ("A venue switched off is not asked for markets and not traded. "
+                 "Nothing else changes: a venue switched on still has to be "
+                 "funded, qualified and inside the loss limits to touch real "
+                 "money."),
+    })
+
+
+@app.post("/api/console/venues/enabled")
+async def api_set_venue_switch(request: Request) -> JSONResponse:
+    body = await request.json() if await request.body() else {}
+    # `venue` and `id` are accepted as well as `venue_id`: a caller that guessed
+    # the wrong one used to get "no venue named" and no way to tell which name
+    # was expected.
+    venue_id = str(body.get("venue_id") or body.get("venue")
+                   or body.get("id") or "").strip()
+    if not venue_id:
+        return JSONResponse(status_code=400, content={
+            "error": "no venue named - send {'venue_id': '<id>', 'enabled': true|false}"})
+    enabled = bool(body.get("enabled", True))
+    result = venue_switches.set_enabled(get_storage(), venue_id, enabled)
+    if not result.get("ok"):
+        return JSONResponse(status_code=500, content=result)
+    return JSONResponse({
+        **result,
+        "venue_id": venue_id, "enabled": enabled,
+        "takes_effect": ("the agent reads this at the start of its next cycle - "
+                         "no restart needed"),
+    })
+
+
+@app.get("/api/console/sports")
+async def api_sports() -> JSONResponse:
+    """
+    The sports lane: what it priced, what it placed, what it settled.
+
+    The lane could price a full match card and had nowhere to put the bets, so
+    "3 executable" was where the story ended. This is the rest of it.
+    """
+    storage = get_storage()
+    try:
+        from ..betting.positions import SportsBook
+        from ..betting.ratings import RatingsBook
+
+        book = SportsBook(storage=storage)
+        return JSONResponse({
+            "available": True,
+            "summary": book.summary(),
+            "open": book.open_bets()[:20],
+            "recent": book.recent(limit=20),
+            "ratings": RatingsBook(storage=storage).snapshot(),
+        })
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"available": False,
+                             "reason": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/console/run-cycle")
 async def api_run_cycle(request: Request) -> JSONResponse:
     """
@@ -860,9 +1028,27 @@ async def api_run_cycle(request: Request) -> JSONResponse:
         return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {e}"})
 
     execution = result.get("execution") or []
+    sports = result.get("sports") or {}
     return JSONResponse({
         "mode": requested_mode,
         "status": result.get("status"),
+        # The sports lane's outcome, including WHY it was quiet. "Nothing
+        # placed" alone is what made the button feel incomplete: the feed
+        # reasons, how many fixtures arrived and what was priced belong on the
+        # answer, not only in the log file.
+        "sports": {
+            "bets_placed": sports.get("bets_placed", 0),
+            "refusals": (sports.get("placement") or {}).get("refusals", [])[:3],
+            "settlement": sports.get("settlement"),
+            "ratings_update": sports.get("ratings_update"),
+            "ratings": sports.get("ratings"),
+            "book": sports.get("book"),
+            "opportunities": sports.get("opportunities", 0),
+            "executable": sports.get("executable", 0),
+            "market_types_available": sports.get("market_types_available", 0),
+            "blockers": (sports.get("blockers") or [])[:3],
+            "how_a_bet_works": sports.get("how_a_bet_works", ""),
+        },
         "markets_scanned": len((result.get("markets") or {})) or None,
         "executed": len([e for e in execution if e.get("position_recorded")]),
         "orders_tracked": len([e for e in execution if e.get("order_recorded")]),
@@ -1156,6 +1342,10 @@ section[id]{scroll-margin-top:132px}
       </div>
     </div>
     <div class="card" style="margin-top:16px">
+      <h2>Sports bets &mdash; priced, placed, settled</h2>
+      <div id="sports"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
       <h2>Out-of-sample validation</h2>
       <div id="validation"></div>
     </div>
@@ -1233,6 +1423,32 @@ section[id]{scroll-margin-top:132px}
     <div class="card" style="margin-top:16px">
       <h2>Brain &mdash; pin the model the agent calls</h2>
       <div id="brainSetup"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Logins &mdash; saved here, used by the agent</h2>
+      <div class="note" style="margin-bottom:11px">
+        <p style="margin-bottom:9px">Save a login once and the agent uses it on
+          every cycle after that, including logins you add while it is already
+          running: the next cycle picks them up without a restart. Values are
+          encrypted and kept in <code id="vaultPath">data/vault.json</code> on
+          this machine; nothing is sent anywhere.</p>
+        <p>Anything already in <code>.env</code> keeps working. Where both exist,
+          the value saved here wins, and each field says which source is in
+          use.</p>
+      </div>
+      <div id="logins"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Venues the agent may use</h2>
+      <div class="note" style="margin-bottom:11px">
+        <p style="margin-bottom:9px">Every venue PTAI knows about, with a switch.
+          What each one can actually do is on the Venue tab; this is only whether
+          the agent should use it. Switching one off takes effect on the next
+          cycle, and nothing else changes &mdash; a venue switched on still has to
+          be funded, qualified and inside the loss limits before it can touch real
+          money.</p>
+      </div>
+      <div id="venueSwitches"></div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>Advanced tools (diagnostics)</h2>
@@ -1804,6 +2020,18 @@ async function runCycle(){
           body.warnings.map(w=>`<li>${w}</li>`).join('')}</ul>`:'') + '</div>';
     return;
   }
+  const sp = body.sports || {};
+  const spPlaced = sp.bets_placed || 0;
+  const spNote = spPlaced || (sp.settlement||{}).settled
+    ? `<div class="note" style="margin-top:7px">Sports: ${spPlaced} bet(s)
+        placed${(sp.settlement&&sp.settlement.settled)?`, ${sp.settlement.settled} settled`:''}
+        &middot; ${sp.opportunities||0} market(s) priced of ${sp.market_types_available||0} types,
+        ${sp.executable||0} executable
+        ${(sp.ratings&&sp.ratings.rated_teams)?`&middot; ${sp.ratings.rated_teams} team(s) rated for the models`:''}</div>`
+    : `<div class="note" style="margin-top:7px">Sports: nothing placed this cycle.
+        ${(sp.blockers||[]).length
+          ? 'Why: '+(sp.blockers||[]).map(b=>esc(b)).join(' &middot; ')
+          : 'The lane prices fixtures but only bets where it has its own view and a price to beat, and it only settles on a result a feed reported.'}</div>`;
   $('cycleOut').innerHTML = `
     <div><b>${body.status||''}</b> &mdash; ${body.executed||0} position(s) recorded,
       ${body.orders_tracked||0} order(s) tracked for reconciliation.</div>
@@ -1811,10 +2039,173 @@ async function runCycle(){
       settlement: ${JSON.stringify(body.settlement||null)} &middot;
       reconciliation: ${JSON.stringify(body.reconciliation||null)} &middot;
       redemption: ${JSON.stringify(body.redemption||null)}
-    </div>`;
+    </div>` + spNote +
+    ((sp.refusals||[]).length ? `<div class="note" style="margin-top:5px">Why no
+      sports bet: ${esc(sp.refusals.map(r=>`${r.outcome||''}: ${(r.reasons||[])[0]||''}`).join(' · '))}</div>` : '');
   // The cycle just wrote its own phase, heartbeat and scan row: show them, so
   // the front page cannot lag behind a cycle the operator just ran by hand.
   loadStatus(); loadAgent();
+}
+
+// ---- logins: saved here, used by the agent ----
+//
+// One row per login, one input per field, and a Save that means saved: the
+// agent reads the vault at the start of every cycle, so what is typed here is in
+// force on the next one. Each field says whether its value is the saved one or
+// the environment's, because "it is set" is not the same as "it is the one the
+// agent uses".
+async function loadLogins(){
+  const {body} = await api('/api/console/logins');
+  const tools = Object.entries(body.tools || {});
+  if(!tools.length){
+    $('logins').innerHTML = `<div class="note">No logins are defined in this build.</div>`;
+    return;
+  }
+  $('vaultPath').textContent = body.vault || 'data/vault.json';
+  $('logins').innerHTML = tools.map(([name, t]) => {
+    const rows = (t.fields||[]).map(f => `
+      <tr>
+        <td style="max-width:210px">${esc(f.label)}${f.required?'':' <span class="pill dim">optional</span>'}</td>
+        <td><input type="text" id="login-${esc(t.name)}-${esc(f.name)}"
+             value="${f.source==='environment'?'':esc(f.shown||'')}"
+             placeholder="${f.set?(f.source==='environment'?'set in .env':'already saved'):(esc(f.example)||'')}"
+             style="width:100%"></td>
+        <td class="mono">${f.set
+            ? `<span class="pill ${f.source==='saved'?'ok':'wait'}">${f.source==='saved'?'saved':'from .env'}</span>`
+            : '<span class="pill no">not set</span>'}</td>
+      </tr>
+      <tr><td></td><td colspan="2" class="note" style="padding-top:0">${esc(f.hint||'')}</td></tr>`).join('');
+    return `<div style="padding:11px 0;border-bottom:1px solid rgba(36,48,64,.5)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <b>${esc(t.label)}</b>
+        <span class="pill ${t.configured?'ok':'wait'}">${t.configured?'configured':'needs a login'}</span>
+      </div>
+      <div class="note" style="margin-top:5px">Unlocks: ${esc(t.unlocks)}</div>
+      ${t.then?`<div class="note" style="margin-top:3px">Then: ${esc(t.then)}</div>`:''}
+      <table style="margin-top:8px"><tbody>${rows}</tbody></table>
+      <div style="margin-top:8px" class="row">
+        <button class="primary" onclick="saveLogin('${esc(t.name)}', ${JSON.stringify(
+            (t.fields||[]).map(f=>f.name)).replace(/"/g,'&quot;')})">Save login</button>
+        ${t.configured?`<button class="danger" onclick="forgetLogin('${esc(t.name)}')">Forget</button>`:''}
+        <span id="loginMsg-${esc(t.name)}" class="note"></span>
+      </div>
+    </div>`;
+  }).join('') + `<div class="note" style="margin-top:11px">${esc(body.note||'')}</div>`;
+}
+
+async function saveLogin(tool, fieldNames){
+  const fields = {};
+  fieldNames.forEach(n => {
+    const el = $('login-'+tool+'-'+n);
+    if(el && el.value) fields[n] = el.value;
+  });
+  const {ok, body} = await api('/api/console/logins', {method:'POST',
+    body:JSON.stringify({tool, fields})});
+  const msg = $('loginMsg-'+tool);
+  if(!ok){
+    msg.innerHTML = `<span class="neg">${esc(body.error||'could not save')}</span>`
+      + ((body.problems||[]).length?` ${esc(body.problems.join('; '))}`:'');
+    return;
+  }
+  msg.innerHTML = `<span class="pos">Saved (${esc((body.saved||[]).join(', '))}). The agent uses it on its next cycle.</span>`;
+  loadLogins();
+}
+
+async function forgetLogin(tool){
+  const {body} = await api('/api/console/logins/forget', {method:'POST',
+    body:JSON.stringify({tool})});
+  const msg = $('loginMsg-'+tool);
+  if(msg) msg.innerHTML = `<span class="warn">${esc(body.error||'Forgotten. .env values, if any, still apply.')}</span>`;
+  loadLogins();
+}
+
+// ---- venue switches ----
+//
+// The operator's answer to "can I stop it scanning the eleven venues with no
+// client written yet". Off means off: not asked for markets, not traded, and the
+// agent logs it as the operator's choice rather than a failure.
+async function loadVenueSwitches(){
+  const {body} = await api('/api/console/venues/enabled');
+  const rows = body.venues || [];
+  if(!rows.length){
+    $('venueSwitches').innerHTML = `<div class="note">The agent has not recorded
+      its venue inventory yet. Run one cycle and this list fills in.</div>`;
+    return;
+  }
+  $('venueSwitches').innerHTML = `<table><thead><tr>
+      <th>Venue</th><th>What it can do</th><th>Use it</th></tr></thead><tbody>`
+    + rows.map(v => `<tr>
+        <td><b>${esc(v.label||v.venue_id)}</b><div class="note">${esc(v.venue_id)}</div></td>
+        <td class="note">${v.detail_known===false
+              ? 'The agent has not been through this venue yet, so its live status is unknown. Run one cycle and this row fills in.'
+              : esc(v.use||'')+(v.reads_live_markets_now?' <span class="pill ok">reads now</span>':' <span class="pill dim">no live read</span>')+(v.can_hold_real_money?'':' <span class="pill dim">paper only</span>')+(v.needs_credentials?' <span class="pill wait">needs login</span>':'')}
+            <div class="note">${esc(v.what_it_needs||'')}</div></td>
+        <td><button class="${v.enabled?'':'primary'}"
+             onclick="setVenue('${esc(v.venue_id)}', ${v.enabled?'false':'true'})">
+             ${v.enabled?'Switched on &mdash; turn off':'Switch on'}</button></td>
+      </tr>`).join('') + `</tbody></table>
+      <div class="note" style="margin-top:11px">${esc(body.note||'')}</div>`;
+}
+
+async function setVenue(venue_id, enabled){
+  const {ok, body} = await api('/api/console/venues/enabled', {method:'POST',
+    body:JSON.stringify({venue_id, enabled})});
+  if(!ok){ alert(body.error||'could not save the switch'); return; }
+  loadVenueSwitches();
+}
+
+// ---- sports bets ----
+//
+// The lane used to end at "3 executable". This is the rest of the story: what was
+// placed, at what price, and how it settled - with the ratings the models are
+// actually using, and how many results each one is built on.
+async function loadSports(){
+  const {body} = await api('/api/console/sports');
+  if(!body.available){
+    $('sports').innerHTML = `<div class="note">${esc(body.reason||'unavailable')}</div>`;
+    return;
+  }
+  const s = body.summary || {};
+  const r = body.ratings || {};
+  const kpis = [
+    ['Staked', money(s.staked_usd), 'across every bet placed'],
+    ['Open', s.open, 'waiting on a result'],
+    ['Won / lost', `${s.won} / ${s.lost}`, 'settled on the final score'],
+    ['Sports P&L', (s.pnl_usd>=0?'+':'')+Number(s.pnl_usd||0).toFixed(2),
+     'paper money, through the same ledger'],
+  ];
+  const rows = (body.recent || []);
+  const settled = body.last_settlement || s.last_settlement || {};
+  $('sports').innerHTML = [
+    `<div class="row" style="gap:12px;margin-bottom:11px">` + kpis.map(([k,v,sub])=>
+      `<div class="card kpi" style="flex:1"><div class="k">${k}</div>
+       <div class="v">${typeof v==='number'?v:esc(v)}</div>
+       <div class="sub">${esc(sub)}</div></div>`).join('') + `</div>`,
+    rows.length ? `<table><thead><tr><th>Bet</th><th>Market</th><th>Odds</th>
+        <th>Stake</th><th>Status</th><th>P&amp;L</th></tr></thead><tbody>` +
+      rows.map(b=>`<tr>
+        <td>${esc(b.outcome)} <span class="note">${esc(b.book||'')}</span></td>
+        <td class="note">${esc(b.league||'')} ${esc(b.market_type||'')}${b.line!=null?' '+b.line:''}</td>
+        <td class="mono">${Number(b.odds||0).toFixed(2)}</td>
+        <td class="mono">${money(b.stake_usd)}</td>
+        <td><span class="pill ${b.status==='won'?'ok':b.status==='lost'?'no':'dim'}">${esc(b.status)}</span></td>
+        <td class="mono ${(b.pnl_usd||0)>=0?'pos':'neg'}">${b.pnl_usd==null?'&mdash;':((b.pnl_usd>=0?'+':'')+Number(b.pnl_usd).toFixed(2))}</td>
+      </tr>`).join('') + `</tbody></table>` :
+      `<div class="empty">No sports bet has been placed yet. The lane needs a
+        model view of a fixture and a price to beat: it builds ratings from
+        finished results, and it will not claim an edge without them.</div>`,
+    `<div class="note" style="margin-top:10px">Ratings: ${r.rated_teams||0} team(s)
+       rated (${esc(r.min_matches||3)}+ results each) across
+       ${Object.keys(r.leagues||{}).length} league(s). ${esc(r.how||'')}</div>`,
+    settled.settled!=null?`<div class="note" style="margin-top:5px">Last settlement:
+       ${settled.settled} bet(s) closed, ${settled.open||0} still open &mdash;
+       ${esc(settled.note||'')}</div>`:'',
+    `<div class="note" style="margin-top:5px">Settleable today: h2h, totals and
+       (half/whole-line) handicaps &mdash; the markets whose result a score can
+       decide. Corners, cards, both-teams-to-score and quarter-line handicaps are
+       refused at placement with the reason on them, because accepting a bet whose
+       result cannot be read is not risk, it is bookkeeping.</div>`,
+  ].join('');
 }
 
 // ---- the agent: the front page, and the only question that matters ----
@@ -2041,6 +2432,7 @@ async function loadAll(){
     await Promise.all([
       loadAgent(), loadStatus(), loadBrainSetup(),
       loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
+      loadLogins(), loadVenueSwitches(), loadSports(),
     ]);
     spyScroll();
   } finally {

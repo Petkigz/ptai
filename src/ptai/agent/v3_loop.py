@@ -64,6 +64,8 @@ from ..markets.base import Market, DataMode
 from ..venues.registry import VenueRegistry
 from ..venues.inventory import inventory_line, record_inventory
 from ..validation.rule_bench import benched_rules, bench_live_authorisation
+from ..venues import credentials as credential_store
+from ..venues import preferences as venue_preferences
 from ..validation.walk_forward import (record_verdict, rows_from_storage,
                                         run_walk_forward)
 from ..venues.polymarket_adapter import PolymarketAdapter
@@ -82,6 +84,8 @@ from ..venues.betfair_adapter import BetdaqAdapter, BetConnectAdapter
 from ..venues.betfair_exchange import BetfairExchangeAdapter
 from ..betting.engine import BettingEngine
 from ..betting.market_types import catalogue_report as betting_catalogue_report
+from ..betting.positions import SportsBook
+from ..betting.ratings import RatingsBook
 from ..venues.ccxt_adapter import CCXTUnifiedAdapter
 from ..venues.veynor_adapter import VeynorAdapter
 from ..venues.openpx_adapter import OpenPXAdapter
@@ -173,6 +177,16 @@ def _side_token_id(market, side):
     return None
 
 
+def _credential_source(data_dir: str, tool: str) -> Dict[str, Any]:
+    """What the agent will actually use for a login, for the record."""
+    try:
+        from ..venues import credentials as credential_store  # noqa: WPS433
+
+        return credential_store.describe(tool, data_dir)
+    except Exception as e:  # noqa: BLE001
+        return {"configured": False, "error": f"{type(e).__name__}: {e}"}
+
+
 class TradingAgentV3:
     """
     PTAI V3 - genuinely multi-venue, multi-strategy
@@ -191,15 +205,41 @@ class TradingAgentV3:
         self.settings = get_settings()
         self.country_code = country_code
         self.dry_run = bool(dry_run)
+        # Storage FIRST, because everything else is placed relative to it. It was
+        # built further down with a hardcoded "./data/ptai.db", so an agent
+        # started inside the console wrote to a DIFFERENT database than the page
+        # was reading (PTAI_DB) - "Run one cycle" could record trades, ratings and
+        # settlements that the operator then could not see. One reader of the
+        # environment, in the one place every entry point goes through (db.py).
+        self.storage = Storage()
+        # Every adapter below is built from `self.settings`. Putting the operator's
+        # SAVED logins into those settings first is what makes "I pasted my Kalshi
+        # key into the console" mean anything to a process that started
+        # afterwards - without it the key sat in the vault while the loops read
+        # empty strings, exactly as before.
+        self.data_dir = str(self.storage_data_dir())
+        try:
+            self.credential_state = credential_store.apply_to_settings(
+                self.settings, self.data_dir)
+            _ready = sorted(k for k, ok in self.credential_state.items() if ok)
+            if _ready:
+                logger.info("Saved logins applied from the vault: "
+                            + ", ".join(_ready))
+        except Exception as e:  # noqa: BLE001 - a bad vault must not stop trading
+            self.credential_state = {}
+            logger.error(f"Could not apply saved logins: "
+                         f"{type(e).__name__}: {e}. The agent will run with "
+                         f"whatever .env provides.")
         
-        # Storage
-        self.storage = Storage(db_path="./data/ptai.db")
         # The bankroll is loaded here, not lazily: every cycle path (the
         # blocked one included) reports it to the console, and a first
         # cycle must not crash on an attribute that appears only after a
         # settlement or redemption happens to run.
         self.bankroll = self.storage.get_bankroll()
-        self.vault = Vault()
+        # ...and the vault sits BESIDE the database this agent is using, so a
+        # login saved in the console is the same file the agent reads. A
+        # fixed "./data/vault.json" is the same bug as the fixed database path.
+        self.vault = Vault(str(Path(self.data_dir) / "vault.json"))
         self.memory = Memory()
         
         # LLM
@@ -273,6 +313,17 @@ class TradingAgentV3:
             max_position_pct=getattr(self.settings, "max_position_pct", 0.06),
         )
         
+        # THE SPORTS LEDGER. The betting lane could price a match card and had
+        # nowhere to put the bets: no position, no settlement, no P&L, no
+        # learning. These two give it the same lifecycle the prediction path has -
+        # and the ratings book is what gives the sports models an independent view
+        # of a fixture, which is the input nothing was producing.
+        self.sports_ratings = RatingsBook(storage=self.storage)
+        self.sports_book = SportsBook(
+            storage=self.storage, tracker=None,   # tracker attached below
+            data_engine=self.betting_engine.data,
+            min_stake=1.0, max_bets_per_cycle=1)
+
         # Venue/Strategy Qualification Engine - V8 - properly connected to main loop
         self.qualification_engine = VenueQualificationEngine()
         self.capability_engine = VenueStrategyQualificationEngine(
@@ -291,15 +342,36 @@ class TradingAgentV3:
         # AND in settings, reporting "unconfigured" as if nothing had been
         # supplied. Credentials are now read by their real names, and a vault
         # failure still falls through to settings rather than discarding them.
+        # Read through the credential store, which is also what the console
+        # writes to and what the per-cycle refresh reads. One reader, one answer:
+        # "saved in the console" and "what the adapter got" cannot disagree.
+        polymarket_login = _credential_source(self.data_dir, "polymarket")
+        stored = credential_store.resolve("polymarket", self.data_dir)
+        # ...and through THIS agent's own vault handle as well. The store reads
+        # the vault file directly, so a vault that was handed in or replaced
+        # (which is how the runtime-wiring test injects credentials) would
+        # otherwise be bypassed. The store wins per field; the handle fills the
+        # gaps, so both paths reach the same adapter.
         try:
-            stored = self.vault.get_tool_credentials("Trader", "polymarket_clob") or {}
-        except Exception as e:
-            # Not `except: pass`. Silent credential loss looks exactly like
-            # "no credentials configured", and every downstream gate then
-            # reports paper-only for a reason nobody can see.
-            logger.error(f"Could not read Polymarket credentials from the vault: "
-                         f"{type(e).__name__}: {e}. Falling back to settings.")
-            stored = {}
+            legacy = {}
+            for name in ("polymarket_clob", "polymarket"):
+                legacy.update(self.vault.get_tool_credentials("Trader", name) or {})
+            if legacy:
+                merged = {k: v for k, v in legacy.items() if v}
+                merged.update({k: v for k, v in stored.items() if v})
+                stored = merged
+        except Exception as e:  # noqa: BLE001 - not `except: pass`
+            logger.error(f"Could not read Polymarket credentials from this "
+                         f"agent's vault handle: {type(e).__name__}: {e}. "
+                         f"Falling back to the credential store.")
+        if not stored:
+            logger.error(
+                "Could not read Polymarket credentials from the vault or the "
+                "environment"
+                + (f": {polymarket_login.get('error')}"
+                   if polymarket_login.get("error") else "")
+                + ". Live trading and redemption will report as unconfigured; "
+                  "paper trading needs neither.")
         pk = stored.get("private_key") or self.settings.polymarket_private_key
         funder = stored.get("funder") or self.settings.polymarket_funder_address
         if not pk or not funder:
@@ -321,7 +393,16 @@ class TradingAgentV3:
         self.venue_registry.register(polymarket_adapter)
         
         # Kalshi - CFTC-regulated US event exchange, cross-venue arb highest prob
-        kalshi_adapter = KalshiAdapter()
+        # Kalshi was constructed as `KalshiAdapter()` - no arguments - so an
+        # operator's own API key could never reach it. It has no order path yet
+        # (the adapter says so), and the key is what raises the read quota that
+        # builds the record in paper.
+        _kalshi = credential_store.resolve("kalshi", self.data_dir)
+        kalshi_adapter = KalshiAdapter(
+            api_key=_kalshi.get("api_key"),
+            api_secret=_kalshi.get("api_secret"),
+            member_id=_kalshi.get("member_id"),
+        )
         self.venue_registry.register(kalshi_adapter)
         
         # Manifold - play money zero-cost testing ground for fair-value engine
@@ -369,10 +450,15 @@ class TradingAgentV3:
         # football questions. It is the feed that carries goals, corners, cards
         # and player props, so the derivative market models have something to
         # price against. Without credentials it returns no markets and says so.
+        # ...and its login comes from the vault/env store, not from three
+        # os.getenv calls buried in the middle of the registration list, which
+        # the console could not write to and the operator could not set from the
+        # product. This is the feed that carries goals, corners and cards.
+        _betfair = credential_store.resolve("betfair", self.data_dir)
         betfair_adapter = BetfairExchangeAdapter(
-            username=os.getenv("BETFAIR_USERNAME", ""),
-            password=os.getenv("BETFAIR_PASSWORD", ""),
-            app_key=os.getenv("BETFAIR_APP_KEY", ""),
+            username=_betfair.get("username", ""),
+            password=_betfair.get("password", ""),
+            app_key=_betfair.get("app_key", ""),
             sports=("football",),
             include_player_markets=False,
         )
@@ -413,7 +499,18 @@ class TradingAgentV3:
         self.money_guard = default_guard(self.storage, self.settings)
         # Rules the recorded verdicts refuse; filled at the top of every cycle.
         self._cycle_benched: Dict[str, Any] = {}
-        self.kill_switch = KillSwitch(data_dir="./data")
+        # Venue switches the operator set; filled at the top of every cycle by
+        # the discovery path, which is the only place they apply.
+        self._cycle_venue_skips: List[str] = []
+        self._cycle_credential_changes: Dict[str, Any] = {}
+        # The fixtures the previous cycle fetched, used to settle sports bets
+        # before the scan fetches this cycle's (settlement runs first on purpose:
+        # the bankroll it returns feeds the sizing that follows).
+        self._sports_fixtures: Optional[List[Any]] = None
+        self._sports_rating_update: Dict[str, Any] = {}
+        self._sports_placement: Dict[str, Any] = {}
+        self._sports_settlement_this_cycle: Optional[Dict[str, Any]] = None
+        self.kill_switch = KillSwitch(data_dir=self.data_dir)
         self.limits_engine = LimitsEngine(
             limits=TradeLimits(
                 max_position_pct=self.settings.max_position_pct,
@@ -490,6 +587,11 @@ class TradingAgentV3:
         
         # Learning
         self.trade_outcome_tracker = TradeOutcomeTracker(storage=self.storage)
+        # The sports book learns through the same tracker as everything else, so
+        # a settled bet reaches qualification, the venue x strategy matrix and the
+        # money guard's loss limits - not a private scoreboard of its own.
+        if getattr(self, "sports_book", None) is not None:
+            self.sports_book.tracker = self.trade_outcome_tracker
         # Closes execution -> settlement -> outcome -> calibration. Without a
         # settlement pass, `record_resolution` has no caller, the resolved count
         # stays at 0, `is_degrading()` can never return True (it needs 50
@@ -605,6 +707,26 @@ class TradingAgentV3:
             adapters_to_scan = list(self.venue_registry.adapters.values())
             if qualified_only and not qualified_ids:
                 logger.info(f"Core Objective: No QUALIFIED venues yet (need 100+ paper trades, win_rate>=55%, Brier<=0.25, profit_factor>=1.1, net_pnl>0) - scanning ALL venues for paper trading learning, but will NOT deploy live capital")
+
+        # THE OPERATOR'S SWITCHES. Applied last, so they also bind the
+        # qualified-only path: a venue the operator switched off is not scanned
+        # and not traded, whatever qualification thinks of it. The skipped list
+        # is logged as a CHOICE rather than a failure - a venue that is missing
+        # from the scan because the operator said so must not read as broken.
+        try:
+            self._cycle_venue_skips = []
+            _prefs = venue_preferences.load(self.storage)
+            adapters_to_scan, self._cycle_venue_skips = venue_preferences.filter_adapters(
+                self.storage, adapters_to_scan, _prefs)
+            if self._cycle_venue_skips:
+                logger.info(
+                    "Venues switched OFF by you, so not scanned this cycle: "
+                    + ", ".join(sorted(self._cycle_venue_skips))
+                    + " (turn them back on in the console's Setup tab)")
+        except Exception as e:  # noqa: BLE001 - a preference read must not stop a scan
+            self._cycle_venue_skips = []
+            logger.warning(f"Could not read the venue switches: "
+                           f"{type(e).__name__}: {e} - scanning every venue")
         
         for adapter in adapters_to_scan:
             venue_id = adapter.venue_id
@@ -1167,6 +1289,19 @@ class TradingAgentV3:
         # candidates (that is the entry gates' job, unchanged) and loses the
         # right to vouch for them with real capital: entries carried only by
         # refused rules run in paper and say so.
+        # LOGINS SAVED WHILE THIS PROCESS IS RUNNING. The adapters were built at
+        # startup; an operator who pastes a key into the console must not have to
+        # find a window and restart it. Applied here, at the top of every cycle,
+        # so the next scan uses it and the log says which venue changed.
+        try:
+            self.credential_state = credential_store.apply_to_settings(
+                self.settings, self.data_dir)
+            self._cycle_credential_changes = credential_store.refresh_adapters(
+                getattr(self, "venue_registry", None), self.settings, self.data_dir)
+        except Exception as e:  # noqa: BLE001 - never stop a cycle over a login
+            self._cycle_credential_changes = {}
+            logger.warning(f"Could not refresh saved logins this cycle: "
+                           f"{type(e).__name__}: {e}")
         try:
             self._cycle_benched = benched_rules(self.storage)
             if self._cycle_benched:
@@ -1217,6 +1352,26 @@ class TradingAgentV3:
                 f"SETTLEMENT PASS FAILED: {type(e).__name__}: {e}. Resolved "
                 f"markets will not be recorded this cycle, so calibration and "
                 f"win rate will be stale.")
+
+        # Sports settlement - close the bets whose FIXTURE has finished.
+        #
+        # Uses the fixtures this cycle fetched on the same feed that priced them,
+        # so a bet settles against a result, never against an assumption. A bet
+        # whose result cannot be read from what came back stays OPEN and is
+        # reported - refunding it would invent money the venue never returned.
+        sports_settlement = None
+        try:
+            sports_settlement = await self.sports_book.settle(
+                events=self._sports_events_for_settlement())
+            if sports_settlement and sports_settlement.get("settled"):
+                self._credit_sports_settlements(sports_settlement)
+            # The settlement runs BEFORE the scan, so it is written onto the
+            # block this cycle will report rather than lost.
+            self._sports_settlement_this_cycle = sports_settlement
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[sports] settlement pass failed: "
+                         f"{type(e).__name__}: {e}. Open sports bets stay open "
+                         f"and nothing is guessed.")
 
         # Reconciliation - find out what the venue did with the orders we sent.
         #
@@ -1321,6 +1476,11 @@ class TradingAgentV3:
             # "nothing to trade" - and the honest empty case is the common one
             # whenever a venue is down or unconfigured.
             empty_venues = {vid: 0 for vid in markets_by_venue} or {}
+            # ...and the sports lane still runs. Its feed is not the prediction
+            # markets' feed, and "no prediction markets" is not a reason to skip
+            # the half of the product that has fixtures today.
+            sports_block = await self._run_sports_lane(
+                "paper" if self.dry_run else "live")
             no_markets_result = {
                 "status": "no_markets",
                 "reason": "No markets discovered from any venue",
@@ -1355,8 +1515,20 @@ class TradingAgentV3:
                 "settlement": (settlement_report.to_dict()
                                if settlement_report else None),
                 "alpha": {},
-                "betting": {"ok": False, "events": 0, "data_mode": "none",
-                            "blockers": ["no markets discovered"]},
+                # The sports lane ran on its OWN feed and its result belongs here:
+                # a cycle with no prediction markets is not a cycle with nothing
+                # to do, and the operator's button must show what it did.
+                "sports": sports_block,
+                "betting": {
+                    "ok": bool(sports_block.get("opportunities")),
+                    "events": sports_block.get("opportunities") and None or 0,
+                    "opportunities": sports_block.get("opportunities", 0),
+                    "executable": sports_block.get("executable", 0),
+                    "bets_placed": sports_block.get("bets_placed", 0),
+                    "data_mode": self.data_mode.value,
+                    "blockers": (["no prediction markets discovered"]
+                                 + (sports_block.get("blockers") or []))[:3],
+                },
                 "execution": [],
                 "do_nothing_success": True,
                 "reasoning": ("No markets discovered from any venue, so no opportunities were "
@@ -1385,28 +1557,21 @@ class TradingAgentV3:
             logger.warning(f"Alpha scan failed: {e}")
             alpha_results = {"error": str(e)}
 
+        # Which purse a SPORTS bet would come out of. `dry_run` is the flag that
+        # propagates to every adapter and decides whether an order could really
+        # leave - and no sports book has an order path at all, so in practice this
+        # is always "paper" today. It is read rather than hardcoded so the label
+        # is the same one the prediction trades carry, from the same source.
+        execution_mode = "paper" if self.dry_run else "live"
         # Betting / sports exchange scan - full match card, not just 1X2.
         # Runs in LIVE_SHADOW by default: it prices goals, corners, cards,
         # handicaps, halves and props, but no capital deploys unless the mode
         # is LIVE and account health is verified.
-        betting_results: Dict[str, Any] = {}
-        try:
-            betting_results = await self.betting_engine.run_cycle(
-                leagues=("nba", "epl"),
-                data_mode=self.data_mode,
-                # Real capital needs a verified account. Until the account-health
-                # probe can actually place and cancel an order this stays False,
-                # so a live data mode cannot by itself deploy money.
-                account_health_ok=False,
-            )
-            logger.info(
-                f"Betting scan: {betting_results.get('events', 0)} fixtures, "
-                f"{betting_results.get('opportunities', 0)} markets priced, "
-                f"{betting_results.get('executable', 0)} executable")
-        except Exception as e:
-            logger.warning(f"Betting scan failed: {e}")
-            betting_results = {"error": str(e)}
-        
+        # THE SPORTS LANE. Separate feed, separate model, same lifecycle as the
+        # prediction path - and it runs even when prediction discovery finds
+        # nothing, which is why it is a method rather than an inline block.
+        sports_block = await self._run_sports_lane(execution_mode)
+
         # V3 Strategy Engine: venue × market × strategy
         # Core Objective Step 3: Measures the opportunity on a common risk-adjusted basis
         logger.info("Core Objective Step 3: Measuring opportunity on common risk-adjusted basis: expected_edge × prob_correct × liquidity × execution × calibration × time / (fees+slippage+uncertainty+risk)")
@@ -2222,18 +2387,20 @@ class TradingAgentV3:
             },
             "alpha": alpha_results,
             "betting": {
-                "ok": betting_results.get("ok", False),
-                "events": betting_results.get("events", 0),
-                "markets_scanned_by_type": betting_results.get("markets_scanned_by_type", {}),
-                "cards_priced": betting_results.get("cards_priced", 0),
-                "market_types_available": betting_results.get("market_types_available", 0),
-                "opportunities": betting_results.get("opportunities", 0),
-                "executable": betting_results.get("executable", 0),
-                "arbs": betting_results.get("arbs", 0),
-                "data_mode": betting_results.get("data_mode", "unknown"),
-                "sharpness": betting_results.get("sharpness", {}),
-                "blockers": betting_results.get("blockers", [])[:3],
+                "ok": bool(sports_block.get("opportunities")),
+                "events": (sports_block.get("placement") or {}).get("events")
+                          or self._sports_events_seen(),
+                "market_types_available": sports_block.get("market_types_available", 0),
+                "opportunities": sports_block.get("opportunities", 0),
+                "executable": sports_block.get("executable", 0),
+                "bets_placed": sports_block.get("bets_placed", 0),
+                # Kept for the readers that ask for them. What the lane settled
+                # is on `sports` - this summary is the headline, not the ledger.
+                "arbs": 0,
+                "data_mode": self.data_mode.value,
+                "blockers": sports_block.get("blockers", []),
             },
+            "sports": sports_block,
             "execution": execution_results,
             # Which venue the money is on, and why. Computed from the evidence
             # this cycle gathered: qualification, the balances the health engine
@@ -2244,6 +2411,13 @@ class TradingAgentV3:
             "do_nothing_success": len(final_trades) == 0
         }
         
+        # The settlement pass ran before the scan; attach its outcome to the block
+        # the operator will read, so "settled 2" is not a log line nobody sees.
+        if isinstance(sports_block, dict):
+            sports_block["settlement"] = getattr(
+                self, "_sports_settlement_this_cycle", None)
+            sports_block["book"] = self.sports_book.summary()
+
         # Record the scan row the console's System Health reads ("Last Scan",
         # "Agent: Running") and the /api/scans history is built from. Every
         # legacy loop wrote this row; the V3 loop - the one `ptai run`
@@ -3495,6 +3669,134 @@ class TradingAgentV3:
         "blocked": "blocked by the risk check",
         "sleeping": "waiting for the next cycle",
     }
+
+    def storage_data_dir(self) -> str:
+        """The folder the database lives in - where the vault lives beside it."""
+        try:
+            return str(Path(getattr(self.storage, "db_path", "./data/ptai.db")).parent)
+        except Exception:  # noqa: BLE001
+            return "./data"
+
+    async def _run_sports_lane(self, execution_mode: str) -> Dict[str, Any]:
+        """
+        Price the sports card, place what passes, and report the ratings.
+
+        A METHOD because this lane does not depend on prediction-market
+        discovery at all, and it used to be unreachable whenever that discovery
+        came back empty: the cycle returned early with "no markets" and the
+        sports feed - a completely different provider - was never asked. On a
+        fresh install with no venue credentials that is exactly when the
+        simulation needs to run, and it was the one thing that never did.
+        """
+        events: List[Any] = []
+        try:
+            events = await self.betting_engine.data.fetch_events(("nba", "epl"))
+            self._sports_fixtures = list(events)
+            self._sports_rating_update = self.sports_ratings.update(events)
+            strengths, ratings = self.sports_ratings.engine_inputs(events)
+            if ratings:
+                logger.info(
+                    f"[sports] model inputs: {len(ratings)} fixture(s) have a "
+                    f"rating on BOTH sides "
+                    f"({self.sports_ratings.snapshot()['rated_teams']} rated "
+                    f"team(s) in total)")
+            else:
+                logger.info(
+                    "[sports] no fixture has a rating on both sides yet, so the "
+                    "models have no independent view and will not claim an edge - "
+                    "ratings are built from finished results, three each")
+            betting_results = await self.betting_engine.run_cycle(
+                leagues=("nba", "epl"),
+                data_mode=self.data_mode,
+                # Real capital needs a verified account. Until the account-health
+                # probe can actually place and cancel an order this stays False,
+                # so a live data mode cannot by itself deploy money.
+                account_health_ok=False,
+                strengths=strengths,
+                ratings=ratings,
+                events=events,
+            )
+            logger.info(
+                f"Betting scan: {betting_results.get('events', 0)} fixtures, "
+                f"{betting_results.get('opportunities', 0)} markets priced, "
+                f"{betting_results.get('executable', 0)} executable")
+        except Exception as e:  # noqa: BLE001
+            self._sports_rating_update = {"error": str(e)}
+            logger.warning(f"Betting scan failed: {e}")
+            betting_results = {"error": str(e), "ok": False}
+
+        try:
+            paper_bankroll = float(self.storage.get_paper_bankroll() or 0.0)
+            self._sports_placement = self.sports_book.place(
+                betting_results,
+                execution_mode=(execution_mode if betting_results.get("ok")
+                                else "paper"),
+                bankroll=paper_bankroll,
+                guard=self.money_guard,
+                limit=1,
+            )
+            for bet in self._sports_placement.get("bets") or []:
+                # Draw the stake from the PAPER purse as it is placed, so paper
+                # equity reflects money committed the way the prediction path's
+                # fills do - a paper bankroll that ignores its sports bets would
+                # be a second, disagreeing account.
+                if bet.get("execution_mode") == "paper":
+                    self.storage.set_paper_bankroll(
+                        float(self.storage.get_paper_bankroll() or 0.0)
+                        - float(bet["stake_usd"] or 0))
+        except Exception as e:  # noqa: BLE001
+            self._sports_placement = {"placed": 0,
+                                      "error": f"{type(e).__name__}: {e}"}
+            logger.warning(f"[sports] placement failed: {type(e).__name__}: {e}")
+
+        return {
+            "bets_placed": self._sports_placement.get("placed", 0),
+            "placement": self._sports_placement,
+            "settlement": None,
+            "ratings": self.sports_ratings.snapshot(),
+            "ratings_update": self._sports_rating_update,
+            "book": self.sports_book.summary(),
+            "market_types_available": betting_results.get("market_types_available", 0),
+            "opportunities": betting_results.get("opportunities", 0),
+            "executable": betting_results.get("executable", 0),
+            "blockers": (betting_results.get("blockers") or [])[:3],
+            "how_a_bet_works": ("quoted from a real feed, placed as a position, "
+                                "settled on the final score, P&L written through "
+                                "the same learning record as every trade"),
+        }
+
+    def _sports_events_for_settlement(self):
+        """The fixtures this cycle already fetched, if it fetched any."""
+        return getattr(self, "_sports_fixtures", None)
+
+    def _sports_events_seen(self) -> int:
+        return len(self._sports_fixtures or [])
+
+    def _credit_sports_settlements(self, settlement: Dict[str, Any]) -> None:
+        """
+        Return the stake and the profit to the paper purse.
+
+        Without this the stake would leave the paper bankroll at placement and
+        never come back - a simulation that loses every bet by construction.
+        """
+        credited = 0.0
+        for row in settlement.get("bets") or []:
+            if row.get("status") not in ("won", "lost", "void"):
+                continue
+            # PAPER only. A live bet's stake and winnings come back into the
+            # venue account, not into the local simulation's purse - crediting
+            # them here would inflate the paper bankroll with real money.
+            if row.get("execution_mode") != "paper":
+                continue
+            # The stake is money that belongs to the account again; the P&L is
+            # what it earned or lost while it was committed.
+            credited += float(row.get("stake_usd") or 0.0) + float(row.get("pnl") or 0.0)
+        if credited:
+            before = float(self.storage.get_paper_bankroll() or 0.0)
+            self.storage.set_paper_bankroll(before + credited)
+            logger.info(f"[sports] paper purse: ${before:.2f} -> "
+                        f"${self.storage.get_paper_bankroll():.2f} "
+                        f"(stakes returned and P&L applied)")
 
     def _set_phase(self, phase: str, detail: Optional[str] = None,
                    next_cycle_at: Optional[str] = None) -> None:

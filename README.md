@@ -260,6 +260,30 @@ Three things do, each consulted immediately before an order is dispatched:
 
 `python main.py doctor` reports all three before you fund anything.
 
+## Logins, Venues, And The Sports Lane
+
+**Logins** are saved in the console's Setup tab and kept encrypted in
+`data/vault.json` on this machine. The agent applies them when it starts AND at
+the top of every cycle, so one saved while the agent is running takes effect on
+the next cycle - no restart. A saved value wins over `.env` (which still works);
+each field shows which source is in force, and secrets are masked. Betfair,
+Kalshi, Polymarket, The Odds API and football-data.org all read from there.
+
+**Venues** have a switch, on the Setup tab: every venue PTAI knows about, with
+"use it" on or off. Off means the agent does not ask it for markets and does not
+trade it - logged as your choice, not as a failure. On still has to pass every
+safety check: funded, qualified, inside the loss limits.
+
+**The sports lane** runs the same lifecycle as the trading side - quoted from a
+real feed, placed as a position, settled on the final score, P&L written through
+the same learning record, and visible on the Money tab. Two rules it holds to:
+a bet is refused at placement if its market cannot be settled from a score
+(corners, cards, both-teams-to-score, quarter-line handicaps - with the reason on
+it), and a bet is settled only on a result a feed reported - an unreadable result
+leaves it OPEN rather than refunding it. Team ratings are Elo built from finished
+results (three per team before a rating exists), which is what gives the sports
+models an independent view to bet against a price with.
+
 ## Browser Execution
 
 - Persistent profile: `./browser/profiles/default` — stays logged in to Polymarket, X

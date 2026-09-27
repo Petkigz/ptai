@@ -8,7 +8,7 @@ import os
 import base64
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from loguru import logger
 import hashlib
@@ -21,6 +21,19 @@ class ToolCredentials:
     created_at: str
     last_used: Optional[str] = None
     is_encrypted: bool = False
+    # Which of `credentials` must be encrypted. The caller says so, because the
+    # old rule - "encrypt the values whose key NAME contains PRIVATE/KEY/TOKEN" -
+    # wrote a Betfair `password` and a Kalshi `api_secret` to disk in the clear.
+    # A secret is whatever the schema calls a secret, not whatever its name
+    # happens to look like.
+    secret_fields: List[str] = field(default_factory=list)
+
+    def secrets(self) -> set:
+        by_name = {k for k in self.credentials
+                   if isinstance(k, str)
+                   and ("PRIVATE" in k.upper() or "KEY" in k.upper()
+                        or "TOKEN" in k.upper() or "SECRET" in k.upper())}
+        return set(self.secret_fields or ()) | by_name
 
 class Vault:
     """
@@ -74,13 +87,17 @@ class Vault:
                     for key, cred_dict in data.items():
                         # Decrypt credentials if encrypted
                         creds = cred_dict.get("credentials", {})
-                        # Try decrypt sensitive fields
+                        record = ToolCredentials(**cred_dict)
+                        # Decrypt the fields this record declares secret, plus the
+                        # ones the old name rule would have encrypted. A value that
+                        # is plaintext on disk (written before the rule existed, or
+                        # by hand) stays readable rather than being lost.
                         decrypted_creds = {}
                         for k, v in creds.items():
-                            if isinstance(v, str) and ("PRIVATE" in k or "KEY" in k or "TOKEN" in k):
+                            if isinstance(v, str) and k in record.secrets():
                                 try:
                                     decrypted_creds[k] = self._decrypt(v)
-                                except:
+                                except Exception:
                                     decrypted_creds[k] = v
                             else:
                                 decrypted_creds[k] = v
@@ -97,8 +114,9 @@ class Vault:
                 cred_dict = asdict(cred)
                 # Encrypt sensitive fields
                 encrypted_creds = {}
+                secrets = cred.secrets()
                 for k, v in cred_dict["credentials"].items():
-                    if isinstance(v, str) and ("PRIVATE" in k or "KEY" in k or "TOKEN" in k) and v:
+                    if isinstance(v, str) and k in secrets and v:
                         encrypted_creds[k] = self._encrypt(v)
                         cred_dict["is_encrypted"] = True
                     else:
@@ -112,14 +130,17 @@ class Vault:
         except Exception as e:
             logger.error(f"Vault save failed: {e}")
     
-    def store_tool_credentials(self, teammate: str, tool: str, credentials: Dict[str, Any]):
+    def store_tool_credentials(self, teammate: str, tool: str,
+                               credentials: Dict[str, Any],
+                               secret_fields: Optional[List[str]] = None):
         key = f"{teammate}:{tool}"
         cred = ToolCredentials(
             teammate=teammate,
             tool=tool,
             credentials=credentials,
             created_at=datetime.now(timezone.utc).isoformat(),
-            is_encrypted=False
+            is_encrypted=False,
+            secret_fields=list(secret_fields or []),
         )
         self.credentials[key] = cred
         self.save()

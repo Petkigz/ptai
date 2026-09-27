@@ -202,7 +202,8 @@ class BettingEngine:
                         data_mode: DataMode = DataMode.LIVE_SHADOW,
                         strengths: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
                         ratings: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
-                        account_health_ok: bool = False) -> Dict[str, Any]:
+                        account_health_ok: bool = False,
+                        events: Optional[Sequence[SportsEvent]] = None) -> Dict[str, Any]:
         """
         One betting cycle.
 
@@ -215,7 +216,11 @@ class BettingEngine:
         ratings = ratings or {}
         t0 = datetime.now(timezone.utc)
 
-        events = await self.data.fetch_events(leagues)
+        # Fixtures may be supplied by the caller, which is how the trading loop
+        # feeds in the ratings it just built from the SAME payload: fetching
+        # twice would cost another round trip per cycle and could hand the model
+        # ratings for fixtures it is not pricing.
+        events = list(events) if events is not None else await self.data.fetch_events(leagues)
         if not events:
             # "No fixtures today" and "every feed refused us" are different facts
             # and the operator needs to see which one they have. The old message

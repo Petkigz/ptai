@@ -121,6 +121,23 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="http://localhost:1234/v1", alias="OPENAI_BASE_URL")
     use_local_llm: bool = Field(default=True, alias="USE_LOCAL_LLM")
 
+    # SPORTS FEEDS
+    #
+    # `SportsDataEngine` read `settings.the_odds_api_key` and
+    # `settings.football_data_token`, which were NOT fields on this class - so
+    # they could only ever be empty, while the engine's own error message told
+    # the operator to "add THE_ODDS_API_KEY or FOOTBALL_DATA_TOKEN in Setup".
+    # There was no Setup and there was no way for a key to arrive. They exist now,
+    # and the console's Setup tab writes them into the vault, which fills these
+    # two on every cycle.
+    the_odds_api_key: Optional[str] = Field(default=None, alias="THE_ODDS_API_KEY")
+    football_data_token: Optional[str] = Field(default=None, alias="FOOTBALL_DATA_TOKEN")
+
+    # Betfair Exchange - the feed that carries corners, cards and goals
+    betfair_username: Optional[str] = Field(default=None, alias="BETFAIR_USERNAME")
+    betfair_password: Optional[str] = Field(default=None, alias="BETFAIR_PASSWORD")
+    betfair_app_key: Optional[str] = Field(default=None, alias="BETFAIR_APP_KEY")
+
     # X
     sentiment_use_x: bool = Field(default=True, alias="SENTIMENT_USE_X")
     x_use_snscrape: bool = Field(default=True, alias="X_USE_SNSCRAPE")
