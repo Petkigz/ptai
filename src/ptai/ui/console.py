@@ -935,6 +935,36 @@ async def api_set_venue_switch(request: Request) -> JSONResponse:
     })
 
 
+@app.get("/api/console/forecast")
+async def api_forecast() -> JSONResponse:
+    """
+    Why the fair value is what it is, component by component.
+
+    The LLM said 65%, the ensemble said 58%, and nothing in the console could
+    say what happened in between or which inputs were even present. This is that
+    answer: the chain for each priced market, the cheap-screen decision that
+    decided which markets got model time, and whether the base-rate component had
+    real counted frequencies behind it.
+    """
+    storage = get_storage()
+    evidence: Dict[str, Any] = {}
+    try:
+        raw = storage.get_state("intelligence.last_forecast_evidence")
+        if raw:
+            evidence = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"available": False,
+                             "reason": f"could not read the last cycle's "
+                                       f"evidence: {type(e).__name__}: {e}"})
+    if not evidence:
+        return JSONResponse({
+            "available": False,
+            "reason": ("no cycle has stored forecast evidence yet - run one cycle "
+                       "and this fills in"),
+        })
+    return JSONResponse({"available": True, **evidence})
+
+
 @app.get("/api/console/sports")
 async def api_sports() -> JSONResponse:
     """
@@ -1049,6 +1079,11 @@ async def api_run_cycle(request: Request) -> JSONResponse:
             "blockers": (sports.get("blockers") or [])[:3],
             "how_a_bet_works": sports.get("how_a_bet_works", ""),
         },
+        # Where the model time went: how many markets were read, how many got
+        # deep analysis, and what the base-rate component actually had.
+        "deep_analysis": result.get("deep_analysis") or {},
+        "base_rates": result.get("base_rates") or {},
+        "pricing": (result.get("pricing") or [])[:5],
         "markets_scanned": len((result.get("markets") or {})) or None,
         "executed": len([e for e in execution if e.get("position_recorded")]),
         "orders_tracked": len([e for e in execution if e.get("order_recorded")]),
@@ -1340,6 +1375,16 @@ section[id]{scroll-margin-top:132px}
           an unmeasured venue is not a zero, and it is not a winner either.
         </div>
       </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Why the fair value is what it is</h2>
+      <div class="note" style="margin-bottom:11px">
+        <p>Every component of the forecast, with the probability it wanted, the
+          confidence it claimed and the weight it actually got. The chain runs
+          market price &rarr; the LLM's own answer &rarr; the weighted ensemble
+          &rarr; calibrated &rarr; conservative.</p>
+      </div>
+      <div id="forecast"></div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>Sports bets &mdash; priced, placed, settled</h2>
@@ -2033,6 +2078,11 @@ async function runCycle(){
           ? 'Why: '+(sp.blockers||[]).map(b=>esc(b)).join(' &middot; ')
           : 'The lane prices fixtures but only bets where it has its own view and a price to beat, and it only settles on a result a feed reported.'}</div>`;
   $('cycleOut').innerHTML = `
+    ${body.deep_analysis && body.deep_analysis.considered
+      ? `<div class="note">Model time: ${((body.deep_analysis.shortlist)||[]).length}
+          of ${body.deep_analysis.considered} market(s) deep-analysed
+          (limit ${body.deep_analysis.limit}); ${body.deep_analysis.screened_out||0}
+          priced on their measured book only.</div>` : ''}
     <div><b>${body.status||''}</b> &mdash; ${body.executed||0} position(s) recorded,
       ${body.orders_tracked||0} order(s) tracked for reconciliation.</div>
     <div class="note" style="margin-top:7px">
@@ -2152,6 +2202,60 @@ async function setVenue(venue_id, enabled){
     body:JSON.stringify({venue_id, enabled})});
   if(!ok){ alert(body.error||'could not save the switch'); return; }
   loadVenueSwitches();
+}
+
+// ---- why the fair value ----
+//
+// The chain, term by term. "The LLM says 65% and the ensemble says 58%" was
+// unanswerable in this console; each component now shows its own number, the
+// confidence it claimed, and the weight it got - including the components that
+// contributed NOTHING, with the reason (no data, blocked, not in the shortlist).
+async function loadForecast(){
+  const {body} = await api('/api/console/forecast');
+  if(!body.available){
+    $('forecast').innerHTML = `<div class="note">${esc(body.reason||'unavailable')}</div>`;
+    return;
+  }
+  const screen = body.deep_analysis || {};
+  const br = body.base_rates || {};
+  const rows = body.pricing || [];
+
+  const screenLine = screen.considered
+    ? `<div class="note">Model time went to <b>${(screen.shortlist||[]).length}</b>
+        of ${screen.considered} market(s) this cycle (limit ${screen.limit||'?'},
+        books read in ${screen.seconds||0}s). ${screen.screened_out||0} were priced
+        on their measured book only &mdash; not on model opinion.</div>`
+    : `<div class="note">${esc(screen.criteria||'no screen has run yet')}</div>`;
+
+  const cats = Object.entries(br.categories||{}).filter(e => e[1].usable);
+  const baseLine = br.available
+    ? `<div class="note">Base rates: real frequencies counted from
+        ${(br.markets_read||0)} closed market(s)
+        (${cats.map(e => `${esc(e[0])} ${(e[1].rate*100).toFixed(0)}% n=${e[1].n}`).join(', ')}).</div>`
+    : `<div class="note warn">Base rates: ${esc(br.reason||'no dataset')}</div>`;
+
+  const trace = rows.length ? rows.map(r => {
+    const comps = (r.components||[]).map(c => `
+      <tr><td class="mono">${esc(c.model)}</td>
+          <td class="mono">${Number(c.probability).toFixed(3)}</td>
+          <td class="mono">${Number(c.confidence).toFixed(2)}</td>
+          <td class="mono">${c.contributes
+              ? Math.round(100*Number(c.weight_share||0))+'%'
+              : '<span class="warn">0%</span>'}</td>
+          <td class="note">${esc(c.note || (c.reasoning||'').slice(0,90))}</td></tr>`).join('');
+    return `<div class="card" style="margin-bottom:11px">
+      <div><b>${esc(r.market_id)}</b> <span class="note">${esc(r.question||'')}</span></div>
+      <div class="mono note" style="margin:7px 0">${esc(r.explain||'')}</div>
+      <table><thead><tr><th>Component</th><th>Probability</th><th>Confidence</th>
+        <th>Weight</th><th>Why</th></tr></thead><tbody>${comps}</tbody></table>
+    </div>`;
+  }).join('') : `<div class="note">No market reached the forecast stage this
+      cycle, so there is no chain to show. That is a statement about discovery,
+      not about the models.</div>`;
+
+  $('forecast').innerHTML = screenLine + baseLine
+    + `<div class="note" style="margin:7px 0 11px">${esc(screen.criteria||'')}</div>`
+    + trace;
 }
 
 // ---- sports bets ----
@@ -2432,7 +2536,7 @@ async function loadAll(){
     await Promise.all([
       loadAgent(), loadStatus(), loadBrainSetup(),
       loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
-      loadLogins(), loadVenueSwitches(), loadSports(),
+      loadLogins(), loadVenueSwitches(), loadSports(), loadForecast(),
     ]);
     spyScroll();
   } finally {

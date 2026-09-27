@@ -121,6 +121,14 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="http://localhost:1234/v1", alias="OPENAI_BASE_URL")
     use_local_llm: bool = Field(default=True, alias="USE_LOCAL_LLM")
 
+    # TWO-STAGE SCAN
+    #
+    # One LLM call per market took 60-75 seconds in the operator's 2026-09-27
+    # log, which cannot fit a 10-minute cycle. The cycle now reads every book
+    # cheaply, ranks on measurable execution quality, and spends X, web research
+    # and the LLM only on this many markets per cycle.
+    deep_analysis_limit: int = Field(default=8, alias="PTAI_DEEP_MARKETS")
+
     # SPORTS FEEDS
     #
     # `SportsDataEngine` read `settings.the_odds_api_key` and

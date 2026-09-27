@@ -234,6 +234,35 @@ class PolymarketClient:
             logger.debug(f"Midpoint fetch failed {token_id}: {e}")
             return None
 
+    def fetch_closed_markets(self, limit: int = 500, offset: int = 0) -> List[Dict]:
+        """
+        Closed markets, newest and busiest first - the raw material for base rates.
+
+        This is the evidence the base-rate model was missing. `outcomePrices` on a
+        closed market is the settlement mark (`["1","0"]` = YES), so a page of
+        these is a real frequency rather than a constant. Returns [] on failure:
+        a network problem is not a reason to publish a base rate.
+        """
+        try:
+            resp = self.session.get(
+                f"{self.gamma_api}/markets",
+                params={"closed": "true", "limit": min(int(limit), 500),
+                        "offset": int(offset), "order": "volume",
+                        "ascending": "false"},
+                timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"Closed-market fetch failed (base rates): {e}")
+            return []
+        if isinstance(data, dict):
+            for key in ("markets", "data"):
+                inner = data.get(key)
+                if isinstance(inner, list):
+                    return inner
+            return []
+        return data if isinstance(data, list) else []
+
     def get_market_resolution(self, market_id: str) -> Optional[Dict]:
         """
         Ask the Gamma API whether a market has closed and how it settled.

@@ -171,6 +171,15 @@ class StrategyEngineV3:
                 f"edge {fv_result.edge:+.3f}, conf {fv_result.confidence:.2f})"
                 + (f" - {fv_result.reasoning.split('Decision: ', 1)[-1].split(' | ')[0]}"
                    if not fv_result.should_trade else ""))
+            # ...and HOW that fair value was built, term by term. The operator
+            # could see the LLM say 65% and the ensemble say 58% with nothing in
+            # between; this is the between.
+            _fc = getattr(fv_result, "forecast_result", None)
+            if _fc is not None:
+                try:
+                    logger.info(f"  why {market.id}: {_fc.explain()}")
+                except Exception as _e:  # noqa: BLE001
+                    logger.debug(f"could not explain {market.id}: {_e}")
             # The opportunity is built on the hunt criterion plus a positive
             # post-cost edge. A 5% POST-COST floor also stood here, so the same
             # profitable NO trade (effective 0.028) was refused before it existed
@@ -217,6 +226,14 @@ class StrategyEngineV3:
                     resolution_risks=fv_result.resolution_analysis.risks if fv_result.resolution_analysis else [],
                     should_trade=fv_result.should_trade
                 )
+                # The chain travels WITH the opportunity, so the operator's
+                # console can show which component said what for the trades that
+                # were actually proposed - not only for the ones in the log file.
+                _fc = getattr(fv_result, "forecast_result", None)
+                if _fc is not None:
+                    opp.raw["fair_value_chain"] = dict(getattr(_fc, "chain", {}) or {})
+                    opp.raw["components"] = list(getattr(_fc, "components", []) or [])
+                    opp.raw["explain"] = _fc.explain()
                 opp.calculate_common_score()
                 # Tag strategy
                 opp.raw = {"strategy": "mispricing", "venue": venue_id_str}

@@ -510,6 +510,17 @@ class TradingAgentV3:
         self._sports_rating_update: Dict[str, Any] = {}
         self._sports_placement: Dict[str, Any] = {}
         self._sports_settlement_this_cycle: Optional[Dict[str, Any]] = None
+        # Two-stage scan state: books read in the cheap pass, and the markets the
+        # deep pass (X, web research, LLM) is allowed to spend time on.
+        self._cycle_books: Dict[str, Any] = {}
+        self._deep_market_ids: set = set()
+        self._deep_shortlist_active = False
+        self._screen: Dict[str, Any] = {}
+        # Base rates: real counted frequencies, refreshed at most once a day.
+        self.base_rates = None
+        self._base_rate_refresh = {"attempted_at": "", "ok": False, "reason": ""}
+        self.deep_analysis_limit = max(1, int(
+            getattr(self.settings, "deep_analysis_limit", 8) or 8))
         self.kill_switch = KillSwitch(data_dir=self.data_dir)
         self.limits_engine = LimitsEngine(
             limits=TradeLimits(
@@ -770,6 +781,134 @@ class TradingAgentV3:
         )
         return markets_by_venue, qual_report
 
+    # How many markets a cycle will spend deep analysis on, and how many it will
+    # even look at before choosing. The operator's 2026-09-27 log showed 60-75
+    # seconds per market of LLM time, one market at a time, which no 10-minute
+    # interval can absorb. Deep analysis is now spent where it can change an
+    # answer, and the rest of the scan is cheap.
+    PRESCAN_LIMIT = 200
+    PRESCAN_CONCURRENCY = 8
+
+    def _screen_score(self, market: Market, book: Dict[str, Any]) -> tuple:
+        """
+        A cheap, explainable reason to look closely at this market.
+
+        No model runs here, so this cannot claim an edge - it scores whether the
+        market is PRICEABLE (a validated two-sided book) and whether there is
+        enough liquidity and volume for a small order to mean anything. Markets
+        that cannot be priced are not worth 70 seconds of LLM time, and markets
+        nobody trades are not either.
+        """
+        if not isinstance(book, dict) or not book.get("validated", False):
+            why = ((book or {}).get("validation") or {}).get("identity") \
+                or ((book or {}).get("warning") or "no validated orderbook")
+            return -1.0, f"book not validated: {str(why)[:120]}"
+        spread = book.get("spread")
+        if spread is None:
+            return -1.0, "no measured spread"
+        if spread > self.strategy_engine_v3.max_spread:
+            return -1.0, (f"spread {spread:.1%} is wider than the "
+                          f"{self.strategy_engine_v3.max_spread:.0%} this system "
+                          f"will trade")
+        depth = float(book.get("depth") or 0.0)
+        liquidity_score = min(1.0, (float(market.liquidity) + depth) / 20000.0)
+        book_quality = max(0.0, 1.0 - float(spread) / 0.10)
+        volume_score = min(1.0, float(market.volume_24h) / 20000.0)
+        score = 0.45 * liquidity_score + 0.40 * book_quality + 0.15 * volume_score
+        return round(score, 6), (
+            f"liquidity {liquidity_score:.2f}, book quality {book_quality:.2f} "
+            f"(spread {float(spread):.1%}), volume {volume_score:.2f}")
+
+    async def _prescan_and_rank(self, markets: List[Market]) -> Dict[str, Any]:
+        """
+        Stage 1 of the scan: read every book cheaply, then rank.
+
+        Fetching one orderbook per market is milliseconds; asking a local model
+        to think about each market is 60-75 seconds. Doing the expensive one on
+        every market is what made a 10-minute cycle impossible, so the cycle now
+        reads books for many markets, ranks them on measurable execution quality
+        and liquidity, and spends the deep analysis - X, web research and the LLM -
+        only on the shortlist.
+        """
+        self._cycle_books = {}
+        self._deep_market_ids = set()
+        self._deep_shortlist_active = False
+
+        candidates = []
+        try:
+            candidates = self.strategy_engine_v3.cheap_filters(list(markets))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Cheap screen filters failed, using every market: "
+                           f"{type(e).__name__}: {e}")
+            candidates = list(markets)
+        candidates = candidates[:self.PRESCAN_LIMIT]
+        if not candidates:
+            self._screen = {"considered": 0, "limit": self.deep_analysis_limit,
+                            "shortlist": [], "screened_out": 0,
+                            "criteria": "no market passed the cheap filters"}
+            logger.info("Cheap screen: no market passed the cheap filters "
+                        "(volume/liquidity/active) - nothing to deep-analyse")
+            return self._screen
+
+        semaphore = asyncio.Semaphore(self.PRESCAN_CONCURRENCY)
+
+        async def read_book(market: Market):
+            async with semaphore:
+                try:
+                    adapter = self.venue_registry.get_adapter_for_market(market)
+                    if not adapter:
+                        return market, None, "no adapter for this market"
+                    return market, await adapter.get_orderbook(market), ""
+                except Exception as e:  # noqa: BLE001
+                    return market, None, f"{type(e).__name__}: {str(e)[:120]}"
+
+        started = time.time()
+        try:
+            results = await asyncio.gather(*(read_book(m) for m in candidates))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Prescan failed: {type(e).__name__}: {e}")
+            results = []
+
+        ranked = []
+        for market, book, error in results:
+            if book is not None:
+                self._cycle_books[market.id] = book
+            score, why = self._screen_score(market, book or {})
+            if error and not book:
+                why = error
+            ranked.append((score, market, why))
+        ranked.sort(key=lambda row: row[0], reverse=True)
+
+        shortlist = [row for row in ranked if row[0] >= 0][:self.deep_analysis_limit]
+        self._deep_market_ids = {row[1].id for row in shortlist}
+        self._deep_shortlist_active = True
+        self._screen = {
+            "considered": len(candidates),
+            "books_read": len(self._cycle_books),
+            "limit": self.deep_analysis_limit,
+            "seconds": round(time.time() - started, 1),
+            "shortlist": [{"market_id": m.id, "venue": str(getattr(m, "source", "")),
+                           "question": (m.question or "")[:90],
+                           "score": score, "why": why}
+                          for score, m, why in shortlist],
+            "screened_out": len(ranked) - len(shortlist),
+            "screened_out_reasons": (
+                "deep analysis - X sentiment, web research and the LLM - is limited "
+                "to the shortlist above. Every other market was still read, priced "
+                "on its measured book, and simply not given model time this cycle."),
+            "criteria": ("validated two-sided book, spread inside the tradable "
+                         "limit, then liquidity, book quality and volume"),
+        }
+        logger.info(
+            f"Cheap screen: {len(candidates)} market(s) read in "
+            f"{self._screen['seconds']}s, {len(shortlist)} chosen for deep analysis "
+            f"(limit {self.deep_analysis_limit}), {self._screen['screened_out']} "
+            f"priced on the cheap context only")
+        for row in self._screen["shortlist"][:5]:
+            logger.info(f"  deep {row['market_id']}: {row['why']} "
+                        f"(score {row['score']})")
+        return self._screen
+
     async def get_context(self, market: Market) -> Dict[str, Any]:
         """
         The name the strategy engine calls.
@@ -813,6 +952,107 @@ class TradingAgentV3:
                else ""))
         return await self.get_context_for_market(market)
 
+    BASE_RATES_REFRESH_HOURS = 24.0
+
+    def _refresh_base_rates(self, force: bool = False) -> Dict[str, Any]:
+        """
+        Count YES frequencies from closed markets, at most once a day.
+
+        Cheap (one paged GET), real (they are settled), and refreshed rather than
+        recomputed per cycle. A failure keeps yesterday's dataset instead of
+        emptying it - and if there is none, the model keeps saying "no data".
+        """
+        from ..intelligence.base_rates import BaseRateBook
+
+        book = self.base_rates or BaseRateBook(storage=self.storage)
+        self.base_rates = book
+
+        if not force and book.dataset.get("built_at"):
+            try:
+                from datetime import datetime, timezone
+                built = datetime.fromisoformat(book.dataset["built_at"])
+                age_hours = (datetime.now(timezone.utc) - built).total_seconds() / 3600.0
+                if age_hours < self.BASE_RATES_REFRESH_HOURS:
+                    self._base_rate_refresh = {
+                        "attempted_at": book.dataset["built_at"], "ok": True,
+                        "reason": f"dataset is {age_hours:.1f}h old (refreshes every "
+                                  f"{self.BASE_RATES_REFRESH_HOURS:.0f}h)"}
+                    return self._base_rate_refresh
+            except (TypeError, ValueError):
+                pass
+
+        from datetime import datetime, timezone
+        attempted = datetime.now(timezone.utc).isoformat()
+        rows = []
+        try:
+            client = getattr(self, "polymarket_client", None)
+            if client is None:
+                from ..markets.polymarket import PolymarketClient
+                client = PolymarketClient()
+                self.polymarket_client = client
+            rows = client.fetch_closed_markets(limit=500)
+        except Exception as e:  # noqa: BLE001
+            rows = []
+            logger.warning(f"Could not fetch closed markets for base rates: "
+                           f"{type(e).__name__}: {e}")
+
+        if not rows:
+            self._base_rate_refresh = {
+                "attempted_at": attempted, "ok": False,
+                "reason": ("no closed markets returned - the base-rate model "
+                           "keeps contributing no weight rather than a constant"),
+            }
+            if not book.dataset:
+                logger.info("Base rates: no dataset and nothing fetched this "
+                            "cycle - the base-rate component stays absent")
+            return self._base_rate_refresh
+
+        book.build_from_markets(rows, source="Polymarket closed markets (Gamma)")
+        stored = book.save()
+        self._base_rate_refresh = {
+            "attempted_at": attempted, "ok": True,
+            "markets_read": len(rows), "stored": stored,
+            "categories_usable": [c for c, v in
+                                  (book.dataset.get("categories") or {}).items()
+                                  if v.get("usable")],
+            "reason": "",
+        }
+        return self._base_rate_refresh
+
+    def _base_rate_prior_for(self, category: str):
+        """The prior for a category, or None when there is nothing usable."""
+        if self.base_rates is None:
+            return None
+        try:
+            return self.base_rates.prior_for(category)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Base-rate prior lookup failed for {category}: {e}")
+            return None
+
+    def _deep_analysis_for(self, market: Market) -> tuple:
+        """
+        Should this market get the expensive evidence, or only its own book?
+
+        Returns (deep, reason). When no screen has run in this cycle - a direct
+        call, or a caller outside the cycle - the answer is yes, so the context
+        provider keeps behaving the way every existing caller expects. Inside a
+        cycle the screen always runs first, and then the shortlist is the only
+        thing that gets model time.
+        """
+        if not self._deep_shortlist_active:
+            return True, "no screen this cycle - analysed in full"
+        if market.id in self._deep_market_ids:
+            for row in (self._screen.get("shortlist") or []):
+                if row.get("market_id") == market.id:
+                    return True, f"deep shortlist: {row.get('why', '')}"
+            return True, "deep shortlist"
+        ranked_out = self._screen.get("screened_out", 0)
+        return False, (
+            f"not in this cycle's deep shortlist ({self.deep_analysis_limit} of "
+            f"{self._screen.get('considered', '?')} markets, {ranked_out} ranked "
+            f"below it on measurable book quality and liquidity) - priced on the "
+            f"measured book alone, and not given model time")
+
     async def get_context_for_market(self, market: Market) -> Dict[str, Any]:
         """
         V9 FIX #4: Connect News + X + Web Research fully into V3
@@ -830,6 +1070,14 @@ class TradingAgentV3:
             "is_mock": market.is_mock
         }
         
+        # Is this market in the deep shortlist? If a screen ran this cycle, the
+        # answer decides whether X, web research and the LLM run at all. Anything
+        # else is priced on its measured book alone, and says so, rather than
+        # being silently priced on nothing.
+        deep, deep_reason = self._deep_analysis_for(market)
+        context["deep_analysis"] = deep
+        context["screen_reason"] = deep_reason
+
         try:
             # V9 FIX #1: Hard LIVE/PAPER/MOCK separation - check data_mode
             if market.data_mode == market.data_mode.MOCK if hasattr(market.data_mode, 'MOCK') else market.is_mock:
@@ -844,7 +1092,14 @@ class TradingAgentV3:
                 venue_id = venue_id.lower()
             adapter = self.venue_registry.get_adapter_for_market(market)
             if adapter:
-                orderbook = await adapter.get_orderbook(market)
+                # The cheap pass already read this book. Re-reading it per market
+                # doubled the I/O of every cycle for an answer the same second
+                # would give; the cache is per cycle, so nothing goes stale
+                # between cycles.
+                orderbook = self._cycle_books.get(market.id)
+                if orderbook is None:
+                    orderbook = await adapter.get_orderbook(market)
+                    self._cycle_books[market.id] = orderbook
                 context["orderbook"] = orderbook
                 context["orderbook_venue"] = adapter.venue_id
                 # The venue's OWN declared taker fee, carried to the stage that
@@ -882,7 +1137,10 @@ class TradingAgentV3:
             
             # V9 FIX #4: News intelligence - actually call news_engine.get_news (real implementation)
             try:
-                if hasattr(self, 'news_engine') and self.news_engine:
+                if not deep:
+                    context["news"] = ""
+                    context["news_skipped"] = deep_reason
+                elif hasattr(self, 'news_engine') and self.news_engine:
                     news_signals = await self.news_engine.get_news(market, max_articles=5)
                     if news_signals:
                         # Synthesize news signals into context
@@ -899,7 +1157,10 @@ class TradingAgentV3:
             
             # V9 FIX #4: X sentiment - actually call x_engine.get_signal with credibility, novelty, time decay, corroboration
             try:
-                if hasattr(self, 'x_engine') and self.x_engine:
+                if not deep:
+                    context["x_status"] = "skipped"
+                    context["x_unavailable_reason"] = deep_reason
+                elif hasattr(self, 'x_engine') and self.x_engine:
                     # x_engine.get_signal is real: analyzes tweets, credibility, novelty, time decay, corroboration
                     x_signal = await self.x_engine.get_signal(market, news=context.get("news",""), web_research=context.get("research",""))
                     if x_signal:
@@ -928,9 +1189,28 @@ class TradingAgentV3:
                     if hasattr(self, 'x_scraper'):
                         is_blocked = getattr(self.x_scraper, 'is_blocked', False) or getattr(self.x_scraper, 'circuit_open', False)
                         context["x_status"] = "blocked_circuit_breaker" if is_blocked else "enabled"
+                        if is_blocked:
+                            # Say it out loud. A blocked scraper produced
+                            # `raw 0.00 / adjusted 0.00 / use False` for every
+                            # market, which reads like a neutral signal that was
+                            # measured rather than a source that was never
+                            # available - so nobody looking at the log could see
+                            # that the sentiment component was simply absent.
+                            context["x_unavailable_reason"] = (
+                                "X scraper is blocked (circuit breaker open after "
+                                "repeated failures) - no posts were read, so there "
+                                "is no sentiment signal, not a neutral one")
                         context["sources"].append("x_scraper")
+                else:
+                    context["x_status"] = "no_engine"
+                    context["x_unavailable_reason"] = (
+                        "no X engine configured - sentiment was not collected")
             except Exception as e:
                 logger.debug(f"X engine failed for {market.id}: {e}")
+                context["x_status"] = "failed"
+                context["x_unavailable_reason"] = (
+                    f"X engine failed: {type(e).__name__}: {str(e)[:150]} - no "
+                    f"sentiment signal was collected for this market")
                 context["sentiment"] = {"score": 0, "credibility": 0.3, "error": str(e)[:200]}
             
             # V10 FIX #11: Web research - not just volume>10k funnel, but also top opportunities by edge/uncertainty
@@ -938,7 +1218,11 @@ class TradingAgentV3:
             # Now: also research if market has high potential edge markers, or is in top candidates
             # We still limit to save time (45s per market), but funnel is broader
             try:
-                if hasattr(self, 'web_researcher') and self.web_researcher:
+                if not deep:
+                    context["research_researched"] = False
+                    context["research_blockers"] = [deep_reason]
+                    context["research"] = ""
+                elif hasattr(self, 'web_researcher') and self.web_researcher:
                     should_research = False
                     research_reason = ""
                     
@@ -972,6 +1256,16 @@ class TradingAgentV3:
                             context["research_sources_retrieved"] = int(
                                 getattr(research_result, 'sources_retrieved', 0) or 0)
                             if researched:
+                                # The OBJECT, not only its text. The
+                                # contradiction engine decides `researched` from
+                                # the ResearchResult it is given, and V3 was
+                                # passing the text alone - so the engine's own
+                                # state said "no sources" and its early return
+                                # threw away the five sources that had just been
+                                # retrieved. The most expensive stage in the
+                                # stack was reporting "NOT RESEARCHED (no
+                                # sources)" over a market it had researched.
+                                context["research_result"] = research_result
                                 summary = getattr(research_result, 'final_summary', '') or ''
                                 context["research"] = summary[:800]
                                 context["research_sources"] = list(
@@ -983,6 +1277,11 @@ class TradingAgentV3:
                                 context["research_reason"] = research_reason
                                 logger.debug(f"Web research for {market.id} ({research_reason}): {context['research'][:100]}")
                             else:
+                                # Nothing was retrieved: say so explicitly and
+                                # do NOT pass a result on, so the contradiction
+                                # engine cannot mistake an empty fetch for
+                                # evidence.
+                                context["research_result"] = None
                                 context["research"] = ""
                                 context["research_sources"] = []
                                 warnings = list(getattr(research_result, 'warnings', []) or [])
@@ -1001,6 +1300,15 @@ class TradingAgentV3:
                 context["category"] = "crypto"
             elif any(k in q_lower for k in ["fed", "cpi", "inflation", "rate", "gdp", "jobs", "earnings"]):
                 context["category"] = "economics"
+
+            # The base-rate prior for THIS category, from resolved markets. None
+            # means the model has nothing to say, and says that.
+            prior = self._base_rate_prior_for(context["category"])
+            if prior:
+                context["base_rate_prior"] = prior
+                logger.debug(f"Base-rate prior for {market.id} "
+                             f"({context['category']}): {prior['rate']:.3f} "
+                             f"from n={prior['n']}")
             
         except Exception as e:
             logger.debug(f"Context fetch failed for {market.id}: {e}")
@@ -1476,6 +1784,21 @@ class TradingAgentV3:
             # "nothing to trade" - and the honest empty case is the common one
             # whenever a venue is down or unconfigured.
             empty_venues = {vid: 0 for vid in markets_by_venue} or {}
+            # Base rates and the forecast evidence are refreshed even here: they
+            # describe what the engine HAS, and a quiet cycle is exactly when the
+            # operator needs to see that the base-rate component is loaded or
+            # that X is blocked.
+            try:
+                self._refresh_base_rates()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Base-rate refresh failed: {type(e).__name__}: {e}")
+            self._screen = {
+                "considered": 0, "shortlist": [], "screened_out": 0,
+                "limit": self.deep_analysis_limit,
+                "criteria": ("no market was discovered, so no screen ran - "
+                             "nothing was priced on a model opinion either"),
+            }
+            self._store_forecast_evidence([])
             # ...and the sports lane still runs. Its feed is not the prediction
             # markets' feed, and "no prediction markets" is not a reason to skip
             # the half of the product that has fixtures today.
@@ -1519,6 +1842,11 @@ class TradingAgentV3:
                 # a cycle with no prediction markets is not a cycle with nothing
                 # to do, and the operator's button must show what it did.
                 "sports": sports_block,
+                "deep_analysis": {"considered": 0, "shortlist": [],
+                                  "limit": self.deep_analysis_limit,
+                                  "screened_out": 0,
+                                  "criteria": "no market was discovered, so no "
+                                              "screen ran"},
                 "betting": {
                     "ok": bool(sports_block.get("opportunities")),
                     "events": sports_block.get("opportunities") and None or 0,
@@ -1550,6 +1878,25 @@ class TradingAgentV3:
 
         # Alpha scan - all additional alpha ideas (Top 5 + queue)
         all_markets_flat = [m for markets in markets_by_venue.values() for m in markets]
+
+        # BASE RATES: a prior counted from resolved markets, refreshed at most
+        # once a day. Until it exists the base-rate model contributes nothing and
+        # says so - which is what the operator's log showed for every market.
+        try:
+            self._refresh_base_rates()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Base-rate refresh failed: {type(e).__name__}: {e}. "
+                           f"The base-rate model keeps contributing no weight.")
+
+        # STAGE 1: the cheap screen. Books for every market, then a ranking.
+        # STAGE 2 (inside the strategy scan): X, web research and the LLM for the
+        # shortlist only. Doing stage 2 on every market is what made a 10-minute
+        # cycle impossible - 60-75 seconds per market of model time on the
+        # operator's log.
+        self._set_phase("screening",
+                        f"reading order books for {min(len(all_markets_flat), self.PRESCAN_LIMIT)} "
+                        f"market(s) to choose {self.deep_analysis_limit} for deep analysis")
+        screen = await self._prescan_and_rank(all_markets_flat)
         try:
             alpha_results = self.alpha_engine.scan_all_alpha(all_markets_flat[:200])
             logger.info(f"Alpha scan: {alpha_results}")
@@ -2346,6 +2693,14 @@ class TradingAgentV3:
                 }
             },
             "strategy_breakdown": scan_result.strategy_breakdown,
+            # Where the cycle's model time went, and what it did not look at.
+            "deep_analysis": screen or getattr(self, "_screen", {}),
+            # Whether the base-rate component had real counted frequencies this
+            # cycle, and from how many resolved markets.
+            "base_rates": (self.base_rates.status() if self.base_rates is not None
+                           else {"available": False,
+                                 "reason": "base rates were never loaded"}),
+            "base_rate_refresh": self._base_rate_refresh,
             "arbitrage": {
                 "total_found": len(scan_result.arbitrage_opportunities),
                 "tradeable": len([a for a in scan_result.arbitrage_opportunities if a.should_trade]),
@@ -2401,6 +2756,8 @@ class TradingAgentV3:
                 "blockers": sports_block.get("blockers", []),
             },
             "sports": sports_block,
+            # The per-market forecast chains, for the trades that were proposed.
+            "pricing": self._pricing_rows(scan_result.all_opportunities)[:20],
             "execution": execution_results,
             # Which venue the money is on, and why. Computed from the evidence
             # this cycle gathered: qualification, the balances the health engine
@@ -2431,6 +2788,13 @@ class TradingAgentV3:
             opportunities_found=int(scan_result.total_candidates or 0),
             avg_edge=(sum(_edges) / len(_edges)) if _edges else 0.0,
         )
+        # The forecast evidence, in the database rather than only in the log.
+        # The console runs as its own process (the .bat starts both), so anything
+        # the operator should be able to read about WHY a fair value came out the
+        # way it did has to survive this process.
+        self._store_forecast_evidence(
+            self._pricing_rows(scan_result.all_opportunities))
+
         _slowest = getattr(self, "_slowest_model_call_seconds", None)
         self._set_phase(
             "cycle_complete",
@@ -3632,6 +3996,44 @@ class TradingAgentV3:
             logger.warning(
                 f"Could not write the agent heartbeat: {type(e).__name__}: {e}")
 
+    def _store_forecast_evidence(self, pricing: Optional[List[Dict[str, Any]]] = None) -> None:
+        """
+        Write what the forecast engine had to work with, for the console.
+
+        Stored for BOTH a busy cycle and a quiet one. On a quiet cycle the useful
+        answer is not "nothing happened" - it is which components were even
+        available (base rates loaded? X blocked? a screen run?) and the operator
+        cannot see that from an empty log line.
+        """
+        try:
+            self.storage.set_state("intelligence.last_forecast_evidence", json.dumps({
+                "at": datetime.now(timezone.utc).isoformat(),
+                "deep_analysis": getattr(self, "_screen", {}) or {},
+                "base_rates": (self.base_rates.status()
+                               if self.base_rates is not None else {"available": False}),
+                "base_rate_refresh": self._base_rate_refresh,
+                "pricing": list(pricing or []),
+            }))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not store the forecast evidence for the "
+                           f"console: {type(e).__name__}: {e}")
+
+    def _pricing_rows(self, opportunities) -> List[Dict[str, Any]]:
+        """The per-market forecast chains, as the console reads them."""
+        rows = []
+        for opp in list(opportunities or [])[:30]:
+            if not isinstance(getattr(opp, "raw", None), dict):
+                continue
+            rows.append({**((opp.raw or {}).get("fair_value_chain") or {}),
+                         "market_id": opp.market.id,
+                         "question": (opp.market.question or "")[:110],
+                         "venue": opp.venue_id,
+                         "side": opp.side,
+                         "tradeable": bool(opp.should_trade),
+                         "explain": (opp.raw or {}).get("explain", ""),
+                         "components": (opp.raw or {}).get("components", [])})
+        return rows
+
     def _record_scan_log(self, result: Dict[str, Any], *, markets_scanned: int,
                          opportunities_found: int, avg_edge: float) -> None:
         """
@@ -3662,6 +4064,7 @@ class TradingAgentV3:
     # same sentence in the console, in the CLI and in a bug report.
     _PHASE_LABELS = {
         "scanning": "scanning the venues for markets",
+        "screening": "reading order books to choose which markets get model time",
         "evaluating": "pricing what it found",
         "executing": "sizing and placing orders",
         "cycle_complete": "cycle complete",

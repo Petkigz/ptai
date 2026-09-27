@@ -33,6 +33,41 @@ class ForecastResult:
     sources: List[str] = field(default_factory=list)
     calibration_adjusted: float = 0.0
     conservative_fair: float = 0.0  # After uncertainty penalty
+    # EVERY component, with the probability it wanted, the confidence it claimed
+    # and the weight it actually got. The operator could see the LLM say 65% and
+    # the ensemble say 58% and nothing in between: "which model contributed what"
+    # had no answer anywhere in the system. This is that answer, per market.
+    components: List[Dict[str, Any]] = field(default_factory=list)
+    # The chain, step by step, in the order the numbers are produced:
+    # market -> llm raw -> ensemble (weighted) -> calibrated -> conservative.
+    chain: Dict[str, Any] = field(default_factory=dict)
+
+    def explain(self) -> str:
+        """
+        One line: how the final probability was built, term by term.
+
+        `fair 0.580 <- ensemble 0.580 [llm_reasoning 0.650 c0.80 w0.24 47% |
+        news 0.500 c0.00 w0.00 0% ...] -> calibrated -> conservative; market 0.465`
+        """
+        parts = []
+        for c in self.components:
+            share = c.get("weight_share")
+            share_txt = f"{share:.0%}" if isinstance(share, (int, float)) else "-"
+            why = "" if c.get("contributes") else f" ({c.get('note') or 'no weight'})"
+            parts.append(
+                f"{c['model']} {c['probability']:.3f} c{c['confidence']:.2f} "
+                f"w{c['weight_used']:.3f} {share_txt}{why}")
+        ch = self.chain or {}
+        llm = ch.get("llm_raw")
+        head = (f"fair {self.fair_probability:.3f} <- ensemble "
+                f"{ch.get('ensemble_raw', self.fair_probability):.3f} "
+                f"(llm raw {llm:.3f}) " if llm is not None
+                else f"fair {self.fair_probability:.3f} <- ensemble "
+                     f"{ch.get('ensemble_raw', self.fair_probability):.3f} ")
+        return (head + "[" + " | ".join(parts) + "]"
+                + f" -> calibrated {ch.get('calibrated', self.fair_probability):.3f}"
+                + f" -> conservative {self.conservative_fair:.3f}"
+                + f"; market {self.market_price:.3f}")
 
     def to_proposal(self) -> Dict[str, Any]:
         """LLM proposes, deterministic code decides"""
@@ -53,8 +88,19 @@ class ForecastResult:
             "resolution_risks": self.resolution_risks,
             "trade": self.should_trade,
             "calibration_adjusted": round(self.calibration_adjusted, 4),
-            "conservative_fair": round(self.conservative_fair, 4)
+            "conservative_fair": round(self.conservative_fair, 4),
+            "components": self.components,
+            "chain": self.chain,
+            "explain": self.explain(),
         }
+
+
+def _llm_raw(forecasts) -> Optional[float]:
+    """The LLM's own probability, before any ensemble weighting - or None."""
+    for f in forecasts:
+        if f.model_name == "llm_reasoning":
+            return round(float(f.probability), 4)
+    return None
 
 
 class EnsembleForecaster:
@@ -64,6 +110,12 @@ class EnsembleForecaster:
     Calibration adjusts final probability.
     """
     def __init__(self, calibration_engine=None, uncertainty_engine=None, llm_router=None):
+        # One detector for the whole process, not one per market. A fresh one per
+        # market can never see a repetition - which is exactly how the operator's
+        # 17 identical 0.65 answers went unnoticed by a system that had the
+        # machinery to notice them.
+        from ..agent.brain import AnswerRepetitionDetector
+        self.answer_repetition = AnswerRepetitionDetector()
         self.calibration_engine = calibration_engine
         self.uncertainty_engine = uncertainty_engine
         self.llm_router = llm_router
@@ -109,13 +161,20 @@ class EnsembleForecaster:
                 conf = min(float(conf), 0.4)
                 reasoning = f"[NOT AN LLM ANSWER - provider={provider or 'none'}] {reasoning}"
 
+            anchored = bool(llm_result.get("anchored", False)
+                            if isinstance(llm_result, dict) else False)
+            basis = (llm_result.get("basis", "") if isinstance(llm_result, dict)
+                     else "") or ""
+            if anchored:
+                reasoning = f"[ANCHORED ANSWER - no weight] {reasoning}"
             return ModelForecast(
                 model_name=model_name,
                 probability=float(fair),
                 confidence=float(conf),
                 uncertainty=1.0 - float(conf),
                 reasoning=reasoning[:500],
-                sources=["lm_studio", "local_llm"]
+                sources=["lm_studio", "local_llm"],
+                anchored=anchored,
             )
         except Exception as e:
             logger.warning(f"LLM forecast conversion failed: {e}")
@@ -129,7 +188,8 @@ class EnsembleForecaster:
             )
 
     def ensemble(self, forecasts: List[ModelForecast], market: Market,
-                 category: str = None) -> ForecastResult:
+                 category: str = None, llm_skipped: str = "",
+                 deep_analysis: bool = True) -> ForecastResult:
         """Weighted ensemble of forecasts"""
         if not forecasts:
             return ForecastResult(
@@ -151,8 +211,10 @@ class EnsembleForecaster:
         all_sources = []
         all_reasoning = []
 
+        component_rows: List[Dict[str, Any]] = []
         for f in forecasts:
-            weight = self.model_weights.get(f.model_name, 0.1) * f.confidence
+            nominal = self.model_weights.get(f.model_name, 0.1)
+            weight = nominal * f.confidence
             # Discount by uncertainty
             weight *= (1 - f.uncertainty * 0.5)
             weighted_prob += f.probability * weight
@@ -161,6 +223,32 @@ class EnsembleForecaster:
             total_uncertainty += f.uncertainty
             all_sources.extend(f.sources)
             all_reasoning.append(f"{f.model_name}={f.probability:.3f}(conf {f.confidence:.2f}): {f.reasoning[:100]}")
+            # WHY a component got the weight it did, kept with the number. A
+            # component with no data has weight 0 - which is the honest outcome -
+            # and the trace must say that rather than leave a 0.500 that reads
+            # like a neutral opinion.
+            note = ""
+            if getattr(f, "anchored", False):
+                note = ("anchored answer (the model repeated itself across "
+                        "different markets): confidence 0, contributes nothing")
+            elif f.confidence <= 0:
+                note = "no data: confidence 0, contributes nothing"
+            elif weight == 0:
+                note = "weighted to zero"
+            component_rows.append({
+                "model": f.model_name,
+                "probability": round(float(f.probability), 4),
+                "confidence": round(float(f.confidence), 4),
+                "uncertainty": round(float(f.uncertainty), 4),
+                "weight_nominal": round(float(nominal), 4),
+                "weight_used": round(float(weight), 6),
+                "contributes": bool(weight > 0),
+                "note": note,
+                "anchored": bool(getattr(f, "anchored", False)),
+                "basis": getattr(f, "basis", "") or "",
+                "reasoning": (f.reasoning or "")[:240],
+                "sources": list(f.sources or []),
+            })
 
         if total_weight > 0:
             ensemble_prob = weighted_prob / total_weight
@@ -229,6 +317,10 @@ class EnsembleForecaster:
 
         reasoning = " | ".join(all_reasoning)
 
+        for row in component_rows:
+            row["weight_share"] = (round(row["weight_used"] / total_weight, 4)
+                                   if total_weight > 0 else 0.0)
+
         return ForecastResult(
             market_id=market.id,
             question=market.question,
@@ -241,9 +333,31 @@ class EnsembleForecaster:
             should_trade=should_trade,
             reasoning=reasoning[:2000],
             model_forecasts=forecasts,
-            sources=list(set(all_sources)),
             calibration_adjusted=calibrated_prob,
-            conservative_fair=conservative_fair
+            conservative_fair=conservative_fair,
+            components=component_rows,
+            chain={
+                # The four numbers the operator asked to see together.
+                "market_price": round(float(market.best_price), 4),
+                "llm_raw": _llm_raw(forecasts),
+                "ensemble_raw": round(float(ensemble_prob), 4),
+                "calibrated": round(float(calibrated_prob), 4),
+                "conservative": round(float(conservative_fair), 4),
+                "executable_edge": None,  # filled by FairValueEngine after costs
+                "total_weight": round(float(total_weight), 6),
+                "components_with_data": [r["model"] for r in component_rows
+                                         if r["contributes"]],
+                "components_without_data": [r["model"] for r in component_rows
+                                            if not r["contributes"]],
+                # Why the largest-weight component is absent, when it is.
+                "llm_skipped": llm_skipped,
+                "deep_analysis": bool(deep_analysis),
+                "llm_anchored": bool(
+                    next((r for r in component_rows
+                          if r["model"] == "llm_reasoning"), {})
+                    .get("anchored", False)),
+            },
+            sources=list(set(all_sources)),
         )
 
     def forecast_market(self, market: Market, context: Dict = None) -> ForecastResult:
@@ -254,7 +368,12 @@ class EnsembleForecaster:
         # Base rate
         from .forecaster import BaseRateModel, NewsModel, XModel, MarketMicrostructureModel
         base_model = BaseRateModel()
-        forecasts.append(base_model.forecast(market, category=context.get("category", "default")))
+        forecasts.append(base_model.forecast(
+            market, category=context.get("category", "default"),
+            # Real counted frequencies when the cycle loaded them. None means the
+            # model keeps contributing nothing, and says so.
+            prior=context.get("base_rate_prior"),
+        ))
 
         # News
         news_model = NewsModel(llm_router=self.llm_router)
@@ -262,15 +381,36 @@ class EnsembleForecaster:
 
         # X
         x_model = XModel()
-        forecasts.append(x_model.forecast(market, sentiment_result=context.get("sentiment"), tweets=context.get("tweets", [])))
+        forecasts.append(x_model.forecast(
+            market,
+            sentiment_result=context.get("sentiment"),
+            tweets=context.get("tweets", []),
+            # The status travels with the evidence so the component can say WHY
+            # it has none: a blocked scraper, a missing engine, or a failure.
+            status=str(context.get("x_status") or ""),
+            unavailable_reason=str(context.get("x_unavailable_reason") or ""),
+        ))
 
         # Market microstructure
         mm_model = MarketMicrostructureModel()
         forecasts.append(mm_model.forecast(market, orderbook=context.get("orderbook"), recent_trades=context.get("recent_trades")))
 
-        # LLM reasoning if available
+        # LLM reasoning if available.
+        #
+        # ...but only for a market that was chosen for deep analysis. The cycle
+        # screens every market on its measured book first and spends model time on
+        # the shortlist: this is where that decision is honoured, and the trace
+        # records it so "no LLM component" reads as a decision rather than as a
+        # failure.
+        deep_ok = context.get("deep_analysis") is not False
+        llm_skipped_reason = "" if deep_ok else str(
+            context.get("screen_reason") or "not in this cycle's deep shortlist")
+        if not deep_ok:
+            logger.debug(f"LLM skipped for {market.id}: {llm_skipped_reason}")
         if context.get("llm_result"):
             forecasts.append(self.add_llm_forecast(market, context["llm_result"]))
+        elif not deep_ok:
+            pass
         elif self.llm_router:
             # Try to get LLM forecast via Brain
             try:
@@ -280,7 +420,8 @@ class EnsembleForecaster:
                 # fallback forecast could run against a different provider,
                 # endpoint, model and timeout than the rest of the intelligence
                 # stack. Hand it the router already in use.
-                brain = Brain(llm_router=self.llm_router)
+                brain = Brain(llm_router=self.llm_router,
+                              answer_repetition=self.answer_repetition)
                 # The research is passed through. V3 goes to the trouble of
                 # fetching news, X sentiment and web research, and the LLM call
                 # was dropping the web research on the floor - so the component
@@ -301,9 +442,15 @@ class EnsembleForecaster:
                     # Carried through, or the ensemble cannot tell an LLM answer
                     # from a heuristic one.
                     "llm_provider": getattr(llm_res, "llm_provider", ""),
+                    # ...and whether the answer was a repeated one, so it can be
+                    # shown as such instead of as a confident forecast.
+                    "anchored": bool((llm_res.raw or {}).get("anchored", False)),
+                    "basis": (llm_res.raw or {}).get("basis", ""),
                 }))
             except Exception as e:
                 logger.warning(f"LLM forecast failed: {e}")
 
         return self.ensemble(forecasts, market,
-                             category=context.get("category"))
+                             category=context.get("category"),
+                             llm_skipped=llm_skipped_reason,
+                             deep_analysis=deep_ok)

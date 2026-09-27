@@ -260,6 +260,56 @@ Three things do, each consulted immediately before an order is dispatched:
 
 `python main.py doctor` reports all three before you fund anything.
 
+## The Forecast Engine: What Each Component Contributed
+
+A fair value is built from independent components and the console now shows the
+chain, term by term, for every market:
+
+```
+market price -> the LLM's own answer -> weighted ensemble -> calibrated
+             -> conservative -> the edge a trade is measured against
+```
+
+On the Money tab each component lists the probability it wanted, the confidence
+it claimed and the weight it actually got - **including the ones that contributed
+nothing, with the reason** ("no news retrieved", "X unavailable (circuit breaker
+open)", "anchored answer", "not in this cycle's deep shortlist"). A component
+that is absent says so; none of them contributes weight it cannot justify.
+
+Three rules this engine holds to, each written because of a specific failure:
+
+* **The prompt contains no example numbers.** It used to print
+  `{"fair_value":0.65,"edge":0.15,"confidence":0.72}` immediately before asking
+  for an answer, and seventeen forecasts came back 0.65/0.72 with edge 0.15 on
+  markets priced 15%-60%. The schema is still given; its values are placeholders.
+* **A repeated answer carries no weight.** If a model returns the same
+  probability across markets priced materially differently, that answer is
+  recorded as no opinion - confidence 0, no ensemble weight, no trade - and says
+  why.
+* **No input, no weight.** A model with nothing to say returns confidence 0
+  rather than a neutral-looking number at the market price, which used to dilute
+  every component that did have evidence.
+
+**Base rates are counted, not assumed.** The base-rate model shipped with
+category constants and no data, so it contributed nothing on every market. It now
+counts YES frequencies from markets the venue reports as closed (refreshed at
+most once a day) and carries a sample-sized weight - a category with fewer than
+30 resolved markets stays "no data" rather than becoming a number.
+
+**Two-stage scan.** One LLM call per market took 60-75 seconds, which no 10-minute
+cycle can absorb. Each cycle now reads every order book cheaply, ranks on
+measurable execution quality and liquidity, and spends the deep analysis (X
+sentiment, web research, the LLM) on the top group only - `PTAI_DEEP_MARKETS`,
+8 by default. Everything else is still read and priced on its measured book, and
+the console reports how many markets were deep-analysed and how many were not.
+
+**Order books are validated before they are priced against.** The CLOB returns
+each side as a list and does not promise which end is best, so reading index 0
+gave the worst quote on both sides - which is how "bid 0.0100 / ask 0.9900,
+spread 98%" appeared on market after market. Books are now sorted, checked
+against the token and market they were requested for, and refused (with the
+reason) when crossed, stale against the market's own price, or one-sided.
+
 ## Logins, Venues, And The Sports Lane
 
 **Logins** are saved in the console's Setup tab and kept encrypted in

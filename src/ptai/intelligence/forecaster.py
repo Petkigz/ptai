@@ -20,6 +20,11 @@ class ModelForecast:
     reasoning: str
     sources: List[str]
     timestamp: datetime = None
+    # Set when the LLM's answer was caught repeating itself across materially
+    # different markets. The flag rides with the component so the trace can say
+    # "this is the answer the prompt was echoing" rather than showing a
+    # confident 0.650 that looks like evidence.
+    anchored: bool = False
 
     def __post_init__(self):
         if self.timestamp is None:
@@ -67,7 +72,20 @@ class BaseRateModel:
         """True only when real historical frequencies were loaded."""
         return bool(self.historical_data)
 
-    def forecast(self, market: Market, category: str = "default") -> ModelForecast:
+    def forecast(self, market: Market, category: str = "default",
+                 prior: Dict = None) -> ModelForecast:
+        """
+        The prior is the evidence; the constants are not.
+
+        `prior` is a frequency counted from resolved markets (see
+        base_rates.BaseRateBook): {rate, n, mean_last_price, source}. With one,
+        this model has a real, sample-sized opinion and says where it came from.
+        Without one it keeps contributing nothing - which is the same answer, for
+        the same reason, as before.
+        """
+        if prior and prior.get("rate") is not None and int(prior.get("n") or 0) > 0:
+            return self._forecast_from_prior(market, category, prior)
+
         base = self.base_rates.get(category, self.base_rates["default"])
         if not self.has_data:
             # No data, no opinion. The probability is still the prior so the
@@ -123,6 +141,42 @@ class BaseRateModel:
             sources=["historical_frequencies", "base_rates"]
         )
 
+    def _forecast_from_prior(self, market: Market, category: str,
+                             prior: Dict) -> ModelForecast:
+        """
+        A frequency from resolved markets, weighted by how much of it there is.
+
+        The weight is deliberately small and grows with the sample: 200 resolved
+        markets is a reason to nudge, not to overrule a live price. And the
+        comparison that matters is reported, not hidden - if this category
+        resolves YES 38% of the time while its markets trade at 45, that gap is
+        the whole reason the component exists.
+        """
+        rate = float(prior["rate"])
+        n = int(prior["n"])
+        mean_price = prior.get("mean_last_price")
+        # 0.15 at n=30 rising towards 0.35 - never a majority vote.
+        confidence = min(0.35, 0.15 + (n - 30) / 2000.0) if n >= 30 else 0.0
+        comparison = ""
+        if isinstance(mean_price, (int, float)) and mean_price:
+            gap = rate - float(mean_price)
+            comparison = (f"; these markets traded at {float(mean_price):.3f} on "
+                          f"average, so the population runs "
+                          f"{'above' if gap < 0 else 'below'} its own base rate "
+                          f"by {abs(gap):.3f}")
+        return ModelForecast(
+            model_name="base_rate",
+            probability=max(0.02, min(0.98, rate)),
+            confidence=confidence,
+            uncertainty=max(0.2, 1.0 - confidence),
+            reasoning=(f"YES resolved in {rate:.1%} of {n} closed "
+                       f"{category} market(s) ({prior.get('source', 'venue')}, "
+                       f"built {str(prior.get('built_at', ''))[:10]}){comparison}"
+                      f" A prior over that population - it does not know this "
+                      f"question, so its weight is capped at {confidence:.2f}."),
+            sources=["base_rates", f"n={n}"],
+        )
+
 
 class NewsModel:
     """
@@ -133,14 +187,24 @@ class NewsModel:
 
     def forecast(self, market: Market, news_text: str = "", research: Dict = None) -> ModelForecast:
         research = research or {}
-        # If no news, neutral
+        # If no news, NEUTRAL IS NOT AN OPINION.
+        #
+        # This branch used to answer with the market's own price at confidence
+        # 0.3, which is a component claiming 30% confidence in a number it did
+        # not produce. Worse than useless in a weighted average: its weight is
+        # real (0.20 x 0.30), and because its probability IS the market price, it
+        # diluted every component that did have something to say back towards
+        # the price. "No news available - neutral" is an absence of evidence and
+        # is now reported as exactly that, the same way the branch below it
+        # already reported a missing news text.
         if not news_text and not research:
             return ModelForecast(
                 model_name="news",
-                probability=market.best_price,
-                confidence=0.3,
-                uncertainty=0.3,
-                reasoning="No news available - neutral",
+                probability=max(0.05, min(0.95, market.best_price)),
+                confidence=0.0,
+                uncertainty=1.0,
+                reasoning=("no news retrieved - this model contributes no weight "
+                           "(the market price is shown for shape only)"),
                 sources=[]
             )
 
@@ -226,7 +290,9 @@ class XModel:
             "total_tweets": len(tweets)
         }
 
-    def forecast(self, market: Market, sentiment_result: Dict = None, tweets: List[Dict] = None) -> ModelForecast:
+    def forecast(self, market: Market, sentiment_result: Dict = None,
+                 tweets: List[Dict] = None, status: str = "",
+                 unavailable_reason: str = "") -> ModelForecast:
         sentiment_result = sentiment_result or {}
         tweets = tweets or []
 
@@ -239,13 +305,20 @@ class XModel:
         # empty context.
         has_x_data = bool(tweets) or abs(float(sentiment_result.get("score", 0) or 0)) > 0
         if not has_x_data:
+            # "Unavailable" is the honest label and it is now explicit, with the
+            # reason the caller gave (circuit breaker, no engine, failure). A bare
+            # 0.00/0.50 out of an empty source reads as a neutral measurement of
+            # nothing, which is how a dead scraper looked like a calm market.
+            why = unavailable_reason or (
+                "no posts scraped and no sentiment signal")
+            label = f"X UNAVAILABLE ({status})" if status else "X UNAVAILABLE"
             return ModelForecast(
                 model_name="x_sentiment",
                 probability=max(0.05, min(0.95, market.best_price)),
                 confidence=0.0,
                 uncertainty=1.0,
-                reasoning="no X data - no posts scraped and no sentiment signal, "
-                          "so this model contributes no weight",
+                reasoning=f"{label}: {why}. No sentiment evidence for this "
+                          f"market, so this model contributes no weight.",
                 sources=[]
             )
 
@@ -269,7 +342,7 @@ class XModel:
             confidence=credibility["credibility"] * 0.7,
             uncertainty=0.25 + (1 - credibility["credibility"])*0.2,
             reasoning=f"X sentiment {raw_sentiment:.2f} -> prob {sentiment_prob:.3f} * credibility {credibility['credibility']:.2f} = {prob:.3f}. Issues: {credibility['issues']}",
-            sources=["x_api", "x_snscrape"] if tweets else []
+            sources=["x_api", "x_snscrape"] if tweets else ["x_sentiment_score_only"]
         )
 
 

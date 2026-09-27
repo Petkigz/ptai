@@ -26,6 +26,143 @@ def _data_api_session():
     return _DATA_API_SESSION
 
 
+MAX_TRUSTED_SPREAD = 0.20       # above this a book cannot pay for its own crossing
+MAX_REFERENCE_DISAGREEMENT = 0.25  # mid vs the market's own price
+
+
+def normalise_book(raw: Dict[str, Any], *,
+                   expected_token_id: Optional[str] = None,
+                   expected_condition_id: Optional[str] = None,
+                   reference_price: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Turn a raw CLOB book into levels this system can trust, or say why it cannot.
+
+    Three things were wrong with reading `bids[0]` / `asks[0]` straight out of
+    the API response:
+
+      1. ORDER. The CLOB returns each side as a list and does not promise which
+         end is best. Taking index 0 gives the WORST quote on one of the sides,
+         which is how "bid 0.0100 / ask 0.9900" appeared as the top of book on
+         market after market. Best is the maximum bid and the minimum ask.
+      2. IDENTITY. Nothing checked that the book we asked for is the book we got.
+         The response carries `asset_id` (and `market`); a mismatched or empty
+         token would return a valid-looking book for a DIFFERENT market, and its
+         prices would be priced as if they were this market's.
+      3. SANITY. A stale or one-sided book can print a 0.98 spread on a market
+         the venue is quoting near 0.50. That is not a trading opportunity and it
+         is not evidence about this market either - it has to be rejected, with
+         the reason kept, before any cost or edge is computed from it.
+
+    Returns a book dict with sorted `bids`/`asks`, `best_bid`/`best_ask`, the
+    measured spread and a `validation` block. `is_real` is False whenever any
+    check failed, so every downstream cost calculation treats the numbers as
+    unmeasured instead of pricing off them.
+    """
+    def _levels(items) -> list:
+        out = []
+        for item in items or []:
+            price = size = None
+            if isinstance(item, dict):
+                price, size = item.get("price"), item.get("size")
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                price, size = item[0], item[1]
+            try:
+                price = float(price)
+                size = float(size)
+            except (TypeError, ValueError):
+                continue
+            # A level outside (0, 1) or with no size is not a quote.
+            if not (0.0 < price < 1.0) or size <= 0:
+                continue
+            out.append((price, size))
+        return out
+
+    bids = sorted(_levels((raw or {}).get("bids")), key=lambda l: -l[0])
+    asks = sorted(_levels((raw or {}).get("asks")), key=lambda l: l[0])
+    best_bid = bids[0][0] if bids else None
+    best_ask = asks[0][0] if asks else None
+    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
+    spread = (best_ask - best_bid) if best_bid and best_ask else None
+
+    checks: Dict[str, Any] = {"levels_read": bool(bids or asks)}
+
+    # --- identity ---------------------------------------------------------
+    asset_id = str((raw or {}).get("asset_id") or (raw or {}).get("assetId") or "")
+    token_ok = True
+    if expected_token_id:
+        if not asset_id:
+            token_ok = False
+            checks["identity"] = ("the book did not say which token it is for, so "
+                                  "it cannot be confirmed as this market's book")
+        elif asset_id != str(expected_token_id):
+            token_ok = False
+            checks["identity"] = (f"the book returned for token {asset_id[:16]}... is "
+                                  f"NOT the token requested "
+                                  f"({str(expected_token_id)[:16]}...)")
+    condition = str((raw or {}).get("market") or "")
+    condition_ok = True
+    if expected_condition_id and condition:
+        condition_ok = condition.lower() == str(expected_condition_id).lower()
+        if not condition_ok:
+            checks["condition"] = (f"the book belongs to market {condition[:16]}..., "
+                                   f"not {str(expected_condition_id)[:16]}...")
+    checks["identity_ok"] = bool(token_ok and condition_ok)
+    checks["token_checked"] = bool(expected_token_id)
+    checks["condition_checked"] = bool(expected_condition_id and condition)
+
+    # --- shape ------------------------------------------------------------
+    two_sided = best_bid is not None and best_ask is not None
+    checks["two_sided"] = two_sided
+    crossed = bool(two_sided and best_bid >= best_ask)
+    checks["crossed"] = crossed
+    if crossed:
+        checks["shape"] = (f"best bid {best_bid:.4f} is at or above best ask "
+                           f"{best_ask:.4f}: the book is stale or one-sided, not "
+                           f"tradeable")
+
+    # --- sanity against the market's own price ---------------------------
+    reference_ok = True
+    if reference_price and mid:
+        gap = abs(mid - float(reference_price))
+        reference_ok = gap <= MAX_REFERENCE_DISAGREEMENT
+        checks["midpoint"] = round(mid, 4)
+        checks["reference_price"] = round(float(reference_price), 4)
+        checks["reference_gap"] = round(gap, 4)
+        if not reference_ok:
+            checks["reference"] = (
+                f"book midpoint {mid:.4f} is {gap:.2f} away from this market's "
+                f"own price {float(reference_price):.4f}: treating the book as "
+                f"stale rather than pricing against it")
+    checks["reference_ok"] = reference_ok
+
+    # What the API's FIRST element was, kept so the difference between "index 0"
+    # and "the best quote" is visible in the log rather than assumed away.
+    raw_bids = _levels((raw or {}).get("bids"))
+    raw_asks = _levels((raw or {}).get("asks"))
+    first_bid = raw_bids[0][0] if raw_bids else None
+    first_ask = raw_asks[0][0] if raw_asks else None
+    if two_sided:
+        if first_bid is not None and abs(first_bid - best_bid) > 1e-9:
+            checks["unsorted_bids"] = (f"first listing was {first_bid:.4f} but the "
+                                       f"best bid is {best_bid:.4f} - the response "
+                                       f"is not sorted best-first")
+        if first_ask is not None and abs(first_ask - best_ask) > 1e-9:
+            checks["unsorted_asks"] = (f"first listing was {first_ask:.4f} but the "
+                                       f"best ask is {best_ask:.4f}")
+
+    return {
+        "bids": bids[:10], "asks": asks[:10],
+        "best_bid": best_bid, "best_ask": best_ask,
+        "first_element_bid": first_bid, "first_element_ask": first_ask,
+        "midpoint": mid, "spread": spread,
+        "levels_bid": len(bids), "levels_ask": len(asks),
+        "validation": checks,
+        "validated": bool(checks["levels_read"] and two_sided
+                          and checks["identity_ok"] and not crossed
+                          and reference_ok),
+    }
+
+
 class PolymarketAdapter(MarketAdapter):
     def __init__(self, private_key: str = None, funder: str = None, dry_run: bool = True):
         super().__init__(venue_id="polymarket", venue_type=VenueType.PREDICTION,
@@ -214,26 +351,54 @@ class PolymarketAdapter(MarketAdapter):
             try:
                 orderbook_data = self.client.get_orderbook(token_id)
                 if orderbook_data and (orderbook_data.get("bids") or orderbook_data.get("asks")):
-                    bids = orderbook_data.get("bids", [])
-                    asks = orderbook_data.get("asks", [])
-                    
-                    def parse_price_size(item):
-                        if isinstance(item, dict):
-                            return float(item.get("price", 0)), float(item.get("size", 0))
-                        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                            return float(item[0]), float(item[1])
-                        return 0.5, 0
-                    
-                    # Get best bid/ask
-                    best_bid_price, best_bid_size = parse_price_size(bids[0]) if bids else (0, 0)
-                    best_ask_price, best_ask_size = parse_price_size(asks[0]) if asks else (0, 0)
-                    
-                    # If only one side, estimate other
-                    if best_bid_price == 0 and best_ask_price > 0:
-                        best_bid_price = best_ask_price - 0.02
-                    if best_ask_price == 0 and best_bid_price > 0:
-                        best_ask_price = best_bid_price + 0.02
-                    
+                    # SORT, VERIFY IDENTITY, SANITY-CHECK, then use. See
+                    # `normalise_book`: `bids[0]`/`asks[0]` are not promised to be
+                    # the best quotes, and an unvalidated book is how a market
+                    # quoted near 0.50 came back with "bid 0.0100 ask 0.9900
+                    # spread 98%" on the operator's 2026-09-27 log.
+                    book = normalise_book(
+                        orderbook_data,
+                        expected_token_id=token_id,
+                        expected_condition_id=(getattr(market, "condition_id", None)
+                                               or (market.raw or {}).get("conditionId")
+                                               if isinstance(market.raw, dict) else None),
+                        reference_price=market.yes_price,
+                    )
+                    bids = [{"price": p_, "size": s_} for p_, s_ in book["bids"]]
+                    asks = [{"price": p_, "size": s_} for p_, s_ in book["asks"]]
+                    best_bid_price = book["best_bid"] or 0.0
+                    best_ask_price = book["best_ask"] or 0.0
+                    best_bid_size = book["bids"][0][1] if book["bids"] else 0
+                    best_ask_size = book["asks"][0][1] if book["asks"] else 0
+
+                    if not book["validated"]:
+                        # A book that failed a check is NOT this market's book,
+                        # and its prices must not become a cost or an edge. The
+                        # reasons are kept so the operator can see which check
+                        # failed instead of reading a suspicious spread.
+                        why = "; ".join(f"{k}: {v}" for k, v in book["validation"].items()
+                                        if isinstance(v, str))
+                        logger.warning(
+                            f"CLOB orderbook for {market.id} REJECTED by validation "
+                            f"({why or 'no usable levels'}) - refusing to price "
+                            f"against it")
+                        return {
+                            "market_id": market.id, "venue_id": "polymarket",
+                            "token_id": token_id,
+                            "bids": bids, "asks": asks,
+                            "bid": best_bid_price or None, "ask": best_ask_price or None,
+                            "spread": None, "is_real": False, "is_mock": False,
+                            "validated": False,
+                            "validation": book["validation"],
+                            "source": "clob_unvalidated",
+                            "executable": False,
+                            "executable_price": None,
+                            "warning": (f"CLOB book failed validation: {why or 'no usable levels'}. "
+                                        f"No cost or edge is computed from it."),
+                            "reasoning": ("the venue returned a book that could not be "
+                                          "confirmed as this market's, or was crossed/stale"),
+                        }
+
                     if best_bid_price > 0 and best_ask_price > 0:
                         bid_size = sum(parse_price_size(b)[1] for b in bids[:5])
                         ask_size = sum(parse_price_size(a)[1] for a in asks[:5])
@@ -281,9 +446,23 @@ class PolymarketAdapter(MarketAdapter):
                             "source": "clob_real",
                             "is_real": True,
                             "is_mock": False,
-                            "executable": True,
-                            "executable_price": best_ask_price if market.yes_price > 0.5 else best_bid_price,
-                            "reasoning": f"REAL CLOB: bid {best_bid_price:.3f} ask {best_ask_price:.3f} spread {spread*100:.2f}% depth ${depth:.0f} slippage {real_slippage*100:.2f}% - trustworthy for $50 trader"
+                            "validated": True,
+                            "validation": book["validation"],
+                            "executable": spread <= MAX_TRUSTED_SPREAD,
+                            # BOTH sides named, because which side of the book
+                            # you pay is a property of the side you trade and not
+                            # of the market's own price. This used to pick one
+                            # quote by testing the market price against a half:
+                            # a YES share costs the ask, a NO share costs one
+                            # minus the bid, and the caller knows its side while
+                            # this reader does not.
+                            "executable_price_yes": best_ask_price,
+                            "executable_price_no": round(1.0 - best_bid_price, 4),
+                            "executable_price": best_ask_price,
+                            "executable_price_note": ("executable_price is the YES "
+                                                      "side's ask; a NO share pays "
+                                                      "executable_price_no (1 - best bid)"),
+                            "reasoning": f"REAL CLOB: bid {best_bid_price:.3f} ask {best_ask_price:.3f} spread {spread*100:.2f}% depth ${depth:.0f} slippage {real_slippage*100:.2f}%"
                         }
                     else:
                         logger.warning(f"CLOB returned empty bid/ask for {market.id} - bids {len(bids)} asks {len(asks)}")

@@ -82,6 +82,9 @@ class ContradictionEngine:
         # Set by research() / synthesize() so evidence can be built from the
         # retrieved sources rather than from the question's wording.
         self._last_result = None
+        # Which market that result belongs to. Without this the shared engine
+        # handed one market's sources to the next market's contradiction report.
+        self._last_result_market: Optional[str] = None
 
     async def research(self, market, max_time_seconds: int = 30):
         """
@@ -97,8 +100,11 @@ class ContradictionEngine:
             logger.debug(self.last_error)
             return None
         try:
-            return await self.web_researcher.research(
+            result = await self.web_researcher.research(
                 market, max_time_seconds=max_time_seconds)
+            self._last_result = result
+            self._last_result_market = getattr(market, "id", None)
+            return result
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
             logger.warning(f"contradiction research failed: {self.last_error}")
@@ -242,8 +248,18 @@ class ContradictionEngine:
         """
         # An explicitly passed result wins; otherwise use whatever research()
         # last stored, so an async caller can research first and synthesize after.
+        #
+        # ...but only for the SAME market. `_last_result` is per engine instance
+        # and the engine is shared by every market in a cycle, so the stored
+        # result of market A was inherited by market B: B was reported as
+        # "researched" on A's sources and its bull/bear cases were built from a
+        # different question's evidence. Passing None now clears the slot
+        # instead of leaving the previous market's research lying there.
         if research_result is not None:
             self._last_result = research_result
+            self._last_result_market = getattr(market, "id", None)
+        elif getattr(self, "_last_result_market", None) != getattr(market, "id", None):
+            self._last_result = None
         report = ContradictionReport(
             market_id=market.id,
             question=market.question

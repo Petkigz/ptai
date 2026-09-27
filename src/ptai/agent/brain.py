@@ -22,6 +22,83 @@ from ..config import get_settings
 from ..markets.base import Market
 from ..sentiment import SentimentResult
 
+class AnswerRepetitionDetector:
+    """
+    Catches a model that answers the same thing to every question.
+
+    Removing the numeric example from the prompt is the cure; this is the
+    detector that says whether the cure worked. It keeps the last few answers
+    and, before any answer is used, asks: is this value just repeating while the
+    markets it is supposedly forecasting are materially different?
+
+    If so the answer is not a forecast. It is treated as no opinion at all -
+    confidence zero, no weight in the ensemble, no trade - and the reason is
+    written on the component so the operator sees WHY the LLM contributed
+    nothing rather than reading a smaller edge and guessing.
+
+    Conservative on purpose: it needs `min_repeats` answers agreeing to within
+    `tolerance` while their market prices span at least `market_spread`. A model
+    that legitimately agrees with the market price on similar markets is not
+    flagged, because those markets are not materially different.
+    """
+
+    def __init__(self, window: int = 6, min_repeats: int = 4,
+                 tolerance: float = 0.005, market_spread: float = 0.10):
+        self.window = window
+        self.min_repeats = min_repeats
+        self.tolerance = tolerance
+        self.market_spread = market_spread
+        self.answers: List[Dict[str, float]] = []
+        self.flagged: List[Dict[str, Any]] = []
+
+    def observe(self, market_id: str, market_price: float,
+                fair_value: float) -> Optional[str]:
+        """
+        Record one answer. Returns a reason string when it looks anchored.
+        """
+        self.answers.append({"market_id": market_id,
+                             "market_price": float(market_price),
+                             "fair_value": float(fair_value)})
+        if len(self.answers) > self.window:
+            self.answers = self.answers[-self.window:]
+
+        close = [a for a in self.answers
+                 if abs(a["fair_value"] - fair_value) <= self.tolerance]
+        if len(close) < self.min_repeats:
+            return None
+        prices = [a["market_price"] for a in close]
+        spread = max(prices) - min(prices)
+        if spread < self.market_spread:
+            # Same answer on markets that ARE alike - that is agreement with the
+            # market, not anchoring, and it must not be punished.
+            return None
+        detail = (f"the model answered {fair_value:.3f} on {len(close)} of its "
+                  f"last {len(self.answers)} forecasts while those markets were "
+                  f"priced {min(prices):.1%}-{max(prices):.1%} "
+                  f"(spread {spread:.1%}). A repeated value across materially "
+                  f"different markets is the prompt being echoed, not a "
+                  f"forecast, so this answer carries no weight")
+        self.flagged.append({"market_id": market_id, "fair_value": fair_value,
+                             "repeats": len(close), "market_spread": round(spread, 4),
+                             "reason": detail})
+        return detail
+
+    def report(self) -> Dict[str, Any]:
+        """What the operator/dashboard reads: how often, and on what."""
+        return {
+            "answers_seen": len(self.answers),
+            "flagged_count": len(self.flagged),
+            "window": self.window,
+            "min_repeats": self.min_repeats,
+            "tolerance": self.tolerance,
+            "market_spread_required": self.market_spread,
+            "last": self.flagged[-1] if self.flagged else None,
+            "how": ("an identical fair value across markets that are priced "
+                    "differently is treated as no opinion: confidence 0, no "
+                    "ensemble weight, no trade"),
+        }
+
+
 @dataclass
 class FairValueResult:
     market_id: str
@@ -94,7 +171,7 @@ def _as_sentiment(sentiment):
 
 
 class Brain:
-    def __init__(self, llm_config=None, llm_router=None):
+    def __init__(self, llm_config=None, llm_router=None, answer_repetition=None):
         self.settings = get_settings()
         self.llm_config = llm_config or self.settings.to_llm_config()
         # Reuse the caller's router when one is given. Building a second one from
@@ -102,6 +179,12 @@ class Brain:
         # provider, endpoint, model and timeout than the intelligence stack that
         # asked for it.
         self.llm_router = llm_router
+        # Every answer this process produces goes through here. Removing the
+        # numeric example from the prompt is the fix for anchoring; this is how
+        # we find out whether it worked, per process, from the answers themselves.
+        # A caller that already has one (the ensemble) passes it in, because a
+        # detector per market can never see the repetition it exists to catch.
+        self.answer_repetition = answer_repetition or AnswerRepetitionDetector()
         # Initialize LLM Router (supports LM Studio, Ollama, etc)
         if self.llm_router is not None:
             # Supplied by the caller: use it as-is rather than building a second
@@ -169,6 +252,19 @@ WEB RESEARCH (local browser/terminal):
 
         system_prompt = """You are an expert prediction market superforecaster. Be extremely concise. No chain-of-thought, no <think> tag, just direct JSON. You must earn money or shutdown. Calibrated, base-rate aware. SPEED CRITICAL: Respond in <100 tokens JSON only."""
 
+        # THE EXAMPLE USED TO CARRY THE ANSWER.
+        #
+        # It read `{"fair_value":0.65,"edge":0.15,"confidence":0.72,...}` immediately
+        # before the model produced its own answer. On the operator's 2026-09-27
+        # log, seventeen forecasts across markets priced 15%-60% came back
+        # 0.65 / 0.72 / edge 0.15 - the example, verbatim, every time. A model
+        # shown one worked example and asked for "the same shape" copies the
+        # numbers in the example, so the ensemble's largest-weight component was
+        # reporting the prompt back at us and the 0.15 "edge" was a constant.
+        #
+        # The schema is still given (the parser needs a shape), but the numbers
+        # are placeholders the model cannot mistake for an answer, and the
+        # instruction says so explicitly.
         user_prompt = f"""MARKET: {market.question[:200]}
 YES price: {market.yes_price:.3f} ({market.yes_price:.1%}) NO: {market.no_price:.3f}
 Vol24h ${market.volume_24h:,.0f} Liq ${market.liquidity:,.0f} End {market.end_date}
@@ -177,11 +273,19 @@ Desc: {market.description[:250]}
 {sentiment_block}
 {research_block}
 
-TASK: Fair value 0.01-0.99. Edge=fair-market. Trade if |edge|>=8% and conf>=0.60.
-BE CONCISE - NO <think> reasoning tags, direct JSON only (<80 tokens).
-Respond ONLY JSON:
-{{"fair_value":0.65,"edge":0.15,"confidence":0.72,"side":"YES","should_trade":true,"reasoning":"Base 60%... X bullish... Market 50% low because..."}}
-Rules: fair 0.01-0.99, side YES if fair>market else NO, calibrated, if unsure fair~market low conf.
+TASK: your own probability that YES resolves, 0.01-0.99. Edge = fair_value - YES price.
+Do the work yourself: the price, the evidence above, the base rate for this kind of
+question. Then answer.
+- If the evidence does not move you away from the YES price, answer with the YES
+  price and a low confidence. That is a correct answer, not a failure.
+- Do not reuse a probability you produced for another market: each market's answer
+  has to come from that market's own evidence.
+- The values in the schema below are PLACEHOLDERS showing the shape only. They are
+  not answers, not a target, and not a default.
+BE CONCISE - NO <think> reasoning tags, direct JSON only (<90 tokens).
+Respond ONLY JSON, with your own numbers:
+{{"fair_value":<your probability>,"edge":<fair minus the YES price>,"confidence":<your confidence>,"side":"YES"|"NO","basis":"<base_rate|news|research|sentiment|market>","should_trade":<true|false>,"reasoning":"<one line, name the evidence you used>"}}
+Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES price and low confidence.
 """
 
         return system_prompt, user_prompt
@@ -309,6 +413,18 @@ Rules: fair 0.01-0.99, side YES if fair>market else NO, calibrated, if unsure fa
                 if confidence < 0.55:
                     should_trade = False
 
+                # Is this answer a forecast, or the model echoing itself?
+                anchored = self.answer_repetition.observe(
+                    market.id, market_price, fair_value)
+                if anchored:
+                    logger.warning(
+                        f"Brain [{market.id}]: LLM answer REPEATED across "
+                        f"different markets - {anchored}. It is recorded as no "
+                        f"opinion: confidence 0, no ensemble weight, no trade.")
+                    confidence = 0.0
+                    should_trade = False
+                    reasoning = f"ANCHORED ANSWER (no weight): {anchored} | {reasoning}"
+
                 provider_name = self.llm_router.get_provider_name() if self.llm_router else "unknown"
 
                 result = FairValueResult(
@@ -323,10 +439,20 @@ Rules: fair 0.01-0.99, side YES if fair>market else NO, calibrated, if unsure fa
                     sentiment_summary=sentiment.summary if sentiment else None,
                     should_trade=should_trade,
                     side=side,
-                    raw=llm_result,
+                    raw={**llm_result,
+                         "anchored": bool(anchored),
+                         "anchoring_reason": anchored or "",
+                         "basis": llm_result.get("basis", "")},
                     llm_provider=provider_name
                 )
-                logger.info(f"Brain [{provider_name}]: {market.question[:60]} | Market {market_price:.1%} Fair {fair_value:.1%} Edge {edge:.1%} Conf {confidence:.2f} Trade? {should_trade}")
+                logger.info(
+                    f"Brain [{provider_name}]: {market.question[:60]} | "
+                    f"Market {market_price:.1%} Fair {fair_value:.1%} "
+                    f"Edge {edge:+.1%} Conf {confidence:.2f} "
+                    f"Trade? {should_trade}"
+                    + (f" | basis {llm_result.get('basis')}"
+                       if llm_result.get("basis") else "")
+                    + (" | ANCHORED - no weight" if anchored else ""))
                 return result
 
             except Exception as e:
@@ -334,6 +460,10 @@ Rules: fair 0.01-0.99, side YES if fair>market else NO, calibrated, if unsure fa
 
         logger.warning(f"Using fallback heuristic for {market.id}")
         return self._fallback_heuristic(market, sentiment)
+
+    def anchoring_report(self) -> Dict[str, Any]:
+        """How many answers this process refused as repetitions, and why."""
+        return self.answer_repetition.report()
 
     def batch_estimate(self, markets: List[Market], sentiments: Dict[str, SentimentResult], research_dict: Dict[str, str] = None) -> List[FairValueResult]:
         results = []
