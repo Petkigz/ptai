@@ -23,8 +23,10 @@ Design rules, each one a reaction to a specific way this goes wrong:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request
@@ -992,6 +994,52 @@ async def api_sports() -> JSONResponse:
                              "reason": f"{type(e).__name__}: {e}"})
 
 
+def _json_safe(value: Any, _depth: int = 0) -> Any:
+    """
+    Anything at all, as something `json.dumps` can send.
+
+    The run-cycle reply carries the cycle's own result under "detail", and a
+    cycle result contains live objects - `CombinatorialGroup`, `Market`, source
+    and mode enums. They are not JSON-serialisable, so `JSONResponse` raised
+    inside the response and the operator got HTTP 500 for a round that HAD run:
+    the page showed an error box, never received the round's bankroll, and the
+    agent pill was left showing whatever it showed before the button was
+    pressed. Found while reproducing the 2026-09-28 report, on a cycle that
+    found 6 markets and built arbitrage groups.
+
+    A reply that describes work that happened must not be able to fail to send,
+    so this is total: unknown objects fall back to their text, and non-finite
+    floats become null (a NaN would break the page's own JSON.parse instead).
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return value
+    if _depth >= 6:
+        return str(value)
+    if isinstance(value, Enum):
+        return _json_safe(getattr(value, "value", None) or str(value), _depth + 1)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v, _depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v, _depth + 1) for v in value]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return _json_safe(dataclasses.asdict(value), _depth + 1)
+        except Exception:  # noqa: BLE001 - fall through to text, never raise
+            return str(value)
+    for attr in ("to_dict", "model_dump", "dict"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                return _json_safe(method(), _depth + 1)
+            except Exception:  # noqa: BLE001
+                continue
+    return str(value)
+
+
 def _round_history(agent: Any, limit: int = 10) -> Dict[str, Any]:
     """
     The completed rounds, from the engine when it can speak and from the record
@@ -1106,7 +1154,11 @@ async def api_run_cycle(request: Request) -> JSONResponse:
 
     execution = result.get("execution") or []
     sports = result.get("sports") or {}
-    return JSONResponse({
+    # Serialised on the way out, once, in one place: see `_json_safe`. Every
+    # field below is read from the cycle result, and the cycle result holds
+    # objects (candidate groups, markets) that would otherwise turn this reply
+    # into a 500 for a round that actually ran.
+    payload = {
         "mode": requested_mode,
         "status": result.get("status"),
         # The sports lane's outcome, including WHY it was quiet. "Nothing
@@ -1142,7 +1194,8 @@ async def api_run_cycle(request: Request) -> JSONResponse:
         "round": result.get("round") or {},
         "rounds": _round_history(agent, 10),
         "detail": result,
-    })
+    }
+    return JSONResponse(_json_safe(payload))
 
 
 @app.get("/", response_class=HTMLResponse)

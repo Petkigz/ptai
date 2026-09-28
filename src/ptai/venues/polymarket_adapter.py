@@ -5,7 +5,7 @@ FIXED V7: Real orderbook intelligence + Real portfolio + No dangerous fallbacks
 import asyncio
 import json
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from loguru import logger
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
@@ -28,6 +28,39 @@ def _data_api_session():
 
 MAX_TRUSTED_SPREAD = 0.20       # above this a book cannot pay for its own crossing
 MAX_REFERENCE_DISAGREEMENT = 0.25  # mid vs the market's own price
+
+
+def parse_price_size(level: Any) -> Tuple[float, float]:
+    """
+    Read ONE order-book level as (price, size), whatever shape the venue used.
+
+    The CLOB sends levels two ways - a dict with `price`/`size`, or a
+    two-element `[price, size]` list - and the previous reader accepted both,
+    but only inside `normalise_book`. Four other call sites (the top-5 sizes and
+    the top-10 imbalance totals) called a helper named `parse_price_size` that
+    was never defined anywhere, so every real book raised NameError, the
+    fallback's `except` swallowed it, and the operator's 2026-09-28 log shows
+    the result on 200 markets in a row:
+
+        CLOB real orderbook failed ...: name 'parse_price_size' is not defined,
+        using enhanced estimation with warning -> ESTIMATED ... NOT REAL
+
+    That is the failure this function exists to make impossible: real depth was
+    in hand and the system reported an estimate instead. It is total on purpose
+    - a level it cannot read comes back as (0.0, 0.0), which every caller treats
+    as "not a quote" (see `normalise_book._levels`) - because a parser that
+    raises inside the book reader is what turned a measured book into an
+    estimate.
+    """
+    price = size = None
+    if isinstance(level, dict):
+        price, size = level.get("price"), level.get("size")
+    elif isinstance(level, (list, tuple)) and len(level) >= 2:
+        price, size = level[0], level[1]
+    try:
+        return float(price), float(size)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
 
 
 def normalise_book(raw: Dict[str, Any], *,
@@ -59,18 +92,11 @@ def normalise_book(raw: Dict[str, Any], *,
     unmeasured instead of pricing off them.
     """
     def _levels(items) -> list:
+        # ONE parser for the whole file, so the depth reader and this one cannot
+        # disagree about what a level looks like.
         out = []
         for item in items or []:
-            price = size = None
-            if isinstance(item, dict):
-                price, size = item.get("price"), item.get("size")
-            elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                price, size = item[0], item[1]
-            try:
-                price = float(price)
-                size = float(size)
-            except (TypeError, ValueError):
-                continue
+            price, size = parse_price_size(item)
             # A level outside (0, 1) or with no size is not a quote.
             if not (0.0 < price < 1.0) or size <= 0:
                 continue
@@ -400,6 +426,9 @@ class PolymarketAdapter(MarketAdapter):
                         }
 
                     if best_bid_price > 0 and best_ask_price > 0:
+                        # Sizes and totals via the one level parser. These four
+                        # lines are where every real CLOB book used to die with
+                        # a NameError and be reported as an ESTIMATE.
                         bid_size = sum(parse_price_size(b)[1] for b in bids[:5])
                         ask_size = sum(parse_price_size(a)[1] for a in asks[:5])
                         spread = best_ask_price - best_bid_price

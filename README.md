@@ -360,6 +360,45 @@ price otherwise, the last price this agent saw if the venue did not answer), wit
 the side respected - a NO position is marked `1 - yes` - and an unpriced position
 carried at cost and counted out loud (`open_positions_unmarked`).
 
+### While A Round Runs: The Screen Has To Agree With The Log
+
+The operator's report - *"when i press run a round it still says stopped while its
+showing that its running"* - was right, and it was three separate faults that all
+produced that one sentence:
+
+  * **The pill read a heartbeat that is written once.** `agent.heartbeat` is
+    stamped at the start of a cycle; `agent.phase` is rewritten for every market
+    the cycle touches. A cycle that ran longer than the liveness window (a
+    200-market scan, or a model call that took 547s, both in the same log) had a
+    stale heartbeat and a phase seconds old - and the verdict used the heartbeat
+    only, so the page printed `STOPPED` with the live line *"market 3 of 25 …
+    previous market took 547s"* underneath it. A phase that says work is
+    happening (`scanning`, `screening`, `evaluating`, `executing`), written
+    inside the window, is now evidence of life; the resting phases
+    (`cycle_complete`, `no_markets`, `blocked`, `sleeping`) deliberately are not,
+    because a process that wrote "sleeping" and then died must not look alive for
+    another window.
+  * **The button's own answer could fail to send.** The run-cycle reply carries
+    the cycle's result under `detail`, which holds live objects
+    (`CombinatorialGroup`, `Market`, enums). They are not JSON-serialisable, so
+    FastAPI raised inside the response and a round that RAN returned HTTP 500:
+    the page showed an error box instead of a bankroll and never re-read the
+    agent state. The reply is now serialised through one total converter - a
+    round that happened always comes back with its number.
+  * **Every real order book was reported as an estimate.** Four lines in the CLOB
+    reader called `parse_price_size`, which was defined nowhere; every book
+    raised `NameError`, the fallback caught it, and 200 markets in a row printed
+    `ESTIMATED … NOT REAL` while the real depth was already in hand. There is now
+    one level parser for the whole file (dict `price`/`size`, or a two-element
+    list), used by the depth reader and `normalise_book` alike, and it never
+    raises - a level that is not a quote reads as no quote.
+
+The same sweep removed the last two undefined names in the tree: the settlement
+guard's missing `logger` (a settler that raised reported `NameError` instead of
+returning `UNSETTLEABLE`, over a stake) and `MarketMechanics`, which
+`get_mechanics` annotated as its return type while only importing it inside the
+method body.
+
 ## Logins, Venues, And The Sports Lane
 
 **Logins** are saved in the console's Setup tab and kept encrypted in

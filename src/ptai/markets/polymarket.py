@@ -12,6 +12,11 @@ import aiohttp
 from loguru import logger
 
 from .base import Market, Token, MarketSource, DataMode
+# Real import, not the function-local one it used to be: `get_mechanics` is
+# annotated `-> "MarketMechanics"` while the name was only imported inside the
+# method body, so the annotation resolved to nothing and a reader (or a type
+# checker, or `typing.get_type_hints`) could not resolve the method's contract.
+from .mechanics import MarketMechanics, mechanics_for_market
 from ..config import get_settings
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -468,8 +473,6 @@ class PolymarketExecutor:
         itself when an order is built, but by then the edge has already been
         computed against a price on a grid the venue may not share.
         """
-        from .mechanics import MarketMechanics, mechanics_for_market
-
         key = str(condition_id or token_id or "")
         if key and not refresh and key in self._mechanics_cache:
             return self._mechanics_cache[key]
@@ -498,8 +501,6 @@ class PolymarketExecutor:
         caller can record what was actually signed rather than what it asked
         for.
         """
-        from .mechanics import MarketMechanics
-
         if mechanics is None:
             mechanics = self.get_mechanics(token_id, condition_id=condition_id)
 
@@ -634,8 +635,6 @@ class PolymarketExecutor:
         The price is still reported so the agent can account for what it paid
         rather than what it hoped to pay.
         """
-        from .mechanics import MarketMechanics
-
         if mechanics is None:
             mechanics = self.get_mechanics(token_id)
         prepared = {

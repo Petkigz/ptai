@@ -26,6 +26,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+# The settlement guard below reports a settler that raises. Without this import
+# the guard itself raised NameError instead of returning a verdict, so an
+# exception anywhere in a settler - a malformed fact, a missing stat, a bad
+# line - escaped mid-settlement rather than coming back as UNSETTLEABLE, and a
+# position could be left with no answer at all. Reported by pyflakes as the
+# only undefined name in the settlement path.
+from loguru import logger
+
 
 # ---------------------------------------------------------------------------
 # Match facts - the single record a settled match is reduced to

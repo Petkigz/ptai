@@ -486,6 +486,25 @@ def _risk(storage, last_cycle: Dict[str, Any]) -> Dict[str, Any]:
 PHASE_KEY = "agent.phase"
 HEARTBEAT_KEY = "agent.heartbeat"
 
+# The phases that mean WORK IS HAPPENING right now.
+#
+# `agent.heartbeat` is written once at the start of a cycle, but a cycle is not
+# short: the operator's own log has a 200-market scan plus model calls that ran
+# for minutes each. When a cycle runs longer than the liveness window, the
+# heartbeat ages out while the phase is still being rewritten for every market
+# the cycle touches - so a verdict that read only the heartbeat reported a
+# working agent as not running. That is the 2026-09-28 report, "it still says
+# stopped while it's showing that it's running": the page printed the live
+# phase line under a STOPPED pill, because the phase was read for display and
+# ignored for the verdict.
+#
+# A phase from this set, written inside the window, is therefore evidence of
+# life. The RESTING phases (`cycle_complete`, `no_markets`, `blocked`,
+# `sleeping`) are deliberately NOT: a process that wrote "sleeping" and then
+# died must not be able to look alive for another window. Those are covered by
+# the scan row a completed cycle writes.
+WORKING_PHASES = frozenset({"scanning", "screening", "evaluating", "executing"})
+
 
 def _interval_minutes() -> int:
     """How often the agent cycles, from the same env the runner sets."""
@@ -615,12 +634,17 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
         block["phase_seconds"] = _age_seconds(phase.get("at"))
         block["next_cycle_at"] = phase.get("next_cycle_at")
 
-    # 3. the verdict, from the two kinds of evidence
+    # 3. the verdict, from the three kinds of evidence
     window = block["window_seconds"]
     beat_ago = block["heartbeat_ago_seconds"]
+    phase_ago = block["phase_seconds"]
+    phase_name = str(block["phase"] or "")
     fresh_scan = scan_ago is not None and scan_ago < window
     fresh_beat = beat_ago is not None and beat_ago < window
-    block["running"] = bool(fresh_scan or fresh_beat)
+    fresh_phase = bool(phase_ago is not None and phase_ago < window
+                       and phase_name in WORKING_PHASES)
+    block["phase_is_live_evidence"] = fresh_phase
+    block["running"] = bool(fresh_scan or fresh_beat or fresh_phase)
     status = str(block["heartbeat_status"] or "")
     block["blocked_by_kill_switch"] = status.startswith("kill_switch")
     if not block["running"]:
@@ -630,10 +654,19 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
                                  "been recorded in this database")
         else:
             freshest = min([a for a in (scan_ago, beat_ago) if a is not None])
+            note = ""
+            if phase_ago is not None and phase_ago < window:
+                # A phase that is fresh but RESTING is not work in progress, and
+                # saying so stops the pill and the phase line reading as a
+                # contradiction: "stopped" with "cycle complete 4s ago" under it.
+                note = (f"; the last phase was "
+                        f"\"{block['phase_label'] or phase_name}\" "
+                        f"({_human_age(phase_ago)} ago), which is not work in "
+                        f"progress")
             block["evidence"] = (
                 f"the last sign of life was {_human_age(freshest)} ago, outside "
                 f"the {window / 60:.0f} min window for a {block['interval_min']} "
-                f"min interval")
+                f"min interval" + note)
     elif block["blocked_by_kill_switch"]:
         block["state"] = "blocked"
         block["evidence"] = (f"alive and refusing to trade: {status} "
@@ -645,9 +678,20 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
         # Alive, mid-cycle, nothing finished yet. Not the same as "running and
         # idle", and the difference is exactly what the operator is watching for.
         block["state"] = "working"
-        block["evidence"] = (f"alive ({status or 'heartbeat'} "
-                             f"{_human_age(beat_ago)} ago), first completed "
-                             f"cycle still in progress")
+        if fresh_phase:
+            # The heartbeat has aged out but the phase has not: the cycle is
+            # simply longer than one window. Say which evidence is the fresh
+            # one rather than reporting an old heartbeat as if it were the story.
+            block["evidence"] = (
+                f"working: phase \"{block['phase_label'] or phase_name}\" "
+                f"written {_human_age(phase_ago)} ago"
+                + (f", heartbeat {_human_age(beat_ago)} ago" if fresh_beat
+                   else " (this cycle has run longer than the heartbeat "
+                        "window, so the phase is the fresh evidence)"))
+        else:
+            block["evidence"] = (f"alive ({status or 'heartbeat'} "
+                                 f"{_human_age(beat_ago)} ago), first completed "
+                                 f"cycle still in progress")
     block["doing"] = (block["phase_detail"] or block["phase_label"]
                       or ("waiting between cycles" if block["state"] == "running"
                           else None))
