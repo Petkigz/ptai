@@ -310,6 +310,56 @@ spread 98%" appeared on market after market. Books are now sorted, checked
 against the token and market they were requested for, and refused (with the
 reason) when crossed, stale against the market's own price, or one-sided.
 
+## A Round: Research, Bets, And A Bankroll At The End
+
+Pressing **Run one round** - or the agent's own interval - runs one complete round
+and ends with a number: the paper account before it and after it.
+
+    Round 4 (312s): paper account $50.00 -> $51.24 = +$1.24 | 6 opened, 0 settled,
+    6 held | of which +$1.24 is the book at current prices (marked, not settled)
+
+What the round does, in order: research the market (discovery plus the order
+books), pick the suitable predictions (the cheap screen, then deep analysis on
+the shortlist - X, web research and the model), research further to choose which
+ones to bet (the forecast chain, fees, depth, net EV, the risk rules), bet them
+with the paper currency, and close by marking the whole book and reporting the
+account at both ends. Every stage's count is on the round (`markets_discovered`,
+`markets_screened`, `markets_researched`, `markets_priced`, `positions_opened`,
+`positions_settled`, `positions_held`, `staked_usd`), so "it ran" can be told
+apart from "it did the work".
+
+**The result is `equity_end - equity_start`, with the two halves kept apart.**
+Realised P&L is money that came back when a market resolved - it is in the
+bankroll and cannot be taken away. Marked P&L is the open book at current prices;
+it moves back and forth and it is not a settlement, and the log says so. A round
+that could not price anything reports NO NUMBER rather than a flat $50.00 that
+reads like break-even. The console shows the last round and the score across all
+of them (up / down / flat, best, worst) on the Agent tab, and the history is
+stored (`agent.rounds`, 50 kept) so it survives a restart.
+
+**More positions at once - bounded by the rules.** A round fills every position
+slot the limits leave open (6 by default) and stops there: a book that already
+holds every slot opens nothing, and the round still researches and reports. Two
+things had to be true for that to be safe, and neither was:
+
+  * The exposure ceilings (position count, 15% per category, 20% correlated, 50%
+    total) are enforced by `ExposureManager`, and nothing ever told it what was
+    already open - it was consulted with an empty list every cycle, so those
+    ceilings were enforced against zero. It is now seeded from the trades table
+    (which stores `category` and `correlation_group`) at the start of every round,
+    and grows as the round opens positions.
+  * The executor allows one order per venue per second. A round opening several
+    positions came back `rate_limited` after the first and silently lost the
+    rest. The round now waits the second out instead of losing the order.
+
+**Paper positions are marked to market.** They used to be carried at cost, so
+paper equity was a constant between settlements and no paper round could ever
+report anything but the figure it started with. They are now marked at the
+current price (the book's mid where a validated book exists, the venue's own
+price otherwise, the last price this agent saw if the venue did not answer), with
+the side respected - a NO position is marked `1 - yes` - and an unpriced position
+carried at cost and counted out loud (`open_positions_unmarked`).
+
 ## Logins, Venues, And The Sports Lane
 
 **Logins** are saved in the console's Setup tab and kept encrypted in

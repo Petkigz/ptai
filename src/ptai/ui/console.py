@@ -41,6 +41,7 @@ from ..execution.capital import (
     set_authorised_budget,
     set_operator_mode,
 )
+from ..execution.round import load_rounds, round_history_summary
 from ..storage.db import Storage
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
 from ..validation.rule_bench import validation_block
@@ -991,6 +992,47 @@ async def api_sports() -> JSONResponse:
                              "reason": f"{type(e).__name__}: {e}"})
 
 
+def _round_history(agent: Any, limit: int = 10) -> Dict[str, Any]:
+    """
+    The completed rounds, from the engine when it can speak and from the record
+    when it cannot.
+
+    Both paths read the same store, so the console can never show a different
+    history from the one the agent scores itself against.
+    """
+    if agent is not None:
+        try:
+            history = agent.round_history(limit=limit)
+            if isinstance(history, dict) and history.get("rounds") is not None:
+                return history
+        except Exception as e:  # noqa: BLE001 - a report must not break the page
+            logger.warning(f"Round history unavailable from the engine: "
+                           f"{type(e).__name__}: {e}")
+    rounds = load_rounds(get_storage(), limit=limit)
+    return {"rounds": rounds, "summary": round_history_summary(rounds)}
+
+
+@app.get("/api/console/rounds")
+async def api_rounds(limit: int = 10) -> JSONResponse:
+    """
+    Completed rounds, newest first, with the score across them.
+
+    The operator asked for a bankroll at the END of a run. A run that returns
+    only what it *did* leaves that question unanswered until somebody reads the
+    database, so this is the route the console polls - and the run-cycle reply
+    carries the round it just completed, from the same record.
+    """
+    try:
+        wanted = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        wanted = 10
+    history = _round_history(_agent(), wanted)
+    return JSONResponse({
+        "rounds": history.get("rounds", []),
+        "summary": history.get("summary", {}),
+    })
+
+
 @app.post("/api/console/run-cycle")
 async def api_run_cycle(request: Request) -> JSONResponse:
     """
@@ -1052,7 +1094,12 @@ async def api_run_cycle(request: Request) -> JSONResponse:
             })
 
     try:
-        result = await agent.run_cycle()
+        # A ROUND, not a bare cycle: the same research, screening, forecasting
+        # and execution, but with every position slot the risk rules leave open
+        # put to work, so the answer at the end is about an account that did
+        # something. `run_round` calls `run_cycle` with that trade ceiling and
+        # returns the round report alongside the cycle's own result.
+        result = await agent.run_round()
     except Exception as e:
         logger.error(f"Console cycle failed: {type(e).__name__}: {e}")
         return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {e}"})
@@ -1090,6 +1137,10 @@ async def api_run_cycle(request: Request) -> JSONResponse:
         "settlement": result.get("settlement"),
         "reconciliation": result.get("reconciliation"),
         "redemption": result.get("redemption"),
+        # The round: the account at both ends of it, the net, and the running
+        # score. This is what the operator asked a completed run to produce.
+        "round": result.get("round") or {},
+        "rounds": _round_history(agent, 10),
         "detail": result,
     })
 
@@ -1216,7 +1267,7 @@ section[id]{scroll-margin-top:132px}
   <div class="mono" style="font-size:12.5px;color:var(--dim)" id="hdrCapital"></div>
   <div class="spacer"></div>
   <button onclick="loadAll()">Refresh</button>
-  <button id="runBtn" onclick="runCycle()">Run one cycle</button>
+  <button id="runBtn" class="primary" onclick="runCycle()">Run one round</button>
   <!--
     One page, jump links. The sections are all on this page and all visible;
     these only scroll to them, so nothing can be hidden from the operator by a
@@ -1251,6 +1302,18 @@ section[id]{scroll-margin-top:132px}
              style="font-size:12px;min-width:210px;text-align:right"></div>
       </div>
     </div>
+    <div class="card" style="margin-top:16px">
+      <h2>The round &mdash; what the bankroll did</h2>
+      <div class="note" style="margin-bottom:9px">
+        A round researches the market, picks the predictions worth betting,
+        researches those further to choose which ones to bet, bets them with the
+        paper currency, and ends with a figure: the account before it and the
+        account after it. A round with nothing priced reports no number rather
+        than a flat one.
+      </div>
+      <div id="round"></div>
+    </div>
+
     <div class="grid cols-4" id="agentKpis" style="margin-top:16px"></div>
     <div class="grid cols-2" style="margin-top:16px">
       <div class="card">
@@ -2053,12 +2116,91 @@ async function loadResults(){
        to real money.</div>`;
 }
 
+// ---- the round ----
+//
+// What a completed run is FOR: the paper account at both ends, the net in
+// dollars, and whether the book is up or down overall. Rendered from the record
+// on every poll so the last round is on the page before the operator presses
+// anything, then refreshed from the run's own reply the moment one finishes.
+function roundFigure(net){
+  if(net==null || net==='') return '<span class="warn">no figure</span>';
+  const v = Number(net);
+  return `<span class="mono ${v>=0?'pos':'neg'}" style="font-weight:700">`
+    + `${v>=0?'+':''}$${Math.abs(v).toFixed(2)}</span>`;
+}
+
+function showRound(round, summary, rows, justRan){
+  const r = round || (rows||[])[0] || null;
+  const s = summary || {};
+  if(!r){
+    $('round').innerHTML = `<div class="note">No round has finished yet. Run one
+      and it will end with a bankroll figure here &mdash; positive or negative.</div>`;
+    return;
+  }
+  const net = r.net_usd;
+  const verdict = r.verdict || 'unknown';
+  const pill = verdict==='up' ? 'ok' : (verdict==='down' ? 'no' : 'dim');
+  const head = net==null
+    ? `<div style="font-size:15px"><b>Round ${r.number||''}</b> &mdash;
+        <span class="warn">no figure</span>
+        <span class="note">${esc((r.warnings||[])[0]
+            || 'nothing could be priced this round, so the account value is unknown rather than unchanged')}</span></div>`
+    : `<div style="font-size:15px"><b>Round ${r.number||''}</b>
+        <span class="pill ${pill}">${esc(verdict)}</span>
+        <span class="mono">${r.equity_start==null?'?':'$'+Number(r.equity_start).toFixed(2)}
+          &rarr; ${r.equity_end==null?'?':'$'+Number(r.equity_end).toFixed(2)}
+          = ${roundFigure(net)}</span>
+        ${justRan?'<span class="note">just finished</span>':''}</div>`;
+  const detail = `<div class="note" style="margin-top:5px">
+      ${r.positions_opened||0} opened &middot; ${r.positions_settled||0} settled &middot;
+      ${r.positions_held||0} held
+      ${r.open_positions_unmarked?`&middot; ${r.open_positions_unmarked} position(s)
+        carried at cost (no current price)`:''}
+      &middot; discovered ${r.markets_discovered||0}, screened ${r.markets_screened||0},
+      researched ${r.markets_researched||0}, priced ${r.markets_priced||0}
+      ${r.staked_usd?`&middot; $${Number(r.staked_usd).toFixed(2)} staked`:''}
+      ${r.duration_seconds?`&middot; took ${Math.round(r.duration_seconds)}s`:''}</div>`;
+  const realised = (r.realised_pnl||r.unrealised_pnl)
+    ? `<div class="note" style="margin-top:5px">of the move:
+        ${roundFigure(r.realised_pnl)} realised (settled and in the bankroll) &middot;
+        ${roundFigure(r.unrealised_pnl)} marked (the open book at current prices,
+        not a settlement)</div>`
+    : '';
+  const score = s.scored
+    ? `<div class="note" style="margin-top:9px">Across ${s.scored} scored round(s):
+        <b class="mono ${Number(s.net_usd)>=0?'pos':'neg'}">${Number(s.net_usd)>=0?'+':''}$${Math.abs(Number(s.net_usd)).toFixed(2)}</b>
+        &middot; ${s.up||0} up, ${s.down||0} down, ${s.flat||0} flat
+        &middot; best ${roundFigure(s.best_round)}, worst ${roundFigure(s.worst_round)}</div>`
+    : `<div class="note" style="margin-top:9px">${esc(s.note
+        || 'no completed round has produced a figure yet')}</div>`;
+  const history = (rows||[]).length > 1
+    ? `<table style="margin-top:11px"><thead><tr><th>#</th><th>Account</th>
+        <th>Before</th><th>After</th><th>Net</th><th>Opened / settled / held</th>
+        <th>Took</th></tr></thead><tbody>`
+      + rows.slice(0,8).map(x=>`<tr>
+          <td class="mono">${x.number||''}</td>
+          <td><span class="pill ${x.account==='live'?'no':'dim'}">${esc(x.account||x.mode||'paper')}</span></td>
+          <td class="mono">${x.equity_start==null?'&mdash;':'$'+Number(x.equity_start).toFixed(2)}</td>
+          <td class="mono">${x.equity_end==null?'&mdash;':'$'+Number(x.equity_end).toFixed(2)}</td>
+          <td>${roundFigure(x.net_usd)}</td>
+          <td class="mono">${x.positions_opened||0} / ${x.positions_settled||0} / ${x.positions_held||0}</td>
+          <td class="mono">${x.duration_seconds!=null?Math.round(x.duration_seconds)+'s':'&mdash;'}</td>
+        </tr>`).join('') + `</tbody></table>`
+    : '';
+  $('round').innerHTML = head + detail + realised + score + history;
+}
+
+async function loadRounds(){
+  const {body} = await api('/api/console/rounds');
+  showRound((body.rounds||[])[0] || null, body.summary||{}, body.rounds||[], false);
+}
+
 async function runCycle(){
   const btn = $('runBtn');
-  btn.disabled = true; btn.textContent = 'Running\u2026';
+  btn.disabled = true; btn.textContent = 'Running a round\u2026';
   const {ok, body} = await api('/api/console/run-cycle', {method:'POST',
     body:JSON.stringify({mode:STATE.mode})});
-  btn.disabled = false; btn.textContent = 'Run one cycle';
+  btn.disabled = false; btn.textContent = 'Run one round';
   if(!ok){
     $('cycleOut').innerHTML = `<div class="errbox"><b>${body.error||'cycle refused'}</b>`
       + ((body.warnings||[]).length?`<ul style="margin-left:16px;margin-top:7px">${
@@ -2092,6 +2234,12 @@ async function runCycle(){
     </div>` + spNote +
     ((sp.refusals||[]).length ? `<div class="note" style="margin-top:5px">Why no
       sports bet: ${esc(sp.refusals.map(r=>`${r.outcome||''}: ${(r.reasons||[])[0]||''}`).join(' · '))}</div>` : '');
+  // The round is the answer, so it goes on the page from the run's OWN reply -
+  // not from a later poll, which would leave the button looking like it only
+  // reported activity.
+  const rh = body.rounds || {};
+  showRound(body.round || (rh.rounds||[])[0] || null, rh.summary || {},
+            rh.rounds || [], true);
   // The cycle just wrote its own phase, heartbeat and scan row: show them, so
   // the front page cannot lag behind a cycle the operator just ran by hand.
   loadStatus(); loadAgent();
@@ -2537,6 +2685,7 @@ async function loadAll(){
       loadAgent(), loadStatus(), loadBrainSetup(),
       loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
       loadLogins(), loadVenueSwitches(), loadSports(), loadForecast(),
+      loadRounds(),
     ]);
     spyScroll();
   } finally {

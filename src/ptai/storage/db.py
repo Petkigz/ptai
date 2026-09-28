@@ -376,6 +376,16 @@ class Storage:
         # needs no side arithmetic to get wrong. NULL on rows that predate it,
         # which the skill gate reads as "not measured" and fails closed on.
         ("trade_outcomes", "yes_price", "REAL"),
+        # WHICH CORRELATED CEILING A POSITION BELONGS TO.
+        #
+        # `category` was already stored; the correlated group was not, and it is
+        # the ceiling (20%) that exists to stop the agent holding the same bet
+        # twice under two questions. Without it the cap could not be re-checked
+        # against the open book: the manager was consulted with an empty list -
+        # see `_seed_exposure_manager` in the V3 loop. NULL means the row
+        # predates this, and the position is then counted in the position count
+        # and the total-exposure ceiling only, which is what is knowable.
+        ("trades", "correlation_group", "TEXT"),
     )
 
     def _migrate(self):
@@ -513,8 +523,8 @@ class Storage:
     def log_trade(self, trade: Dict[str, Any]) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cur = self.conn.execute("""
-            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes, venue_id, strategy, category, order_id, execution_mode, token_price_at_entry, yes_price_at_entry, fees_usd)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (timestamp, market_id, market_question, event_slug, outcome, side, market_price, fair_value, edge, kelly_fraction, position_size_usd, position_size_pct, confidence, status, notes, venue_id, strategy, category, correlation_group, order_id, execution_mode, token_price_at_entry, yes_price_at_entry, fees_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now,
             trade.get("market_id"),
@@ -534,6 +544,7 @@ class Storage:
             trade.get("venue_id"),
             trade.get("strategy"),
             trade.get("category"),
+            trade.get("correlation_group"),
             trade.get("order_id"),
             # Named, or silently dropped on the floor. This INSERT has already
             # lost columns that way once (strategy/category/order_id), and a

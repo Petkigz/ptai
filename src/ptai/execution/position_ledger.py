@@ -63,6 +63,17 @@ class PositionLedger:
     paper_resting_order_cost: float = 0.0
     paper_free_cash: float = 0.0
     paper_equity: float = 0.0
+    # The paper account's P&L, split the same way the live account's is.
+    #
+    # Paper positions used to be carried at cost unconditionally, so paper equity
+    # was ALWAYS equal to the paper bankroll until a market happened to settle:
+    # a simulated round could not show a profit or a loss it had actually earned
+    # or suffered, and "did this round make or lose money" had no answer inside
+    # the round. They are marked to market now, exactly like live positions.
+    paper_unrealised_pnl: float = 0.0
+    paper_realised_pnl: float = 0.0
+    paper_marked: int = 0
+    paper_unmarked: int = 0
     initial_bankroll: float = 50.0
     warnings: List[str] = field(default_factory=list)
 
@@ -104,6 +115,10 @@ class PositionLedger:
             "paper_resting_order_cost": round(self.paper_resting_order_cost, 2),
             "paper_free_cash": round(self.paper_free_cash, 2),
             "paper_equity": round(self.paper_equity, 2),
+            "paper_unrealised_pnl": round(self.paper_unrealised_pnl, 2),
+            "paper_realised_pnl": round(self.paper_realised_pnl, 2),
+            "paper_marked": self.paper_marked,
+            "paper_unmarked": self.paper_unmarked,
             "initial_bankroll": round(self.initial_bankroll, 2),
             "can_open_new": self.can_open_new,
             "warnings": self.warnings,
@@ -231,11 +246,36 @@ class PositionLedgerBuilder:
                 # free cash available for live positions - and it must reduce
                 # the PAPER free cash exactly the way a live position reduces
                 # the live free cash, or a paper run sizes trades against
-                # capital it does not have. Carried at cost, like an unmarked
-                # live position.
+                # capital it does not have.
+                #
+                # MARKED TO MARKET, the same way a live position is. Carrying
+                # them at cost made paper equity a constant: the simulated
+                # account could not show a gain or a loss until a market
+                # resolved, so a completed round never had a bankroll to
+                # report - it reported its starting figure whatever had
+                # happened to the prices since.
                 ledger.paper_position_count += 1
                 ledger.paper_position_cost += size
-                ledger.paper_position_value += size
+                paper_entry = float(trade.get("token_price_at_entry")
+                                    or trade.get("market_price") or 0.0)
+                paper_side = str(trade.get("side") or "").upper()
+                paper_bought_yes = paper_side in ("YES", "1", "LONG", "BUY", "TRUE")
+                paper_mark = None
+                if price_lookup is not None and trade.get("market_id"):
+                    try:
+                        paper_mark = price_lookup(str(trade["market_id"]))
+                    except Exception:
+                        paper_mark = None
+                if paper_mark is None or paper_entry <= 0:
+                    # An unknown mark is not a zero and not a gain: carried at
+                    # cost, counted, and said out loud.
+                    ledger.paper_unmarked += 1
+                    ledger.paper_position_value += size
+                    continue
+                paper_marked_price = (float(paper_mark) if paper_bought_yes
+                                      else (1.0 - float(paper_mark)))
+                ledger.paper_position_value += (size / paper_entry) * paper_marked_price
+                ledger.paper_marked += 1
                 continue
 
             ledger.live_position_count += 1
@@ -351,6 +391,25 @@ class PositionLedgerBuilder:
         ledger.paper_equity = (ledger.paper_free_cash
                                + ledger.paper_position_value
                                + ledger.paper_resting_order_cost)
+        ledger.paper_unrealised_pnl = (ledger.paper_position_value
+                                       - ledger.paper_position_cost)
+        try:
+            paper_row = self.storage.conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) AS total FROM trades "
+                "WHERE resolved = 1 AND (execution_mode = 'paper' "
+                "OR (COALESCE(execution_mode,'') = '' AND status = 'settled' "
+                "AND notes LIKE '%PAPER%'))"
+            ).fetchone()
+            ledger.paper_realised_pnl = float(paper_row["total"] or 0.0) if paper_row else 0.0
+        except Exception:
+            # The paper realised figure is reporting, not sizing: an unreadable
+            # one leaves it at zero and says the row could not be read.
+            ledger.warnings.append("paper realised P&L could not be read from the record")
+        if ledger.paper_unmarked:
+            ledger.warnings.append(
+                f"{ledger.paper_unmarked} open paper position(s) could not be "
+                f"marked to market and are carried at cost; paper equity reflects "
+                f"only the {ledger.paper_marked} that could be priced")
 
         return ledger
 

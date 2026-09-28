@@ -123,6 +123,8 @@ from ..risk.kill_switch import KillSwitch, KillLevel
 from ..risk.limits import LimitsEngine, TradeLimits
 
 from ..execution.order_manager import OrderManager
+from ..execution.round import (MARKS_KEY, RoundReport, load_rounds,
+                               record_round, round_history_summary)
 from ..execution.redemption import Redeemer
 from ..execution.execution_guard import ExecutionGuard
 from ..execution.reconciliation import ReconciliationEngine
@@ -516,6 +518,16 @@ class TradingAgentV3:
         self._deep_market_ids: set = set()
         self._deep_shortlist_active = False
         self._screen: Dict[str, Any] = {}
+        # Round state: the opening book value, the report being built, and what
+        # settled inside it.
+        self._round_open_ledger = None
+        self._round_report = None
+        self._round_settled = 0
+        # Which account the exposure ceilings were seeded with. None means no
+        # seed has run, so nothing may be added to the view (see
+        # `_seed_exposure_manager`).
+        self._exposure_account: Optional[str] = None
+        self._round_started_at = ""
         # Base rates: real counted frequencies, refreshed at most once a day.
         self.base_rates = None
         self._base_rate_refresh = {"attempted_at": "", "ok": False, "reason": ""}
@@ -951,6 +963,161 @@ class TradingAgentV3:
             + (f" (previous market took {_elapsed:.0f}s)" if self._cycle_market_index > 1
                else ""))
         return await self.get_context_for_market(market)
+
+    # ------------------------------------------------------------------
+    # A ROUND.
+    #
+    # One press of the button, from research to a bankroll figure. The round is
+    # scored on the account that is actually trading it - the paper account in
+    # paper mode, the real one otherwise - and its result is equity_end minus
+    # equity_start with the realised and marked parts kept apart.
+    # ------------------------------------------------------------------
+    def _round_marks(self) -> Dict[str, float]:
+        """The marks stored at the end of the last round, for the opening book."""
+        try:
+            raw = self.storage.get_state(MARKS_KEY)
+            return json.loads(raw) if raw else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _store_round_marks(self, marks: Dict[str, float]) -> None:
+        try:
+            self.storage.set_state(MARKS_KEY, json.dumps(marks))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not store position marks: "
+                           f"{type(e).__name__}: {e}")
+
+    def _current_marks(self, markets: List[Market]) -> Dict[str, float]:
+        """
+        What each market is worth now, from the books this cycle read.
+
+        A validated two-sided book gives the midpoint - the honest mark for a
+        position that would have to cross the spread to close. Without one, the
+        venue's own reference price is used and the position is still marked,
+        because a price the venue published is evidence; a book that FAILED
+        validation is not used at all, and those positions are counted as
+        unmarked rather than priced off a book we refused.
+        """
+        marks: Dict[str, float] = {}
+        for market in markets or []:
+            book = (getattr(self, "_cycle_books", {}) or {}).get(market.id) or {}
+            mid = None
+            if isinstance(book, dict) and book.get("validated") and book.get("midpoint"):
+                mid = float(book["midpoint"])
+            elif not isinstance(book, dict) or book.get("validated", True):
+                price = getattr(market, "yes_price", None)
+                if price:
+                    mid = float(price)
+            if mid is not None and 0.0 < mid < 1.0:
+                marks[str(market.id)] = round(mid, 6)
+        return marks
+
+    def _round_ledger(self, price_lookup) -> Any:
+        """The ledger as it stands, with whatever marks we have."""
+        try:
+            return self.ledger_builder.build(price_lookup=price_lookup)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not build the ledger for the round: "
+                           f"{type(e).__name__}: {e}")
+            return None
+
+    def _score_round(self, report: RoundReport, markets: List[Market],
+                     scan_result: Any, execution_results: List[Dict[str, Any]],
+                     discovered: int) -> RoundReport:
+        """
+        Close the round: mark the book, compare it with the opening book, store it.
+        """
+        # WHAT THE BOOK IS WORTH NOW: this cycle's own prices where it managed to
+        # read a book, and otherwise the last price this agent saw for that
+        # market. The stored marks are the fallback, not the fresh read, because
+        # a round that could not reach a venue must not turn a marked position
+        # into an unmarked one and "lose" a move it already reported - that
+        # reports a loss the account did not suffer, which is the same class of
+        # error as inventing a gain.
+        marks = dict(self._round_marks())
+        marks.update(self._current_marks(markets))
+        end = self._round_ledger(lambda mid: marks.get(str(mid)))
+        if end is None:
+            report.warnings.append(
+                "the ledger could not be read at the end of the round, so no "
+                "result can be reported")
+            report.markets_discovered = discovered
+            return report
+
+        account = "paper" if report.mode == "paper" else "live"
+        if account == "paper":
+            report.equity_end = float(end.paper_equity)
+            report.cash_end = float(end.paper_bankroll)
+            report.unrealised_pnl = float(end.paper_unrealised_pnl)
+            report.realised_pnl = float(end.paper_realised_pnl)
+            report.positions_held = int(end.paper_position_count)
+            report.open_positions_marked = int(end.paper_marked)
+            report.open_positions_unmarked = int(end.paper_unmarked)
+        else:
+            report.equity_end = float(end.equity)
+            report.cash_end = float(end.free_cash + end.reserved_capital
+                                    + end.resting_order_cost)
+            report.unrealised_pnl = float(end.unrealised_pnl)
+            report.realised_pnl = float(end.realised_pnl)
+            report.positions_held = int(end.live_position_count)
+            report.open_positions_marked = 1 if end.open_position_value else 0
+        report.warnings.extend(end.warnings[:4])
+
+        opening = getattr(self, "_round_open_ledger", None)
+        if opening is None:
+            report.notes.append(
+                "no opening book value was recorded for this round, so its "
+                "result cannot be measured - the next round will have one")
+        else:
+            if account == "paper":
+                report.equity_start = float(opening.paper_equity)
+                report.cash_start = float(opening.paper_bankroll)
+            else:
+                report.equity_start = float(opening.equity)
+                report.cash_start = float(opening.free_cash
+                                          + opening.reserved_capital
+                                          + opening.resting_order_cost)
+
+        report.markets_discovered = discovered
+        report.markets_screened = int((self._screen or {}).get("considered") or 0)
+        report.markets_researched = len(self._deep_market_ids or [])
+        if scan_result is not None:
+            report.markets_priced = int(getattr(scan_result, "total_scanned", 0) or 0)
+            report.candidates = int(getattr(scan_result, "total_candidates", 0) or 0)
+        opened = [e for e in (execution_results or []) if e.get("position_recorded")]
+        report.positions_opened = len(opened)
+        # What actually left the account, from the FILL rather than from the
+        # request: a $3 order that filled $1.38 against a thin book staked
+        # $1.38, and the slot's `amount` is the request. Reading the wrong one
+        # made every round report $0.00 staked.
+        _staked = 0.0
+        for _entry in opened:
+            _fill = _entry.get("fill")
+            _value = (_fill.get("filled_usd") if isinstance(_fill, dict) else None)
+            if _value is None:
+                _value = _entry.get("amount_usd", _entry.get("amount"))
+            try:
+                _staked += float(_value or 0.0)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Round staked total skipped an unreadable amount on "
+                    f"{_entry.get('market_id')}: {_value!r}")
+        report.staked_usd = round(_staked, 4)
+        report.positions_settled = int(
+            (getattr(self, "_round_settled", 0) or 0))
+        if report.open_positions_unmarked:
+            report.warnings.append(
+                f"{report.open_positions_unmarked} position(s) could not be priced "
+                f"and are carried at cost; the result reflects only the rest")
+        if report.verdict == "flat" and report.positions_opened:
+            report.notes.append(
+                "positions were opened and the book has not moved yet - a round "
+                "that opens positions usually ends marked, not settled")
+        report.notes.append(
+            "marked = the book at current prices (it can move back). realised = "
+            "markets that resolved (that money is banked)")
+        self._store_round_marks(marks)
+        return report
 
     BASE_RATES_REFRESH_HOURS = 24.0
 
@@ -1549,6 +1716,56 @@ class TradingAgentV3:
             self.execution_guard.update_bankroll(self.bankroll)
         return report.to_dict()
 
+    async def run_round(self, target_per_venue: int = 200,
+                        max_trades: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Run one complete round: research, decide, bet, and report the bankroll.
+
+        The difference from `run_cycle` is the number of positions. A round is
+        meant to leave the account measurably different, and three positions on a
+        $50 bankroll is a thin sample of a market the operator asked to be
+        involved in "more at once". The ceiling is the RISK rules, not this
+        method: it fills every position slot the limits leave open and no more,
+        reads them from the same ledger sizing reads, and never widens a cap.
+
+        Paper rounds are the same call with the same rules - the paper account
+        carries its own cash, so six positions of $3 is $18 of a $50 simulation,
+        under both the 6%-a-position and 50%-exposure ceilings.
+        """
+        if max_trades is None:
+            try:
+                limits_max = int(self.limits_engine.limits.max_open_positions)
+            except Exception:  # noqa: BLE001
+                limits_max = 6
+            ledger = self._round_ledger(
+                lambda mid: self._round_marks().get(str(mid)))
+            if ledger is not None:
+                account = "paper" if self.dry_run else "live"
+                held = (ledger.paper_position_count if account == "paper"
+                        else ledger.live_position_count)
+            else:
+                held = 0
+            free_slots = max(0, limits_max - int(held))
+            # Never at least one: a book that already holds every position the
+            # rules allow is a full book, and widening the ceiling to keep the
+            # round busy is exactly the thing the ceiling exists to prevent.
+            # Nothing is left to open - the round still researches and reports.
+            max_trades = free_slots
+            logger.info(
+                f"Round sizing: {held} position(s) already open, the risk rules "
+                f"allow {limits_max} - this round may open up to {max_trades}"
+                if max_trades else
+                f"Round sizing: the {held} open position(s) fill every slot the "
+                f"risk rules allow ({limits_max}) - this round will research and "
+                f"score the book, and will not open anything")
+        return await self.run_cycle(target_per_venue=target_per_venue,
+                                    max_trades=max_trades)
+
+    def round_history(self, limit: int = 20) -> Dict[str, Any]:
+        """Completed rounds and the running score, for the console."""
+        rounds = load_rounds(self.storage, limit=limit)
+        return {"rounds": rounds, "summary": round_history_summary(rounds)}
+
     async def run_cycle(self, target_per_venue: int = 200, max_trades: int = 3) -> Dict[str, Any]:
         """
         V3 Cycle: multi-venue × multi-strategy WITH Qualification Engine V8
@@ -1650,6 +1867,8 @@ class TradingAgentV3:
         settlement_report = None
         try:
             settlement_report = await self.settlement_engine.settle_pending()
+            self._round_settled = int(
+                getattr(settlement_report, "settled", 0) or 0)
             if settlement_report.settled:
                 # Bankroll moved; refresh the derived values before sizing.
                 self.bankroll = self.storage.get_bankroll()
@@ -1778,6 +1997,42 @@ class TradingAgentV3:
             f"{total_markets} market(s) from {len(markets_by_venue)} venue(s); "
             f"pricing them against fees, depth and uncertainty")
         
+        # ------------------------------------------------------------------
+        # OPEN THE ROUND.
+        #
+        # Recorded BEFORE any work: the opening book value uses the marks stored
+        # at the end of the last round, so a position carried in is measured
+        # against what it was worth then rather than against what it cost - an
+        # unrealised gain already reported must not be reported a second time.
+        # Chances and costs are all measured against this snapshot.
+        # ------------------------------------------------------------------
+        self._round_settled = 0
+        self._round_started_at = datetime.now(timezone.utc).isoformat()
+        _opening_marks = self._round_marks()
+        self._round_open_ledger = self._round_ledger(
+            lambda mid: _opening_marks.get(str(mid)))
+        _mode = "paper" if self.dry_run else "live"
+        self._round_report = RoundReport(
+            number=len(load_rounds(self.storage, limit=9999)) + 1,
+            started_at=self._round_started_at,
+            mode=_mode,
+            account=_mode,
+        )
+        if self._round_open_ledger is not None:
+            if _mode == "paper":
+                self._round_report.equity_start = float(
+                    self._round_open_ledger.paper_equity)
+                self._round_report.cash_start = float(
+                    self._round_open_ledger.paper_bankroll)
+            else:
+                self._round_report.equity_start = float(self._round_open_ledger.equity)
+        logger.info(
+            f"=== ROUND {self._round_report.number} opened ({_mode} account, "
+            f"opening value "
+            + (f"${self._round_report.equity_start:,.2f})"
+               if self._round_report.equity_start is not None
+               else "unknown - no prior marks)") + " ===")
+
         if total_markets == 0:
             # Same shape as the full result. The no-markets path used to return
             # a different set of keys, so a UI had to special-case it to render
@@ -1799,6 +2054,26 @@ class TradingAgentV3:
                              "nothing was priced on a model opinion either"),
             }
             self._store_forecast_evidence([])
+            # A round that found nothing still closes: the book from earlier
+            # rounds is marked, so the operator sees the account value either
+            # way instead of a button that reports only that it was quiet.
+            _quiet_round = self._round_report or RoundReport(
+                mode="paper" if self.dry_run else "live")
+            try:
+                self._score_round(_quiet_round, markets=[], scan_result=None,
+                                  execution_results=[], discovered=0)
+                _quiet_round.notes.append(
+                    "no venue returned a market this round - the account value "
+                    "below is the book carried in, marked at the prices from "
+                    "the last round that had any")
+            except Exception as e:  # noqa: BLE001
+                _quiet_round.warnings.append(
+                    f"the round could not be closed: {type(e).__name__}: {e}")
+            _quiet_round.finished_at = datetime.now(timezone.utc).isoformat()
+            _quiet_round.duration_seconds = time.time() - start
+            record_round(self.storage, _quiet_round)
+            logger.info("ROUND RESULT: " + _quiet_round.headline())
+            self._round_report = _quiet_round
             # ...and the sports lane still runs. Its feed is not the prediction
             # markets' feed, and "no prediction markets" is not a reason to skip
             # the half of the product that has fixtures today.
@@ -1863,6 +2138,9 @@ class TradingAgentV3:
                               "evaluated. This is not a signal to hold: a venue that fails to "
                               "return markets is unavailable, not quiet."),
             }
+            # The round, after the dict it belongs to exists: a quiet round still
+            # states the account's value rather than reporting only that it ran.
+            no_markets_result["round"] = _quiet_round.to_dict()
             # A cycle that discovered nothing is still a cycle that RAN. On a
             # fresh deployment - no venue credentials yet, or a venue down -
             # every cycle takes this path, and without the row the console
@@ -1878,6 +2156,7 @@ class TradingAgentV3:
 
         # Alpha scan - all additional alpha ideas (Top 5 + queue)
         all_markets_flat = [m for markets in markets_by_venue.values() for m in markets]
+
 
         # BASE RATES: a prior counted from resolved markets, refreshed at most
         # once a day. Until it exists the base-rate model contributes nothing and
@@ -2312,6 +2591,18 @@ class TradingAgentV3:
         self.multi_venue_executor.bankroll = current_bankroll
         self.execution_guard.update_bankroll(current_bankroll)
         self.account_health_engine.bankroll = current_bankroll
+
+        # THE CAPS HAVE TO SEE THE BOOK. `ExposureManager.can_open` is the check
+        # that enforces the position COUNT and the category / correlated / total
+        # exposure ceilings, and it was being consulted with an empty list on
+        # every cycle: nothing here ever told it what was already open, so those
+        # ceilings were enforced against zero. A round is now asked to open every
+        # slot the limits leave free ("do more at once"), which is only safe if
+        # the rules that bound "more at once" can see what is already held.
+        _exposure_seed = self._seed_exposure_manager(ledger)
+        if (not _exposure_seed.get("readable", True)
+                and self._round_report is not None):
+            self._round_report.warnings.append(str(_exposure_seed.get("warning")))
         
         self._set_phase(
             "executing",
@@ -2756,8 +3047,15 @@ class TradingAgentV3:
                 "blockers": sports_block.get("blockers", []),
             },
             "sports": sports_block,
+            # What the exposure caps could see when they ran. An unreadable book
+            # must be on the report, not only in a log line: a caps check that
+            # cannot see the book cannot refuse anything.
+            "exposure": _exposure_seed,
             # The per-market forecast chains, for the trades that were proposed.
             "pricing": self._pricing_rows(scan_result.all_opportunities)[:20],
+            # The round is attached AFTER it is closed, below - closing it is
+            # what marks the book and states the bankroll, so there is nothing
+            # honest to report at this point in the cycle yet.
             "execution": execution_results,
             # Which venue the money is on, and why. Computed from the evidence
             # this cycle gathered: qualification, the balances the health engine
@@ -2794,6 +3092,36 @@ class TradingAgentV3:
         # way it did has to survive this process.
         self._store_forecast_evidence(
             self._pricing_rows(scan_result.all_opportunities))
+
+        # ------------------------------------------------------------------
+        # CLOSE THE ROUND: mark the book and state the result.
+        # ------------------------------------------------------------------
+        _round = self._round_report or RoundReport(
+            mode="paper" if self.dry_run else "live")
+        try:
+            self._score_round(
+                _round,
+                markets=[m for group in markets_by_venue.values() for m in group],
+                scan_result=scan_result,
+                execution_results=execution_results,
+                discovered=int(total_markets or 0),
+            )
+        except Exception as e:  # noqa: BLE001
+            _round.warnings.append(
+                f"the round could not be closed: {type(e).__name__}: {e}")
+            logger.error(f"Round close failed: {type(e).__name__}: {e}")
+        _round.finished_at = datetime.now(timezone.utc).isoformat()
+        try:
+            _round.duration_seconds = (datetime.now(timezone.utc)
+                                       - datetime.fromisoformat(_round.started_at)
+                                       ).total_seconds()
+        except (TypeError, ValueError):
+            _round.duration_seconds = float(result.get("execution_time") or 0.0)
+        record_round(self.storage, _round)
+        logger.info("ROUND RESULT: " + _round.headline())
+        self._round_report = _round
+        # The round: what it earned or lost, and on which account. Now it exists.
+        result["round"] = _round.to_dict()
 
         _slowest = getattr(self, "_slowest_model_call_seconds", None)
         self._set_phase(
@@ -2878,6 +3206,40 @@ class TradingAgentV3:
 
         return result
 
+    # One order per venue per second, which is what the executor enforces. The
+    # number here is the executor's own window plus a small margin.
+    VENUE_ORDER_SPACING_SECONDS = 1.05
+
+    async def _wait_for_venue_spacing(self, venue_id: str) -> float:
+        """
+        Wait out the venue's order spacing instead of losing the order.
+
+        `MultiVenueExecutor.check_rate_limit` allows one request per venue per
+        second and answers anything faster with `rate_limited`. That rule is
+        right; dropping the order is not. In a round that opens several
+        positions on the one venue that holds the capital, the first position
+        filled and the rest came back rate_limited and were never retried - the
+        round reported one position and quietly lost the others, which is the
+        exact opposite of "do more at once". Waiting the second out keeps both
+        the venue's rule and the round.
+        """
+        if not venue_id:
+            return 0.0
+        try:
+            last = float((getattr(self.multi_venue_executor, "rate_limits", {}) or {})
+                         .get(venue_id) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if last <= 0:
+            return 0.0
+        wait = self.VENUE_ORDER_SPACING_SECONDS - (time.time() - last)
+        if wait <= 0:
+            return 0.0
+        logger.info(f"Order spacing: waiting {wait:.2f}s before the next order at "
+                    f"{venue_id} - the venue allows one per second")
+        await asyncio.sleep(wait)
+        return wait
+
     async def _execute_with_side_aware_cap(self, opp, amount_usd: float,
                                            exploration: bool = False):
         """
@@ -2900,6 +3262,12 @@ class TradingAgentV3:
            touch real capital would be live trading at an unqualified venue,
            which is the one thing the qualification gate exists to prevent.
         """
+        # Space the orders the venue will accept. Checked HERE, on the single
+        # canonical dispatch path, so paper and live orders are spaced the same
+        # way and a second caller cannot bypass it.
+        await self._wait_for_venue_spacing(
+            str(getattr(opp, "venue_id", "") or ""))
+
         if str(opp.side).upper() == "NO":
             yes_price = float(opp.market_price)
             cap = max(0.01, min(0.99, 1.0 - yes_price + 0.02))
@@ -3047,6 +3415,116 @@ class TradingAgentV3:
             return "paper", (entry.get("detail")
                              or f"no live capital available at {venue_id}")
         return "live", str(entry.get("detail") or f"cap ${cap:.2f}")
+
+    @staticmethod
+    def _trade_row_mode(row: Dict[str, Any]) -> str:
+        """Which account a trades row belongs to. `status` first, as the schema intends."""
+        mode = str(row.get("execution_mode") or "").strip().lower()
+        if mode in ("paper", "live"):
+            return mode
+        status = str(row.get("status") or "").strip().lower()
+        if status == "paper" or "PAPER" in str(row.get("notes") or "").upper():
+            return "paper"
+        return "live"
+
+    def _seed_exposure_manager(self, ledger: Any) -> Dict[str, Any]:
+        """
+        Load the open book into the exposure manager before the risk rules run.
+
+        `ExposureManager.can_open` enforces the position COUNT and the category,
+        correlated-group and total-exposure ceilings. Nothing in this loop ever
+        told it what was already open, so it was consulted with an empty list
+        every cycle and those four ceilings were enforced against zero. That was
+        survivable while a cycle opened three positions; it is not survivable now
+        that a round fills every slot the limits leave free.
+
+        Seeded from the trades table rather than from memory: the process that
+        placed the positions may not be this one. Only the account this round is
+        trading is seeded - a paper round must not be refused because the live
+        book is full, and a live round must not spend against a paper position.
+
+        A row whose category was never recorded is counted in the position count
+        and the total ceiling, but keyed on its own market for the category and
+        correlated-group ceilings: its membership cannot be reconstructed, and
+        inventing one would either refuse trades that should pass or pass trades
+        the ceiling exists to stop. That gap is reported, not hidden.
+        """
+        mode = "paper" if self.dry_run else "live"
+        report: Dict[str, Any] = {
+            "account": mode,
+            "positions": 0,
+            "unknown_category": 0,
+            "book_value_usd": 0.0,
+            "bankroll": None,
+            "readable": True,
+            "warning": None,
+        }
+        try:
+            rows = self.storage.get_open_positions() or []
+        except Exception as e:  # noqa: BLE001
+            report["readable"] = False
+            report["warning"] = (
+                f"the open book could not be read ({type(e).__name__}: {e}), so the "
+                f"exposure ceilings cannot see it - positions opened this round "
+                f"were checked against an empty book")
+            logger.warning("Exposure seed FAILED: " + report["warning"])
+            # Nothing may be added to a view that was never loaded. The round
+            # carries the failure; it is not dressed up as an empty book.
+            self._exposure_account = None
+            return report
+
+        seeded: List[Dict[str, Any]] = []
+        for row in rows:
+            if self._trade_row_mode(row) != mode:
+                continue
+            try:
+                amount = float(row.get("position_size_usd") or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if amount <= 0:
+                continue
+            market_id = str(row.get("market_id") or "")
+            category = str(row.get("category") or "").strip()
+            correlation = str(row.get("correlation_group") or "").strip()
+            if not category:
+                report["unknown_category"] += 1
+                category = f"unknown:{market_id}"
+            seeded.append({
+                "market_id": market_id,
+                "amount_usd": amount,
+                "category": category,
+                "correlation_group": correlation or category,
+                "venue": str(row.get("venue_id") or "polymarket"),
+            })
+            report["book_value_usd"] = round(
+                report["book_value_usd"] + amount, 2)
+
+        # The denominator the caps are percentages of is the account's own
+        # bankroll, read from the same place sizing reads it.
+        try:
+            bankroll = (float(self.storage.get_paper_bankroll() or 0.0)
+                        if mode == "paper"
+                        else float(self.storage.get_performance_summary()
+                                   .get("bankroll", 50.0) or 0.0))
+        except Exception:  # noqa: BLE001
+            bankroll = float(getattr(ledger, "initial_bankroll", 50.0) or 50.0)
+        if bankroll <= 0:
+            bankroll = float(getattr(ledger, "initial_bankroll", 50.0) or 50.0)
+        report["bankroll"] = round(bankroll, 2)
+        report["positions"] = len(seeded)
+
+        self.exposure_manager.positions = seeded
+        self.exposure_manager.update_bankroll(bankroll)
+        self._exposure_account = mode
+        logger.info(
+            f"Exposure caps seeded with the {mode} book: {len(seeded)} position(s) "
+            f"worth ${report['book_value_usd']:.2f} against a ${bankroll:.2f} "
+            f"bankroll, {self.exposure_manager.max_open_positions - len(seeded)} "
+            f"slot(s) open"
+            + (f"; {report['unknown_category']} position(s) have no recorded "
+               f"category and count only against the count and total ceilings"
+               if report["unknown_category"] else ""))
+        return report
 
     def _will_simulate(self, opp) -> bool:
         """
@@ -3447,6 +3925,29 @@ class TradingAgentV3:
                 "Free capital exhausted mid-cycle - no further positions "
                 "will be opened in this batch.")
 
+        # ...and the exposure view grows with it, so the NEXT trade in this round
+        # is checked against the positions this one just opened. Without this the
+        # caps would only ever see the book as it stood at the start of the round
+        # and the sixth position would be judged as though the other five did not
+        # exist - the original bug, one level down. Only the account this round is
+        # trading is updated: a paper exploration fill in a live round must not
+        # consume a live ceiling.
+        if ("paper" if exec_result.is_simulated else "live") == self._exposure_account:
+            try:
+                self.exposure_manager.add_position(
+                    market_id=opp.market.id,
+                    amount_usd=float(_committed),
+                    category=str(getattr(opp, "category", "") or "unknown"),
+                    correlation_group=str(
+                        getattr(opp, "correlation_group", "") or ""),
+                    venue=str(venue_id or ""),
+                )
+            except Exception as e:  # noqa: BLE001 - the caps must not fail silently
+                logger.warning(
+                    f"Could not add {opp.market.id} to the exposure view: "
+                    f"{type(e).__name__}: {e} - later positions in this round "
+                    f"are checked against a book that does not include it")
+
         # --- Record the position so it can later be SETTLED -----------
         #
         # This block did not persist anything usable:
@@ -3513,6 +4014,12 @@ class TradingAgentV3:
                 "token_price_at_entry": token_price_at_entry,
                 "market_price": yes_price_at_entry,
                 "execution_mode": execution_mode,
+                # Which ceiling this position counts against, stored at the
+                # moment the membership was known. Without these two columns
+                # the category (15%) and correlated-group (20%) caps could
+                # never be re-checked against the open book.
+                "category": getattr(opp, "category", None),
+                "correlation_group": getattr(opp, "correlation_group", None),
                 "fees_usd": getattr(exec_result, "fees_usd", None),
                 "fair_value": opp.estimated_fair,
                 "edge": opp.effective_edge,
