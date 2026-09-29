@@ -165,7 +165,15 @@ class AlphaEngine:
                 refs = self.reference_odds.get_all_reference_odds(m)
                 ref_total += len(refs)
                 ref_tradeable += len([r for r in refs if r.should_trade])
-            results["reference_odds"] = {"total": ref_total, "tradeable": ref_tradeable}
+            # WHY an anchor is missing travels with the count. Before this the
+            # only trace of a reference that could not be read was the engine's
+            # own warning, repeated for every market; the reason is a value now,
+            # and the cycle prints it once.
+            results["reference_odds"] = {
+                "total": ref_total, "tradeable": ref_tradeable,
+                "markets_read": len(markets[:20]),
+                "unavailable": dict(self.reference_odds.unavailable or {}),
+            }
         except Exception as e:
             results["reference_odds"] = {"total": 0, "tradeable": 0, "error": str(e)}
 

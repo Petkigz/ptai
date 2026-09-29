@@ -237,6 +237,10 @@ class ReferenceOddsEngine:
             return None
 
         days = self._days_to_expiry(market)
+        if not isinstance(days, (int, float)) or days <= 0:
+            self.unavailable["deribit"] = ("the market has no usable expiry, so "
+                                           "the option cannot be priced")
+            return None
         prob = lognormal_digital_prob(spot, target, iv, days)
         if prob is None:
             self.unavailable["deribit"] = "could not price the target (bad expiry or IV)"
@@ -596,6 +600,42 @@ class ReferenceOddsEngine:
     # Aggregation
     # ------------------------------------------------------------------
 
+    # How long a source that raised is left alone. One default cycle: long
+    # enough that a broken parser or a blocked host is reported once, short
+    # enough that a transient fault is retried without a restart.
+    SOURCE_FAILURE_BACKOFF_SECONDS = 300.0
+
+    def _prune_failed_sources(self) -> None:
+        if not hasattr(self, "_failed_until"):
+            self._failed_until: Dict[str, float] = {}
+            self._failure_reason: Dict[str, str] = {}
+        import time as _time
+        now = _time.monotonic()
+        for source in [s for s, until in self._failed_until.items() if until <= now]:
+            self._failed_until.pop(source, None)
+            self._failure_reason.pop(source, None)
+
+    def _source_is_failing(self, source: str) -> bool:
+        self._prune_failed_sources()
+        import time as _time
+        return self._failed_until.get(source, 0.0) > _time.monotonic()
+
+    def _record_source_failure(self, source: str, reason: str) -> None:
+        """Remember the fault, say it ONCE, and stop hammering the source."""
+        import time as _time
+        self._prune_failed_sources()
+        first_time = source not in self._failed_until
+        self._failed_until[source] = (_time.monotonic()
+                                      + self.SOURCE_FAILURE_BACKOFF_SECONDS)
+        self._failure_reason[source] = reason
+        self.unavailable[source] = (f"{reason} (not retried for "
+                                    f"{self.SOURCE_FAILURE_BACKOFF_SECONDS / 60:.0f} min)")
+        if first_time:
+            logger.warning(
+                f"[reference] {source} raised {reason} - the source is skipped for "
+                f"{self.SOURCE_FAILURE_BACKOFF_SECONDS / 60:.0f} minutes instead of "
+                f"being retried for every market")
+
     def get_all_reference_odds(self, market: Market,
                                kalshi_markets: Optional[List[Market]] = None
                                ) -> List[ReferenceOdds]:
@@ -608,6 +648,16 @@ class ReferenceOddsEngine:
         """
         self.unavailable = {}
         self.last_run_at = datetime.now(timezone.utc).isoformat()
+        # A source that RAISED is a fault in that source, not a fact about this
+        # market - and this function is called once PER MARKET, so the memo has to
+        # outlive the call. The operator's 2026-09-29 log had deribit's
+        #   TypeError: '<=' not supported between instances of 'NoneType' and 'int'
+        # once every couple of seconds for a whole scan, which buried everything
+        # else in the log. A failing source is skipped for a few minutes and tried
+        # again after that, so a transient fault cannot disable it for good.
+        self._prune_failed_sources()
+        for source, reason in self._failure_reason.items():
+            self.unavailable.setdefault(source, reason + " (skipped for now)")
         category = self._detect_category(market)
         price = float(market.best_price)
 
@@ -625,11 +675,12 @@ class ReferenceOddsEngine:
 
         references: List[ReferenceOdds] = []
         for source, fn in candidates:
+            if self._source_is_failing(source):
+                continue
             try:
                 result = fn()
             except Exception as e:
-                self.unavailable[source] = f"{type(e).__name__}: {e}"
-                logger.debug(f"[reference] {source} raised: {type(e).__name__}: {e}")
+                self._record_source_failure(source, f"{type(e).__name__}: {e}")
                 continue
             if not result:
                 continue
@@ -780,6 +831,16 @@ def lognormal_digital_prob(spot: float, target: float, iv: float,
     markets trade, the carry term is small next to the IV term and inventing
     a rate curve would be worse than omitting it.
     """
+    # Every one of these can arrive as None (a market with no end date has no
+    # expiry, and `None <= 0` is a TypeError, not a refusal). The operator's log
+    # had the deribit source raising
+    #   TypeError: '<=' not supported between instances of 'NoneType' and 'int'
+    # on every market, every cycle, so the reference looked broken instead of
+    # absent.
+    for name, value in (("spot", spot), ("target", target), ("iv", iv),
+                        ("days", days)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
     if spot <= 0 or target <= 0 or iv <= 0 or days <= 0:
         return None
     years = days / 365.0

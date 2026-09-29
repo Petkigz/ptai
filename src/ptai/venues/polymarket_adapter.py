@@ -338,6 +338,47 @@ class PolymarketAdapter(MarketAdapter):
             logger.error(f"Sync discovery failed: {e}")
             return []
 
+    def _no_book_refusal(self, market: Market, token_id: Optional[str],
+                         why: str) -> Dict[str, Any]:
+        """
+        "The venue has no book for this token" as a VALUE, in the shape the rest
+        of the loop already understands.
+
+        Same keys as a real book so no caller has to special-case it, `is_real`
+        and `executable` False, and no bid/ask at all - the absence of a price is
+        the information. `_screen_score` and the edge engine both refuse a book
+        that is not real, so this market is excluded from the shortlist and from
+        any cost, which is the correct outcome for a market the venue does not
+        list.
+        """
+        return {
+            "market_id": market.id,
+            "venue_id": "polymarket",
+            "token_id": token_id,
+            "bids": [], "asks": [],
+            "bid": None, "ask": None,
+            "spread": None, "spread_pct": None,
+            "depth": None,
+            "liquidity": market.liquidity,
+            "volume_24h": market.volume_24h,
+            "slippage_estimate": None,
+            "execution_quality": 0.0,
+            "liquidity_score": min(1.0, market.liquidity / 20000),
+            "source": "no_clob_book",
+            "is_real": False,
+            "is_mock": False,
+            "validated": False,
+            "executable": False,
+            "executable_price": None,
+            "venue_says": why,
+            "warning": ("the venue's CLOB has no usable book for this market's "
+                        f"token ({why}) - no price is invented from liquidity "
+                        "or volume"),
+            "reasoning": ("the venue itself reports no book for this token, so "
+                          "there is no executable price and no cost or edge can "
+                          "be computed"),
+        }
+
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         """
         Real orderbook intelligence - FIXED V7: Truly real CLOB depth, not mock
@@ -350,32 +391,57 @@ class PolymarketAdapter(MarketAdapter):
         try:
             token_id = market.yes_token_id
             if not token_id:
-                logger.warning(f"Market {market.id} no yes_token_id - cannot get real orderbook")
+                # This branch used to return `market.yes_price +/- 0.01` with a
+                # generated size. That is a quote for a token that does not
+                # exist, and the only thing it can produce downstream is a cost
+                # and an edge computed from numbers nobody quoted. A market with
+                # no token cannot be priced here, and saying so is the answer.
+                logger.debug(f"Market {market.id} has no yes_token_id - nothing to "
+                             f"price against")
                 return {
                     "market_id": market.id,
                     "venue_id": "polymarket",
-                    "spread": 0.02,
-                    "spread_pct": 0.02,
-                    "bid": market.yes_price - 0.01,
-                    "ask": market.yes_price + 0.01,
-                    "bid_size": market.liquidity * 0.1,
-                    "ask_size": market.liquidity * 0.1,
-                    "depth": market.liquidity,
+                    "token_id": None,
+                    "bid": None, "ask": None, "spread": None, "spread_pct": None,
+                    "depth": None,
                     "liquidity": market.liquidity,
                     "volume_24h": market.volume_24h,
-                    "slippage_estimate": 0.01,
-                    "execution_quality": 0.3,
+                    "slippage_estimate": None,
+                    "execution_quality": 0.0,
                     "liquidity_score": min(1.0, market.liquidity / 20000),
-                    "source": "no_token_fallback",
+                    "source": "no_token",
                     "is_real": False,
-                    "is_mock": True,
-                    "warning": "No token_id - cannot get real CLOB depth, estimation only, not trustworthy for $50 trader",
-                    "executable": False
+                    "is_mock": False,
+                    "executable": False,
+                    "executable_price": None,
+                    "warning": ("this market has no CLOB token id, so there is no "
+                                "book to price against. No quote is invented."),
+                    "reasoning": "no token id on the market record",
                 }
 
             # Try real CLOB orderbook - THIS IS THE REAL IMPLEMENTATION
             try:
-                orderbook_data = self.client.get_orderbook(token_id)
+                # `get_orderbook_with_reason` tells us WHY there is no book, and
+                # the difference decides what this method may say: a venue that
+                # has no book for the token is a refusal, a venue we could not
+                # reach is an estimate (labelled as one).
+                orderbook_data, book_failure = (
+                    self.client.get_orderbook_with_reason(token_id)
+                    if hasattr(self.client, "get_orderbook_with_reason")
+                    else (self.client.get_orderbook(token_id), {}))
+                if not orderbook_data and book_failure.get("kind") == "not_listed":
+                    # Debug, not warning: this is one class of market (closed,
+                    # settled, never CLOB-listed) and in the operator's log it
+                    # repeated for hundreds of markets, burying everything else.
+                    # The scan counts them and says so once - see
+                    # `_prescan_and_rank` - and the refusal itself is a value in
+                    # the returned book, not a log line.
+                    logger.debug(
+                        f"No CLOB book for {market.id}: {book_failure.get('detail')} "
+                        f"- refusing to price it. Nothing is estimated from "
+                        f"liquidity or volume for a token the venue does not list.")
+                    return self._no_book_refusal(market, token_id,
+                                                 f"{book_failure.get('status') or 'HTTP 404'}")
                 if orderbook_data and (orderbook_data.get("bids") or orderbook_data.get("asks")):
                     # SORT, VERIFY IDENTITY, SANITY-CHECK, then use. See
                     # `normalise_book`: `bids[0]`/`asks[0]` are not promised to be
@@ -494,7 +560,29 @@ class PolymarketAdapter(MarketAdapter):
                             "reasoning": f"REAL CLOB: bid {best_bid_price:.3f} ask {best_ask_price:.3f} spread {spread*100:.2f}% depth ${depth:.0f} slippage {real_slippage*100:.2f}%"
                         }
                     else:
-                        logger.warning(f"CLOB returned empty bid/ask for {market.id} - bids {len(bids)} asks {len(asks)}")
+                        # The venue answered, and its answer has no two-sided
+                        # quote: it is empty, or only one side has levels. That
+                        # is information - there is nothing to trade here - and
+                        # estimating a price from volume would replace it with
+                        # an invented number. Refuse instead.
+                        logger.debug(
+                            f"CLOB book for {market.id} has no two-sided quote "
+                            f"(bid {best_bid_price} ask {best_ask_price}, "
+                            f"{len(bids)} bid / {len(asks)} ask levels) - refusing "
+                            f"to price it, nothing is estimated from liquidity "
+                            f"or volume")
+                        return self._no_book_refusal(market, token_id, "empty book")
+                elif orderbook_data is not None and not getattr(
+                        orderbook_data, "get", lambda *_: None)("error"):
+                    # The venue answered with an empty book object: no bids and
+                    # no asks at all. It is the same fact as the 404 - this
+                    # market has no book to price against - so it gets the same
+                    # refusal, not an estimate.
+                    logger.debug(
+                        f"CLOB answered with an empty book for {market.id} - "
+                        f"refusing to price it. No price is invented from "
+                        f"liquidity or volume.")
+                    return self._no_book_refusal(market, token_id, "empty book")
             except Exception as e:
                 logger.warning(f"CLOB real orderbook failed {market.id}: {e}, using enhanced estimation with warning")
 
@@ -528,7 +616,7 @@ class PolymarketAdapter(MarketAdapter):
             bid_size = liquidity * 0.15 * imbalance_factor
             ask_size = liquidity * 0.15 * (2 - imbalance_factor)
             
-            logger.warning(f"ESTIMATED orderbook {market.id}: liq ${liquidity} vol ${volume_24h} spread {spread*100:.1f}% slippage {slippage*100:.2f}% exec {execution_quality:.2f} trustworthy {trustworthy} - NOT REAL, $50 trader should verify executable price")
+            logger.warning(f"ESTIMATED orderbook {market.id}: liq ${liquidity} vol ${volume_24h} spread {spread*100:.1f}% slippage {slippage*100:.2f}% exec {execution_quality:.2f} trustworthy {trustworthy} - NOT REAL (the venue did not answer), $50 trader should verify executable price")
             
             return {
                 "market_id": market.id,

@@ -917,11 +917,19 @@ class TradingAgentV3:
             "criteria": ("validated two-sided book, spread inside the tradable "
                          "limit, then liquidity, book quality and volume"),
         }
+        unreadable = sum(1 for _, book, _ in results
+                         if book and book.get("source") in ("no_clob_book", "no_token"))
+        self._screen["no_book"] = unreadable
+        self._screen["no_book_note"] = (
+            "markets the venue has no book for. They are not priced, not ranked "
+            "and not traded; their cost and edge are absent rather than estimated.")
         logger.info(
             f"Cheap screen: {len(candidates)} market(s) read in "
             f"{self._screen['seconds']}s, {len(shortlist)} chosen for deep analysis "
             f"(limit {self.deep_analysis_limit}), {self._screen['screened_out']} "
-            f"priced on the cheap context only")
+            f"priced on the cheap context only"
+            + (f"; {unreadable} had no venue book at all (not priced)"
+               if unreadable else ""))
         for row in self._screen["shortlist"][:5]:
             logger.info(f"  deep {row['market_id']}: {row['why']} "
                         f"(score {row['score']})")
@@ -1301,9 +1309,28 @@ class TradingAgentV3:
                         market.raw["orderbook"] = orderbook
                 except Exception as e:
                     logger.debug(f"Could not attach the orderbook to {market.id}: {e}")
-                # Check if orderbook is real
+                # Check if orderbook is real. Three different facts, three
+                # different sentences: the venue has no book for this market (a
+                # refusal), we could not reach the venue (an estimate), or the
+                # venue answered with something unusable. The operator's log had
+                # all three printed as "ESTIMATION", which hid the first - the one
+                # that says the market is not tradable there at all.
                 if not orderbook.get("is_real", False):
-                    logger.warning(f"Orderbook for {market.id} is ESTIMATION not real CLOB - edge may not be executable")
+                    source = str(orderbook.get("source") or "")
+                    if source in ("no_clob_book", "no_token"):
+                        logger.warning(
+                            f"No venue book for {market.id} ({source}): "
+                            f"{orderbook.get('warning') or 'no book returned'} "
+                            f"- no cost or edge is computed from it")
+                    elif source == "clob_unvalidated":
+                        logger.warning(
+                            f"Unusable venue book for {market.id} - it failed "
+                            f"validation, so edge may not be executable")
+                    else:
+                        logger.warning(
+                            f"Orderbook for {market.id} is ESTIMATION not real "
+                            f"CLOB (the venue did not answer) - edge may not be "
+                            f"executable")
             else:
                 logger.error(f"ABORT: No exact adapter for market {market.id} venue {venue_id} - never fallback to first eligible")
                 context["orderbook"] = {"error": f"No adapter for {venue_id}", "is_real": False, "executable": False}
@@ -2206,6 +2233,16 @@ class TradingAgentV3:
                    + (f" ({', '.join(f'{k}: {v}' for k, v in list(comb.get('refused_reasons', {}).items())[:2])})"
                       if comb.get("refused_reasons") else "")
                    if comb.get("refused") else ""))
+            ref = alpha_results.get("reference_odds") or {}
+            if ref and not ref.get("error"):
+                absent = ref.get("unavailable") or {}
+                logger.info(
+                    f"Reference odds: {ref.get('total', 0)} anchor(s) from "
+                    f"{ref.get('markets_read', 0)} market(s), "
+                    f"{ref.get('tradeable', 0)} actionable"
+                    + ("; unavailable: " + "; ".join(
+                        f"{k} - {v}" for k, v in list(absent.items())[:3])
+                       if absent else ""))
         except Exception as e:
             logger.warning(f"Alpha scan failed: {e}")
             alpha_results = {"error": str(e)}

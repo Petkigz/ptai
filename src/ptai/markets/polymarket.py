@@ -219,14 +219,54 @@ class PolymarketClient:
         return await loop.run_in_executor(None, lambda: self.scan_markets(target_count, order_by))
 
     def get_orderbook(self, token_id: str) -> Optional[Dict]:
-        """Get orderbook for a token from CLOB"""
+        """The book, or None. Kept for callers that only need the book."""
+        data, _ = self.get_orderbook_with_reason(token_id)
+        return data
+
+    def get_orderbook_with_reason(self, token_id: str):
+        """
+        The book, and WHY there is none when there is none.
+
+        The operator's 2026-09-29 log:
+
+            Orderbook fetch failed for 2139...268: 404 Client Error: Not Found
+            ESTIMATED orderbook 4190831: liq $1753212 ... - NOT REAL, $50 trader
+            should verify executable price
+
+        A 404 from `/book` is not a transient failure: the venue's CLOB has no
+        book for that token - the market is not available to trade there (closed,
+        settled, or never CLOB-listed). Both of those lines are about one fact,
+        and the second one invents numbers for a market the venue has just said
+        does not exist. The adapter can only act on that difference if this method
+        hands it back, so it returns `(book, reason)` with `reason["kind"]` being
+        `"not_listed"` for a 404 and `"transport"` for anything else.
+
+        A transport failure is a different sentence - "we could not ask" - and is
+        the only case where a clearly-labelled estimate is defensible.
+        """
         try:
-            resp = self.session.get(f"{self.clob_api}/book", params={"token_id": token_id}, timeout=10)
+            resp = self.session.get(f"{self.clob_api}/book",
+                                    params={"token_id": token_id}, timeout=10)
+            if resp.status_code == 404:
+                # Debug, not warning: the adapter says the consequence once per
+                # market, in the operator's words. 200 warnings per scan for one
+                # class of market is how a log becomes unreadable.
+                logger.debug(f"CLOB has no book for token {token_id} (HTTP 404): "
+                             f"the venue does not list it")
+                return None, {"kind": "not_listed", "status": 404,
+                              "detail": ("the venue's CLOB returns 404 for this "
+                                         "token - it has no book there")}
             resp.raise_for_status()
-            return resp.json()
+            return resp.json(), {}
         except Exception as e:
-            logger.warning(f"Orderbook fetch failed for {token_id}: {e}")
-            return None
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            kind = "not_listed" if status == 404 else "transport"
+            if kind == "not_listed":
+                logger.debug(f"CLOB has no book for token {token_id} (HTTP 404)")
+            else:
+                logger.warning(f"Orderbook fetch failed for {token_id}: {e}")
+            return None, {"kind": kind, "status": status,
+                          "detail": f"{type(e).__name__}: {e}"}
 
     def get_midpoint(self, token_id: str) -> Optional[float]:
         """Get midpoint price"""

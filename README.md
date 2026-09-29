@@ -529,6 +529,47 @@ position - the execution lane for multi-leg baskets (all-or-nothing fills, no
 unhedged remainder) is not built yet, and the report says so rather than implying
 otherwise.
 
+### No Book Is Not A Price
+
+The 2026-09-29 log had two lines, hundreds of times each:
+
+    Orderbook fetch failed for 2139...268: 404 Client Error: Not Found for url:
+      https://clob.polymarket.com/book?token_id=2139...268
+    ESTIMATED orderbook 4190831: liq $1753212.63358 vol $1011431.527044 spread
+      1.0% ... - NOT REAL, $50 trader should verify executable price
+
+The first is the venue stating a fact - its CLOB has no book for that token -
+and the second invents a spread, a depth and an execution quality for the market
+the venue has just refused. Reading a book now returns `(book, reason)`:
+
+  * **`not_listed`** - the venue answered 404 (closed, settled, or never
+    CLOB-listed). The market gets a refusal: `source "no_clob_book"`, every
+    price field `None`, `execution_quality 0.0`, `executable False`. Nothing is
+    estimated from liquidity or volume, and nothing downstream can price it.
+  * **the venue answered with nothing** - an empty book, or levels on one side
+    only. Same refusal: there is no two-sided market to trade.
+  * **`transport`** - nobody answered (timeout, TLS, DNS). This is the only case
+    a labelled estimate is honest, and it says so in the log. It is never an
+    input to a cost or an edge.
+
+The flood is fixed at both ends. The 404 body no longer prints a warning per
+market - the scan counts the refusals and says so once
+(*"N had no venue book at all (not priced)"*), a count that also travels in the
+screen payload as `no_book`.
+
+A reference source that raises gets the same treatment. `get_all_reference_odds`
+is called once per market, so a per-call memo was no memo at all: the deribit
+`TypeError: '<=' not supported between instances of 'NoneType' and 'int'`
+printed every couple of seconds for a whole scan. The cause is fixed at the
+source (a market with no usable expiry is refused with that reason instead of
+being priced, and the lognormal pricer rejects a missing input), and a source
+that still raises is skipped for five minutes with one line saying why - then
+tried again, so a transient fault cannot disable an anchor for good. The cycle
+prints the reasons it has, once:
+
+    Reference odds: 0 anchor(s) from 20 market(s), 0 actionable; unavailable:
+      deribit - the market has no usable expiry, so the option cannot be priced
+
 ## Logins, Venues, And The Sports Lane
 
 **Logins** are saved in the console's Setup tab and kept encrypted in
