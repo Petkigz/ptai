@@ -1369,6 +1369,77 @@ coverage counts add up to 19. Saving a Betfair login moves the venue from
 `needs_login / can_run_today False` to `paper_only / can_run_today True` and the
 counts from 6 readable venues to 7.
 
+## Reaching Polymarket, Venue By Venue
+
+Your words: *"lets start giving the venues enough code to reach poly market. i
+dont know whats better all at once or one by ne. also the one venue at a time was
+me thinking it would require more resources to run several venues at once but now
+that i can disable thinking i think its ok to run them."*
+
+**One at a time - and the list is much shorter than nineteen.**
+
+"Reaching Polymarket" is three layers, and they have to be built in this order:
+
+```
+1. reads_markets        a client that returns live markets
+2. reads_account        the venue tells PTAI the balance and open positions
+3. places_real_orders   a submission path that can actually reach the venue
+```
+
+Polymarket has all three. Every other venue is measured against that, layer by
+layer, in the agent's own inventory record - and the console's *Every venue* table
+now lists them **in that order**, each with the next piece of work:
+
+```
+kalshi         1 layer missing: place a real order
+betfair        1 layer missing: place a real order; then save the login
+crypto_binance 1 layer missing: place a real order
+manifold       1 layer missing: place a real order
+whitebit       1 layer missing: place a real order
+predictit      2 layers missing: read the account; place a real order
+apify          3 layers missing - no Apify API client ...
+simmer         3 layers missing - no Simmer SDK client ...
+```
+
+**But code is only half of it, and the other half decides where the effort goes.**
+A venue you cannot put money into is a paper exercise no matter how much is
+written for it, so every row also answers *can money reach this venue from where
+you are*:
+
+* **Kalshi** - its own adapter says `restricted` for Uganda, and its funding route
+  is a US bank account. It is the closest non-Polymarket adapter in the code
+  (real REST API, balance reads, an order endpoint) and it still cannot take your
+  money. Build it for the product, not for your own account.
+* **Betfair** - Uganda appears on Betfair's published restricted lists (the
+  adapter answers `requires_verification`, so PTAI says unverified rather than
+  claiming access). Worth confirming with Betfair before a line of code.
+* **Manifold** - real API, play money only: it can never hold real capital, and
+  that makes it the safest place to prove a full live path end to end.
+* **Crypto (Binance, WhiteBIT)** - fundable by you, real APIs, but they are not
+  probability books: the mispricing-versus-forecast stack does not apply without
+  a separate strategy lane.
+* The other eleven have no client written at all, and most are UK/EU exchanges
+  that will not accept a Uganda account either.
+
+So the honest queue for a real trade is: **Polymarket (done)**, then the first
+venue that is both buildable *and* fundable from Uganda - and that is a decision
+the console now lays out rather than a guess.
+
+**On "one venue at a time":** your reason was resources, and it was the right
+thing to check - but it was never what one venue was protecting. PTAI already
+scans nineteen venues every cycle, and the model is asked per market either way,
+so scanning more venues costs no extra model calls. What one venue protected was
+CAPITAL: every live venue is a separate funded account with its own minimum order
+size, and the agent cannot move money between them.
+
+It is now a setting - `PTAI_MAX_LIVE_VENUES`, default **1** (unchanged), ceiling 5
+- and the protection that matters is kept: **free cash is spent down the list of
+live venues**, so the same dollar is never promised to two accounts. A second
+venue can only go live when it has its own order path, its own funded account, its
+own authorised budget and its own qualification record. Today raising the setting
+changes nothing, because exactly one venue can place a real order - which is the
+point: the switch is ready, the capability is not.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

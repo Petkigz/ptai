@@ -2819,6 +2819,11 @@ class TradingAgentV3:
             self._resolve_live_capital(
                 portfolio=portfolio,
                 free_cash=ledger.free_cash)
+        # ...and EVERY venue that holds live capital, not just the first: the
+        # dispatch gate reads this set, so a second funded venue can deploy
+        # without the first venue's id being treated as the only answer.
+        self._cycle_live_venues = set(
+            getattr(self, "_cycle_live_capital", None) or {})
         # Two pools, and a trade draws only from the one it will spend.
         # free_capital is the operator's live account; free_capital_paper is
         # its shadow, carrying the same rules. Sizing a paper trade against
@@ -3905,56 +3910,70 @@ class TradingAgentV3:
         from ..strategy.venue_selection import VenueSelector
 
         caps: Dict[str, Any] = {}
+        selector = VenueSelector(storage=self.storage)
         try:
-            live_venue = VenueSelector(storage=self.storage).remembered_live_venue()
+            live_venues = selector.remembered_live_venues()
         except Exception as e:
-            logger.warning(f"Could not read the selected live venue: {e}")
-            live_venue = None
+            logger.warning(f"Could not read the selected live venues: {e}")
+            live_venues = []
 
-        if not live_venue:
+        if not live_venues:
             return None, caps
 
-        try:
-            authorised = float(authorised_budget(self.storage, live_venue) or 0.0)
-        except Exception as e:
-            logger.warning(f"Could not read the authorised budget: {e}")
-            authorised = 0.0
-
-        venue_balance = None
-        if isinstance(portfolio, dict):
-            raw = portfolio.get("venue_confirmed_balance")
+        # FREE CASH IS SPENT DOWN THE LIST, NOT HANDED TO EVERY VENUE.
+        #
+        # With one live venue this could not matter. With `PTAI_MAX_LIVE_VENUES`
+        # above 1 it is the protection that stops the same dollar being promised
+        # to two accounts at once: each venue's cap is what is left of free cash
+        # after the venues before it, so the caps can never sum to more money
+        # than the account actually has.
+        remaining_free = float(free_cash or 0.0)
+        for live_venue in live_venues:
             try:
-                venue_balance = float(raw) if raw is not None else None
-            except (TypeError, ValueError):
-                venue_balance = None
+                authorised = float(authorised_budget(self.storage, live_venue) or 0.0)
+            except Exception as e:
+                logger.warning(f"Could not read the authorised budget for "
+                               f"{live_venue}: {e}")
+                authorised = 0.0
 
-        parts = {
-            "venue_balance_usd": venue_balance,
-            "authorised_usd": authorised,
-            "free_cash_usd": float(free_cash or 0.0),
-        }
-        # Live capital needs all three. Any one missing is a refusal, not a
-        # default: venue balance unread -> fail closed; nothing authorised ->
-        # the operator has not given this agent the money; free cash 0 -> already
-        # committed.
-        if venue_balance is None:
-            caps[live_venue] = {
-                "cap_usd": 0.0, "parts": parts,
-                "detail": ("the venue's balance could not be read, so no live "
-                           "capital is deployable at this venue")}
-        elif authorised <= 0:
-            caps[live_venue] = {
-                "cap_usd": 0.0, "parts": parts,
-                "detail": (f"no budget authorised for {live_venue}: the agent "
-                           f"runs in paper there until the operator authorises "
-                           f"an amount")}
-        else:
-            cap = max(0.0, min(venue_balance, authorised, float(free_cash or 0.0)))
-            caps[live_venue] = {
-                "cap_usd": cap, "parts": parts,
-                "detail": (f"min(venue ${venue_balance:.2f}, authorised "
-                           f"${authorised:.2f}, free ${float(free_cash or 0.0):.2f})")}
-        return live_venue, caps
+            venue_balance = None
+            if isinstance(portfolio, dict):
+                raw = (portfolio.get("venue_confirmed_balances") or {}).get(
+                    live_venue, portfolio.get("venue_confirmed_balance"))
+                try:
+                    venue_balance = float(raw) if raw is not None else None
+                except (TypeError, ValueError):
+                    venue_balance = None
+
+            parts = {
+                "venue_balance_usd": venue_balance,
+                "authorised_usd": authorised,
+                "free_cash_usd": round(remaining_free, 2),
+            }
+            # Live capital needs all three. Any one missing is a refusal, not a
+            # default: venue balance unread -> fail closed; nothing authorised ->
+            # the operator has not given this agent the money; free cash 0 ->
+            # already committed.
+            if venue_balance is None:
+                caps[live_venue] = {
+                    "cap_usd": 0.0, "parts": parts,
+                    "detail": ("the venue's balance could not be read, so no live "
+                               "capital is deployable at this venue")}
+            elif authorised <= 0:
+                caps[live_venue] = {
+                    "cap_usd": 0.0, "parts": parts,
+                    "detail": (f"no budget authorised for {live_venue}: the agent "
+                               f"runs in paper there until the operator authorises "
+                               f"an amount")}
+            else:
+                cap = max(0.0, min(venue_balance, authorised, remaining_free))
+                remaining_free = max(0.0, remaining_free - cap)
+                caps[live_venue] = {
+                    "cap_usd": cap, "parts": parts,
+                    "detail": (f"min(venue ${venue_balance:.2f}, authorised "
+                               f"${authorised:.2f}, free "
+                               f"${parts['free_cash_usd']:.2f})")}
+        return live_venues[0], caps
 
     def _money_lane(self, opp, amount_usd: float) -> tuple:
         """
@@ -3987,14 +4006,19 @@ class TradingAgentV3:
             return "paper", "the adapter cannot place real orders"
         if getattr(opp, "_is_exploration", False):
             return "paper", "exploration is paper-only"
-        live_venue = getattr(self, "_cycle_live_venue", None)
-        if not live_venue:
+        live_venues = set(getattr(self, "_cycle_live_venues", None)
+                          or ([getattr(self, "_cycle_live_venue", None)]
+                              if getattr(self, "_cycle_live_venue", None) else []))
+        if not live_venues:
             return "paper", ("no live venue holds capital, so no real money may "
                              "be deployed anywhere")
-        if venue_id and venue_id != live_venue:
-            return "paper", (f"{venue_id} is not the selected live venue "
-                             f"({live_venue}) - one venue holds the live capital "
-                             f"at a time")
+        if venue_id and venue_id not in live_venues:
+            return "paper", (
+                f"{venue_id} does not hold live capital this cycle "
+                f"({', '.join(sorted(live_venues))} "
+                f"{'does' if len(live_venues) == 1 else 'do'}) - money goes to "
+                f"the venue(s) the operator funded, and the agent cannot move it "
+                f"between venues")
         entry = (getattr(self, "_cycle_live_capital", None) or {}).get(venue_id)
         if not entry:
             return "paper", f"no authorised capital computed for {venue_id} this cycle"

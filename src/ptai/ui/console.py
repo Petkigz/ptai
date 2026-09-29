@@ -57,6 +57,10 @@ live_log.install()
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
 from ..validation.rule_bench import validation_block
 from ..venues.inventory import load_inventory
+from ..strategy.venue_selection import (
+    MAX_LIVE_VENUES_CEILING,
+    max_live_venues_default,
+)
 from ..venues import credentials as credential_store
 from ..venues import preferences as venue_switches
 
@@ -1265,7 +1269,13 @@ async def api_venue() -> JSONResponse:
         unusable=unusable,
         unfundable=unfundable,
     )
-    selection = selector.select(assessments, total_budget_usd=plan.get("total_budget_usd") or 0.0)
+    selection = selector.select(
+        assessments,
+        total_budget_usd=plan.get("total_budget_usd") or 0.0,
+        # How many venues may hold real capital is the operator's setting, and the
+        # panel reads the same number the agent does rather than a second opinion.
+        max_live_venues=max_live_venues_default(),
+    )
 
     def _with_capability(a) -> Dict[str, Any]:
         """The assessment, plus what the inventory says PTAI can do with it."""
@@ -1287,7 +1297,10 @@ async def api_venue() -> JSONResponse:
         "assessments": [_with_capability(a) for a in assessments],
         "ranking_basis": selection.ranking_basis,
         "min_sample_for_evidence": MIN_SAMPLE_FOR_EVIDENCE,
-        "one_live_venue_cap": True,
+        "one_live_venue_cap": max_live_venues_default() <= 1,
+        "max_live_venues": max_live_venues_default(),
+        "max_live_venues_ceiling": MAX_LIVE_VENUES_CEILING,
+        "max_live_venues_setting": "PTAI_MAX_LIVE_VENUES",
         "balances_read": sum(1 for b in balances.values() if b.get("available")),
         "venues_asked": len(balances),
         # Distinguishes "every venue stayed silent" from "nothing was asked".
@@ -1300,6 +1313,9 @@ async def api_venue() -> JSONResponse:
         # Every venue PTAI knows about and what it can do, so "can I run this
         # one too?" has an answer on the page rather than only in the code.
         "inventory": inventory,
+        # The build-out queue: which venues are closest to Polymarket, what each
+        # one is missing, and whether money could ever reach it from here.
+        "reach": inventory.get("reach") or {},
         # What out-of-sample validation says about the rules that are choosing
         # these trades. It can refuse a rule; it can never qualify a venue.
         # ...together with the bench: what the agent DOES about a refused
@@ -2481,7 +2497,10 @@ async function loadVenue(){
       <tr><td style="color:var(--dim)">Next venue to fund</td>
           <td class="mono">${candLabel?esc(candLabel):'&mdash;'}</td></tr>
       <tr><td style="color:var(--dim)">How many may hold capital</td>
-          <td class="mono">1 &mdash; the agent cannot move money between venues</td></tr>
+          <td class="mono">${body.max_live_venues||1} (set ${esc(body.max_live_venues_setting||'PTAI_MAX_LIVE_VENUES')})
+            <div class="note" style="margin-top:4px">Each live venue is a separate
+            funded account; the same dollar is never promised to two of them.
+            ${body.one_live_venue_cap?'Raise the setting when a second venue has an order path and a funded account.':''}</div></td></tr>
       <tr><td style="color:var(--dim)">Balances actually read</td>
           <td class="mono">${ body.engine_running
               ? `${body.balances_read||0} of ${body.venues_asked||0} venue(s) answered`
@@ -2629,6 +2648,15 @@ async function loadVenue(){
       : u===USE_SCAN ? '<span class="pill dim">scanner only</span>'
       : '<span class="pill wait">no client built</span>';
     const c = inv.counts || {};
+    // The distance to Polymarket, per venue, on the page: what is missing and
+    // what the next piece of work is. The operator asked "all at once or one by
+    // one" - this is the ordered answer, and it is ordered the same way in the
+    // agent's own inventory record.
+    const nextById = {};
+    ((body.reach||{}).next_steps||[]).forEach(r=>{ nextById[r.venue_id]=r; });
+    const REACH_LABEL = {reads_markets:'read live markets',
+                         reads_account:'read the account (balance, positions)',
+                         places_real_orders:'place a real order'};
     $('venueAll').innerHTML = `
       <div class="note">${c.registered||invRows.length} venue(s) registered by the agent:
         <b>${c.readable_now||0}</b> readable right now with no account,
@@ -2639,18 +2667,28 @@ async function loadVenue(){
         <b>${c.no_client||0}</b> with no client written.</div>
       <table style="margin-top:10px">
         <tr><th>Venue</th><th>What PTAI can do with it</th><th>Runs today</th>
-            <th>What it needs</th></tr>` +
+            <th>Next step to reach Polymarket</th></tr>` +
       invRows.map(v=>`<tr>
         <td><b>${esc(v.label)}</b><br><span style="color:var(--dim);font-size:11.5px">${esc(v.venue_id)}${
             v.venue_type?` &middot; ${esc(v.venue_type)}`:''}</span></td>
         <td>${usePill(v.use)}<div class="note" style="margin-top:5px">${esc(v.why||'')}</div></td>
         <td class="mono ${v.can_run_today?'pos':'neg'}">${v.can_run_today?'yes':'no'}</td>
-        <td><span class="note">${esc(v.what_it_needs||'')}</span>${
+        <td>${(nextById[v.venue_id] ? (() => {
+            const r = nextById[v.venue_id];
+            const missing = (r.missing||[]).map(m=>REACH_LABEL[m]||m).join(', ');
+            const fund = r.fundable_from_here === true
+              ? '<span class="pill ok">fundable here</span>'
+              : r.fundable_from_here === false
+                ? '<span class="pill wait">cannot hold your money</span>'
+                : '<span class="pill dim">funding unverified</span>';
+            return `<div class="note">${r.distance} layer(s) missing${missing?': '+esc(missing):''}</div>`
+              + (r.distance ? `<div class="note" style="margin-top:4px">${esc(r.next_step||'')}</div>` : '')
+              + `<div style="margin-top:5px">${fund}</div>`;
+          })() : '<span class="note">no plan recorded</span>')}${
             v.fundable && v.minimum_deposit_usd!=null
               ? `<div class="note" style="margin-top:4px">funding: ${esc(v.currency||'')},
                  minimum ${money(v.minimum_deposit_usd)}</div>`
-              : (v.reason_unfundable
-                 ? `<div class="note" style="margin-top:4px">${esc(v.reason_unfundable)}</div>`:'')}</td>
+              : ''}</td>
       </tr>`).join('') + '</table>';
   }
 

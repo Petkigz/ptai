@@ -66,6 +66,7 @@ def _funding_note(venue_id: str) -> Dict[str, Any]:
                 "minimum_deposit_usd": route.get("minimum_deposit_usd"),
                 "recommended_deposit_usd": route.get("recommended_deposit_usd"),
                 "available_from": route.get("available_from"),
+                "residency_required": route.get("residency_required"),
                 "reason_unfundable": None,
             }
         return {
@@ -119,6 +120,81 @@ def _label(venue_id: str, adapter: Any) -> str:
     return _LABELS.get(venue_id, venue_id)
 
 
+#: The three layers, in the order they have to be built. A venue "reaches
+#: Polymarket" when all three are present - and the last one is the only one that
+#: can spend money.
+REACH_LAYERS = ("reads_markets", "reads_account", "places_real_orders")
+
+_LAYER_LABEL = {
+    "reads_markets": "read live markets",
+    "reads_account": "read the account (balance and positions)",
+    "places_real_orders": "place a real order",
+}
+
+
+def _reach_layers(caps: Any, status: str, note: str, requires_creds: bool,
+                  login_configured: bool, login: Dict[str, Any],
+                  funding: Dict[str, Any], can_run_today: bool,
+                  fundable_from_here: Optional[bool] = None,
+                  eligibility: Optional[Dict[str, Any]] = None,
+                  country_code: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Which of the three layers this venue has, and what the next piece of work is.
+
+    Deliberately derived from the adapter's OWN capability declarations - the same
+    flags the runtime gates read - so a venue cannot be described as closer to
+    Polymarket here than it is in the code that would have to submit the order.
+    """
+    supported = bool(getattr(caps, "supports_market_discovery", False))
+    layers = {
+        "reads_markets": bool(status != STATUS_UNIMPLEMENTED and supported),
+        "reads_account": bool(getattr(caps, "supports_portfolio", False)),
+        "places_real_orders": bool(getattr(caps, "real_order_path", False)),
+    }
+    missing = [name for name in REACH_LAYERS if not layers[name]]
+
+    if not layers["reads_markets"]:
+        next_step = (note or "write the client: this venue returns no markets yet")
+    elif not layers["reads_account"]:
+        next_step = ("write the account read (balance and open positions) - the "
+                     "adapter has no portfolio call")
+    elif not layers["places_real_orders"]:
+        next_step = (note or "write the order path: the adapter has no submission "
+                             "path, so it can be read and paper-traded only")
+    else:
+        next_step = "nothing - all three layers are written"
+
+    # The two things code cannot supply. Said here rather than left to the
+    # operator to discover after the next venue is built.
+    if requires_creds and not login_configured:
+        where = login.get("label") or login.get("tool") or ""
+        next_step += (f"; then save the {where} login" if where
+                      else "; then it needs a login PTAI can save")
+    _country = (country_code or "").upper()
+    if fundable_from_here is False:
+        why = (funding.get("reason_unfundable")
+               or (funding.get("residency_required")
+                   and f"funding needs {funding['residency_required']}")
+               or ((eligibility or {}).get("means"))
+               or "no funding route is recorded")
+        next_step += f"; and it cannot hold real money from here: {why}"
+    elif fundable_from_here is None:
+        next_step += (f"; and funding from {_country or 'here'} is unverified - "
+                      f"check with the venue before relying on it")
+
+    return {
+        "reach": {
+            "reference": "polymarket",
+            "layers": layers,
+            "missing": missing,
+            "distance": len(missing),
+            "next_step": next_step,
+            "runs_today": bool(can_run_today),
+            "layer_labels": {k: _LAYER_LABEL[k] for k in REACH_LAYERS},
+        },
+    }
+
+
 def _login_state(venue_id: str, data_dir: Optional[str]) -> Dict[str, Any]:
     """
     The login this venue's adapter reads, and whether the operator has saved it.
@@ -154,8 +230,39 @@ def _login_state(venue_id: str, data_dir: Optional[str]) -> Dict[str, Any]:
     return state
 
 
+def _eligibility(adapter: Any, country_code: Optional[str]) -> Dict[str, Any]:
+    """
+    The venue's own answer about this operator's country.
+
+    Read from `adapter.check_eligibility` - the same call the runtime consults -
+    rather than from a table maintained here, so the row cannot claim access the
+    adapter would refuse. An adapter that cannot answer says so.
+    """
+    out: Dict[str, Any] = {"country": (country_code or "").upper(),
+                           "status": "", "means": ""}
+    if not country_code:
+        return out
+    try:
+        status = adapter.check_eligibility(str(country_code).upper())
+    except Exception as e:  # noqa: BLE001 - a screen must still render
+        logger.debug(f"{getattr(adapter, 'venue_id', '?')} eligibility failed: "
+                     f"{type(e).__name__}: {e}")
+        return out
+    value = getattr(status, "value", status)
+    out["status"] = str(value)
+    out["means"] = {
+        "eligible": "the venue accepts operators here",
+        "restricted": ("the venue refuses operators here, so real money cannot be "
+                       "deployed - it can still be read and paper-traded"),
+        "requires_verification": ("the venue has to verify the operator before it "
+                                  "will take real money"),
+    }.get(str(value), "the adapter does not know, so this is unverified")
+    return out
+
+
 def adapter_row(venue_id: str, adapter: Any,
-                login: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                login: Optional[Dict[str, Any]] = None,
+                country_code: Optional[str] = None) -> Dict[str, Any]:
     """
     One venue, described by what its code can do - not by what it might.
 
@@ -193,6 +300,19 @@ def adapter_row(venue_id: str, adapter: Any,
         use = USE_PAPER_ONLY
 
     funding = _funding_note(venue_id)
+    eligibility = _eligibility(adapter, country_code)
+    # CAN MONEY REACH THIS VENUE FROM WHERE THE OPERATOR IS. A funding route that
+    # exists is not the same as a funding route this operator can use: Kalshi's
+    # route is a US bank account, and its own adapter says "restricted" for UG.
+    # True / False / None (unverified) - never a hopeful yes.
+    if not funding.get("fundable"):
+        fundable_from_here: Optional[bool] = False
+    elif eligibility.get("status") == "restricted":
+        fundable_from_here = False
+    elif eligibility.get("status") == "eligible":
+        fundable_from_here = True
+    else:
+        fundable_from_here = None
 
     if use == USE_NO_CLIENT:
         can_run_today = False
@@ -241,6 +361,25 @@ def adapter_row(venue_id: str, adapter: Any,
         "label": _label(venue_id, adapter),
         "venue_type": getattr(getattr(adapter, "venue_type", None), "value", None),
         "implementation_status": status,
+        # HOW FAR THIS VENUE IS FROM POLYMARKET, layer by layer. "Can hold real
+        # money" was one flag; the work is three layers and the operator asking
+        # "let's start giving the venues enough code to reach Polymarket" needs to
+        # see which layer is missing on each one, in a fixed order:
+        #
+        #   1. READS MARKETS  - a client that returns live markets at all
+        #   2. READS ACCOUNT  - the venue will tell PTAI the balance and positions
+        #   3. PLACES ORDERS  - a submission path that can reach the venue
+        #
+        # Plus the two things the code cannot supply: a login, and a way to fund
+        # the account from where the operator is. Both are named rather than
+        # implied, so no venue looks one small step away when it is three.
+        "eligibility": eligibility,
+        "fundable_from_here": fundable_from_here,
+        **_reach_layers(caps, status, note=getattr(caps, "implementation_note", "") or "",
+                        requires_creds=requires_creds, login_configured=login_configured,
+                        login=login, funding=funding, can_run_today=can_run_today,
+                        fundable_from_here=fundable_from_here,
+                        eligibility=eligibility, country_code=country_code),
         "reads_live_markets_now": reads_now,
         "needs_credentials": needs_login,
         # The login this venue reads, and whether it is already saved. Present on
@@ -268,7 +407,8 @@ def adapter_row(venue_id: str, adapter: Any,
 
 
 def build_inventory(registry: Any,
-                    data_dir: Optional[str] = None) -> Dict[str, Any]:
+                    data_dir: Optional[str] = None,
+                    country_code: Optional[str] = None) -> Dict[str, Any]:
     """
     Every registered adapter, as the operator's answer table.
 
@@ -278,8 +418,10 @@ def build_inventory(registry: Any,
     own view) the login named on the row is unclaimed, exactly as before.
     """
     adapters = getattr(registry, "adapters", None) or {}
+    country_code = country_code or getattr(registry, "country_code", None)
     rows = {venue_id: adapter_row(venue_id, adapter,
-                                  login=_login_state(venue_id, data_dir))
+                                  login=_login_state(venue_id, data_dir),
+                                  country_code=country_code)
             for venue_id, adapter in sorted(adapters.items())}
 
     def count(pred) -> int:
@@ -296,13 +438,54 @@ def build_inventory(registry: Any,
         "need_credentials": count(lambda r: r["needs_credentials"]),
         "logins_configured": count(lambda r: r["logged_in"]),
         "no_client": count(lambda r: r["use"] == USE_NO_CLIENT),
+        # Venues where the operator could actually put money AND PTAI could
+        # actually submit the order. This is the number that matters to the
+        # question "let's give the venues enough code": everything else is work
+        # that cannot yet become a trade.
+        "can_hold_real_money_from_here": count(
+            lambda r: (r.get("reach") or {}).get("layers", {})
+            .get("places_real_orders") is True
+            and r.get("fundable_from_here") is True),
+        "fundable_from_here": count(lambda r: r.get("fundable_from_here") is True),
     }
+    # WHERE THE NEXT PIECE OF VENUE CODE SHOULD GO. The operator's question was
+    # "all at once or one by one" - this orders the answer: venues that already
+    # read and only lack the order path first, then the ones missing two layers,
+    # then the ones with no client at all (which are the most work and the least
+    # certain). Within a distance, fundable venues come first: a venue nobody can
+    # put money into is a paper exercise whatever is written for it.
+    def _rank(row: Dict[str, Any]) -> tuple:
+        reach = row.get("reach") or {}
+        # Fundable-from-here is ranked ABOVE unfundable: a venue whose deposit
+        # route this operator cannot use is a paper exercise whatever is written
+        # for it, and the queue for real work should say so.
+        return (int(reach.get("distance", 99)),
+                row.get("fundable_from_here") is not True,
+                str(row.get("venue_id")))
+
+    ordered = sorted(rows.values(), key=_rank)
     return {
         "available": bool(rows),
         "at": datetime.now(timezone.utc).isoformat(),
         "source": "the live registry the agent built at startup",
         "counts": counts,
         "venues": rows,
+        "reach": {
+            "reference": "polymarket",
+            "real_orders": [r["venue_id"] for r in ordered
+                            if (r.get("reach") or {}).get("layers", {})
+                            .get("places_real_orders")],
+            "next_steps": [
+                {"venue_id": r["venue_id"], "label": r["label"],
+                 "distance": (r.get("reach") or {}).get("distance"),
+                 "missing": (r.get("reach") or {}).get("missing"),
+                 "next_step": (r.get("reach") or {}).get("next_step"),
+                 "fundable": bool(r.get("fundable")),
+                 "fundable_from_here": r.get("fundable_from_here"),
+                 "can_run_today": bool(r.get("can_run_today"))}
+                for r in ordered if (r.get("reach") or {}).get("distance")
+            ],
+        },
     }
 
 
@@ -373,7 +556,10 @@ def inventory_line(inventory: Dict[str, Any]) -> str:
     ordered = [v for v in (inventory.get("venues") or {}).values()
                if v.get("use") == USE_REAL_MONEY]
     can_be_real = ", ".join(v["label"] for v in ordered) or "none"
-    return (f"{counts.get('registered', 0)} venues registered: "
+    real = [v["label"] for v in (inventory.get("venues") or {}).values()
+            if (v.get("reach") or {}).get("layers", {}).get("places_real_orders")]
+    return (f"{counts.get('registered', 0)} venues registered, "
+            f"{len(real)} can place a real order ({', '.join(real) or 'none'}): "
             f"{counts.get('readable_now', 0)} readable now, "
             f"{counts.get('paper_tradable', 0)} paper-tradable, "
             f"{counts.get('need_credentials', 0)} still needs a login "

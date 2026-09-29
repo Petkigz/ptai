@@ -37,6 +37,8 @@ have already earned it.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -59,6 +61,35 @@ QUALIFICATION_GATES = {
 # minimum. Two half-funded accounts cannot both meet a minimum order size, which
 # is worse than one that can trade.
 MAX_LIVE_VENUES_SMALL_BUDGET = 1
+
+#: Hard ceiling on `PTAI_MAX_LIVE_VENUES`. Not a risk rule - a typo guard.
+MAX_LIVE_VENUES_CEILING = 5
+
+
+def max_live_venues_default() -> int:
+    """
+    How many venues may hold real capital at once. `PTAI_MAX_LIVE_VENUES`, 1.
+
+    The operator's reason for one venue was resources: "i was thinking it would
+    require more resources to run several venues at once but now that i can
+    disable thinking i think its ok to run them". Scanning several venues costs
+    nothing extra - PTAI already scans nineteen every cycle, and the model is
+    asked once per market either way - so this number was never about compute.
+    What it actually controls is CAPITAL: every live venue is a separate funded
+    account with its own minimum order size, and the agent cannot move money
+    between them.
+
+    So it is a setting, not a wall, and raising it is safe in the way that
+    matters: the same dollar is never promised to two venues, because
+    `TradingAgentV3._live_capital_caps` spends free cash down the list of live
+    venues instead of giving each one all of it.
+    """
+    raw = os.environ.get("PTAI_MAX_LIVE_VENUES", "")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return MAX_LIVE_VENUES_SMALL_BUDGET
+    return max(1, min(MAX_LIVE_VENUES_CEILING, value))
 # A switch has to earn back what it costs. If the per-trade edge cannot cover the
 # withdrawal and the re-deposit within one qualification horizon, the move is
 # churn - the operator paying the rails to chase noise.
@@ -232,6 +263,8 @@ class VenueSelection:
     # The venue the agent is ACTUALLY trading, read from storage. It is not
     # recomputed from the ranking, or the money's home would drift on noise.
     remembered_live_venue: Optional[str] = None
+    # Every venue that came out of this selection as live, in priority order.
+    live_venues_ids: List[str] = field(default_factory=list)
 
     @property
     def live_venues(self) -> List[VenueAssessment]:
@@ -244,6 +277,7 @@ class VenueSelection:
             "verdict": self.verdict,
             "reasons": self.reasons,
             "live_venues": [a.venue_id for a in self.live_venues],
+            "live_venue_ids": list(self.live_venues_ids),
             "assessments": [a.to_dict() for a in self.assessments],
             "switch_warranted": self.switch_warranted,
             "switch_plan": self.switch_plan,
@@ -277,6 +311,46 @@ class VenueSelector:
     # The state key under which the live venue is remembered. One key, one
     # meaning, so a restart does not change which venue the agent thinks it is on.
     LIVE_VENUE_KEY = "venue_selection.live_venue"
+    # ...and the list, for a run with more than one live venue. The single key is
+    # still written (with the first venue) so nothing that reads it breaks, and it
+    # is still read when the list is absent - an install that upgrades does not
+    # lose the venue its money is in.
+    LIVE_VENUES_KEY = "venue_selection.live_venues"
+
+    def remembered_live_venues(self) -> List[str]:
+        """Every venue the agent was last trading with, in priority order."""
+        if self.storage is None:
+            return []
+        try:
+            raw = self.storage.get_state(self.LIVE_VENUES_KEY)
+        except Exception as e:
+            logger.debug(f"Could not read the remembered live venues: {e}")
+            raw = None
+        if raw:
+            try:
+                values = json.loads(raw)
+                if isinstance(values, list):
+                    clean = [str(v) for v in values if str(v or "").strip()]
+                    if clean:
+                        return clean
+            except (TypeError, ValueError):
+                logger.debug("The remembered live-venue list is unreadable; "
+                             "falling back to the single venue")
+        single = self.remembered_live_venue()
+        return [single] if single else []
+
+    def remember_live_venues(self, venue_ids: Optional[List[str]]) -> None:
+        """Write down which venues hold live capital. `[]`/None clears it."""
+        ids = [str(v) for v in (venue_ids or []) if str(v or "").strip()]
+        # The single key first: it is what a running older process reads.
+        self.remember_live_venue(ids[0] if ids else None)
+        if self.storage is None:
+            return
+        try:
+            self.storage.set_state(self.LIVE_VENUES_KEY, json.dumps(ids))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not remember the live venues: "
+                           f"{type(e).__name__}: {e}")
 
     def remembered_live_venue(self) -> Optional[str]:
         """The venue the agent was last trading with, from storage."""
@@ -810,7 +884,8 @@ class VenueSelector:
 
     def select(self, assessments: List[VenueAssessment],
                total_budget_usd: float = 0.0,
-               smallest_practical_usd: float = 10.0) -> VenueSelection:
+               smallest_practical_usd: float = 10.0,
+               max_live_venues: Optional[int] = None) -> VenueSelection:
         """
         Choose the live venue, and say whether switching is worth it.
 
@@ -823,6 +898,11 @@ class VenueSelector:
         """
         selection = VenueSelection(assessments=assessments,
                                    total_budget_usd=float(total_budget_usd or 0.0))
+        # How many venues may hold real capital. The operator's setting, because
+        # the reason for one was never compute; see `max_live_venues_default`.
+        if max_live_venues is None:
+            max_live_venues = max_live_venues_default()
+        selection.max_live_venues = max(1, int(max_live_venues))
 
         for a in assessments:
             self._assign_role(a)
@@ -834,28 +914,33 @@ class VenueSelector:
         # Recomputing it every cycle would let a marginally better per-trade
         # number move the home of the real money without anybody deciding to.
         # The ranking says where money SHOULD go; this says where it IS.
-        remembered = self.remembered_live_venue()
+        remembered_ids = self.remembered_live_venues()
+        remembered = remembered_ids[0] if remembered_ids else None
+        selection.remembered_live_venue = remembered
 
-        # The incumbent is ordered first, BEFORE the cap is applied. Apply the cap
-        # first and it can demote the venue the money is already in, which turns
-        # "the cap keeps one live venue" into "the cap relocates the money".
+        # The incumbents are ordered first, BEFORE the cap is applied. Apply the
+        # cap first and it can demote the venue the money is already in, which
+        # turns "the cap keeps N live venues" into "the cap relocates the money".
         live.sort(
-            key=lambda a: (a.venue_id == remembered, a.qualified,
+            key=lambda a: (a.venue_id in remembered_ids, a.qualified,
                            a.has_evidence, a.pnl_per_trade),
             reverse=True,
         )
 
-        # Two live venues on a small budget is two accounts that cannot meet a
-        # minimum order. The cap is explicit rather than implied.
-        if len(live) > MAX_LIVE_VENUES_SMALL_BUDGET:
-            keep = live[:MAX_LIVE_VENUES_SMALL_BUDGET]
+        # The cap is explicit rather than implied: two accounts that each cannot
+        # meet a minimum order are worse than one that can, and the operator's
+        # budget decides how many can be funded. Raising it is
+        # `PTAI_MAX_LIVE_VENUES`, and each extra venue still needs its own funded,
+        # authorised, qualified account.
+        if len(live) > selection.max_live_venues:
+            keep = live[:selection.max_live_venues]
             for a in live:
                 if a not in keep:
                     a.role = ROLE_PAPER
                     a.notes.append(
-                        "a second live venue is not funded on this budget: two "
-                        "accounts that each cannot meet a minimum order beats "
-                        "nothing, but one that can beats both")
+                        f"{selection.max_live_venues} venue(s) may hold real "
+                        f"capital on this budget (PTAI_MAX_LIVE_VENUES); this one "
+                        f"is scanned and paper-traded until a slot frees up")
             live = keep
 
         live_ids = [a.venue_id for a in live]
@@ -876,13 +961,17 @@ class VenueSelector:
             live = []
         elif live and not remembered:
             # First time a venue becomes ready. Adopt it and write the choice
-            # down, so every later cycle reads the same answer.
-            self.remember_live_venue(live[0].venue_id)
+            # down, so every later cycle reads the same answer. With more than one
+            # allowed, every ready venue is adopted: they are separate funded
+            # accounts and the agent cannot move money between them, so there is
+            # nothing to migrate - the choice is only which ones are deployable.
+            self.remember_live_venues([a.venue_id for a in live])
             remembered = live[0].venue_id
+            remembered_ids = [a.venue_id for a in live]
 
         selection.live_venue = live[0].venue_id if live else None
+        selection.live_venues_ids = [a.venue_id for a in live]
         selection.remembered_live_venue = remembered
-        selection.max_live_venues = MAX_LIVE_VENUES_SMALL_BUDGET
 
         # The candidate: the best venue that could HOLD money.
         #
