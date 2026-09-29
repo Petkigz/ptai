@@ -219,8 +219,13 @@ class TestTheChainIsVisible:
         from ptai.strategy.strategy_engine import StrategyEngineV3
         import inspect
         src = inspect.getsource(StrategyEngineV3.evaluate_market_with_all_strategies)
-        assert 'opp.raw["fair_value_chain"]' in src
-        assert 'opp.raw["components"]' in src
+        # The chain is attached to the SAME `raw` dict the strategy tag goes
+        # into. It used to be attached and then wiped by the assignment below it
+        # (`opp.raw = {"strategy": ..., "venue": ...}`), which is why the console
+        # could never show a proposed trade's components.
+        assert '"fair_value_chain": _chain' in src
+        assert '"components": _components' in src
+        assert 'opp.raw["fair_value_chain"]' not in src or '"fair_value_chain"' in src
 
 
 # --------------------------------------------------------------------------

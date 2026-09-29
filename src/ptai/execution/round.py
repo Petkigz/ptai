@@ -86,6 +86,11 @@ class RoundReport:
     positions_held: int = 0
     open_positions_marked: int = 0
     open_positions_unmarked: int = 0
+    # WHAT THE ROUND TRADED, and how close it came when it traded nothing. A
+    # round that reports only a bankroll number cannot answer "what did it do"
+    # or "how far off was it" - the two questions the operator asked.
+    trades: List[Dict[str, Any]] = field(default_factory=list)
+    closest_call: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -141,6 +146,8 @@ class RoundReport:
             "research_sources": self.research_sources,
             "open_positions_marked": self.open_positions_marked,
             "open_positions_unmarked": self.open_positions_unmarked,
+            "trades": list(self.trades),
+            "closest_call": dict(self.closest_call),
             "notes": self.notes,
             "warnings": self.warnings,
         }
@@ -160,6 +167,8 @@ class RoundReport:
         parts.append(f"{self.positions_opened} opened, "
                      f"{self.positions_settled} settled, "
                      f"{self.positions_held} held")
+        if self.trades:
+            parts.append(f"{len(self.trades)} trade(s) this round")
         if abs(self.unrealised_pnl) >= 0.005:
             parts.append(f"of which {money(self.unrealised_pnl)} is the book at "
                          f"current prices (marked, not settled)")

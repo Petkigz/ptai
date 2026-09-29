@@ -651,6 +651,7 @@ class TradingAgentV3:
         # was asked - never from the shortlist, which is only a plan.
         self._cycle_context_calls = 0
         self._cycle_deep_context_calls = 0
+        self._cycle_closest_call = {}
         self._last_cycle_model = ""
         self._screen: Dict[str, Any] = {}
         # Round state: the opening book value, the report being built, and what
@@ -1227,6 +1228,40 @@ class TradingAgentV3:
                 marks[str(market.id)] = round(mid, 6)
         return marks
 
+    def _held_market_ids(self, account: str = "paper") -> set:
+        """
+        The markets this account already has an open position in.
+
+        Read from the trade log, which is the same record the ledger and the
+        console use, so the guard cannot disagree with what the operator sees.
+        An unreadable log returns an empty set - the guard is an extra refusal,
+        not the only one, and refusing every market because the log hiccuped
+        would stop the round for no reason.
+        """
+        try:
+            rows = self.storage.get_open_positions() or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not read open positions for the held-market "
+                         f"guard: {type(e).__name__}: {e}")
+            return set()
+        held = set()
+        for row in rows:
+            mode = str(row.get("execution_mode") or "").lower()
+            if mode and mode != account:
+                continue
+            # Anything unresolved that is not an explicit refusal is a position.
+            # The status a paper trade carries is "paper" (the real fill is
+            # "executed"), so an allow-list silently held nothing and the guard
+            # let the same market be bought again every round.
+            status = str(row.get("status") or "").lower()
+            if status in ("rejected", "blocked", "error", "cancelled",
+                          "canceled", "failed", "unknown"):
+                continue
+            market_id = row.get("market_id")
+            if market_id:
+                held.add(str(market_id))
+        return held
+
     def _round_ledger(self, price_lookup) -> Any:
         """The ledger as it stands, with whatever marks we have."""
         try:
@@ -1320,6 +1355,37 @@ class TradingAgentV3:
         report.staked_usd = round(_staked, 4)
         report.positions_settled = int(
             (getattr(self, "_round_settled", 0) or 0))
+        # WHAT THE ROUND ACTUALLY TRADED, one row per order it opened. The
+        # round's headline is a number; this is the answer to "what did it do to
+        # earn or lose it". A refusal is not a trade - those stay in the
+        # execution list, counted by reason.
+        trades: List[Dict[str, Any]] = []
+        for entry in (execution_results or []):
+            if not entry.get("position_recorded"):
+                continue
+            fill = entry.get("fill") if isinstance(entry.get("fill"), dict) else {}
+            ev = (entry.get("expected_net_ev")
+                  if isinstance(entry.get("expected_net_ev"), dict) else {})
+            trades.append({
+                "market_id": entry.get("market_id"),
+                "venue": entry.get("venue"),
+                "side": entry.get("side"),
+                "strategy": entry.get("strategy"),
+                "question": entry.get("question"),
+                "amount_usd": round(float(
+                    fill.get("filled_usd") or entry.get("amount") or 0.0), 4),
+                "price": fill.get("filled_price"),
+                "shares": fill.get("filled_shares"),
+                "edge": entry.get("edge"),
+                "expected_net_ev": ev.get("net_ev_usd"),
+                "execution_mode": entry.get("execution_mode"),
+                "paper_because": entry.get("paper_because", ""),
+                "exploration": bool(entry.get("exploration")),
+                "status": fill.get("status") or entry.get("status"),
+                "pnl": entry.get("pnl"),
+            })
+        report.trades = trades
+        report.closest_call = dict(getattr(self, "_cycle_closest_call", None) or {})
         if report.open_positions_unmarked:
             report.warnings.append(
                 f"{report.open_positions_unmarked} position(s) could not be priced "
@@ -2553,6 +2619,12 @@ class TradingAgentV3:
                 "priced": int(getattr(self, "_cycle_context_calls", 0) or 0),
                 "deep_priced": int(getattr(self, "_cycle_deep_context_calls", 0) or 0),
             })
+        # HOW CLOSE WAS IT. Kept on the agent for the round, the cycle report
+        # and the console's round panel: the operator asking "how long do I have
+        # to run this" is asking about this number, and a round that reports
+        # only zeros cannot answer him.
+        self._cycle_closest_call = dict(
+            getattr(scan_result, "best_near_miss", None) or {})
         _sc = self._cycle_scan_counts
         _unpriced = max(0, int(_sc.get("discovered", 0) or 0)
                         - int(_sc.get("evaluated", 0) or 0)
@@ -2594,6 +2666,7 @@ class TradingAgentV3:
         # placeholder), the per-forecast line named the provider CLASS, and a
         # market the model never saw was indistinguishable from one it priced.
         logger.info(self._local_model_line())
+        logger.info(self._closest_call_line())
         # WHY nothing traded. A cycle that refused everything used to look
         # identical to a cycle that found nothing, which is how a resolution
         # rule blocking a whole category stayed invisible for a week.
@@ -2609,7 +2682,9 @@ class TradingAgentV3:
         # V10 FIX #8: Exploration lane 95/5 - qualified capital lane + shadow lane
         logger.info("Core Objective Step 4: Only deploys capital when passes independently enforced rules: edge>=8% conf>=60% liquidity>=0.3 exec_quality>=0.3 EV>0, exposure caps, correlation caps, drawdown limits, kill_switch, execution_guard")
         logger.info("V10 FIX #2: Kelly → proposed amount → exposure → correlation → limits → guard → executor (same amount)")
-        logger.info("V10 FIX #8: 95% research → qualified venues, 5% → promising unqualified (shadow/paper only, no live capital)")
+        logger.info("Capital lanes: qualified venues may be traded live once one "
+                    "qualifies; everything else is paper/shadow only. Nothing "
+                    "live is deployed without a qualified venue.")
         
         final_trades = []
         exploration_trades = []  # shadow lane
@@ -2740,11 +2815,41 @@ class TradingAgentV3:
                 f"exploration lane - no live capital is deployable without a "
                 f"qualified venue.")
         
-        # V10 FIX #8: 95/5 split - 95% qualified, 5% exploration (shadow only)
-        # Take top unqualified as exploration candidates (max 1 per cycle for $50 bankroll)
-        exploration_candidates = sorted(unqualified_opps, key=lambda x: x.score, reverse=True)[:1] if unqualified_opps else []
+        # V10 FIX #8: 95/5 split - 95% qualified, 5% exploration (shadow only).
+        #
+        # The pool is the scan's own paper candidates plus any opportunity that
+        # reached `final_selected` but sits on an unqualified venue. It did not
+        # exist in practice before 2026-09-29: `final_selected` requires the
+        # LIVE gates, so on a fresh install (nothing qualified) the pool was
+        # always empty and the lane that is supposed to bootstrap the
+        # qualification evidence never placed a trade - the operator's words for
+        # it were "I have not seen 1 trade".
+        _paper_pool = list(getattr(scan_result, "exploration_candidates", None) or [])
+        _paper_pool.extend(unqualified_opps)
+        # A market this account already holds is not a new learning opportunity,
+        # it is the same bet placed again: buying it every round stacks one
+        # market's outcome into every slot and trains the qualification record on
+        # a single question. The held markets are named, so a round that explored
+        # nothing new says why instead of looking idle.
+        _held = self._held_market_ids("paper")
+        if _held:
+            _before = len(_paper_pool)
+            _paper_pool = [o for o in _paper_pool
+                           if str(o.market.id) not in _held]
+            if _before != len(_paper_pool):
+                logger.info(
+                    f"Exploration lane: {_before - len(_paper_pool)} candidate(s) "
+                    f"skipped - this account already holds "
+                    f"{len(_held)} market(s) ({', '.join(sorted(_held)[:5])}); "
+                    f"re-buying one is the same bet twice, not a new one")
+        exploration_candidates = sorted(
+            _paper_pool, key=lambda x: float(getattr(x, "score", 0.0) or 0.0),
+            reverse=True)[:1] if _paper_pool else []
         if exploration_candidates:
-            logger.info(f"V10 FIX #8 Exploration lane: {len(exploration_candidates)} unqualified venues selected for shadow/paper learning (NO live capital): {[o.venue_id+':'+o.market.id for o in exploration_candidates]}")
+            logger.info(
+                f"Exploration lane (paper): {len(exploration_candidates)} "
+                f"candidate(s) for shadow/paper learning, no live capital: "
+                f"{[o.venue_id + ':' + o.market.id for o in exploration_candidates]}")
         
         # Live-capital refusals that happen before dispatch (at SIZING, where a
         # cap can zero an order). Kept here because `execution_results` is
@@ -2958,7 +3063,22 @@ class TradingAgentV3:
                 opp._expected_ev = None
             exploration_trades.append(opp)
             _ev = getattr(opp._expected_ev, "net_ev_usd", None)
-            logger.info(f"Exploration SHADOW: {opp.market.id} @ {opp.venue_id} score {opp.score:.3f} amount ${opp._proposed_amount:.2f} netEV ${_ev if _ev is not None else 'unmeasured'} - shadow/paper only, NO live capital, for discovering new edges")
+            _why = (opp.raw or {}).get("exploration_because", "")
+            logger.info(
+                f"PAPER/EXPLORATION trade: {opp.market.id} @ {opp.venue_id} "
+                f"{str(opp.side).upper()} ${opp._proposed_amount:.2f} - the "
+                f"model's {float(opp.estimated_fair):.3f} against the "
+                f"{float(opp.raw.get('price_paid') or opp.market_price):.3f} a "
+                f"share costs, which leaves "
+                f"{float(opp.effective_edge or 0.0):+.3f} after the cash costs "
+                f"(net EV ${_ev if _ev is not None else 'unmeasured'}); "
+                f"{_why}. Paper only, no live capital, for learning")
+            if opp.raw is not None:
+                # The console and the round read this rather than re-deriving it.
+                opp.raw["paper_note"] = (
+                    f"paper/exploration: model {float(opp.estimated_fair):.3f} vs "
+                    f"executable {float(opp.raw.get('price_paid') or opp.market_price):.3f}"
+                    f" - {float(opp.effective_edge or 0.0):+.3f} after cash costs")
 
         # The exploration lane is downstream of qualification, so on a fresh
         # install it is the ONLY source of evidence. Route it into the execution
@@ -3253,6 +3373,10 @@ class TradingAgentV3:
                     },
                     "canonical_path": "V3 → Guard → MultiVenueExecutor → adapter → place_order()",
                     "account_health": account_health.to_dict(),
+                    # Was this a shadow trade? The round lists its trades and
+                    # the label has to travel with the row.
+                    "exploration": bool(getattr(opp, "_is_exploration", False)),
+                    "question": (opp.market.question or "")[:120],
                     # Which purse paid, read from the FILL rather than from the
                     # intent: a simulated fill is paper money even when the venue
                     # holds credentials and could have moved real money.
@@ -3300,7 +3424,9 @@ class TradingAgentV3:
 
         # V10 FIX #8: Log exploration lane results (shadow only, no capital)
         if exploration_trades:
-            logger.info(f"V10 FIX #8 Exploration lane complete: {len(exploration_trades)} shadow trades for learning, NO live capital deployed")
+            logger.info(
+                f"Exploration lane complete: {len(exploration_trades)} paper "
+                f"trade(s) for learning, no live capital deployed")
         
         elapsed = time.time() - start
         
@@ -3446,6 +3572,12 @@ class TradingAgentV3:
             "exposure": _exposure_seed,
             # The per-market forecast chains, for the trades that were proposed.
             "pricing": self._pricing_rows(scan_result.all_opportunities)[:20],
+            # The closest call of the round and the paper candidates the scan
+            # found, so "how close was it" and "why did nothing trade" are on
+            # the report rather than only in a log line.
+            "closest_call": dict(getattr(self, "_cycle_closest_call", None) or {}),
+            "paper_candidates": len(
+                getattr(scan_result, "exploration_candidates", None) or []),
             # The round is attached AFTER it is closed, below - closing it is
             # what marks the book and states the bankroll, so there is nothing
             # honest to report at this point in the cycle yet.
@@ -5098,6 +5230,34 @@ class TradingAgentV3:
         if status["model"]:
             self._last_cycle_model = status["model"]
         return status
+
+    def _closest_call_line(self) -> str:
+        """
+        The best market this round priced that did not qualify to trade.
+
+        "How long am I supposed to run it to produce results" has a measurable
+        answer: watch this number against the bar. When the executable edge on
+        the closest call reaches 8% on the mid AND the conservative estimate
+        clears the price, the live gates open; below that, the number says how
+        far away the round was instead of leaving the operator with a zero.
+        """
+        row = getattr(self, "_cycle_closest_call", None) or {}
+        if not row:
+            return ("Closest call this round: nothing was priced, so there is "
+                    "nothing to measure against the 8% bar")
+        edge = float(row.get("executable_edge") or 0.0)
+        cons = float(row.get("conservative_executable_edge") or 0.0)
+        model = ("the model answered" if row.get("model_answered")
+                 else "no model answer was recorded for it")
+        return (
+            f"Closest call this round: {row.get('market_id')} "
+            f"{str(row.get('side') or 'YES').upper()} - the model's "
+            f"{float(row.get('fair') or 0.0):.3f} against the "
+            f"{float(row.get('market') or 0.0):.3f} mid leaves "
+            f"{edge:+.3f} a share after every cash cost (conservative estimate "
+            f"{cons:+.3f}); refused: {str(row.get('refusal') or 'unknown')[:160]} "
+            f"({model}; the live bar is 8% mispricing and the conservative "
+            f"estimate clearing the price)")
 
     def _local_model_line(self) -> str:
         """The cycle's model line, from the status dict. Never raises."""

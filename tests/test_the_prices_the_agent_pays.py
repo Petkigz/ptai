@@ -96,11 +96,17 @@ class TestTheTradeInTheLogIsRefused:
         assert MAX_TRADABLE_SPREAD < 0.998
 
     def test_a_normal_market_still_trades(self):
+        # 0.75 against a 0.60 mid, with 0.10 of uncertainty: the CONSERVATIVE
+        # estimate is 0.75 - 0.10 = 0.65 and it has to clear the 0.602 ask,
+        # which is the rule the live gate applies (the best estimate alone is
+        # not enough - a 0.70 estimate against the same ask would be refused,
+        # because 0.70 - 0.10 lands on the price).
         edge = EdgeCalculator().calculate(
-            market=_market(), fair_prob=0.70, uncertainty=0.1,
+            market=_market(), fair_prob=0.75, uncertainty=0.1,
             orderbook=BOOK_OK, amount_usd=3.0, side="YES")
         assert edge.price_paid == pytest.approx(0.602)
         assert edge.executable_edge > 0
+        assert edge.conservative_executable_edge > 0
         assert edge.blocked_by == ""
         assert edge.should_trade
 

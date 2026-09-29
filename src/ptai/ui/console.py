@@ -2876,6 +2876,31 @@ function showRound(round, summary, rows, justRan){
         ${roundFigure(r.unrealised_pnl)} marked (the open book at current prices,
         not a settlement)</div>`
     : '';
+  const pct = v => (v==null || isNaN(Number(v))) ? '&mdash;' : (Number(v)*100).toFixed(1)+'%';
+  const trades = (r.trades && r.trades.length)
+    ? `<table style="margin-top:9px"><thead><tr><th>Market</th><th>Venue</th>
+        <th>Side</th><th>Stake</th><th>Price</th><th>Edge</th><th>Mode</th>
+        <th>Status</th></tr></thead><tbody>`
+      + r.trades.slice(0,10).map(t=>`<tr>
+          <td class="mono" title="${esc(t.question||t.market_id||'')}">${esc(String(t.market_id||'').slice(0,20))}</td>
+          <td>${esc(t.venue||'')}</td>
+          <td>${esc(t.side||'')}</td>
+          <td class="mono">$${Number(t.amount_usd||0).toFixed(2)}</td>
+          <td class="mono">${t.price==null?'&mdash;':Number(t.price).toFixed(3)}</td>
+          <td class="mono">${pct(t.edge)}</td>
+          <td><span class="pill ${t.execution_mode==='live'?'no':'dim'}">${esc(t.exploration?'paper/exploration':(t.execution_mode||'paper'))}</span></td>
+          <td class="note" title="${esc(t.status||'')}">${esc(String(t.status||'').slice(0,28))}</td>
+        </tr>`).join('') + `</tbody></table>`
+    : '';
+  const closest = (r.closest_call && r.closest_call.market_id)
+    ? `<div class="note" style="margin-top:7px">Closest call:
+        <span class="mono">${esc(r.closest_call.market_id)}</span>
+        ${esc(String(r.closest_call.side||'').toUpperCase())} &mdash; the model's
+        ${Number(r.closest_call.fair||0).toFixed(3)} against the
+        ${Number(r.closest_call.market||0).toFixed(3)} mid leaves
+        <b class="mono">${pct(r.closest_call.executable_edge)}</b> a share after
+        every cash cost; refused: ${esc(String(r.closest_call.refusal||'').slice(0,150))}</div>`
+    : '';
   const score = s.scored
     ? `<div class="note" style="margin-top:9px">Across ${s.scored} scored round(s):
         <b class="mono ${Number(s.net_usd)>=0?'pos':'neg'}">${Number(s.net_usd)>=0?'+':''}$${Math.abs(Number(s.net_usd)).toFixed(2)}</b>
@@ -2897,7 +2922,7 @@ function showRound(round, summary, rows, justRan){
           <td class="mono">${x.duration_seconds!=null?Math.round(x.duration_seconds)+'s':'&mdash;'}</td>
         </tr>`).join('') + `</tbody></table>`
     : '';
-  $('round').innerHTML = head + detail + realised + score + history;
+  $('round').innerHTML = head + detail + trades + closest + realised + score + history;
 }
 
 async function loadRounds(){

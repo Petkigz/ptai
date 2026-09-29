@@ -160,14 +160,23 @@ class TestAssumptionsAreNamedAndCarryWeight:
         refused - and the refusal names the assumptions.
         """
         engine = ExpectedNetEVEngine()
-        # A 10c mispricing, no fee schedule and no book: the costs are ours.
+        # An 8.5c mispricing, no fee schedule and no book: the costs are ours.
         #
         # The edge is sized deliberately: it must clear BOTH hard thresholds on
         # the assumption-based numbers (net EV > 0 and >= 3% of stake), so that
         # the ONLY thing refusing it is the cost-stress clause. A thinner edge
         # would be refused by the 3% floor and this test would pass with the
         # clause deleted - which is exactly what the first version of it did.
-        opp = _opp(fees_pct=None, fair=0.68, price=0.58, order_gas_usd=None)
+        #
+        # 2026-09-29: the size moved from 0.68 to 0.665 because uncertainty
+        # stopped being charged as a CASH cost (it is a haircut on the fair
+        # value, `conservative_probability`, and was being charged a second and
+        # third time here). The old 0.68 cleared the stress clause once that
+        # fabricated 50%-of-uncertainty charge was removed, so the fixture was
+        # re-sized to keep testing the clause rather than the removed charge:
+        # net +$0.21 (7.0% of stake), stressed -$0.02, refused by the clause
+        # alone.
+        opp = _opp(fees_pct=None, fair=0.665, price=0.58, order_gas_usd=None)
         assumed = engine.calculate(opp, 3.0, {})
         assert assumed.assumed_costs, "the fixture must rely on assumptions"
         assert assumed.net_ev_usd > 0 and assumed.net_ev_pct >= 0.03, (

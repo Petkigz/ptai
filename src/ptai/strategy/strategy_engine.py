@@ -28,6 +28,61 @@ from ..venues.registry import VenueRegistry
 
 from .fair_value import FairValueEngine
 from .edge import HUNT_MISPRICING_MIN, EdgeCalculator, hunted_mispricing
+
+
+# The PAPER lane's own bar, deliberately below the live one (8% mispricing on
+# the mid AND the conservative estimate clearing the price AND confidence >=
+# 60%). The live bar is the operator's rule and it does not move.
+#
+# This lane exists because the qualification lifecycle needs resolved paper
+# trades - a venue earns live capital with 100 of them - and because a round
+# that can never place a single trade teaches the operator and the learning
+# chains nothing. What it does NOT do is invent an edge or hide a cost: it
+# requires a real two-sided book, a model that actually answered, a mispricing
+# of at least 5% on the side traded, and at least 2 cents per share left after
+# paying the executable price and every cash cost. It is labelled everywhere it
+# appears - the log, the round, the console - as paper/exploration.
+EXPLORATION_MISPRICING_MIN = 0.05
+EXPLORATION_EXECUTABLE_EDGE_MIN = 0.02
+
+
+def _refusal_text(fv_result) -> str:
+    """The gate's own sentence, without the boolean it is prefixed with."""
+    text = str(getattr(fv_result, "reasoning", "") or "").split(
+        "Decision: ", 1)[-1].split(" | ", 1)[0].strip()
+    for prefix in ("False because ", "True because ", "False. ", "True. "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    return text[:200]
+
+
+def exploration_eligible(fv_result, executable_edge: float,
+                         execution_quality: float,
+                         liquidity_score: float) -> bool:
+    """Is this refused market a PAPER candidate for the shadow lane?"""
+    if fv_result is None or getattr(fv_result, "should_trade", False):
+        return False
+    # There has to be a real, two-sided, executable book. An estimated book has
+    # no price to pay, and a spread too wide to cross is a loss however good the
+    # estimate is: both are refusals the lane must not work around.
+    if not bool(getattr(fv_result, "book_is_real", False)):
+        return False
+    if str(getattr(fv_result, "blocked_by", "") or ""):
+        return False
+    # The best estimate must survive the price and the cash costs. If it does
+    # not, there is no trade here at any estimate and the lane must not take it.
+    if float(executable_edge or 0.0) < EXPLORATION_EXECUTABLE_EDGE_MIN:
+        return False
+    if abs(float(getattr(fv_result, "edge", 0.0) or 0.0)) < EXPLORATION_MISPRICING_MIN:
+        return False
+    if float(liquidity_score or 0.0) < 0.3 or float(execution_quality or 0.0) < 0.3:
+        return False
+    # A model must have ANSWERED this market. A heuristic rule of thumb is not
+    # evidence and the shadow lane exists to produce evidence.
+    chain = getattr(getattr(fv_result, "forecast_result", None), "chain", {}) or {}
+    if chain.get("llm_raw") is None:
+        return False
+    return True
 from .strategy_selector import StrategyType, StrategySelector
 from .arbitrage import ArbitrageEngine
 from .event_trading import EventTradingEngine
@@ -56,6 +111,16 @@ class VenueScanReport:
     evaluated: int = 0          # markets that reached the pricing stage
     skipped_no_book: int = 0    # ...of the iterated ones, how many had no usable book
     beyond_cap: int = 0         # markets the per-venue cap left unpriced
+    # The best market this venue priced that still did not qualify to trade, and
+    # what refused it. "How close was the round?" is the question an operator
+    # asking "how long do I have to run this" needs answered, and a scan that
+    # reports only zeros cannot answer it.
+    best_near_miss: Optional[Dict[str, Any]] = None
+    # Paper candidates this venue produced: refused by the LIVE gates, eligible
+    # for the learning lane. They travel on the report rather than in a third
+    # return value, so `scan_venue`'s contract (report, opportunities) is
+    # unchanged for every existing caller.
+    exploration_candidates: List[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -73,6 +138,25 @@ class MultiVenueScanResult:
     execution_time: float = 0.0
     reasoning: str = ""
     best_opportunity: Optional[VenueOpportunity] = None
+    # Paper/shadow candidates: refused by the LIVE gates, eligible for the
+    # learning lane. Kept out of `all_opportunities` so no count the operator
+    # reads (candidates, tradeable, best opportunity) moves because of them.
+    exploration_candidates: List[VenueOpportunity] = field(default_factory=list)
+    # ...and the closest call of the whole round, for the same reason.
+    best_near_miss: Optional[Dict[str, Any]] = None
+
+
+def _best_near_miss(venue_reports) -> Optional[Dict[str, Any]]:
+    """The closest call of the round, across every venue that priced one."""
+    best = None
+    for report in venue_reports or []:
+        row = getattr(report, "best_near_miss", None)
+        if not row:
+            continue
+        if best is None or abs(float(row.get("executable_edge") or 0.0)) > abs(
+                float(best.get("executable_edge") or 0.0)):
+            best = dict(row)
+    return best
 
 
 def _slippage_from_book(orderbook, market_price: float):
@@ -164,10 +248,16 @@ class StrategyEngineV3:
         limit = min(200, max(50, len(sorted_markets)))
         return sorted_markets[:limit]
 
-    def evaluate_market_with_all_strategies(self, market: Market, context: Dict = None) -> List[VenueOpportunity]:
+    def evaluate_market_with_all_strategies(self, market: Market, context: Dict = None,
+                                            record: Optional[List[Dict[str, Any]]] = None) -> List[VenueOpportunity]:
         """
         Core V3: evaluate single market with ALL strategies
-        Returns list of VenueOpportunities, one per strategy that finds edge
+        Returns list of VenueOpportunity, one per strategy that finds edge.
+
+        `record`, when given, collects the pricing facts for this market - the
+        numbers the round's "how close was it" line is built from. A scan that
+        reports only zeros cannot answer "how long do I have to run this", and
+        the answer has to come from the same numbers the gates used.
         """
         context = context or {}
         opportunities: List[VenueOpportunity] = []
@@ -205,7 +295,43 @@ class StrategyEngineV3:
             # post-cost edge. A 5% POST-COST floor also stood here, so the same
             # profitable NO trade (effective 0.028) was refused before it existed
             # - the mispricing was never evaluated by anything downstream.
-            if fv_result.should_trade and fv_result.effective_edge > 0:
+            #
+            # A market the LIVE gates refused can still be a PAPER candidate:
+            # `exploration_eligible` is the lane's own bar (see the constants at
+            # the top of this file), and the two are kept apart here so that no
+            # count the operator reads - candidates, tradeable, best opportunity
+            # - moves because a shadow trade was built.
+            _exec_quality = _execution_quality_from_book(
+                context.get("orderbook"), market)
+            _liquidity_score = min(1.0, market.liquidity / 10000)
+            _is_exploration = exploration_eligible(
+                fv_result,
+                getattr(fv_result, "effective_edge", 0.0),
+                _exec_quality, _liquidity_score)
+            if record is not None:
+                record.append({
+                    "market_id": market.id,
+                    "question": (market.question or "")[:110],
+                    "side": getattr(fv_result, "side", "YES"),
+                    "fair": float(getattr(fv_result, "fair_value", 0.0) or 0.0),
+                    "market": float(market.best_price or 0.0),
+                    "mispricing": float(getattr(fv_result, "edge", 0.0) or 0.0),
+                    "executable_edge": float(
+                        getattr(fv_result, "effective_edge", 0.0) or 0.0),
+                    "conservative_executable_edge": float(
+                        getattr(fv_result, "conservative_executable_edge", 0.0) or 0.0),
+                    "conservative_fair": float(
+                        getattr(fv_result, "conservative_fair", 0.0) or 0.0),
+                    "confidence": float(getattr(fv_result, "confidence", 0.0) or 0.0),
+                    "uncertainty": float(getattr(fv_result, "uncertainty", 0.0) or 0.0),
+                    "model_answered": (
+                        (getattr(getattr(fv_result, "forecast_result", None),
+                                 "chain", {}) or {}).get("llm_raw") is not None),
+                    "should_trade": bool(getattr(fv_result, "should_trade", False)),
+                    "refusal": (_refusal_text(fv_result)),
+                })
+            if ((fv_result.should_trade and fv_result.effective_edge > 0)
+                    or _is_exploration):
                 opp = VenueOpportunity(
                     market=market,
                     venue_id=venue_id_str,
@@ -222,15 +348,14 @@ class StrategyEngineV3:
                     effective_edge=fv_result.effective_edge,
                     confidence=fv_result.confidence,
                     uncertainty=fv_result.uncertainty,
-                    liquidity_score=min(1.0, market.liquidity / 10000),
+                    liquidity_score=_liquidity_score,
                     # Measured from the book when there is one. This was the
                     # literal 0.8 for every mispricing opportunity, so a market
                     # with a wide spread and no depth scored the same as a deep
                     # one - and execution_quality feeds the opportunity score, the
                     # EV penalty and the ranking, so the ranking was partly made
                     # of a constant.
-                    execution_quality=_execution_quality_from_book(
-                        context.get("orderbook"), market),
+                    execution_quality=_exec_quality,
                     category=context.get("category", "mispricing"),
                     # What this trade will actually cost, from the venue that
                     # will charge it and the book it will trade against. None
@@ -245,19 +370,51 @@ class StrategyEngineV3:
                     bull_case=fv_result.contradiction_report.bull_case if fv_result.contradiction_report else "",
                     bear_case=fv_result.contradiction_report.bear_case if fv_result.contradiction_report else "",
                     resolution_risks=fv_result.resolution_analysis.risks if fv_result.resolution_analysis else [],
-                    should_trade=fv_result.should_trade
+                    # A shadow trade is not a trade PTAI may deploy live capital
+                    # on, and `should_trade` stays False so nothing downstream
+                    # can mistake it for one.
+                    should_trade=bool(fv_result.should_trade),
                 )
                 # The chain travels WITH the opportunity, so the operator's
                 # console can show which component said what for the trades that
                 # were actually proposed - not only for the ones in the log file.
                 _fc = getattr(fv_result, "forecast_result", None)
+                _chain = {}
+                _components = []
+                _explain = ""
                 if _fc is not None:
-                    opp.raw["fair_value_chain"] = dict(getattr(_fc, "chain", {}) or {})
-                    opp.raw["components"] = list(getattr(_fc, "components", []) or [])
-                    opp.raw["explain"] = _fc.explain()
+                    _chain = dict(getattr(_fc, "chain", {}) or {})
+                    _components = list(getattr(_fc, "components", []) or [])
+                    try:
+                        _explain = _fc.explain()
+                    except Exception:  # noqa: BLE001 - an explanation must not
+                        _explain = ""  # stop a priced market
                 opp.calculate_common_score()
-                # Tag strategy
-                opp.raw = {"strategy": "mispricing", "venue": venue_id_str}
+                # Tag strategy. The chain attached two lines above used to be
+                # WIPED here by this assignment - the comment said the chain
+                # travels with the opportunity so the console can show which
+                # component said what, and this line is why no console ever could.
+                opp.raw = {
+                    "strategy": ("mispricing (paper/exploration)" if _is_exploration
+                                 else "mispricing"),
+                    "venue": venue_id_str,
+                    "fair_value_chain": _chain,
+                    "components": _components,
+                    "explain": _explain,
+                }
+                opp.raw["price_paid"] = float(
+                    getattr(fv_result, "price_paid", 0.0) or 0.0)
+                if _is_exploration:
+                    _refusal = _refusal_text(fv_result)[:160]
+                    opp.raw["exploration"] = True
+                    opp.raw["exploration_because"] = (
+                        "the live gates refused it (" + _refusal + ") - the paper "
+                        "lane's bar is a real book, a model that answered, at least "
+                        + f"{EXPLORATION_MISPRICING_MIN:.0%} mispricing and at least "
+                        + f"{EXPLORATION_EXECUTABLE_EDGE_MIN:.0%} left after costs on "
+                        "the price paid")
+                    opp.raw["conservative_executable_edge"] = float(
+                        getattr(fv_result, "conservative_executable_edge", 0.0) or 0.0)
                 opportunities.append(opp)
         except Exception as e:
             logger.debug(f"Mispricing eval failed for {market.id}: {e}")
@@ -324,6 +481,8 @@ class StrategyEngineV3:
 
         # Evaluate each market with all strategies
         all_opps: List[VenueOpportunity] = []
+        exploration_opps: List[VenueOpportunity] = []
+        priced_records: List[Dict[str, Any]] = []
         skipped_no_book = 0
         evaluated = 0
         for market in after_liquidity[:self.evaluate_limit]:  # per-venue cap
@@ -381,14 +540,36 @@ class StrategyEngineV3:
                 }
             
             evaluated += 1
-            opps = self.evaluate_market_with_all_strategies(market, context=context)
-            all_opps.extend(opps)
+            opps = self.evaluate_market_with_all_strategies(
+                market, context=context, record=priced_records)
+            for _opp in opps:
+                # PAPER CANDIDATES ARE NOT CANDIDATES. A shadow trade must not
+                # move `candidates`, `tradeable`, `avg_edge` or the round's
+                # "best opportunity" - all of which the operator reads as what
+                # the LIVE gates found.
+                if (_opp.raw or {}).get("exploration"):
+                    exploration_opps.append(_opp)
+                else:
+                    all_opps.append(_opp)
         
         if skipped_no_book:
             logger.info(
                 f"{venue_id}: {skipped_no_book} market(s) not evaluated - their book "
                 f"is an estimate or absent, so there is no cost and no edge to "
                 f"compute (they are counted, not priced)")
+
+        # HOW CLOSE WAS IT. The best priced market that did not qualify, with
+        # the gate that refused it - a refusal of "no mispricing" and a refusal
+        # of "the conservative estimate missed the ask by half a cent" are very
+        # different answers to "how long do I have to run this".
+        def _near_miss_key(row):
+            return abs(float(row.get("executable_edge") or 0.0))
+        near_miss = None
+        for row in priced_records:
+            if row.get("should_trade"):
+                continue
+            if near_miss is None or _near_miss_key(row) > _near_miss_key(near_miss):
+                near_miss = row
         
         # Candidates after strategy evaluation
         candidates = [o for o in all_opps if o.effective_edge >= 0.03]
@@ -423,6 +604,8 @@ class StrategyEngineV3:
             candidates=len(candidates),
             tradeable=len(tradeable),
             top_opportunity=top_opp,
+            best_near_miss=near_miss,
+            exploration_candidates=exploration_opps,
             avg_edge=avg_edge,
             avg_score=avg_score,
             evaluated=evaluated,
@@ -507,16 +690,22 @@ class StrategyEngineV3:
         total_scanned = sum(len(m) for m in markets_by_venue.values())
         venue_reports: List[VenueScanReport] = []
         all_opportunities: List[VenueOpportunity] = []
+        exploration_candidates: List[VenueOpportunity] = []
         strategy_breakdown: Dict[str, int] = {}
         
         # Scan each venue
         for venue_id, markets in markets_by_venue.items():
             try:
-                report, opps = await self.scan_venue(venue_id, markets,
-                                                    context_provider=context_provider,
-                                                    book_lookup=book_lookup)
+                report, opps = await self.scan_venue(
+                    venue_id, markets, context_provider=context_provider,
+                    book_lookup=book_lookup)
                 venue_reports.append(report)
                 all_opportunities.extend(opps)
+                # ...and the paper candidates, which travel on the report: they
+                # are what the shadow lane may act on and they are NOT
+                # opportunities the live gates approved.
+                exploration_candidates.extend(
+                    getattr(report, "exploration_candidates", None) or [])
                 
                 # Strategy breakdown
                 for opp in opps:
@@ -655,5 +844,7 @@ class StrategyEngineV3:
             strategy_breakdown=strategy_breakdown,
             execution_time=elapsed,
             reasoning=reasoning,
-            best_opportunity=best_opp
+            best_opportunity=best_opp,
+            exploration_candidates=exploration_candidates,
+            best_near_miss=_best_near_miss(venue_reports),
         )

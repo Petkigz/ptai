@@ -72,8 +72,15 @@ class EffectiveEdge:
     # there is no trade anywhere near it.
     price_paid: float = 0.0
     executable_edge: float = 0.0
+    # The same figure at the CONSERVATIVE estimate (`conservative_fair`). The
+    # live gate is decided on this one; the paper/exploration lane records the
+    # best-estimate one and says so.
+    conservative_executable_edge: float = 0.0
     book_is_real: bool = False
     blocked_by: str = ""
+    # Set when the best estimate would trade but the conservative estimate does
+    # not - a live-lane refusal, and deliberately not an exploration refusal.
+    conservative_blocked_by: str = ""
 
 
 def _as_price(value) -> Optional[float]:
@@ -219,8 +226,19 @@ class EdgeCalculator:
         elif market.liquidity < 2000:
             liquidity_penalty = 0.01
 
-        # Uncertainty penalty - from uncertainty engine
-        uncertainty_penalty = uncertainty * 0.5  # 50% of uncertainty as penalty
+        # Uncertainty - a RISK HAIRCUT, not a cash cost.
+        #
+        # This was `uncertainty * 0.5` charged as a fraction of the whole
+        # position, on top of the haircut the same uncertainty had already
+        # applied to the fair value. On the operator's 2026-09-29 log it was
+        # `unc 0.339` - 84.75% of the share price charged as if somebody
+        # collected it - and it is what turned a 15-point model disagreement
+        # (the model said 0.55, the market asked 0.40) into
+        # `Effective -0.072` and DO NOTHING. There is no cash here to charge:
+        # uncertainty lowers the ESTIMATE (`conservative_fair` below, one
+        # definition, in `conservative_probability`), and that is where it is
+        # enforced. It is still reported, under its own name.
+        uncertainty_penalty = uncertainty * 0.5
 
         # Correlation penalty - if already exposed to correlated markets
         # category_exposure is current exposure to this category (0-1)
@@ -252,7 +270,10 @@ class EdgeCalculator:
         except:
             gas_deduction = 0.016
         
-        total_deductions = fees + gas_deduction + spread + slippage + liquidity_penalty + uncertainty_penalty + correlation_penalty + time_penalty
+        # What is deducted from the money is CASH: fees, gas, the spread paid,
+        # slippage, a liquidity charge, correlation and time. `uncertainty_penalty`
+        # is deliberately absent - see above.
+        total_deductions = fees + gas_deduction + spread + slippage + liquidity_penalty + correlation_penalty + time_penalty
 
         # UNITS. `raw_edge` is in PRICE UNITS - dollars per share, where a share
         # pays $1. Every deduction above is a FRACTION OF THE POSITION (fee_pct
@@ -277,13 +298,15 @@ class EdgeCalculator:
         total_deductions_price_units = total_deductions * paid_price
         effective_edge = raw_edge - total_deductions_price_units
 
-        # Conservative fair after uncertainty - same conversion, same reason.
-        uncertainty_cost_price_units = uncertainty_penalty * paid_price
-        if fair_prob > market_price:
-            conservative_fair = fair_prob - uncertainty_cost_price_units
-        else:
-            conservative_fair = fair_prob + uncertainty_cost_price_units
-        conservative_fair = max(0.01, min(0.99, conservative_fair))
+        # The conservative fair value: the same one haircut the ensemble
+        # applies, from the same function, shrinking the estimate toward the
+        # price and stopping at it. Both numbers are reported below - the
+        # system's best estimate and its conservative version - and the live
+        # gate is decided on the conservative one, because that is what
+        # "conservative" is for.
+        from ..intelligence.uncertainty import conservative_probability
+        conservative_fair = conservative_probability(fair_prob, market_price,
+                                                     uncertainty)
 
         # -- The price that can actually be paid --------------------------------
         # `raw_edge` above is measured against the market's own quote, which is
@@ -306,6 +329,8 @@ class EdgeCalculator:
                         and ask is not None)
 
         blocked_by = ""
+        conservative_blocked_by = ""
+        conservative_executable_edge = 0.0
         if book_is_real:
             if side == "YES":
                 price_paid, size_there = ask, quoted_sizes[1]
@@ -315,6 +340,13 @@ class EdgeCalculator:
             # so it must not be deducted a second time.
             executable_deductions = total_deductions - spread
             executable_edge = fair_prob - price_paid - executable_deductions * price_paid
+            # ...and what is left if the estimate is the CONSERVATIVE one. The
+            # live decision is made on this number: "the conservative estimate
+            # must clear the price" is the rule the architecture claims, and
+            # until now the gate compared the best estimate while the
+            # conservative value was only printed.
+            conservative_executable_edge = (conservative_fair - price_paid
+                                            - executable_deductions * price_paid)
 
             if size_there is not None and not size_there:
                 blocked_by = (
@@ -327,27 +359,42 @@ class EdgeCalculator:
             if not blocked_by and executable_edge <= 0:
                 blocked_by = (f"no executable edge: fair {fair_prob:.3f} vs the "
                               f"{price_paid:.3f} a share actually costs")
+            if not blocked_by and conservative_executable_edge <= 0:
+                conservative_blocked_by = (
+                    f"the conservative estimate {conservative_fair:.3f} (best "
+                    f"estimate {fair_prob:.3f}) does not clear the "
+                    f"{price_paid:.3f} a share costs, which leaves "
+                    f"{conservative_executable_edge:+.3f}")
         else:
             price_paid = market_price
             executable_edge = effective_edge
+            conservative_executable_edge = (
+                conservative_fair - market_price
+                - (total_deductions - spread) * market_price)
             blocked_by = "orderbook is not real - there is no executable price to trade on"
 
         # Should trade? The 8% is the same mispricing rule as everywhere else,
-        # the costs must not have eaten the edge entirely, and the trade has to
-        # be possible at a price that still pays.
-        should_trade = raw_edge >= 0.08 and effective_edge > 0 and not blocked_by
+        # the costs must not have eaten the edge entirely, the conservative
+        # estimate has to clear the price actually paid, and the trade has to be
+        # possible at all.
+        should_trade = (raw_edge >= 0.08 and effective_edge > 0
+                        and conservative_executable_edge > 0
+                        and not blocked_by)
 
         reasoning = (
             f"[{side}] Raw {raw_edge:.3f} (fair {fair_prob:.3f} - mkt {market_price:.3f}) | "
-            f"Deductions ({total_deductions*paid_price:.3f} of edge = "
+            f"CASH deductions ({total_deductions*paid_price:.3f} of edge = "
             f"{total_deductions:.3f} of notional x price {paid_price:.3f}): "
             f"fees {fees:.3f} gas {gas_deduction:.3f} spread {spread:.3f} slip {slippage:.3f} liq {liquidity_penalty:.3f} "
-            f"unc {uncertainty_penalty:.3f} corr {correlation_penalty:.3f} time {time_penalty:.3f} | "
-            f"Effective {effective_edge:.3f} conservative_fair {conservative_fair:.3f} | "
+            f"corr {correlation_penalty:.3f} time {time_penalty:.3f} | "
+            f"risk haircut (NOT cash): uncertainty {uncertainty:.3f} moves the "
+            f"estimate {fair_prob:.3f} -> {conservative_fair:.3f} | "
+            f"Effective {effective_edge:.3f} | "
             f"Should trade: {should_trade} (raw>=8%, effective>0) | $50 math: fee {fees*100:.1f}% + gas {gas_deduction*100:.1f}% + spread {spread*100:.1f}% = { (fees+gas_deduction+spread)*100:.1f}% cost must exceed to break even | "
-            f"Executable: pay {price_paid:.3f} -> {executable_edge:+.3f} "
+            f"Executable: pay {price_paid:.3f} -> best {executable_edge:+.3f}, conservative {conservative_executable_edge:+.3f} "
             f"{'(book not real)' if not book_is_real else ''}"
             f"{(' REFUSED: ' + blocked_by) if blocked_by else ''}"
+            f"{(' REFUSED: ' + conservative_blocked_by) if conservative_blocked_by else ''}"
         )
 
         logger.info(f"Edge calc {market.id}: {reasoning}")
@@ -370,6 +417,8 @@ class EdgeCalculator:
             executable_edge=executable_edge,
             book_is_real=book_is_real,
             blocked_by=blocked_by,
+            conservative_executable_edge=conservative_executable_edge,
+            conservative_blocked_by=conservative_blocked_by,
         )
 
     def calculate_for_opportunity(self, opportunity: VenueOpportunity, orderbook: Dict = None) -> EffectiveEdge:

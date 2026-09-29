@@ -29,6 +29,21 @@ class FairValueResult:
     forecast_result: Optional[ForecastResult] = None
     resolution_analysis: Any = None
     contradiction_report: Any = None
+    # The estimate after the uncertainty haircut, and what it leaves at the
+    # price that would be paid. The live gate is decided on these; the
+    # paper/exploration lane records the best-estimate figures and says so.
+    conservative_fair: float = 0.0
+    conservative_executable_edge: float = 0.0
+    # Why the price could not be paid, and whether there was a real book at all.
+    # The paper lane must not take a market with no executable price, and it
+    # cannot tell from the edge alone (a non-real book leaves the mid-based
+    # effective edge in place).
+    blocked_by: str = ""
+    book_is_real: bool = False
+    # What a share actually costs on the side being traded (the ask crossed, or
+    # the bid's mirror). The paper lane's log quotes the model's estimate
+    # against THIS rather than against the mid.
+    price_paid: float = 0.0
 
 
 class FairValueEngine:
@@ -191,6 +206,22 @@ class FairValueEngine:
             should_trade = False
             reason = f"Not executable: {effective.blocked_by}"
 
+        # ...and the CONSERVATIVE estimate has to clear the price actually paid,
+        # not merely the best one. The gate above measured the best estimate;
+        # this is the rule the architecture claims - "an opportunity whose
+        # conservative fair value does not beat what a share costs is not a
+        # trade" - and without it the conservative number was printed and never
+        # used. A market where the two disagree is still a candidate for the
+        # PAPER lane, which is why the refusal is recorded separately from the
+        # hard blocks above (`effective.blocked_by`).
+        if should_trade and not effective.should_trade:
+            should_trade = False
+            reason = ("Not executable at the conservative estimate: "
+                      + (effective.conservative_blocked_by
+                         or effective.blocked_by
+                         or "the conservative fair value does not clear the "
+                            "price a share costs"))
+
         # Override if contradiction report says high risk.
         # Measured on the same mispricing scale as the 12% in the uncertainty
         # gate above, not on the post-cost edge - otherwise contradictory
@@ -235,6 +266,12 @@ class FairValueEngine:
             uncertainty=forecast_result.uncertainty,
             edge=raw_edge,  # the mispricing on `side`, not the ensemble's YES edge
             effective_edge=effective.executable_edge,
+            conservative_fair=float(getattr(effective, "conservative_fair", 0.0) or 0.0),
+            conservative_executable_edge=float(
+                getattr(effective, "conservative_executable_edge", 0.0) or 0.0),
+            blocked_by=str(getattr(effective, "blocked_by", "") or ""),
+            book_is_real=bool(getattr(effective, "book_is_real", False)),
+            price_paid=float(getattr(effective, "price_paid", 0.0) or 0.0),
             side=side,
             should_trade=should_trade,
             reasoning=final_reasoning,

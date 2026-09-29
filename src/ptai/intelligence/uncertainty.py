@@ -8,6 +8,43 @@ from loguru import logger
 from ..markets.orderbook import read_spread
 
 
+def conservative_probability(probability: float, market_price: float,
+                             uncertainty: float) -> float:
+    """
+    The system's ONE uncertainty haircut: shrink the estimate toward the price.
+
+    The estimate loses its edge, and never gains one - the haircut moves it
+    toward what the market says and stops at the market. Two defects the old
+    rule had, both visible in the operator's 2026-09-29 18:14 log:
+
+      * it moved the estimate toward 0.5 whatever the market said, so a fair
+        value of 0.49 against a market of 0.40 - the case the whole mispricing
+        hunt is built for - was made LARGER by its own risk haircut: the log
+        printed `-> conservative 0.990` beside the edge calculator's own
+        `conservative_fair 0.355` in the same cycle. A haircut that increases
+        the edge is not a haircut;
+      * anchored on 0.5 it can cross the price and report a conservative edge
+        on the OTHER side of the market, which is an invented trade.
+
+    The size of the haircut is the uncertainty itself, which is what the
+    engine's own documentation has always said it was: "forecast 71% ±8% ->
+    conservative 63%".
+    """
+    try:
+        probability = float(probability)
+        market_price = float(market_price)
+        uncertainty = max(0.0, float(uncertainty))
+    except (TypeError, ValueError):
+        return probability
+    if probability >= market_price:
+        conservative = probability - uncertainty
+        conservative = max(market_price, conservative)
+    else:
+        conservative = probability + uncertainty
+        conservative = min(market_price, conservative)
+    return max(0.01, min(0.99, conservative))
+
+
 class UncertaintyEngine:
     """
     Calculates uncertainty margin and conservative fair value.
@@ -26,13 +63,28 @@ class UncertaintyEngine:
         ]
 
     def calculate_uncertainty(self, forecasts: List, context: Dict = None) -> float:
-        """Calculate total uncertainty from multiple sources"""
+        """
+        Calculate total uncertainty from multiple sources.
+
+        ONLY the components that answered are measured. A component with no
+        data has confidence 0, and it used to vote twice: its placeholder
+        probability widened the "model disagreement" term and its zero
+        confidence dragged the average down, charging 0.21 of "low confidence"
+        for a market whose actual model was 75% confident. Its absence is
+        already charged once, honestly, by the sparse-data term below.
+        """
         context = context or {}
         uncertainties = []
 
+        # The components with something to say. Everything in this method is
+        # measured over these and only these.
+        with_data = [f for f in forecasts or []
+                     if float(getattr(f, "confidence", 0.0) or 0.0) > 0
+                     and not getattr(f, "anchored", False)]
+
         # Model disagreement - if models disagree widely, high uncertainty
-        if forecasts:
-            probs = [f.probability for f in forecasts]
+        if with_data:
+            probs = [f.probability for f in with_data]
             if len(probs) > 1:
                 mean = sum(probs) / len(probs)
                 variance = sum((p - mean) ** 2 for p in probs) / len(probs)
@@ -40,8 +92,8 @@ class UncertaintyEngine:
                 uncertainties.append(disagreement * 1.5)  # weight disagreement heavily
 
         # Low confidence
-        if forecasts:
-            avg_conf = sum(f.confidence for f in forecasts) / len(forecasts)
+        if with_data:
+            avg_conf = sum(f.confidence for f in with_data) / len(with_data)
             low_conf_uncertainty = (1 - avg_conf) * 0.3
             uncertainties.append(low_conf_uncertainty)
 
@@ -90,25 +142,14 @@ class UncertaintyEngine:
 
     def conservative_estimate(self, probability: float, uncertainty: float) -> float:
         """
-        Conservative fair value: penalize by uncertainty.
-        If forecast 71% ±8%, conservative = 71% - 8% = 63% for YES side,
-        or if betting NO, would be +8%.
-        For edge calculation, we want to be conservative toward market price.
+        Conservative fair value, with no market to shrink toward.
+
+        Kept for callers that only have the probability. The one haircut the
+        system actually applies is `conservative_probability` below, which
+        needs the price; this delegates with a 0.5 anchor so an old caller
+        still gets "71% ±8% -> 63%".
         """
-        # For simplicity: subtract uncertainty (be conservative)
-        # In production: would use confidence interval
-        conservative = probability - uncertainty
-        # But don't go beyond 0.5 if original was above 0.5 and market is below?
-        # Actually: conservative should move toward 0.5 (less confident)
-        # 71% with 8% uncertainty -> 63% (moves toward 0.5)
-        # 29% with 8% uncertainty -> 37% (also toward 0.5)
-        if probability > 0.5:
-            conservative = probability - uncertainty
-        else:
-            conservative = probability + uncertainty
-        
-        conservative = max(0.01, min(0.99, conservative))
-        return conservative
+        return conservative_probability(probability, 0.5, uncertainty)
 
     def effective_edge(self, market_price: float, fair_prob: float, uncertainty: float, fees: float = 0, spread: float = 0, slippage: float = 0) -> Tuple[float, float, str]:
         """

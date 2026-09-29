@@ -1165,6 +1165,101 @@ every request carries `chat_template_kwargs: {"enable_thinking": true}` and the
 prompt asks for reasoning. The stand-in's recording is the request body, so this
 is PTAI's own wire traffic, not a claim about it.
 
+## Paper Mode Trades, And A Round Shows What It Made
+
+Your words: *"paper mode need to start generating income and doing trades
+because in all the logs I've seen so far I've not seen 1 trade ... give the
+results in the ui, the profits or losses made in a round. now I don't know how
+long I'm supposed to run it to produce results so tell me."*
+
+Paper mode could not place a trade for arithmetic reasons. Here is the same
+market, priced by a real cycle, before and after (`fair 0.490` against a book
+bidding 0.40 / asking 0.42, a 15-point model disagreement):
+
+```
+before    Deductions (... unc 0.339 ...) | Effective -0.072     -> 0 candidates
+after     CASH deductions (0.026 of edge): fees 0.036 gas 0.010 spread 0.020 |
+          risk haircut (NOT cash): uncertainty 0.195 moves the estimate
+          0.490 -> 0.400 | Effective 0.064 | Executable: pay 0.420 -> best +0.051
+```
+
+Three faults, all fixed:
+
+1. **The confidence and the uncertainty were averaged over components that said
+   nothing.** A component with no data already had weight 0 - it could not move
+   the estimate - but it was still counted in the average: three of five
+   components silent turned a model's honest 75% confidence into
+   `conf 0.29` (the floor is 60%) and its 25% uncertainty into `0.71`, which
+   then demanded a 12% mispricing before anything could be *considered*. Both
+   averages now run over the components that actually contributed, and the trace
+   says how many had data (`confidence 0.725 over 2 component(s) with data; 3
+   had none`).
+2. **Uncertainty was charged as cash on top of the haircut it already applied.**
+   `unc 0.339` was 84.75% of the share price charged as though a venue collected
+   it. Uncertainty is a haircut on the ESTIMATE, not money: it is charged once,
+   in `conservative_probability()` (the estimate shrinks toward the price and
+   stops at it), and the log line now separates `CASH deductions` from
+   `risk haircut (NOT cash)`.
+3. **The "conservative" estimate was not conservative.** It was anchored on 0.5
+   whatever the market said, so a 0.49 estimate of a 0.40 market came back as
+   `conservative 0.990` - printed in the same cycle as the edge calculator's own
+   `0.355`. There is one definition now (`conservative_probability`), used by the
+   ensemble and the edge calculator alike, and the live gate is decided on it.
+
+And one structural fault: the paper/exploration lane - the lane that produces
+the resolved trades a venue earns live capital with - was fed from markets that
+had ALREADY passed the live gates, so on a fresh install it could never fire.
+
+**What a round does now**
+
+* The live bar is unchanged: 8% mispricing on the mid, the conservative estimate
+  clearing the price a share costs, confidence ≥ 60%, liquidity and execution
+  quality floors, exposure caps, kill switch.
+* When nothing clears it, the best **model-backed** market that would still pay
+  after every cash cost becomes ONE paper trade, sized at $1, labelled
+  everywhere as `PAPER/EXPLORATION` (log, round, console). Its own bar: a real
+  two-sided book, a model that actually answered (a rule of thumb is not
+  evidence), ≥ 5% mispricing, and ≥ 2% left after paying the executable price and
+  every cash cost. It never touches live capital and 95% of the round is
+  unaffected by it.
+* A market the account already holds is not bought again - that is the same bet
+  twice, not a new learning opportunity.
+* Every round records `trades` (market, side, stake, price, shares, expected net
+  EV, paper/live, exploration or not) and the round's result:
+  `net_usd = equity_end - equity_start`, split into **realised** (markets that
+  resolved - that money is banked) and **marked** (the book at current prices,
+  which can move back). The console's Round card shows all of it, plus the
+  **closest call** of the round: the market that came nearest, what it was worth
+  after every cost, and the gate that refused it.
+
+**How long to run it**
+
+* A trade is worth what its edge says: $1 at a 5% post-cost edge is about 5
+  cents per trade, before the market resolves. That is the honest arithmetic of
+  a $50 paper book - income scales with the stake and the edge, not with the
+  clock.
+* Trades per day are bounded by how many markets carry a real model-backed
+  disagreement, not by the interval: one paper trade per round is the lane's
+  ceiling, and the round will only find that market when the model disagrees
+  with the price enough to pay the spread.
+* **Realised** profit or loss needs markets to RESOLVE - days to weeks, run to
+  their end date. Until then every round shows the marked number, and the
+  console says so rather than reporting a settled result it does not have.
+* Live capital needs **100 resolved paper trades** per venue with win rate ≥ 55%,
+  Brier ≤ 0.25 and profit factor ≥ 1.1. That is the milestone to watch, and it is
+  why the paper lane has to trade at all.
+* The number to watch while you wait is the **closest call**: it prints the best
+  executable edge of the round against the live bar. When that number is inside
+  8%, the live lane is close; when it is far off, the log is telling you the
+  market - not the wiring - is refusing.
+
+**Verified end to end**: a real `run_cycle` over a stub venue with a real
+two-sided book and a model that answers 0.55 against a 0.42 ask places one paper
+trade (2.38 shares at 0.42, $1.00), records the position, and the round reports
+`$50.00 -> $49.95 = -$0.05 | 1 opened, 1 held | 1 trade(s) this round | of which
+-$0.05 is the book at current prices (marked, not settled)`. A model that agrees
+with the market trades nothing and never reaches the venue.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

@@ -64,10 +64,12 @@ class ForecastResult:
                 f"(llm raw {llm:.3f}) " if llm is not None
                 else f"fair {self.fair_probability:.3f} <- ensemble "
                      f"{ch.get('ensemble_raw', self.fair_probability):.3f} ")
+        basis = ch.get("confidence_basis")
         return (head + "[" + " | ".join(parts) + "]"
                 + f" -> calibrated {ch.get('calibrated', self.fair_probability):.3f}"
                 + f" -> conservative {self.conservative_fair:.3f}"
-                + f"; market {self.market_price:.3f}")
+                + f"; market {self.market_price:.3f}"
+                + (f" | {basis}" if basis else ""))
 
     def to_proposal(self) -> Dict[str, Any]:
         """LLM proposes, deterministic code decides"""
@@ -247,6 +249,20 @@ class EnsembleForecaster:
         weighted_prob = 0
         total_conf = 0
         total_uncertainty = 0
+        # ...and the same two sums over ONLY the components that contributed.
+        #
+        # A component with no data already has weight 0 - it cannot move the
+        # estimate. It was still counted in `total_conf / len(forecasts)` and in
+        # the uncertainty average, so a silent component VOTED: three of the
+        # five components having no data (a fresh install, every market) turned
+        # a model's honest 0.75 confidence into `conf 0.29` - below the 60%
+        # floor every gate in the chain applies - and its 0.25 uncertainty into
+        # 0.71, which then required a 12% mispricing before anything could be
+        # considered. The operator's log shows the result: `conf 0.29`,
+        # `unc 0.339`, `0 candidates`, and never one trade.
+        contrib_conf = 0.0
+        contrib_uncertainty = 0.0
+        contributors = 0
         all_sources = []
         all_reasoning = []
 
@@ -260,6 +276,10 @@ class EnsembleForecaster:
             total_weight += weight
             total_conf += f.confidence
             total_uncertainty += f.uncertainty
+            if weight > 0:
+                contributors += 1
+                contrib_conf += f.confidence
+                contrib_uncertainty += f.uncertainty
             all_sources.extend(f.sources)
             all_reasoning.append(f"{f.model_name}={f.probability:.3f}(conf {f.confidence:.2f}): {f.reasoning[:100]}")
             # WHY a component got the weight it did, kept with the number. A
@@ -305,8 +325,11 @@ class EnsembleForecaster:
             ensemble_prob = market.best_price
 
         if total_weight > 0:
-            avg_conf = total_conf / len(forecasts) if forecasts else 0.5
-            avg_uncertainty = total_uncertainty / len(forecasts) if forecasts else 0.5
+            # Over the components that actually answered. `len(forecasts)` is
+            # not that number: it counts the ones that said nothing.
+            avg_conf = contrib_conf / contributors if contributors else 0.0
+            avg_uncertainty = (contrib_uncertainty / contributors
+                               if contributors else 0.5)
         else:
             avg_conf = 0.0
             avg_uncertainty = 0.5
@@ -334,29 +357,26 @@ class EnsembleForecaster:
             except Exception as e:
                 logger.warning(f"Calibration failed: {e}")
 
-        # Uncertainty penalty - conservative fair value
-        # forecast 71% ±8% -> conservative 63%
-        conservative_fair = calibrated_prob
-        if self.uncertainty_engine:
-            try:
-                conservative_fair = self.uncertainty_engine.conservative_estimate(
-                    probability=calibrated_prob,
-                    uncertainty=avg_uncertainty
-                )
-            except:
-                # Simple fallback: penalize by uncertainty
-                conservative_fair = calibrated_prob - avg_uncertainty * 0.5
-                conservative_fair = max(0.05, min(0.95, conservative_fair))
-        else:
-            conservative_fair = calibrated_prob - avg_uncertainty * 0.3
-            conservative_fair = max(0.05, min(0.95, conservative_fair))
+        # The conservative fair value - ONE haircut, in the direction that
+        # removes edge rather than inventing it (see
+        # `conservative_probability`). This used to be computed against 0.5
+        # whatever the market said, which on the operator's own numbers turned
+        # a 0.49 estimate of a 0.40 market into a "conservative" 0.990 - a
+        # number that cannot be a conservative version of 0.49 on either side.
+        from .uncertainty import conservative_probability
+        conservative_fair = conservative_probability(
+            calibrated_prob, market.best_price, avg_uncertainty)
 
         edge = calibrated_prob - market.best_price
         conservative_edge = conservative_fair - market.best_price
 
-        # Determine if should trade based on effective edge (conservative)
-        # Effective edge will be calculated later by edge calculator with fees etc
-        should_trade = abs(conservative_edge) >= 0.08 and avg_conf >= 0.6
+        # Tradeable on the conservative estimate, and the bar is on the side
+        # the edge is on: `abs()` here called a market the system believed was
+        # OVERPRICED (fair far below the price) a reason to trade.
+        conservative_edge_hunted = (conservative_edge
+                                    if calibrated_prob >= market.best_price
+                                    else -conservative_edge)
+        should_trade = conservative_edge_hunted >= 0.08 and avg_conf >= 0.6
 
         reasoning = " | ".join(all_reasoning)
 
@@ -399,6 +419,15 @@ class EnsembleForecaster:
                     next((r for r in component_rows
                           if r["model"] == "llm_reasoning"), {})
                     .get("anchored", False)),
+                # How many components had anything to say, and what the
+                # confidence and uncertainty were averaged over. Without this
+                # the trace cannot explain why a 0.75-confident model produced
+                # "conf 0.29" - which is exactly what the operator's log showed.
+                "confidence_basis": (
+                    f"confidence {avg_conf:.3f} and uncertainty "
+                    f"{avg_uncertainty:.3f} over {contributors} component(s) "
+                    f"with data; {len(forecasts) - contributors} had none and "
+                    f"contribute nothing to either"),
             },
             sources=list(set(all_sources)),
         )

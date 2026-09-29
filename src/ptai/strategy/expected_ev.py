@@ -292,7 +292,10 @@ class ExpectedNetEVEngine:
         Calculate expected net P&L with realistic costs
         
         Formula:
-        Expected Net P&L = Σ prob(outcome) × payoff(outcome) − fees − spread − slippage − funding − gas − execution_loss − uncertainty_penalty
+        Expected Net P&L = Σ prob(outcome) × payoff(outcome) − fees − spread − slippage − funding − gas − execution_loss
+
+        Uncertainty is NOT one of those terms: it is a risk haircut on the
+        probability (`conservative_probability`), applied once, upstream.
         
         For prediction markets (binary):
         - If YES side: payoff if YES wins = (1-market_price)/market_price * amount, if NO wins = -amount
@@ -424,12 +427,17 @@ class ExpectedNetEVEngine:
                 f"{execution_quality:.2f}")
         execution_loss_usd = amount_usd * execution_loss_pct
         
-        # Uncertainty penalty - model disagreement, low confidence
-        # Higher uncertainty = higher penalty
-        uncertainty_penalty_pct = uncertainty * 0.5  # 50% of uncertainty as penalty
-        if confidence < 0.7:
-            uncertainty_penalty_pct += (0.7 - confidence) * 0.1
-        uncertainty_penalty_usd = amount_usd * uncertainty_penalty_pct
+        # Uncertainty is a RISK HAIRCUT, not a cash cost, and it is charged
+        # once - in the fair value the EV is computed on
+        # (`UncertaintyEngine.conservative_probability`). Here it used to be
+        # charged a second time as `uncertainty * 0.5` of the whole stake, plus
+        # another `(0.7 - confidence) * 0.1`: on the operator's 2026-09-29 log
+        # that was `unc 0.339` of the notional, so a trade whose only problem
+        # was an uncertain model carried a 34%-of-stake "cost" that no venue
+        # charges. What the EV subtracts is money: fees, gas, spread, slippage,
+        # funding, execution loss.
+        uncertainty_penalty_pct = 0.0
+        uncertainty_penalty_usd = 0.0
         
         # Gross EV calculation
         # For prediction market binary YES:
@@ -672,7 +680,7 @@ class ExpectedNetEVEngine:
     def get_report(self) -> Dict[str, Any]:
         return {
             "engine": "ExpectedNetEVEngine - V10 FIX #9",
-            "principle": "Expected Net P&L = Σ prob×payoff − fees − spread − slippage − funding − gas − execution_loss − uncertainty_penalty",
+            "principle": "Expected Net P&L = Σ prob×payoff − fees − spread − slippage − funding − gas − execution_loss (uncertainty is a haircut on prob, not a cash cost)",
             "vs_old": "Old: edge×prob×liquidity×execution×calibration×time/(fees+slippage+uncertainty+risk) - not economically meaningful. New: actual expected $ profit after all costs, per dollar, per risk, per capital-time",
             "metrics": [
                 "gross_ev_usd - expected profit before costs",
@@ -681,5 +689,6 @@ class ExpectedNetEVEngine:
                 "ev_per_risk - net EV per unit uncertainty",
                 "ev_per_capital_time - net EV per $ per day (capital efficiency)"
             ],
-            "costs_modeled": ["fees", "spread (half)", "slippage (amount/liquidity)", "gas (on-chain)", "funding (perps)", "execution_loss (queue/rejection/latency)", "uncertainty_penalty (model disagreement)"]
+            "costs_modeled": ["fees", "spread (half)", "slippage (amount/liquidity)", "gas (on-chain)", "funding (perps)", "execution_loss (queue/rejection/latency)"],
+            "risk_haircut": "uncertainty lowers the fair value once (conservative_probability); it is not charged as cash",
         }

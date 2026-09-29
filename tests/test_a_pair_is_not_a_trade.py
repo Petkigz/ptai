@@ -219,7 +219,7 @@ class TestNoRealBookIsCountedNotPriced:
         engine.liquidity_filter = lambda markets: list(markets)
         called: List[str] = []
 
-        def _evaluate(market, context=None):
+        def _evaluate(market, context=None, record=None):
             called.append(market.id)
             return []
 
@@ -248,8 +248,10 @@ class TestNoRealBookIsCountedNotPriced:
         engine.cheap_filters = lambda markets: list(markets)
         engine.liquidity_filter = lambda markets: list(markets)
         called: List[str] = []
+        # `record` is the per-market pricing record the scan collects for the
+        # round's "how close was it" line; a stand-in has to accept it.
         engine.evaluate_market_with_all_strategies = (
-            lambda market, context=None: (called.append(market.id), [])[1])
+            lambda market, context=None, record=None: (called.append(market.id), [])[1])
         asyncio.run(engine.scan_venue(
             "polymarket", [make_market("p-1", "Will X win?", MarketSource.POLYMARKET)],
             book_lookup=lambda mid: book(0.40, 0.44)))

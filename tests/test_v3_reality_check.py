@@ -308,7 +308,10 @@ class TestEdgeWithFeesGas:
     def test_the_same_edge_with_a_real_book_and_a_payable_price_is_a_trade(self):
         """
         The other half of the rule above: the same arithmetic, with a real
-        two-sided book whose ask still leaves the edge intact.
+        two-sided book whose ask still leaves the edge intact - and enough
+        confidence that the CONSERVATIVE estimate still clears that ask
+        (0.75 - 0.10 = 0.65 against 0.601; the same 0.10 haircut on a 0.70
+        estimate would land exactly on the 0.60 mid and leave no edge).
         """
         calc = EdgeCalculator()
         market = Market(
@@ -317,13 +320,14 @@ class TestEdgeWithFeesGas:
         )
         market.outcome_prices = [0.60, 0.40]
         opp = calc.calculate(
-            market=market, fair_prob=0.70, uncertainty=0.1, amount_usd=3.0,
+            market=market, fair_prob=0.75, uncertainty=0.1, amount_usd=3.0,
             orderbook={"bid": 0.599, "ask": 0.601, "spread": 0.002,
                        "bid_size": 5000, "ask_size": 5000, "is_real": True},
             side="YES")
         assert opp.book_is_real
         assert abs(opp.price_paid - 0.601) < 1e-9
         assert opp.executable_edge > 0
+        assert opp.conservative_executable_edge > 0
         assert opp.blocked_by == ""
         assert opp.should_trade
 
