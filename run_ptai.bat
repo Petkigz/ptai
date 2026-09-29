@@ -4,8 +4,10 @@ REM  PTAI - run on your PC (Windows)  -  THE ONE FILE TO RUN
 REM
 REM  Double-click to:
 REM    1. check the Python dependencies (only slow on the first run)
-REM    2. start the trading agent in PAPER mode (no real money is spent)
-REM    3. open the PTAI console in your browser (only when it is ready)
+REM    2. open the PTAI console in your browser (only when it is ready)
+REM    3. the console starts the trading agent in PAPER mode (no real money
+REM       is spent) IN ITS OWN PROCESS - one window, one agent, one place
+REM       where the settings, the round and the log are visible
 REM
 REM  Want to know WHY it will not start? Run this file with the argument
 REM  check (or from a command prompt: run_ptai.bat check) and it prints one
@@ -15,8 +17,8 @@ REM  Runs directly on your system Python - no venv is created.
 REM  The agent's memory lives in the data\ folder next to this file and
 REM  survives restarts; it is not touched by Python or dependency updates.
 REM
-REM  To stop: close the "PTAI Agent (paper)" and "PTAI Console" windows
-REM  (Ctrl-C inside them), and close this window.
+REM  To stop: press Stop in the page (the record then says the agent was
+REM  stopped on purpose), or close the "PTAI" window.
 REM
 REM  Ports: this PC already uses 3000 and 8000 for another project, so the
 REM  console runs on 8010 by default. Change it below if 8010 is taken.
@@ -37,6 +39,7 @@ echo.
 echo  === PTAI ===
 echo  Console   : http://localhost:%PTAI_DASHBOARD_PORT%
 echo  Agent     : PAPER mode (no real money), $%BANKROLL%, one cycle every %INTERVAL_MIN% minutes
+echo              started by the console itself - one window, one agent
 echo.
 
 REM ---------------- find python (system python, no venv) ---------------------
@@ -97,15 +100,26 @@ if errorlevel 1 (
 )
 
 REM ---------------- start the agent (paper mode, own window) ------------------
-start "PTAI Agent (paper)" /min /d "%~dp0" cmd /k "%PYTHON% main.py run --bankroll %BANKROLL% --interval %INTERVAL_MIN%"
-
-REM ---------------- console (own window, then wait for it) ---------------------
-REM The console is the one front end: the agent's state, the money, the venue,
-REM orders, activity and setup. The old diagnostic dashboard (logs, V2/V3
-REM internals, backtest) is a lab tool and is NOT started here - Launching the
-REM whole toolbox next to the trader is what made the product feel like a pile
-REM of loose parts.
-start "PTAI Console" /d "%~dp0" cmd /k "set PYTHONPATH=%~dp0src && %PYTHON% -m ptai.ui.console"
+REM ---------------- ONE window: the console, which runs the agent ------------
+REM There used to be TWO windows here: the agent (`main.py run --bankroll ...`)
+REM and the console. That split is what the operator saw as the web page being
+REM disconnected from the command line: settings typed in the page could not
+REM change the loop running in the other window, the page ran an engine of its
+REM own inside the web process, and the agent's output was in a window the page
+REM could not show. Now this process IS the agent's host:
+REM
+REM   * PTAI_AGENT_AUTOSTART=1 tells it to start the loop at startup;
+REM   * Start / Stop / interval / "Run a round now" all act on that one loop;
+REM   * the agent's log is on the page, from the process doing the work.
+REM
+REM The CLI is still the same loop and still works (`main.py run`); if it is
+REM already running, this console says so and names its pid instead of starting
+REM a second engine over the same database.
+REM
+REM The old diagnostic dashboard (logs, V2/V3 internals, backtest) is a lab tool
+REM and is NOT started here - launching the whole toolbox next to the trader is
+REM what made the product feel like a pile of loose parts.
+start "PTAI" /d "%~dp0" cmd /k "set PYTHONPATH=%~dp0src && set PTAI_AGENT_AUTOSTART=1 && set BANKROLL=%BANKROLL% && set INTERVAL_MIN=%INTERVAL_MIN% && %PYTHON% -m ptai.ui.console"
 
 echo Waiting for the console to come up on port %PTAI_DASHBOARD_PORT% ...
 set /a TRIES=0
@@ -116,7 +130,7 @@ set /a TRIES+=1
 if %TRIES% geq 90 (
   echo.
   echo [ERROR] The console did not answer on port %PTAI_DASHBOARD_PORT%
-  echo         within 90 seconds. Check the "PTAI Console" window for the
+  echo         within 90 seconds. Check the "PTAI" window for the
   echo         error message. If the port is already used by something else,
   echo         change PTAI_DASHBOARD_PORT at the top of this file.
   goto fail
@@ -132,12 +146,12 @@ echo.
 echo  ============================================================
 echo   PTAI is running:
 echo.
-echo   - Console   : http://localhost:%PTAI_DASHBOARD_PORT%  (in its own window)
-echo   - Agent     : PAPER mode, one cycle every %INTERVAL_MIN% minutes
-echo                  (in the minimized "PTAI Agent (paper)" window)
+echo   - Console   : http://localhost:%PTAI_DASHBOARD_PORT%  (in the "PTAI" window)
+echo   - Agent     : PAPER mode, running INSIDE the console process, one
+echo                  cycle every %INTERVAL_MIN% minutes to start with. The
+echo                  page's interval box changes that while it runs.
 echo.
-echo   To stop PTAI: close the "PTAI Agent (paper)" window and the
-echo   "PTAI Console" window (Ctrl-C inside each). Then close this.
+echo   Stop the agent from the page (Stop), or close the "PTAI" window.
 echo.
 echo   To see what PTAI checked before starting: run_ptai.bat check
 echo  ============================================================

@@ -189,6 +189,12 @@ def _credential_source(data_dir: str, tool: str) -> Dict[str, Any]:
         return {"configured": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# How long a single sleep in the main loop is allowed to be. The wait between
+# cycles is sliced into pieces this long so a changed interval, or a manual "run a
+# round now", is noticed within one slice instead of after the whole old interval.
+WAIT_SLICE_SECONDS = 60.0
+
+
 class TradingAgentV3:
     """
     PTAI V3 - genuinely multi-venue, multi-strategy
@@ -2209,7 +2215,10 @@ class TradingAgentV3:
         # leave - and no sports book has an order path at all, so in practice this
         # is always "paper" today. It is read rather than hardcoded so the label
         # is the same one the prediction trades carry, from the same source.
-        execution_mode = "paper" if self.dry_run else "live"
+        _mode = self.effective_execution_mode()
+        if _mode["mode"] != _mode["asked"]:
+            logger.warning(f"This cycle runs in {_mode['mode']}: {_mode['why']}")
+        execution_mode = _mode["mode"]
         # Betting / sports exchange scan - full match card, not just 1X2.
         # Runs in LIVE_SHADOW by default: it prices goals, corners, cards,
         # handicaps, halves and props, but no capital deploys unless the mode
@@ -2661,6 +2670,7 @@ class TradingAgentV3:
                 # and verified costs no additional calls.
                 try:
                     self._last_account_health[venue_id] = account_health.to_dict()
+                    self._record_venue_health()
                 except Exception as e:
                     logger.debug(f"Could not cache account health for {venue_id}: {e}")
                 if not account_health.healthy and not account_health.paper_trading_ok:
@@ -3229,6 +3239,11 @@ class TradingAgentV3:
 
     # One order per venue per second, which is what the executor enforces. The
     # number here is the executor's own window plus a small margin.
+# How long a single sleep in the main loop is allowed to be. The wait between
+# cycles is sliced into pieces this long so a changed interval, or a manual "run a
+# round now", is noticed within one slice instead of after the whole old interval.
+# It is a module constant so a test can shrink it; the loop itself never changes
+# it.
     VENUE_ORDER_SPACING_SECONDS = 1.05
 
     async def _wait_for_venue_spacing(self, venue_id: str) -> float:
@@ -3856,6 +3871,7 @@ class TradingAgentV3:
                 return f"{label} venue {opp.venue_id} health unreadable: {e}"
             try:
                 self._last_account_health[opp.venue_id] = health.to_dict()
+                self._record_venue_health()
             except Exception:
                 pass
             if not health.healthy and not health.paper_trading_ok:
@@ -4502,6 +4518,29 @@ class TradingAgentV3:
             logger.error(f"Venue selection failed: {type(e).__name__}: {e}")
             return {"error": f"{type(e).__name__}: {e}"}
 
+    def _record_venue_health(self) -> None:
+        """
+        Persist the venue health this cycle read, for whoever is not this process.
+
+        The console has to show the same balances the agent is sizing against,
+        and when the agent runs in the command-line window the console has no
+        adapter objects to ask. Cached health was already in memory for venue
+        selection; writing it here costs nothing and is the difference between a
+        page that says "no venue answered" and one that shows the balance, its
+        provenance and the moment it was read.
+        """
+        try:
+            payload = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "pid": os.getpid(),
+                "role": getattr(self, "engine_role", None),
+                "venues": self._last_account_health,
+            }
+            self.storage.set_state("agent.venue_health",
+                                   json.dumps(payload, default=str))
+        except Exception as e:  # noqa: BLE001 - reporting must not break a cycle
+            logger.debug(f"Could not record venue health: {type(e).__name__}: {e}")
+
     def _write_agent_heartbeat(self, status: str) -> None:
         """
         Leave the "the agent process is alive" mark the dashboard reads.
@@ -4599,6 +4638,7 @@ class TradingAgentV3:
         "no_markets": "nothing to trade from any venue",
         "blocked": "blocked by the risk check",
         "sleeping": "waiting for the next cycle",
+        "stopped": "stopped by the operator",
     }
 
     def storage_data_dir(self) -> str:
@@ -4803,6 +4843,118 @@ class TradingAgentV3:
         """The venue's own answer on whether this market's event is exclusive."""
         return self._arb_venue_facts(market).get("neg_risk")
 
+    def effective_execution_mode(self) -> Dict[str, Any]:
+        """
+        Paper or live, from BOTH halves of the decision, with the reason.
+
+        The operator's switch (`console.mode`, which the page writes) is the
+        INTENT. Whether this process can sign an order at all is the CAPABILITY,
+        fixed when it started (`dry_run`). Acting on intent alone would let a
+        page click try to send real orders from a paper process; acting on
+        capability alone is what the operator complained about - the switch
+        "did nothing" because the running process never re-read it.
+
+        Both must agree for a live cycle, and when they do not, this says which
+        half is missing. Re-read every cycle, so flipping the switch in the page
+        takes effect at the next cycle instead of at the next restart.
+        """
+        asked = "paper"
+        try:
+            from ..execution.capital import operator_mode
+            asked = str(operator_mode(self.storage) or "paper").lower()
+        except Exception as e:  # noqa: BLE001 - unreadable intent means paper
+            logger.debug(f"Operator mode unreadable: {type(e).__name__}: {e}")
+        if asked != "live":
+            return {"mode": "paper", "asked": asked,
+                    "why": "the operator's switch is on paper"}
+        if self.dry_run:
+            return {"mode": "paper", "asked": asked,
+                    "why": ("the switch is on live, but this process was started "
+                            "in dry run, so no order can leave it - restart the "
+                            "agent in live mode (" + self._live_command() + ")")}
+        return {"mode": "live", "asked": asked,
+                "why": "the switch is on live and this process can sign orders"}
+
+    @staticmethod
+    def _live_command() -> str:
+        return "python main.py run --live"
+
+    def request_immediate_cycle(self) -> bool:
+        """
+        Ask the running loop to start its next cycle now.
+
+        The console's "Run a round" button used to build a SECOND engine inside
+        the web process, which then wrote to the same liveness keys and round
+        history as the loop that was already running. Waking the one loop is what
+        the button always meant.
+
+        THREAD SAFETY, and this is not theoretical: the web handler runs in the
+        console's event loop while the agent runs in its own loop in another
+        thread. `asyncio.Event.set()` called from a foreign thread sets the flag
+        but does not wake the waiter on the other loop, so a round request sat
+        there until the next scheduled cycle - the button looked like it did
+        nothing. Setting the event THROUGH the agent's loop is what wakes it.
+        """
+        wake = getattr(self, "_wake_event", None)
+        if wake is None:
+            return False
+        try:
+            loop = getattr(self, "_wake_loop", None)
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if loop is not None and loop is not running:
+                loop.call_soon_threadsafe(wake.set)
+            else:
+                wake.set()
+            logger.info("A cycle was requested by the operator; waking the loop")
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not wake the loop: {type(e).__name__}: {e}")
+            return False
+
+    async def _wait_for_next_cycle(self, minutes: int) -> Optional[int]:
+        """
+        Sleep until the next cycle, wakeable early.
+
+        Two things shorten the wait, and both are settings the operator changes
+        in the page:
+
+          * a manual "run a round now" sets the wake event;
+          * a changed interval means this wait is for the wrong length, so the
+            wait is abandoned and the caller re-reads it (within a minute, not
+            after the whole old interval).
+
+        The wait is sliced at a minute so neither change needs a restart.
+        """
+        from .engine_host import operator_interval_minutes
+
+        wake = getattr(self, "_wake_event", None)
+        remaining = max(0.0, float(minutes) * 60.0)
+        started_with = int(minutes)
+        while remaining > 0:
+            if wake is not None and wake.is_set():
+                wake.clear()
+                return operator_interval_minutes(self.storage, started_with)
+            now_interval = operator_interval_minutes(self.storage, started_with)
+            if now_interval != started_with:
+                logger.info(f"Cycle interval changed to {now_interval} minute(s) "
+                            f"(was {started_with}) - applying it now instead of "
+                            f"waiting out the old one")
+                return now_interval
+            slice_seconds = min(WAIT_SLICE_SECONDS, remaining)
+            if wake is not None:
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=slice_seconds)
+                    continue
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(slice_seconds)
+            remaining -= slice_seconds
+        return None
+
     def _set_phase(self, phase: str, detail: Optional[str] = None,
                    next_cycle_at: Optional[str] = None) -> None:
         """
@@ -4818,6 +4970,15 @@ class TradingAgentV3:
         nothing while the agent works is a bug report, not a crash.
         """
         label = self._PHASE_LABELS.get(phase, phase.replace("_", " "))
+        # The lease is renewed on every phase write. This is the pulse the agent
+        # produces most often (once per market), so a cycle that runs for minutes
+        # keeps its claim alive without anyone remembering to renew it.
+        if getattr(self, "engine_role", None):
+            try:
+                from .engine_host import renew_engine_lease
+                renew_engine_lease(self.storage, kind=self.engine_role)
+            except Exception as e:  # noqa: BLE001 - never break a cycle over this
+                logger.debug(f"Lease renew failed: {type(e).__name__}: {e}")
         try:
             self.storage.set_state("agent.phase", json.dumps({
                 "at": datetime.now(timezone.utc).isoformat(),
@@ -4831,39 +4992,119 @@ class TradingAgentV3:
                 f"Could not write the agent phase '{phase}': "
                 f"{type(e).__name__}: {e}")
 
-    async def run_continuous(self, interval_minutes: int = 10):
-        """Run V3 loop every 10 minutes"""
-        logger.info(f"Starting PTAI V3 continuous loop every {interval_minutes} minutes")
-        while True:
-            try:
-                if not self.kill_switch.can_trade():
-                    logger.warning(f"Kill switch L{self.kill_switch.current_level} blocks trading, sleeping")
-                    # The agent is REFUSING, not dead: keep the heartbeat
-                    # fresh while the kill switch holds the loop.
-                    self._write_agent_heartbeat(
-                        f"kill_switch_L{self.kill_switch.current_level}")
+    async def run_continuous(self, interval_minutes: Optional[int] = None,
+                             kind: Optional[str] = None,
+                             force_lease: bool = False) -> Dict[str, Any]:
+        """
+        The agent's loop: one cycle, a wait, repeat - owned by exactly one process.
+
+        Three things changed for the operator's 2026-09-29 report, and all three
+        were about the loop being deaf to the page:
+
+          * it CLAIMS A LEASE first, so a second engine is refused by pid instead
+            of quietly writing to the same keys (the console used to run a rival
+            engine on every button press);
+          * the interval is re-read from the operator's setting for every wait, so
+            a change applies to the next cycle instead of the next restart; and
+          * the wait is interruptible, so "run a round now" runs the round on THIS
+            engine rather than a second one.
+
+        Returns a small dict so a caller (the console host) can put the reason on
+        the page instead of guessing from silence.
+        """
+        from .engine_host import (claim_engine_lease,
+                                  operator_interval_minutes,
+                                  release_engine_lease)
+
+        self.engine_role = kind or getattr(self, "engine_role", None) or "cli"
+        role = self.engine_role
+        requested = operator_interval_minutes(self.storage, interval_minutes)
+        claim = claim_engine_lease(self.storage, role, interval_min=requested,
+                                   force=force_lease)
+        if not claim.get("claimed"):
+            holder = claim.get("holder") or {}
+            logger.error(
+                f"NOT starting a second engine: {claim.get('reason')} "
+                f"(last seen {holder.get('age_seconds')}s ago). Stop that one "
+                f"first - from the console's Stop button, or by closing its "
+                f"window - or start this one with --force to take over.")
+            return {"started": False, "reason": claim.get("reason"),
+                    "holder": holder}
+
+        # The wake event lives as long as the loop does, and remembers ITS loop:
+        # a request to run now arrives from the console's thread, and only a
+        # threadsafe call INTO this loop can wake a waiter on it.
+        self._wake_event = asyncio.Event()
+        self._wake_loop = asyncio.get_running_loop()
+        interval = int(requested)
+        logger.info(f"Starting PTAI V3 continuous loop every {interval} minutes "
+                    f"(role: {role}, pid {os.getpid()})")
+        try:
+            while True:
+                try:
+                    if not self.kill_switch.can_trade():
+                        logger.warning(f"Kill switch L{self.kill_switch.current_level} blocks trading, sleeping")
+                        # The agent is REFUSING, not dead: keep the heartbeat
+                        # fresh while the kill switch holds the loop.
+                        self._write_agent_heartbeat(
+                            f"kill_switch_L{self.kill_switch.current_level}")
+                        await asyncio.sleep(60)
+                        continue
+
+                    mode = self.effective_execution_mode()
+                    if mode["asked"] != mode["mode"]:
+                        logger.warning(f"Execution mode: {mode['mode']} "
+                                       f"({mode['why']})")
+
+                    # A WORKING phase before the cycle starts, not after its first
+                    # step. A cycle's first step can take minutes (a slow model, a
+                    # venue that does not answer), and while it ran the page still
+                    # showed the RESTING phase - "waiting until 08:04" - which is
+                    # what a stalled agent looks like. This also gives the loop a
+                    # lease renewal and a heartbeat at the moment it needs them.
+                    self.cycles_started = getattr(self, "cycles_started", 0) + 1
+                    cycle_started = datetime.now(timezone.utc)
+                    self._set_phase(
+                        "scanning",
+                        f"cycle {self.cycles_started} started at "
+                        f"{cycle_started.strftime('%H:%M')} UTC: refreshing "
+                        f"qualification and scanning the venues")
+                    self._write_agent_heartbeat("running")
+                    logger.info(f"Starting cycle {self.cycles_started} at "
+                                f"{cycle_started.isoformat()}")
+
+                    result = await self.run_cycle()
+                    elapsed = (datetime.now(timezone.utc)
+                               - cycle_started).total_seconds()
+                    logger.info(
+                        f"V3 cycle result: {result.get('status', 'unknown')} "
+                        f"{(result.get('opportunities') or {}).get('final_selected', 0)} trades "
+                        f"(cycle {self.cycles_started} took {elapsed:.0f}s)")
+
+                    # Announce the wait as well, with the time the next cycle is
+                    # due. "Waiting until 14:35" is the answer to the operator's
+                    # next question, and without it the console goes blank for the
+                    # whole interval, which is what a stalled agent looks like.
+                    next_at = datetime.now(timezone.utc) + timedelta(minutes=interval)
+                    self._set_phase(
+                        "sleeping",
+                        f"last cycle: {result.get('status', 'unknown')}. The next "
+                        f"cycle starts at {next_at.strftime('%H:%M')} UTC "
+                        f"(every {interval} min, set in the console)",
+                        next_cycle_at=next_at.isoformat())
+
+                    changed = await self._wait_for_next_cycle(interval)
+                    if changed:
+                        interval = int(changed)
+                except asyncio.CancelledError:
+                    logger.info("The agent loop was stopped by the operator")
+                    raise
+                except Exception as e:
+                    logger.error(f"V3 loop error: {type(e).__name__}: {e}")
                     await asyncio.sleep(60)
-                    continue
-                
-                result = await self.run_cycle()
-                logger.info(
-                    f"V3 cycle result: {result.get('status', 'unknown')} "
-                    f"{(result.get('opportunities') or {}).get('final_selected', 0)} trades")
-
-                # Announce the wait as well, with the time the next cycle is
-                # due. "Waiting until 14:35" is the answer to the operator's
-                # next question, and without it the console goes blank for the
-                # whole interval, which is what a stalled agent looks like.
-                next_at = datetime.now(timezone.utc) + timedelta(
-                    minutes=interval_minutes)
-                self._set_phase(
-                    "sleeping",
-                    f"last cycle: {result.get('status', 'unknown')}. The next "
-                    f"cycle starts at {next_at.strftime('%H:%M')} UTC",
-                    next_cycle_at=next_at.isoformat())
-
-                # Sleep
-                await asyncio.sleep(interval_minutes * 60)
-            except Exception as e:
-                logger.error(f"V3 loop error: {e}")
-                await asyncio.sleep(60)
+        finally:
+            release_engine_lease(self.storage,
+                                 reason=f"the {role} engine stopped")
+            self._set_phase("stopped", "the agent was stopped; it is not working "
+                                       "and nothing is being researched")
+            logger.info(f"The {role} engine released the agent")

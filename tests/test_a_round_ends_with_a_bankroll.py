@@ -574,17 +574,73 @@ def client(monkeypatch, tmp_path):
 
 
 class TestTheConsoleShowsTheRound:
+    """
+    The round card, through the routes that actually paint it.
+
+    V50 changed WHERE a pressed round runs. It used to run inside the web handler
+    (the handler built its own engine to do it), and the button's HTTP reply
+    carried the result. Now the console HOSTS the agent: the button wakes that one
+    loop, the round runs there, and the page gets the figures from the rounds
+    route - the same route the card polls. These tests follow the data to where
+    the page now reads it, and pin the button's reply at the same time.
+    """
+
+    @pytest.fixture()
+    def hosted(self, client, monkeypatch, tmp_path):
+        """The console as `run_ptai.bat` leaves it: this process runs the agent."""
+        import importlib
+        from src.ptai.agent.v3_loop import TradingAgentV3
+        import src.ptai.ui.console as console
+        console = importlib.import_module("src.ptai.ui.console")
+        engine = TradingAgentV3(country_code="UG", dry_run=True)
+        monkeypatch.setattr(console, "_agent", lambda: engine)
+        monkeypatch.setattr(console, "_controller_agent_started", lambda: True)
+        monkeypatch.setattr(engine, "request_immediate_cycle",
+                            lambda: True, raising=False)
+        return client, engine
+
+    @staticmethod
+    def _run_a_round(engine):
+        import asyncio
+        return asyncio.run(engine.run_round())
+
     def test_a_fresh_install_reports_no_round_rather_than_a_flat_one(self, client):
         body = client.get("/api/console/rounds").json()
         assert body["rounds"] == []
         assert body["summary"]["net_usd"] is None
         assert "no completed round" in body["summary"]["note"]
 
-    def test_the_button_runs_a_round_and_answers_with_the_bankroll(self, client):
+    def test_the_button_asks_the_running_agent_instead_of_building_one(self,
+                                                                      hosted):
+        """
+        One press, one engine. The reply says what happened (a round was asked
+        for) and does NOT contain a round it never ran.
+        """
+        client, engine = hosted
+        beaten = {"n": 0}
+
+        def _wake():
+            beaten["n"] += 1
+            return True
+
+        import src.ptai.ui.console as console
+        console._agent().request_immediate_cycle = _wake
         response = client.post("/api/console/run-cycle", json={"mode": "paper"})
-        assert response.status_code == 200
+        assert response.status_code == 202
         body = response.json()
-        round_ = body["round"]
+        assert body["status"] == "requested"
+        assert beaten["n"] == 1
+        assert "round" not in body
+        assert "watch the log" in body["message"]
+
+    def test_the_round_card_gets_the_bankroll_from_the_rounds_route(self, hosted):
+        """
+        The operator's checklist, on the payload the card renders: a round with an
+        account at both ends and a net that equals the difference.
+        """
+        client, engine = hosted
+        self._run_a_round(engine)
+        round_ = client.get("/api/console/rounds").json()["rounds"][0]
         assert round_["number"] >= 1
         assert round_["account"] == "paper"
         assert round_["equity_start"] is not None
@@ -593,30 +649,31 @@ class TestTheConsoleShowsTheRound:
             round_["equity_end"] - round_["equity_start"], abs=0.011)
         assert round_["verdict"] in ("up", "down", "flat")
         assert "duration_seconds" in round_ and round_["duration_seconds"] >= 0
-        # The per-stage counts the operator listed are on the result, whatever
-        # the venue feed did.
         for key in ("markets_discovered", "markets_screened", "markets_researched",
                     "markets_priced", "positions_opened", "positions_held",
                     "staked_usd"):
             assert key in round_, key
 
-    def test_the_run_also_answers_with_the_history(self, client):
-        body = client.post("/api/console/run-cycle", json={"mode": "paper"}).json()
-        history = body["rounds"]
-        assert len(history["rounds"]) >= 1
-        assert history["summary"]["scored"] >= 1
-        newest = history["rounds"][0]
-        assert newest["number"] == body["round"]["number"]
+    def test_the_rounds_route_also_answers_with_the_history(self, hosted):
+        client, engine = hosted
+        self._run_a_round(engine)
+        body = client.get("/api/console/rounds").json()
+        assert len(body["rounds"]) >= 1
+        assert body["summary"]["scored"] >= 1
+        assert body["rounds"][0]["number"] == body["rounds"][0]["number"]
 
-    def test_the_completed_round_survives_the_next_poll(self, client):
-        ran = client.post("/api/console/run-cycle", json={"mode": "paper"}).json()
+    def test_the_completed_round_survives_the_next_poll(self, hosted):
+        client, engine = hosted
+        self._run_a_round(engine)
+        first = client.get("/api/console/rounds").json()
         polled = client.get("/api/console/rounds").json()
-        assert polled["rounds"][0]["number"] == ran["round"]["number"]
+        assert polled["rounds"][0]["number"] == first["rounds"][0]["number"]
         assert polled["summary"]["scored"] == 1
 
-    def test_the_page_has_a_round_card_and_a_button_that_says_round(self, client):
+    def test_the_page_has_a_round_card_and_a_button_that_asks_for_a_round(
+            self, client):
         html = client.get("/").text
-        assert "Run one round" in html
+        assert "Run a round now" in html
         assert 'id="round"' in html
         assert "what the bankroll did" in html
         assert "loadRounds()" in html
@@ -625,10 +682,20 @@ class TestTheConsoleShowsTheRound:
             "a round with no result must be rendered as no figure, not as zero"
         )
 
-    def test_the_exported_round_route_does_not_claim_a_mode_it_did_not_run(self, client):
-        body = client.post("/api/console/run-cycle", json={"mode": "paper"}).json()
-        assert body["mode"] == "paper"
-        assert body["round"]["mode"] == "paper"
+    def test_the_button_never_claims_a_round_it_did_not_run(self, hosted):
+        """
+        The reply to a press is about the REQUEST. The round's own mode and figures
+        arrive on the rounds route, from the engine that ran it - so nothing can
+        report a mode that was never executed.
+        """
+        client, engine = hosted
+        body = client.post("/api/console/run-cycle",
+                           json={"mode": "paper"}).json()
+        assert "round" not in body and "mode" not in body
+        self._run_a_round(engine)
+        round_ = client.get("/api/console/rounds").json()["rounds"][0]
+        assert round_["mode"] == "paper"
+
 
 # ===========================================================================
 # 6. the whole round on a stub venue: research, pick, bet, bankroll

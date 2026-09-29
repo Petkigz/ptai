@@ -25,6 +25,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
+import sys
+import threading
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -44,7 +47,13 @@ from ..execution.capital import (
     set_operator_mode,
 )
 from ..execution.round import load_rounds, round_history_summary
+from ..agent import engine_host
 from ..storage.db import Storage
+from . import live_log
+
+# The console process now runs the agent (see the host further down), so the page
+# can show the lines the command-line window used to be the only source of.
+live_log.install()
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
 from ..validation.rule_bench import validation_block
 from ..venues.inventory import load_inventory
@@ -52,6 +61,42 @@ from ..venues import credentials as credential_store
 from ..venues import preferences as venue_switches
 
 app = FastAPI(title="PTAI Console", version="console-1")
+
+
+@app.on_event("startup")
+async def _startup_autostart_agent() -> None:
+    """
+    When the runner starts this console, the AGENT starts here too.
+
+    `run_ptai.bat` used to open two windows - the agent, and the console - and
+    that is the split the operator reported: the page could not change the agent
+    (different process), and the agent's `--interval 10` could not be changed from
+    the page (a CLI flag, fixed at start). `run_ptai.bat` now opens ONE window and
+    sets `PTAI_AGENT_AUTOSTART=1`, so "run PTAI" still means "the agent is
+    working", with the loop, the settings and the log all in this process.
+
+    Autostart is skipped, with the reason on the page, if another engine already
+    owns the agent: two engines on one database is precisely the bug this fixes.
+    """
+    if os.environ.get("PTAI_AGENT_AUTOSTART", "").strip() not in ("1", "true", "yes"):
+        return
+    storage = get_storage()
+    lease = engine_host.engine_lease_status(storage)
+    if lease.get("held"):
+        logger.warning(
+            f"Not autostarting the agent here: {lease.get('note')}. The page will "
+            f"name that engine; use its Stop button to hand the agent over.")
+        _CONTROLLER["refused"] = {
+            "reason": ("autostart skipped: another engine already owns the agent"),
+            "holder": lease, "at": datetime.now(timezone.utc).isoformat(),
+        }
+        return
+    result = _start_agent_in_process(started_by="run_ptai.bat")
+    if result.get("started"):
+        logger.info("The runner asked for the agent and the console started it "
+                    "here; Start/Stop and the interval control the loop")
+    else:
+        logger.warning(f"Autostart did not start the agent: {result.get('reason')}")
 
 
 # ----------------------------------------------------------------------
@@ -130,7 +175,51 @@ def get_storage() -> Storage:
 # balance; without this a browser tab left open becomes a sustained load on every
 # venue's API, which is how an account gets rate limited for no reason.
 _BALANCE_CACHE: Dict[str, Any] = {"at": 0.0, "values": {}}
-_BALANCE_TTL_SECONDS = 20.0
+# Five seconds, not twenty. The page polls the balance because the operator is
+# watching the money move during a round; twenty seconds of stale numbers is how
+# a deposit or a fill can look like it did nothing. The venues themselves are
+# protected by the agent's own rate limiting and the push of this cache.
+_BALANCE_TTL_SECONDS = 5.0
+
+
+def _recorded_balances() -> Dict[str, Dict[str, Any]]:
+    """
+    The venue health the owning agent last wrote down, for a console that is not
+    the process running it.
+
+    Only funded rungs count as available, from the same evidence the agent sizes
+    against - the alternative is a page that either invents a balance or claims
+    none exists while the agent is trading with one.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        raw = get_storage().get_state("agent.venue_health")
+        if not raw:
+            return out
+        payload = json.loads(raw)
+        venues = payload.get("venues") or {}
+        at = payload.get("at")
+        pid = payload.get("pid")
+        role = payload.get("role")
+        funded_rungs = {"funded", "trade_permitted"}
+        for venue_id, health in venues.items():
+            if not isinstance(health, dict):
+                continue
+            evidence = health.get("evidence") or {}
+            reached = str(health.get("readiness") or "")
+            out[str(venue_id)] = {
+                "available": reached in funded_rungs,
+                "balance": float(evidence.get("balance_usd") or 0.0),
+                "source": str(evidence.get("balance_provenance") or ""),
+                "recorded": True,
+                "recorded_at": at,
+                "recorded_by": f"the {role} engine (pid {pid})",
+                "readiness": reached,
+            }
+    except Exception as e:  # noqa: BLE001 - the caller falls back to live reads
+        logger.debug(f"Could not read the recorded venue health: "
+                     f"{type(e).__name__}: {e}")
+    return out
 
 
 async def _venue_balances(agent=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -152,6 +241,16 @@ async def _venue_balances(agent=None, force: bool = False) -> Dict[str, Dict[str
     balances: Dict[str, Dict[str, Any]] = {}
     registry = getattr(agent, "venue_registry", None)
     adapters = getattr(registry, "adapters", {}) if registry is not None else {}
+    if not adapters:
+        # The agent is not in THIS process: it is the command window's engine (or
+        # nothing is running). Ask the record the agent keeps - the venue health it
+        # read in its last cycle - instead of answering "no venue answered", which
+        # described the wrong process rather than the agent.
+        recorded = _recorded_balances()
+        if recorded:
+            _BALANCE_CACHE["at"] = _time.monotonic()
+            _BALANCE_CACHE["values"] = dict(recorded)
+            return recorded
     for venue_id, adapter in adapters.items():
         getter = getattr(adapter, "get_portfolio", None)
         if getter is None:
@@ -331,7 +430,255 @@ _agent_cache: Dict[str, Any] = {}
 
 
 def _agent():
+    """
+    The engine THIS process runs, if any.
+
+    Since the console hosts the agent (below), this is normally set and the
+    page's balances, rounds and log come from the same engine that is trading -
+    not from a copy built for a button press.
+    """
     return _agent_cache.get("agent")
+
+
+# ----------------------------------------------------------------------
+# the host: ONE engine, started and stopped from this page
+# ----------------------------------------------------------------------
+#
+# The operator's 2026-09-29 report - "the webui is too disconnected with the
+# command line ... things take too long to change or dont change at all. some
+# things are even mising" - traced to this process not owning the agent at all.
+# `run_ptai.bat` started the agent in a command window, the browser started a
+# SECOND engine on every button press, and the two wrote the same keys. Settings
+# changed in the page could not reach the loop in the other window, and the
+# window's output was invisible here.
+#
+# So: the browser can start, stop, wake and reconfigure THE agent. When it starts
+# one, the loop runs here, in a thread, under the same `run_continuous` the CLI
+# uses - one implementation, one lease, one set of keys. Whoever holds the lease
+# (this console or the command window) is named on the page.
+
+_CONTROLLER: Dict[str, Any] = {
+    "agent": None, "thread": None, "loop": None, "started_at": None,
+    "role": None, "state": "idle", "error": None, "started_by": None,
+    "refused": None,
+}
+
+
+def _newest_log_file() -> Optional[Dict[str, Any]]:
+    """
+    The newest file in `logs/`, for the operator who wants the whole history.
+
+    The in-memory buffer is what the page scrolls; the file is what survives a
+    restart, and saying which is which prevents the "my log is missing lines"
+    confusion that comes from a ring buffer quietly dropping old ones.
+    """
+    try:
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))), "logs")
+        if not os.path.isdir(root):
+            return None
+        files = [os.path.join(root, f) for f in os.listdir(root)
+                 if f.endswith(".log")]
+        if not files:
+            return None
+        newest = max(files, key=os.path.getmtime)
+        return {
+            "path": newest,
+            "name": os.path.basename(newest),
+            "size_kb": round(os.path.getsize(newest) / 1024.0, 1),
+            "modified_at": datetime.fromtimestamp(
+                os.path.getmtime(newest), timezone.utc).isoformat(),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _controller_agent_started() -> bool:
+    thread = _CONTROLLER.get("thread")
+    return bool(thread is not None and thread.is_alive())
+
+
+def _controller_status(storage=None) -> Dict[str, Any]:
+    """
+    The agent's lifecycle as one answer: who owns it, whether this process is
+    running it, and what the owner says it is doing.
+    """
+    storage = storage or get_storage()
+    try:
+        interval = engine_host.interval_source(storage)
+    except Exception as e:  # noqa: BLE001
+        interval = {"minutes": None,
+                    "source": f"unreadable: {type(e).__name__}: {e}"}
+    try:
+        lease = engine_host.engine_lease_status(
+            storage, interval_min=interval.get("minutes"))
+    except Exception as e:  # noqa: BLE001
+        lease = {"held": False,
+                 "note": f"the lease could not be read: {type(e).__name__}: {e}"}
+    here_running = _controller_agent_started()
+    return {
+        "interval": interval,
+        "lease": lease,
+        "owned_by_this_console": here_running,
+        "console_hosting": here_running,
+        "agent_state": _CONTROLLER.get("state"),
+        "agent_started_at": _CONTROLLER.get("started_at"),
+        "agent_started_by": _CONTROLLER.get("started_by"),
+        "agent_error": _CONTROLLER.get("error"),
+        "refused": _CONTROLLER.get("refused"),
+        "cycle_running": bool(_CONTROLLER.get("cycle_running")),
+        "runs_elsewhere": bool(lease.get("held") and not here_running),
+        "python": sys.executable,
+    }
+
+
+def _start_agent_in_process(force: bool = False,
+                            started_by: str = "the console") -> Dict[str, Any]:
+    """
+    Start THE agent loop in this process, in its own thread and event loop.
+
+    Thread, not subprocess: the loop needs the adapters, the storage and the
+    loguru sink that this process already has, and a thread keeps one window and
+    one process for the operator to look at. `run_continuous` claims the lease
+    itself, so a second engine anywhere is refused with the holder's name and pid.
+    """
+    if _controller_agent_started():
+        return {"started": False, "already_running": True,
+                "reason": "the agent is already running in this console"}
+
+    storage = get_storage()
+    interval = engine_host.interval_source(storage)
+    claim = engine_host.claim_engine_lease(
+        storage, "console", interval_min=interval.get("minutes"), force=force)
+    if not claim.get("claimed"):
+        holder = claim.get("holder") or {}
+        _CONTROLLER["refused"] = {
+            "reason": claim.get("reason"), "holder": holder,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        return {"started": False, "reason": claim.get("reason"), "holder": holder}
+
+    try:
+        from ..agent.v3_loop import TradingAgentV3
+        agent = TradingAgentV3(dry_run=True)
+    except Exception as e:  # noqa: BLE001
+        engine_host.release_engine_lease(storage,
+                                         reason="the console could not start")
+        _CONTROLLER["error"] = f"{type(e).__name__}: {e}"
+        return {"started": False,
+                "reason": f"could not build the engine: {type(e).__name__}: {e}"}
+
+    # A console-started agent is a PAPER engine, checked rather than assumed: the
+    # page must never be the way a real order reaches a venue by accident.
+    if getattr(agent, "dry_run", None) is not True:
+        engine_host.release_engine_lease(storage,
+                                         reason="refused: not a paper engine")
+        return {"started": False,
+                "reason": ("refusing to start: the engine built here was not in "
+                           "dry run, so a button could have sent a real order")}
+
+    _CONTROLLER.update({"agent": agent, "loop": None, "started_at": None,
+                        "error": None, "refused": None, "started_by": started_by,
+                        "role": "console", "state": "starting"})
+    _agent_cache["agent"] = agent
+
+    def _run() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _CONTROLLER["loop"] = loop
+        _CONTROLLER["started_at"] = datetime.now(timezone.utc).isoformat()
+        _CONTROLLER["state"] = "running"
+        logger.info(f"The console is now running the agent (pid {os.getpid()}, "
+                    f"every {interval.get('minutes')} min)")
+        try:
+            loop.run_until_complete(agent.run_continuous(kind="console"))
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so an `except Exception` here
+            # would let a stop surface as an unhandled thread traceback - and a
+            # deliberate Stop is not an error.
+            logger.info("The console-hosted agent was stopped on purpose")
+        except Exception as e:  # noqa: BLE001 - the page must be able to report it
+            logger.error(f"The console-hosted agent stopped: {type(e).__name__}: {e}")
+            _CONTROLLER["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            _CONTROLLER["state"] = "stopped"
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+            # The engine object goes with the loop. Keeping it would leave the
+            # next Start with adapters bound to a closed event loop.
+            if _agent_cache.get("agent") is agent:
+                _agent_cache.pop("agent", None)
+            _CONTROLLER["agent"] = None
+            _CONTROLLER["loop"] = None
+            logger.info("The console-hosted agent has stopped")
+
+    thread = threading.Thread(target=_run, name="ptai-agent", daemon=True)
+    _CONTROLLER["thread"] = thread
+    thread.start()
+    return {"started": True, "role": "console", "pid": os.getpid(),
+            "interval": interval.get("minutes")}
+
+
+def _stop_agent(timeout: float = 20.0) -> Dict[str, Any]:
+    """
+    Stop the agent and SAY it was stopped.
+
+    An operator stop must be distinguishable from a crash: the lease is released
+    with a reason, so the page reads "stopped on purpose at 10:31" instead of
+    decaying into "no sign of life", which is what a dead agent looks like.
+    """
+    storage = get_storage()
+    agent = _CONTROLLER.get("agent")
+    loop = _CONTROLLER.get("loop")
+    if agent is None or loop is None:
+        # Not ours: either nobody is running, or the command window owns it. In
+        # the second case the lease still names the holder, which the page shows.
+        lease = engine_host.engine_lease_status(storage)
+        if lease.get("held") and not lease.get("is_self"):
+            return {"stopped": False,
+                    "reason": (f"the agent is running outside this console "
+                               f"({lease.get('kind')} engine, pid {lease.get('pid')} "
+                               f"on {lease.get('host')}); close that window to stop it")}
+        engine_host.release_engine_lease(storage,
+                                         reason="the operator pressed Stop")
+        return {"stopped": True,
+                "reason": "the agent was not running; the record is clean now"}
+
+    def _cancel() -> None:
+        try:
+            for task in asyncio.all_tasks(loop):
+                loop.call_soon_threadsafe(task.cancel)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not cancel the agent's tasks: {type(e).__name__}: {e}")
+
+    _cancel()
+    thread = _CONTROLLER.get("thread")
+    if thread is not None:
+        thread.join(timeout=timeout)
+    stopped = not (thread is not None and thread.is_alive())
+    _CONTROLLER["state"] = "stopped" if stopped else "stopping"
+    if stopped:
+        engine_host.release_engine_lease(storage, reason="the operator pressed Stop")
+    else:
+        # The cancellation was requested but a call inside the cycle has not
+        # returned yet, so say exactly that on the page. Leaving the phase saying
+        # "working" would claim the agent is still trading after the operator told
+        # it to stop, which is the one thing a Stop button must never do.
+        try:
+            storage.set_state("agent.phase", json.dumps({
+                "phase": "stopping", "label": "stopping",
+                "detail": ("you pressed Stop; a call inside the current cycle has "
+                           "not returned yet, so the agent stops as soon as it "
+                           "does - nothing new starts in the meantime"),
+                "at": datetime.now(timezone.utc).isoformat()}))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not write the stopping phase: {e}")
+    return {"stopped": stopped, "pid": os.getpid(),
+            "reason": ("stopped" if stopped else
+                       f"asked to stop; still finishing a long call after "
+                       f"{timeout:.0f}s")}
 
 
 # A short cache for the local model check, for the same reason the balances
@@ -339,7 +686,10 @@ def _agent():
 # request to LM Studio. The model list changes when the operator changes it,
 # not between two refreshes.
 _BRAIN_CACHE: Dict[str, Any] = {"at": 0.0, "value": {}}
-_BRAIN_TTL_SECONDS = 15.0
+# Five seconds, for the same reason the balances have one: the page now polls
+# faster while the agent is working, and a setup panel that lags a change looks
+# like a panel that ignored it.
+_BRAIN_TTL_SECONDS = 5.0
 
 
 def _brain_status(force: bool = False) -> Dict[str, Any]:
@@ -444,6 +794,10 @@ async def api_agent() -> JSONResponse:
         "blockers": blockers,
         "next_action": (blockers[0].get("clear") if blockers else None),
         "brain": brain,
+        # Which engine is running this agent, and what it will do next. The page
+        # paints the pill and the Start/Stop buttons from here, so the buttons
+        # cannot disagree with the agent they claim to control.
+        "engine": _controller_status(storage),
     })
 
 
@@ -532,10 +886,27 @@ async def api_status() -> JSONResponse:
     storage = get_storage()
     state = ConsoleState(storage)
     agent = _agent()
+    control = _controller_status(storage)
+    lease = control.get("lease") or {}
     out: Dict[str, Any] = {
         "mode": state.mode,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "engine": {"running": agent is not None},
+        # "running" is a claim about the AGENT, and the lease is what knows: the
+        # loop may be in the command window, in this console, or nowhere. Reporting
+        # `agent is not None` made a console that hosts nothing say the agent was
+        # dead while it was working one window away.
+        "engine": {
+            "running": bool(lease.get("held")),
+            "owned_by_this_console": bool(control.get("console_hosting")),
+            "kind": lease.get("kind"),
+            "pid": lease.get("pid"),
+            "host": lease.get("host"),
+            "note": lease.get("note"),
+            "released": bool(lease.get("released")),
+            "released_reason": lease.get("released_reason"),
+            "interval_min": (control.get("interval") or {}).get("minutes"),
+            "interval_source": (control.get("interval") or {}).get("source"),
+        },
         "steps": [],
         "storage": {},
     }
@@ -1081,13 +1452,154 @@ async def api_rounds(limit: int = 10) -> JSONResponse:
     })
 
 
+@app.get("/api/console/agent-control")
+async def api_agent_control() -> JSONResponse:
+    """
+    Who owns the agent, and can this page start, stop or wake it.
+
+    The page's buttons read their own truth from here. Before this, nothing in
+    the console could start or stop the agent at all: its lifecycle was a
+    console window, and the web page could only ask a second engine of its own
+    to do work, which is where the operator's "disconnected" came from.
+    """
+    return JSONResponse(_json_safe(_controller_status()))
+
+
+@app.post("/api/console/agent-control")
+async def api_agent_control_action(request: Request) -> JSONResponse:
+    """start / stop / run-now, from the page."""
+    body = await request.json() if await request.body() else {}
+    action = str(body.get("action") or "").strip().lower()
+    interval_min = body.get("interval_min")
+    if action == "start":
+        if interval_min not in (None, ""):
+            try:
+                engine_host.set_operator_interval_minutes(get_storage(), interval_min)
+            except ValueError as e:
+                return JSONResponse(status_code=400, content={"error": str(e)})
+        result = _start_agent_in_process(started_by="the console")
+        status = 200 if result.get("started") else 409
+        return JSONResponse(status_code=status,
+                            content=_json_safe({**result,
+                                                "control": _controller_status()}))
+    if action == "stop":
+        result = _stop_agent()
+        return JSONResponse(status_code=200 if result.get("stopped") else 409,
+                            content=_json_safe({**result,
+                                                "control": _controller_status()}))
+    if action in ("run-now", "run_now", "round"):
+        agent = _agent()
+        if agent is not None and _controller_agent_started():
+            woke = agent.request_immediate_cycle()
+            return JSONResponse(status_code=200, content=_json_safe({
+                "status": "requested" if woke else "no-loop",
+                "woke": woke,
+                "message": ("the agent will start its next cycle now, in the "
+                            "engine that is already running"
+                            if woke else
+                            "the agent is running here but its loop is not "
+                            "waiting; it will pick the request up shortly"),
+                "control": _controller_status(),
+            }))
+        control = _controller_status()
+        lease = control.get("lease") or {}
+        if lease.get("held"):
+            return JSONResponse(status_code=409, content=_json_safe({
+                "error": (f"the agent is running elsewhere: the {lease.get('kind')} "
+                          f"engine, pid {lease.get('pid')} on {lease.get('host')} "
+                          f"(alive {lease.get('age_seconds')}s ago). It is doing the "
+                          f"work - there is no need to start a second one. To run "
+                          f"rounds from this page, stop that engine and press Start."),
+                "control": control,
+            }))
+        # Nobody owns the agent: starting it IS the round the operator asked for.
+        result = _start_agent_in_process(started_by="Run a round")
+        return JSONResponse(status_code=200 if result.get("started") else 409,
+                            content=_json_safe({**result,
+                                                "status": "started",
+                                                "control": _controller_status()}))
+    return JSONResponse(status_code=400, content={
+        "error": f"unknown action {action!r}; use start, stop or run-now"})
+
+
+@app.post("/api/console/agent/interval")
+async def api_agent_interval(request: Request) -> JSONResponse:
+    """
+    Set the cycle interval for the RUNNING agent.
+
+    It used to be a CLI flag (`--interval 10` in the .bat), fixed at process
+    start, which is why a change here "did not change anything" until a restart.
+    The loop re-reads this value before every wait, so a new interval applies to
+    the next wait - and a shortened interval interrupts the wait that is already
+    in progress (within a minute) instead of being ignored until it expires.
+    """
+    storage = get_storage()
+    body = await request.json() if await request.body() else {}
+    raw = body.get("minutes")
+    if raw in (None, ""):
+        return JSONResponse(status_code=400, content={"error": "minutes is required"})
+    try:
+        value = engine_host.set_operator_interval_minutes(storage, raw)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    agent = _agent()
+    applied = None
+    if agent is not None:
+        applied = agent.request_immediate_cycle()
+    control = _controller_status(storage)
+    return JSONResponse(_json_safe({
+        "interval": control["interval"],
+        "set": value,
+        "applied_to_running_agent": bool(applied),
+        "message": (f"the agent now runs every {value} minute(s); the wait in "
+                    f"progress was cut short so it starts applying now"),
+        "control": control,
+    }))
+
+
+@app.get("/api/console/logs")
+async def api_logs(after: int = 0, limit: int = 200) -> JSONResponse:
+    """
+    The agent's log, where the agent runs.
+
+    The operator had to keep a second window open to read what the agent was
+    doing - and when the page ran a cycle of its own, that output went nowhere he
+    could see. This is the console process's own loguru buffer: the same lines, in
+    the browser, including the process and pid in the page's own header so it is
+    unambiguous WHICH engine is talking.
+    """
+    payload = live_log.tail(after=after, limit=limit)
+    payload.update({
+        "pid": os.getpid(),
+        "role": (_CONTROLLER.get("role") or "console"),
+        "log_file": _newest_log_file(),
+    })
+    return JSONResponse(_json_safe(payload))
+
+
 @app.post("/api/console/run-cycle")
 async def api_run_cycle(request: Request) -> JSONResponse:
     """
-    Run one cycle in the CURRENT mode, and refuse if live is not ready.
+    "Run a round" - on THE agent, not on a copy of it.
 
-    This route exists so a first-time operator cannot accidentally open a live
-    position from a button they thought was a preview.
+    This route used to build a second engine inside the web process whenever the
+    agent was not already here, then run a full round in it. That engine wrote to
+    the same liveness keys and round history as the loop in the command window, so
+    two engines appeared as one and neither could see the other - the operator's
+    "disconnected", "takes too long", "some things are missing".
+
+    Now the button means what it says:
+
+      * the agent runs HERE  -> wake the one loop; the round starts in the engine
+        that owns the round history, the phase keys and the log;
+      * the agent runs ELSEWHERE (the command window) -> refuse, and name the
+        process that is already doing the work. A second engine is never the
+        answer;
+      * nobody runs it -> start the agent here and let it take the first cycle.
+
+    A live round is refused unless a funded, authorised venue is ready, exactly as
+    before: a first-time operator must not open a real position from a preview
+    button.
     """
     storage = get_storage()
     state = ConsoleState(storage)
@@ -1103,99 +1615,53 @@ async def api_run_cycle(request: Request) -> JSONResponse:
                 "warnings": plan["warnings"],
             })
 
-    agent = _agent()
-    if agent is None:
-        if requested_mode == "live":
-            # A live engine must be the supervised process, not something this
-            # web handler constructs. Two things would otherwise become real
-            # money: the button, and whatever loads the page.
-            return JSONResponse(status_code=503, content={
-                "error": ("live cycles run in the engine process, not in the "
-                          "console. Start it with `python -m src.ptai.cli run "
-                          "--no-dry-run`; it appears here when it is running."),
-                "mode": requested_mode,
-            })
-        # PAPER cycles are safe to construct here, and deliberately so: the
-        # agent is built with dry_run=True, which propagates to every adapter,
-        # so no order can be sent. No credentials are needed and no capital is
-        # at risk, which is what makes paper mode the right place to start.
-        try:
-            from ..agent.v3_loop import TradingAgentV3
+    control = _controller_status(storage)
+    lease = control.get("lease") or {}
 
-            agent = TradingAgentV3(country_code="UG", dry_run=True)
-            _agent_cache["agent"] = agent
-            logger.info("Paper engine constructed in-process for the console")
-        except Exception as e:
-            logger.error(f"Could not start a paper engine: {type(e).__name__}: {e}")
-            return JSONResponse(status_code=500, content={
-                "error": f"could not start a paper engine: {type(e).__name__}: {e}",
-                "mode": "paper",
-            })
-        # A paper engine constructed on demand must not be mistaken for a
-        # supervised live one.
-        if getattr(agent, "dry_run", None) is not True:
-            _agent_cache.pop("agent", None)
-            return JSONResponse(status_code=500, content={
-                "error": ("refusing to run: the engine built here was not in "
-                          "dry run, so a paper cycle could have sent a real order"),
-                "mode": "paper",
-            })
+    if _controller_agent_started():
+        if _CONTROLLER.get("cycle_running"):
+            return JSONResponse(status_code=202, content=_json_safe({
+                "status": "running",
+                "message": "a round is already running; the page will show it as "
+                           "it finishes",
+                "control": control,
+            }))
+        agent = _agent()
+        woke = bool(agent is not None and agent.request_immediate_cycle())
+        logger.info("The operator asked for a round; the running agent was woken"
+                    if woke else
+                    "The operator asked for a round; the agent is between cycles")
+        return JSONResponse(status_code=202, content=_json_safe({
+            "status": "requested",
+            "message": ("the agent is running and will start its next round now - "
+                        "watch the log and the round card; a full round takes real "
+                        "time" if woke else
+                        "the agent is running and will start a round immediately"),
+            "control": control,
+        }))
 
-    try:
-        # A ROUND, not a bare cycle: the same research, screening, forecasting
-        # and execution, but with every position slot the risk rules leave open
-        # put to work, so the answer at the end is about an account that did
-        # something. `run_round` calls `run_cycle` with that trade ceiling and
-        # returns the round report alongside the cycle's own result.
-        result = await agent.run_round()
-    except Exception as e:
-        logger.error(f"Console cycle failed: {type(e).__name__}: {e}")
-        return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {e}"})
+    if lease.get("held"):
+        return JSONResponse(status_code=409, content=_json_safe({
+            "error": (f"the agent is already running in the {lease.get('kind')} "
+                      f"engine (pid {lease.get('pid')} on {lease.get('host')}, alive "
+                      f"{lease.get('age_seconds')}s ago). It is doing the work; a "
+                      f"second engine on the same database is exactly what made the "
+                      f"page disagree with the command line. Press Stop there (or "
+                      f"close that window) and this button will start the agent here."),
+            "control": control,
+        }))
 
-    execution = result.get("execution") or []
-    sports = result.get("sports") or {}
-    # Serialised on the way out, once, in one place: see `_json_safe`. Every
-    # field below is read from the cycle result, and the cycle result holds
-    # objects (candidate groups, markets) that would otherwise turn this reply
-    # into a 500 for a round that actually ran.
-    payload = {
-        "mode": requested_mode,
-        "status": result.get("status"),
-        # The sports lane's outcome, including WHY it was quiet. "Nothing
-        # placed" alone is what made the button feel incomplete: the feed
-        # reasons, how many fixtures arrived and what was priced belong on the
-        # answer, not only in the log file.
-        "sports": {
-            "bets_placed": sports.get("bets_placed", 0),
-            "refusals": (sports.get("placement") or {}).get("refusals", [])[:3],
-            "settlement": sports.get("settlement"),
-            "ratings_update": sports.get("ratings_update"),
-            "ratings": sports.get("ratings"),
-            "book": sports.get("book"),
-            "opportunities": sports.get("opportunities", 0),
-            "executable": sports.get("executable", 0),
-            "market_types_available": sports.get("market_types_available", 0),
-            "blockers": (sports.get("blockers") or [])[:3],
-            "how_a_bet_works": sports.get("how_a_bet_works", ""),
-        },
-        # Where the model time went: how many markets were read, how many got
-        # deep analysis, and what the base-rate component actually had.
-        "deep_analysis": result.get("deep_analysis") or {},
-        "base_rates": result.get("base_rates") or {},
-        "pricing": (result.get("pricing") or [])[:5],
-        "markets_scanned": len((result.get("markets") or {})) or None,
-        "executed": len([e for e in execution if e.get("position_recorded")]),
-        "orders_tracked": len([e for e in execution if e.get("order_recorded")]),
-        "settlement": result.get("settlement"),
-        "reconciliation": result.get("reconciliation"),
-        "redemption": result.get("redemption"),
-        # The round: the account at both ends of it, the net, and the running
-        # score. This is what the operator asked a completed run to produce.
-        "round": result.get("round") or {},
-        "rounds": _round_history(agent, 10),
-        "detail": result,
-    }
-    return JSONResponse(_json_safe(payload))
+    result = _start_agent_in_process(started_by="Run a round")
+    if not result.get("started"):
+        return JSONResponse(status_code=409, content=_json_safe({
+            "error": result.get("reason"), "control": _controller_status()}))
+    logger.info("The operator asked for a round; the console started the agent here")
+    return JSONResponse(status_code=200, content=_json_safe({
+        "status": "started",
+        "message": ("the agent was not running, so it was started here and is "
+                    "taking a round now - the round card and the log will fill in"),
+        "control": _controller_status(),
+    }))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1320,7 +1786,18 @@ section[id]{scroll-margin-top:132px}
   <div class="mono" style="font-size:12.5px;color:var(--dim)" id="hdrCapital"></div>
   <div class="spacer"></div>
   <button onclick="loadAll()">Refresh</button>
-  <button id="runBtn" class="primary" onclick="runCycle()">Run one round</button>
+  <button id="startBtn" onclick="agentAction('start')">Start the agent</button>
+  <button id="stopBtn" onclick="agentAction('stop')">Stop</button>
+  <button id="runBtn" class="primary" onclick="runCycle()">Run a round now</button>
+  <!--
+    Which process is running the agent, and every setting that reaches it. The
+    operator's report was that the page and the command line were two systems;
+    this line exists so they are never in doubt about which one is doing the work.
+  -->
+  <div id="engineLine" class="mono"
+       style="flex-basis:100%;font-size:12px;color:var(--dim);margin-top:6px">
+    reading which engine owns the agent&hellip;
+  </div>
   <!--
     One page, jump links. The sections are all on this page and all visible;
     these only scroll to them, so nothing can be hidden from the operator by a
@@ -1365,6 +1842,38 @@ section[id]{scroll-margin-top:132px}
         than a flat one.
       </div>
       <div id="round"></div>
+    </div>
+
+    <!--
+      The loop's own settings, in one row, applied to the RUNNING agent. The
+      interval used to live in the .bat (`--interval 10`) and was fixed for the
+      life of the process, so changing it here could not have any effect.
+    -->
+    <div class="card" style="margin-top:16px">
+      <h2>How often it works</h2>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <label class="note" for="intervalMin">A cycle every</label>
+        <input id="intervalMin" type="number" min="1" max="1440" step="1"
+               style="width:90px" placeholder="10">
+        <span class="note">minutes</span>
+        <button onclick="setIntervalMin()">Apply to the running agent</button>
+        <span class="note" id="intervalNote">
+          A new interval is picked up before the next wait - and a shortened one
+          cuts the wait that is already running.
+        </span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>The agent's own log</h2>
+      <div class="note" style="margin-bottom:9px">
+        The same lines the command-line window shows, from the process that is
+        running the agent. <span id="logWhere"></span>
+      </div>
+      <pre id="agentLog" class="mono"
+           style="max-height:340px;overflow:auto;font-size:11.5px;line-height:1.45;
+                  background:#0b0f13;border:1px solid var(--line);border-radius:8px;
+                  padding:10px;white-space:pre-wrap"></pre>
     </div>
 
     <div class="grid cols-4" id="agentKpis" style="margin-top:16px"></div>
@@ -2248,16 +2757,158 @@ async function loadRounds(){
   showRound((body.rounds||[])[0] || null, body.summary||{}, body.rounds||[], false);
 }
 
+// ---- the agent's lifecycle, from the page ----
+//
+// start / stop / run-now all act on THE agent. If the command window owns the
+// loop, these say so and name the process rather than starting a second engine
+// that would write to the same keys.
+let ENGINE = {control: null, logSeq: 0};
+
+const STATE_WORD_ENGINE = {running:'the agent is running', starting:'the agent is starting',
+                           stopping:'the agent is stopping', stopped:'the agent is stopped',
+                           idle:'the agent is not running'};
+
+async function loadControl(){
+  const {ok, body} = await api('/api/console/agent-control');
+  if(!ok || !body || !body.lease){ return; }
+  ENGINE.control = body;
+  paintEngine(body);
+  const box = $('intervalMin');
+  if(box && document.activeElement !== box && body.interval && body.interval.minutes){
+    box.value = body.interval.minutes;
+  }
+}
+
+function paintEngine(body){
+  const el = $('engineLine');
+  if(!el) return;
+  const lease = body.lease || {};
+  const iv = body.interval || {};
+  const bits = [];
+  if(body.console_hosting){
+    bits.push('<b>this console is running the agent</b> (pid ' +
+      esc(String(body.lease.pid || '')) + ')');
+  } else if(lease.held){
+    bits.push('<b>the agent runs in the ' + esc(String(lease.kind||'another')) +
+      ' engine</b> (pid ' + esc(String(lease.pid||'?')) + ' on ' +
+      esc(String(lease.host||'?')) + ', alive ' +
+      esc(ageText(lease.age_seconds)) + ' ago)');
+  } else if(lease.released){
+    bits.push('the agent is <b>stopped</b>: ' + esc(String(lease.released_reason||'')) +
+      ' at ' + esc(String(lease.released_at||'').slice(11,16)) + ' UTC');
+  } else {
+    bits.push('no engine is running the agent' +
+      (lease.note ? ' (' + esc(String(lease.note)) + ')' : ''));
+  }
+  bits.push('cycle every <b>' + esc(String(iv.minutes==null?'?':iv.minutes)) +
+    ' min</b> (' + esc(String(iv.source||'')) + ')');
+  if(body.agent_error){
+    bits.push('<span class="neg">the last engine error: ' +
+      esc(String(body.agent_error)) + '</span>');
+  }
+  el.innerHTML = bits.join(' &middot; ');
+  const start = $('startBtn'), stop = $('stopBtn'), run = $('runBtn');
+  if(start && stop && run){
+    const busy = body.agent_state==='starting';
+    start.disabled = body.console_hosting || busy || lease.held;
+    stop.disabled = !body.console_hosting && !lease.held;
+    run.disabled = false;
+    start.textContent = body.console_hosting ? 'Agent is running here' : 'Start the agent';
+  }
+}
+
+async function agentAction(what){
+  const btn = what==='start' ? $('startBtn') : $('stopBtn');
+  const was = btn.textContent;
+  btn.disabled = true; btn.textContent = what==='start' ? 'Starting\u2026' : 'Stopping\u2026';
+  const {ok, body} = await api('/api/console/agent-control', {method:'POST',
+    body:JSON.stringify({action:what})});
+  btn.textContent = was;
+  const box = $('cycleOut');
+  const text = ok ? (what==='start' ? 'The agent is starting here; its first cycle ' +
+        'begins immediately and the round card and log will fill in.'
+      : 'The agent was stopped on purpose, and the record says so.')
+    : (body.error || body.reason || 'that did not work');
+  if(box) box.innerHTML = '<div class="' + (ok?'note':'errbox') + '"><b>' +
+    esc(String(text)) + '</b>' + (!ok && body.holder && body.holder.pid
+      ? '<div class="note" style="margin-top:5px">held by the ' +
+        esc(String(body.holder.kind||'')) + ' engine, pid ' +
+        esc(String(body.holder.pid)) + ' on ' + esc(String(body.holder.host||'')) +
+        ', alive ' + esc(ageText(body.holder.age_seconds)) + ' ago</div>' : '') + '</div>';
+  await loadAll(); await loadControl();
+}
+
+async function setIntervalMin(){
+  const box = $('intervalMin');
+  const minutes = box ? box.value : '';
+  const {ok, body} = await api('/api/console/agent/interval', {method:'POST',
+    body:JSON.stringify({minutes:minutes})});
+  const note = $('intervalNote');
+  if(note){
+    note.innerHTML = ok
+      ? esc(String(body.message||'saved')) +
+        (body.applied_to_running_agent
+          ? ' <b>The running agent was woken; its next wait uses the new interval.</b>'
+          : ' The agent is not running here, so the next start uses it.')
+      : '<span class="neg">' + esc(String(body.error||'could not set the interval')) + '</span>';
+  }
+  loadControl();
+}
+
+// ---- the log, as the process writes it ----
+async function loadLogs(){
+  // A hidden tab polls nothing. The log timer is the fastest one on the page, and
+  // it must respect the same rule the panels do.
+  if(document.visibilityState === 'hidden') return;
+  const {ok, body} = await api('/api/console/logs?after=' + ENGINE.logSeq + '&limit=200');
+  if(!ok || !body || !body.lines){ return; }
+  const pre = $('agentLog');
+  if(!pre) return;
+  const where = $('logWhere');
+  if(where){
+    const file = body.log_file && body.log_file.name
+      ? ' The durable log file is <b>' + esc(body.log_file.name) + '</b> (' +
+        esc(String(body.log_file.size_kb)) + ' kB).' : '';
+    where.innerHTML = 'Showing the last ' + esc(String(body.buffered)) + ' line(s) ' +
+      'buffered by the ' + esc(String(body.role)) + ' engine, pid ' +
+      esc(String(body.pid)) + '.' + file;
+  }
+  const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+  const fresh = body.lines.filter(l=>l.seq > ENGINE.logSeq);
+  if(ENGINE.logSeq === 0){
+    pre.textContent = body.lines.map(l=>l.time + ' | ' + l.level.padEnd(7) + ' | ' + l.text).join('\n');
+  } else if(fresh.length){
+    pre.textContent += (pre.textContent ? '\n' : '') +
+      fresh.map(l=>l.time + ' | ' + l.level.padEnd(7) + ' | ' + l.text).join('\n');
+  }
+  ENGINE.logSeq = body.next || ENGINE.logSeq;
+  // Trim what the DOM holds, not just the buffer: an operator who leaves the page
+  // open for a day must not end up with a 100k-line <pre>.
+  const lines = pre.textContent.split('\n');
+  if(lines.length > 600){ pre.textContent = lines.slice(lines.length-600).join('\n'); }
+  if(stick) pre.scrollTop = pre.scrollHeight;
+}
+
 async function runCycle(){
   const btn = $('runBtn');
-  btn.disabled = true; btn.textContent = 'Running a round\u2026';
+  btn.disabled = true; btn.textContent = 'Asking the agent\u2026';
   const {ok, body} = await api('/api/console/run-cycle', {method:'POST',
     body:JSON.stringify({mode:STATE.mode})});
-  btn.disabled = false; btn.textContent = 'Run one round';
+  btn.disabled = false; btn.textContent = 'Run a round now';
   if(!ok){
-    $('cycleOut').innerHTML = `<div class="errbox"><b>${body.error||'cycle refused'}</b>`
+    $('cycleOut').innerHTML = `<div class="errbox"><b>${esc(String(body.error||'cycle refused'))}</b>`
       + ((body.warnings||[]).length?`<ul style="margin-left:16px;margin-top:7px">${
-          body.warnings.map(w=>`<li>${w}</li>`).join('')}</ul>`:'') + '</div>';
+          body.warnings.map(w=>`<li>${esc(String(w))}</li>`).join('')}</ul>`:'') + '</div>';
+    loadControl();
+    return;
+  }
+  // "requested" or "started": the round runs in the engine that OWNS the loop, so
+  // the page waits for its own log and round card to fill in rather than pretending
+  // the button did the work in this browser request.
+  if(body.status === 'requested' || body.status === 'started' ||
+     body.status === 'running'){
+    $('cycleOut').innerHTML = `<div class="note"><b>${esc(String(body.message||''))}</b></div>`;
+    loadControl(); loadLogs(); loadAgent();
     return;
   }
   const sp = body.sports || {};
@@ -2735,7 +3386,7 @@ async function loadAll(){
   _loading = true;
   try{
     await Promise.all([
-      loadAgent(), loadStatus(), loadBrainSetup(),
+      loadAgent(), loadStatus(), loadBrainSetup(), loadControl(),
       loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
       loadLogins(), loadVenueSwitches(), loadSports(), loadForecast(),
       loadRounds(),
@@ -2750,7 +3401,38 @@ async function loadAll(){
 // database; the only writable thing on the page is the budget box, and its
 // input is never re-rendered by a refresh.
 loadAll();
-setInterval(loadAll, 15000);
+// Polling follows the work. A running agent's round card, log and pill change by
+// the second, so a fixed 15-second timer made every action look like it "took too
+// long to change". When nothing is running there is nothing to watch, so the page
+// backs off and leaves the machine alone.
+const POLL_FAST_MS = 3000, POLL_SLOW_MS = 15000, LOG_MS = 2500;
+let _pollMs = POLL_SLOW_MS;
+
+function agentLooksBusy(){
+  const c = ENGINE.control || {};
+  return !!(c.console_hosting || (c.lease && c.lease.held) || c.cycle_running ||
+            (c.agent_state && c.agent_state !== 'stopped' && c.agent_state !== 'idle'));
+}
+
+async function pollLoop(){
+  const started = Date.now();
+  try{
+    if(document.visibilityState === 'hidden'){ await loadLogs(); return; }
+    await loadLogs();
+    await loadControl();
+    _pollMs = agentLooksBusy() ? POLL_FAST_MS : POLL_SLOW_MS;
+    if(_pollMs === POLL_FAST_MS){ await loadAll(); }
+  }catch(e){
+    _pollMs = POLL_SLOW_MS;
+  }
+  // Keep the cadence even when a poll itself is slow: eight endpoints must not
+  // turn a 3-second watch into a 9-second one.
+  const spent = Date.now() - started;
+  setTimeout(pollLoop, Math.max(500, _pollMs - spent));
+}
+
+setInterval(loadLogs, LOG_MS);
+setTimeout(pollLoop, 600);
 // Coming back to a backgrounded tab refreshes immediately instead of waiting
 // out the rest of the interval.
 document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') loadAll(); });

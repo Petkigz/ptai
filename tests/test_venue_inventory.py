@@ -443,7 +443,10 @@ class TestThePanelRendersTheRows:
 
         script = console_module.CONSOLE_HTML.split("<script>")[1].split("</script>")[0]
         # Drop the bootstrap tail: this harness drives one panel, not the page.
-        script = script.split("loadAll();")[0]
+        # The marker is the line-start `loadAll();`: a bare split on the text also
+        # matches the calls INSIDE the page's own functions, which truncates the
+        # script mid-function and reads as a syntax error in node.
+        script = script.split("\nloadAll();")[0]
 
         harness = f"""
 // A DOM thin enough to run the console's own script, and nothing more. Every

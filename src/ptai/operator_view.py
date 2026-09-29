@@ -506,9 +506,33 @@ HEARTBEAT_KEY = "agent.heartbeat"
 WORKING_PHASES = frozenset({"scanning", "screening", "evaluating", "executing"})
 
 
-def _interval_minutes() -> int:
-    """How often the agent cycles, from the same env the runner sets."""
+def _engine_lease(storage) -> Dict[str, Any]:
+    """The engine that owns the agent, read defensively (it is a display fact)."""
+    try:
+        from .agent.engine_host import engine_lease_status
+        return engine_lease_status(storage)
+    except Exception as e:  # noqa: BLE001
+        return {"held": False, "note": f"{type(e).__name__}: {e}"}
+
+
+def _interval_minutes(storage=None) -> int:
+    """
+    How often the agent cycles: the operator's setting first, the env second.
+
+    The interval used to live only in the .bat (`--interval 10`) and in the
+    environment, so a change made in the console described nothing about the
+    process that was already running. The loop now re-reads the stored value
+    before every wait, and this function reads the same one, so the number on the
+    page is the number the agent is using.
+    """
     import os
+    if storage is not None:
+        try:
+            raw = storage.get_state("operator.interval_min")
+            if raw:
+                return max(1, int(float(raw)))
+        except Exception:  # noqa: BLE001 - fall back to the environment
+            pass
     try:
         return max(1, int(os.environ.get("INTERVAL_MIN") or 10))
     except (TypeError, ValueError):
@@ -574,8 +598,9 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
     block: Dict[str, Any] = {
         "available": False,
         "source": "state keys agent.phase / agent.heartbeat + market_scans",
-        "interval_min": interval_min or _interval_minutes(),
-        "window_seconds": round(live_window_seconds(interval_min), 1),
+        "interval_min": interval_min or _interval_minutes(storage),
+        "window_seconds": round(live_window_seconds(
+            interval_min or _interval_minutes(storage)), 1),
         "running": False,
         "state": "unknown",
         "evidence": None,
@@ -649,7 +674,21 @@ def agent_state(storage, interval_min: Optional[int] = None) -> Dict[str, Any]:
     block["blocked_by_kill_switch"] = status.startswith("kill_switch")
     if not block["running"]:
         block["state"] = "not_running"
-        if scan_ago is None and beat_ago is None:
+        # An engine that was STOPPED ON PURPOSE says so, before any "no sign of
+        # life" wording: the operator pressed Stop and the page must not make them
+        # wonder whether it took, or imply the agent never existed.
+        try:
+            lease = _engine_lease(storage)
+        except Exception:  # noqa: BLE001
+            lease = {}
+        block["engine"] = lease
+        if lease.get("released"):
+            block["stopped_by_operator"] = True
+            block["evidence"] = (
+                f"stopped on purpose at "
+                f"{str(lease.get('released_at') or '')[:19].replace('T', ' ')} UTC "
+                f"({lease.get('released_reason') or 'no reason recorded'})")
+        elif scan_ago is None and beat_ago is None:
             block["evidence"] = ("no completed cycle and no heartbeat have ever "
                                  "been recorded in this database")
         else:

@@ -13,6 +13,7 @@ lies to its operator:
 """
 
 import asyncio
+import json
 import os
 import tempfile
 
@@ -416,17 +417,54 @@ class TestTheConsoleRefuses:
         assert "no account to send money to" in body["principle"].lower()
         assert body["routes"]["polymarket"]["deposit_steps"]
 
-    def test_a_paper_cycle_runs_from_the_console(self, client):
+    def test_a_paper_cycle_runs_from_the_console(self, client, monkeypatch):
         """
-        Paper mode has to be runnable, or the operator has to launch a second
-        process to see the thing they asked to see. It is safe to construct here
-        precisely because dry_run propagates to every adapter.
+        Paper has to be runnable from the page, or the operator has to launch a
+        second process to see the thing they asked to see.
+
+        V50 changed the shape of that answer, not the requirement. The console now
+        HOSTS the agent: pressing the button starts the one engine IN THIS PROCESS
+        (paper, checked before the thread starts) and returns what happened. Before,
+        the handler built an engine of its own and ran a round in it, which is how
+        two engines ended up writing one database.
         """
-        response = client.post("/api/console/run-cycle", json={"mode": "paper"})
-        assert response.status_code == 200
-        body = response.json()
-        assert body["mode"] == "paper"
-        assert "status" in body and "settlement" in body
+        import importlib
+        console = importlib.import_module("src.ptai.ui.console")
+        built = {}
+
+        class _StubEngine:
+            """Stands in for the real agent so the test does not start one."""
+
+            dry_run = True
+
+            def __init__(self, *args, **kwargs):
+                built.update(kwargs)
+                built["args"] = args
+                self._bet = asyncio.Event()
+
+            async def run_continuous(self, **kwargs):
+                await self._bet.wait()
+
+        monkeypatch.setattr("src.ptai.agent.v3_loop.TradingAgentV3", _StubEngine)
+        try:
+            response = client.post("/api/console/run-cycle", json={"mode": "paper"})
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["status"] == "started"
+            assert "started here" in body["message"]
+            # The engine built for the page is a PAPER engine.
+            assert built.get("dry_run") is True
+            # ... and it is the console's own agent, not a second process.
+            control = body["control"]
+            assert control["console_hosting"] is True
+            status = client.get("/api/console/status").json()
+            assert status["engine"]["running"] is True
+            assert status["engine"]["owned_by_this_console"] is True
+        finally:
+            stopped = console._stop_agent(timeout=5)
+            assert stopped["stopped"] is True
+        lease = json.loads(console.get_storage().get_state("agent.engine_lease"))
+        assert lease["released"] is True
 
     def test_a_live_cycle_is_never_run_from_the_console(self, client):
         """

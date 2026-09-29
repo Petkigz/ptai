@@ -393,10 +393,22 @@ class TestTheConsoleStopsTalkingToItself:
             assert client.get("/api/console/capital").status_code == 200
 
     def test_the_page_only_polls_while_it_is_visible(self):
+        """
+        A hidden tab must not keep asking the server for anything. V50 replaced the
+        fixed 15-second timer with an adaptive one (3 s while the agent is working,
+        15 s while nothing is), so the cadence is pinned by its constants and the
+        guard is pinned in every polling path - including the log, which is the
+        fastest timer on the page.
+        """
         import inspect
 
         from src.ptai.ui import console as console_module
         source = inspect.getsource(console_module)
-        assert "document.visibilityState === 'hidden'" in source
         assert "_loading" in source
-        assert "setInterval(loadAll, 15000)" in source
+        assert source.count("document.visibilityState === 'hidden'") >= 2
+        assert "POLL_FAST_MS = 3000" in source
+        assert "POLL_SLOW_MS = 15000" in source
+        assert "setTimeout(pollLoop" in source
+        # The log poll is guarded too, in its own function.
+        logs = source.split("async function loadLogs(){")[1].split("\n}")[0]
+        assert "visibilityState" in logs

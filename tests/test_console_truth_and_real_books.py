@@ -360,9 +360,15 @@ class TestTheRoundReplyIsAlwaysSendable:
 
     def test_the_endpoint_answers_a_round_that_ran(self, tmp_path, monkeypatch):
         """
-        End to end: a round whose result contains live objects must come back
-        200 with the round's bankroll on it. This is the operator pressing the
-        button and getting an answer instead of an error box.
+        The button's reply is always sendable JSON, in every branch - and when the
+        agent is running here it ASKS the running loop for a round instead of
+        building a second engine against the same database.
+
+        V50 changed what the reply says: the round now runs in the engine that owns
+        the loop (the console host, or the command window), so a button press
+        returns "the agent will start its next round now" rather than the round's
+        result inline. The old shape - construct an engine in the web handler and
+        run the round there - is exactly what made the page a second system.
         """
         import importlib
 
@@ -374,37 +380,52 @@ class TestTheRoundReplyIsAlwaysSendable:
         storage.set_bankroll(50.0)
         storage.set_paper_bankroll(50.0)
 
-        from src.ptai.strategy.combinatorial import CombinatorialGroup
-
         class _Agent:
             dry_run = True
+            woken = 0
+
+            def request_immediate_cycle(self):
+                self.woken += 1
+                return True
 
             async def run_round(self, *a, **k):
-                return {
-                    "status": "complete",
-                    "execution": [{"position_recorded": True}],
-                    "alpha_scan": {"combinatorial": {"opps": [CombinatorialGroup(
-                        group_id="g", event_slug="e", markets=[], sum_yes=2.5,
-                        is_exhaustive=True, is_exclusive=True,
-                        arbitrage_type="sell_all_yes_buy_all_no",
-                        estimated_profit_pct=0.3, cost=3.0, payout=5.0,
-                        should_trade=True, reasoning="why not")]}},
-                    "round": {"number": 1, "net_usd": 0.32, "verdict": "up",
-                              "account": {"start_usd": 50.0, "end_usd": 50.32}},
-                }
+                # A round result holds live objects; the page must never receive
+                # one of these on the wire.
+                from src.ptai.strategy.combinatorial import CombinatorialGroup
+                return {"status": "complete", "round": {"number": 1},
+                        "alpha_scan": {"combinatorial": {"opps": [CombinatorialGroup(
+                            group_id="g", event_slug="e", markets=[], sum_yes=2.5,
+                            is_exhaustive=True, is_exclusive=True,
+                            arbitrage_type="sell_all_yes_buy_all_no",
+                            estimated_profit_pct=0.3, cost=3.0, payout=5.0,
+                            should_trade=True, reasoning="why not")]}}}
 
-            def round_history(self, limit=10):
-                return {"rounds": [], "summary": {}}
-
-        monkeypatch.setattr(console, "_agent", lambda: _Agent())
+        agent = _Agent()
+        monkeypatch.setattr(console, "_agent", lambda: agent)
         monkeypatch.setattr(console, "get_storage", lambda: storage)
+        # The console is the host: its thread is alive, so the button must wake
+        # that loop rather than run a round of its own.
+        monkeypatch.setattr(console, "_controller_agent_started", lambda: True)
 
         client = TestClient(console.app)
         response = client.post("/api/console/run-cycle", json={"mode": "paper"})
 
-        assert response.status_code == 200, response.text
+        assert response.status_code == 202, response.text
         body = response.json()
-        assert body["round"]["net_usd"] == 0.32
-        assert body["executed"] == 1
-        # The objects are still described, as text, rather than dropped.
-        assert "sell_all_yes_buy_all_no" in json.dumps(body)
+        assert body["status"] == "requested"
+        assert agent.woken == 1
+        assert "round" not in body
+        json.dumps(body)  # nothing that could not cross the wire
+
+        # And with another engine holding the lease, the button refuses by name
+        # instead of starting a rival one.
+        monkeypatch.setattr(console, "_controller_agent_started", lambda: False)
+        storage.set_state("agent.engine_lease", json.dumps({
+            "kind": "cli", "pid": 4242, "host": "his-pc",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            "released": False}))
+        refused = client.post("/api/console/run-cycle", json={"mode": "paper"})
+        assert refused.status_code == 409, refused.text
+        assert "cli" in refused.json()["error"]
+        assert "4242" in refused.json()["error"]

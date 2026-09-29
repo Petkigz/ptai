@@ -399,6 +399,88 @@ returning `UNSETTLEABLE`, over a stake) and `MarketMechanics`, which
 `get_mechanics` annotated as its return type while only importing it inside the
 method body.
 
+### The Page And The Command Line Are One System
+
+The operator's report - *"the webui is too disconeccted with the command line .
+things take too long to change or dont change at all . some things are even
+mising"* - was not a styling problem. `run_ptai.bat` started TWO processes:
+
+```
+start "PTAI Agent (paper)" cmd /k "python main.py run --bankroll 50 --interval 10"
+start "PTAI Console"       cmd /k "python -m ptai.ui.console"
+```
+
+and the console built a THIRD engine inside the web process on every press of
+"Run one round". Three consequences, all of them his sentence:
+
+  * **Two engines, one database.** Both wrote `agent.phase`, `agent.heartbeat`,
+    `agent.rounds` and the trades table, so the page could attribute one engine's
+    work to the other and neither knew the other existed. The button's reply
+    described a round the loop in the other window had never seen.
+  * **Settings that could not reach the loop.** `--interval 10` and `--dry-run`
+    were fixed when the process started. Changing the mode in the page changed
+    what the page *said*; the agent that was actually trading kept its startup
+    flags until it was restarted, and the interval had no endpoint at all.
+  * **Things that were simply missing.** Nothing in the page could start or stop
+    the agent - its lifecycle was a console window - and the agent's log existed
+    only in that window, so the browser could not show what the agent was doing
+    while the operator watched it.
+
+The fix is one owner, one setting store, one front end:
+
+  * **A LEASE (`agent.engine_lease`).** Any engine that starts the loop claims it
+    first, recording kind, pid, host, start time and a heartbeat that is renewed
+    on every phase write. A second starter is refused **by name and pid** -
+    `python main.py run` now answers *"the agent is already running in the
+    console engine (pid 4408)"* and exits rather than running a rival loop.
+    `--force` takes it over deliberately. A lease the operator stops is marked
+    RELEASED with a reason, so the page reads *"stopped on purpose at 10:31"*
+    instead of decaying into "no sign of life", which is what a crash looks like.
+  * **The console HOSTS the agent.** `run_ptai.bat` now opens ONE window: the
+    console process, with `PTAI_AGENT_AUTOSTART=1`, starts the loop in its own
+    thread under the same `run_continuous` the CLI uses. Start, Stop, the interval
+    box and "Run a round now" all act on that one loop. The CLI is still the same
+    engine and still works; it is simply not a second one.
+  * **The interval lives in the database (`operator.interval_min`).** The loop
+    re-reads it before every wait, the wait is sliced so a change applies within a
+    minute instead of after the old interval, and a shortened interval ends the
+    wait that is already running. `--interval` on the command line now WRITES that
+    setting instead of pinning a process-local number.
+  * **Mode is read every cycle, with the reason when it cannot be honoured.**
+    The page's switch is the intent; `dry_run` at start-up is the capability. Live
+    needs both, and when the switch is live but the process was started with
+    `--dry-run`, the loop says so in the log and in the page rather than silently
+    trading paper or pretending the click worked.
+  * **"Run a round now" asks the loop; it does not build one.** If the console
+    hosts the agent it wakes it (a threadsafe wake into the agent's own event
+    loop - an `asyncio.Event.set()` from the web thread sets a flag on the wrong
+    loop and changes nothing, which the real console proved before the tests did).
+    If another engine owns the agent, it refuses and names it. If nobody owns it,
+    the console starts it here. The reply says which of the three happened; the
+    figures arrive on the round card from the engine that ran the round.
+  * **The agent's log is on the page.** The console keeps a ring buffer of its own
+    loguru records and serves `/api/console/logs`; the page follows it by
+    sequence number and shows the same lines the command window shows, with the
+    process id and which engine wrote them. The durable file under `logs/` is
+    named next to it.
+  * **Polling follows the work.** The fixed 15-second timer is gone: the page
+    reads every 3 s while an agent is running (the log every 2.5 s), backs off to
+    15 s when nothing is, and polls nothing at all while the tab is hidden. The
+    balance and brain caches fell from 20 s/15 s to 5 s for the same reason -
+    "it takes too long to change" was partly a cache, not the network.
+  * **A cycle announces itself.** The loop writes a working phase and a heartbeat
+    *before* the cycle's first network call, and logs `Starting cycle N` and
+    `cycle N took Xs`. A cycle that hangs in a venue call therefore shows as
+    WORKING with the time it started, instead of the page resting on a stale
+    "next cycle at 08:04" while nothing else happens.
+
+Verified against a running console, not only in tests: the console starts the
+agent under its own pid, `Run a round now` started cycle 2 in the same millisecond
+it was requested, setting the interval to 2 minutes produced
+*"The next cycle starts at 07:59 UTC (every 2 min, set in the console)"* on the
+running loop, Stop released the lease with *"the operator pressed Stop"*, and a
+`main.py run` in another process was refused with the console's pid.
+
 ### An Arbitrage Has To Be One
 
 The scan groups markets by event and adds up their YES prices, because in a group

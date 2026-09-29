@@ -356,7 +356,14 @@ def _print_cycle_result(result: dict) -> None:
 def run(
     bankroll: Optional[float] = typer.Option(None, "--bankroll", "-b", help="Bankroll override"),
     once: bool = typer.Option(False, "--once", help="Run one cycle only"),
-    interval: int = typer.Option(10, "--interval", "-i", help="Interval minutes"),
+    interval: Optional[int] = typer.Option(
+        None, "--interval", "-i",
+        help="Interval minutes. Omit to use the interval set in the console "
+             "(the default is 10)."),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Start even if another engine already owns the agent (one agent "
+             "owns it at a time; this takes it over)"),
     dry_run: bool = typer.Option(True, "--dry-run/--live", help="Dry run"),
     headless: bool = typer.Option(False, "--headless", help="Browser headless"),
     llm: str = typer.Option("auto", "--llm", help="LLM provider: auto, lm_studio, ollama"),
@@ -378,9 +385,24 @@ def run(
     settings.dry_run = dry_run
     settings.llm_provider = llm
 
+    # The interval the operator set in the console is the one that runs. Before
+    # this, `--interval 10` from the .bat was the value forever and the number
+    # on the page only ever described a process that had not started yet.
+    from .agent.engine_host import interval_source, set_operator_interval_minutes
+    _storage = None
+    try:
+        from .storage.db import Storage
+        _storage = Storage()
+        if interval is not None:
+            set_operator_interval_minutes(_storage, interval)
+        _interval = interval_source(_storage)
+    except Exception as e:  # noqa: BLE001 - the loop still gets the CLI value
+        logger.warning(f"Could not read the saved interval: {type(e).__name__}: {e}")
+        _interval = {"minutes": interval or 10, "source": "the command line"}
+
     console.print(Panel(
         f"[bold]Bankroll: ${bankroll or settings.bankroll}\n"
-        f"Interval: {interval}min\n"
+        f"Interval: {_interval['minutes']}min ({_interval['source']})\n"
         f"Dry Run: {dry_run}\n"
         f"Country: {country}\n"
         f"Headless: {headless}\n"
@@ -406,7 +428,10 @@ def run(
             console.print(
                 "[dim]V3 runs the qualification pipeline each cycle. "
                 "Ctrl-C to stop.[/dim]")
-            await agent.run_continuous(interval_minutes=interval)
+            outcome = await agent.run_continuous(interval_minutes=interval,
+                                                 kind="cli", force_lease=force)
+            if outcome and not outcome.get("started"):
+                console.print(f"[yellow]{outcome.get('reason')}[/yellow]")
 
     try:
         asyncio.run(_run())
