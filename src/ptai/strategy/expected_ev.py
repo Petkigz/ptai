@@ -458,6 +458,27 @@ class ExpectedNetEVEngine:
         if opportunity.venue_type.value == "financial" or "crypto" in opportunity.venue_id or "stock" in opportunity.venue_id:
             gross_ev_usd = amount_usd * edge * confidence
         
+        # A two-leg pair is not a directional bet.
+        #
+        # The operator's 2026-09-29 log priced one as though it were: an
+        # opportunity flagged as a Polymarket+PredictIt pair, "fair" = the OTHER
+        # venue's price (0.610) and "market" = this venue's quote (0.0005),
+        # produced "netEV $1218.82" on a $1.00 stake. That number is not a
+        # forecast of anything - the pair's economics are the locked spread
+        # between the two legs, which the arbitrage lane prices from both
+        # books. Pricing it as a long shot at 0.05c is how a refused pair ended
+        # up ranked first. Refuse here rather than report a number no lane can
+        # honour.
+        research_only_note = ""
+        _raw = getattr(opportunity, "raw", None) or {}
+        if isinstance(_raw, dict) and (_raw.get("research_only") or _raw.get("pair")):
+            research_only_note = (
+                "REFUSED: this opportunity is research-only ("
+                + ("two-leg pair" if _raw.get("pair") else "no execution path")
+                + ") - it has no directional economics to price; the arbitrage "
+                  "lane prices both legs from their own books")
+            gross_ev_usd = 0.0
+
         # Net EV after all costs
         total_costs = fees_usd + spread_usd + slippage_usd + gas_usd + funding_usd + execution_loss_usd + uncertainty_penalty_usd
         net_ev_usd = gross_ev_usd - total_costs
@@ -526,6 +547,7 @@ class ExpectedNetEVEngine:
         
         # Should trade if net EV >0 and meets thresholds
         should_trade = (
+            not research_only_note and  # research is not a trade
             net_ev_usd > 0 and
             net_ev_pct >= 0.03 and  # at least 3% net after all costs
             mispricing >= HUNT_MISPRICING_MIN and  # 8% gross, costs charged below
@@ -535,6 +557,7 @@ class ExpectedNetEVEngine:
         )
         
         reasoning = (
+            (research_only_note + " | " if research_only_note else "") +
             f"Gross EV ${gross_ev_usd:.2f} ({gross_ev_pct*100:.1f}%) = fair {fair_prob:.2f} vs mkt {market_price:.2f} edge {edge*100:.1f}% conf {confidence:.2f} * ${amount_usd:.2f} | "
             f"Costs: fees ${fees_usd:.2f} ({fee_pct*100:.1f}%) spread ${spread_usd:.2f} ({spread_pct*100:.1f}%) slippage ${slippage_usd:.2f} ({slippage_pct*100:.1f}%) "
             f"gas ${gas_usd:.2f} funding ${funding_usd:.2f} exec_loss ${execution_loss_usd:.2f} unc_penalty ${uncertainty_penalty_usd:.2f} = total ${total_costs:.2f} | "

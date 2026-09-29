@@ -290,7 +290,11 @@ def _inject_opportunity(agent, market, monkeypatch, edge=0.15):
     )
 
     async def scan_all_venues(self, markets_by_venue, context_provider=None,
-                              max_final_trades=3):
+                              max_final_trades=3, book_lookup=None,
+                              fee_rate_lookup=None, **kwargs):
+        # The real scan also receives this cycle's books and the venue's own fee
+        # reader (V52: an arbitrage exists only at executable prices); the
+        # double has to accept the same call it stands in for.
         return result
 
     monkeypatch.setattr(type(agent.strategy_engine_v3), "scan_all_venues",

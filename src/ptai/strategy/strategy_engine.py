@@ -277,7 +277,8 @@ class StrategyEngineV3:
 
         return opportunities
 
-    async def scan_venue(self, venue_id: str, markets: List[Market], context_provider=None) -> VenueScanReport:
+    async def scan_venue(self, venue_id: str, markets: List[Market], context_provider=None,
+                         book_lookup=None) -> VenueScanReport:
         """Scan single venue with all strategies"""
         start_total = len(markets)
         
@@ -286,7 +287,23 @@ class StrategyEngineV3:
         
         # Evaluate each market with all strategies
         all_opps: List[VenueOpportunity] = []
+        skipped_no_book = 0
         for market in after_liquidity[:100]:  # Limit per venue for performance
+            # A market whose book is not real cannot produce a cost or an edge.
+            # The operator's 2026-09-29 log ran every one of them through the
+            # whole stack - resolution analysis, contradiction, forecaster,
+            # ensemble, edge engine, strategy engine, six lines each, four
+            # hundred markets - and every one of them ended in "REFUSED:
+            # orderbook is not real". The count is reported once instead.
+            if book_lookup is not None:
+                try:
+                    _book = book_lookup(market.id)
+                except Exception:  # noqa: BLE001 - an unreadable book is not a real one
+                    _book = None
+                if isinstance(_book, dict) and _book and not (
+                        _book.get("is_real") and _book.get("validated")):
+                    skipped_no_book += 1
+                    continue
             context = {}
             if context_provider:
                 try:
@@ -327,6 +344,12 @@ class StrategyEngineV3:
             
             opps = self.evaluate_market_with_all_strategies(market, context=context)
             all_opps.extend(opps)
+        
+        if skipped_no_book:
+            logger.info(
+                f"{venue_id}: {skipped_no_book} market(s) not evaluated - their book "
+                f"is an estimate or absent, so there is no cost and no edge to "
+                f"compute (they are counted, not priced)")
         
         # Candidates after strategy evaluation
         candidates = [o for o in all_opps if o.effective_edge >= 0.03]
@@ -424,7 +447,9 @@ class StrategyEngineV3:
         priced = [o for o in opportunities if o is not None]
         return sorted(priced, key=cls.capital_efficiency_key, reverse=True)
 
-    async def scan_all_venues(self, markets_by_venue: Dict[str, List[Market]], context_provider=None, max_final_trades: int = 3) -> MultiVenueScanResult:
+    async def scan_all_venues(self, markets_by_venue: Dict[str, List[Market]], context_provider=None,
+                              max_final_trades: int = 3,
+                              book_lookup=None, fee_rate_lookup=None) -> MultiVenueScanResult:
         """
         Main V3 entry: scan all venues, evaluate all strategies, rank on common basis
         Returns report like:
@@ -444,7 +469,9 @@ class StrategyEngineV3:
         # Scan each venue
         for venue_id, markets in markets_by_venue.items():
             try:
-                report, opps = await self.scan_venue(venue_id, markets, context_provider=context_provider)
+                report, opps = await self.scan_venue(venue_id, markets,
+                                                    context_provider=context_provider,
+                                                    book_lookup=book_lookup)
                 venue_reports.append(report)
                 all_opportunities.extend(opps)
                 
@@ -469,7 +496,11 @@ class StrategyEngineV3:
         all_markets_flat = [m for markets in markets_by_venue.values() for m in markets]
         arbitrage_opps = []
         try:
-            arbitrage_raw = self.arbitrage_engine.find_arbitrage(all_markets_flat[:500])  # Limit for performance
+            # The books this cycle already read, and each venue's own fee
+            # schedule: an arbitrage is only an arbitrage at executable prices.
+            arbitrage_raw = self.arbitrage_engine.find_arbitrage(
+                all_markets_flat[:500],  # Limit for performance
+                book_lookup=book_lookup, fee_rate_lookup=fee_rate_lookup)
             arbitrage_opps = arbitrage_raw
             arb_venue_opps = self.arbitrage_engine.to_venue_opportunities(arbitrage_raw)
             all_opportunities.extend(arb_venue_opps)
@@ -515,7 +546,16 @@ class StrategyEngineV3:
         
         final_selected = tradeable[:max_final_trades]
         
-        best_opp = final_selected[0] if final_selected else (ranked[0] if ranked else None)
+        # The fallback must not name a research-only finding (a two-leg pair, a
+        # basket with no execution path) as the cycle's "best opportunity": the
+        # operator's log showed an aborted pair advertised as the best trade of
+        # the cycle, with edge 1.323 and a $1218.82 EV on a $1.00 stake.
+        def _is_research_only(o) -> bool:
+            raw = getattr(o, "raw", None)
+            return bool(isinstance(raw, dict) and raw.get("research_only"))
+        
+        best_opp = final_selected[0] if final_selected else next(
+            (o for o in ranked if not _is_research_only(o)), None)
         
         elapsed = time.time() - start
         

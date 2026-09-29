@@ -570,6 +570,54 @@ prints the reasons it has, once:
     Reference odds: 0 anchor(s) from 20 market(s), 0 actionable; unavailable:
       deribit - the market has no usable expiry, so the option cannot be priced
 
+### A Similar Question Is Not The Same Market
+
+The 2026-09-29 log printed this eleven times in one cycle, and then traded on it:
+
+    ARBITRAGE FOUND: Same event confidence 0.82: 'Will Sarah Knafo win the 2027
+      French presidential election?' vs 'Who will win the next French
+      presidential election?' | Cost 0.420 profit 0.581 (138.4%) adjusted 112.0%
+      | Trade: True
+
+Knafo is one candidate in the market the second question settles; a gap between
+them is a gap between two different questions, not a mispricing of one. The
+"0.82 same event confidence" was a string-similarity score, which is why the same
+engine flagged a Brazilian candidate against the winner market. Two more lines in
+that log came from the same finding:
+
+    Best opportunity: MarketSource.POLYMARKET+MarketSource.PREDICTIT_arb YES edge
+      1.323
+    ERROR ... ABORT: opportunity venue_id MarketSource.POLYMARKET+MarketSource.
+      PREDICTIT_arb does not match adapter polymarket - exact routing required
+
+The venue id was an enum repr, the pair (two legs, two venues) was being sent down
+the single-venue order path, and the arb lane then died on a field the
+opportunity never had. All three are now rules:
+
+  * **Identity, not similarity.** A pair is the same market only when the
+    normalized questions are identical and, when both venues state an end date,
+    the dates agree within seven days. Everything else is a pair *candidate* -
+    research, printed at DEBUG, never `ARBITRAGE FOUND`.
+  * **Executable prices.** Cost is the cheap leg's ask plus (1 - the other leg's
+    bid), each charged the venue's own taker fee. Both books must be real and
+    validated; if a book is an estimate, absent, or the fee cannot be read, the
+    pair is refused with that reason and the mid-price figure is kept only as
+    `indicative_profit_pct`. A margin under 3% after fees is not tradeable.
+  * **`estimated_profit_pct` means money.** It is 0.0 until a pair is executable,
+    because it is the number the ranking sorts on.
+  * **A pair never reaches the single-venue path.** Converted opportunities carry
+    `should_trade=False`, a routable `polymarket+predictit` venue id, and
+    `raw.research_only`; the arbitrage lane reads the pair itself and builds both
+    legs. The cycle's "best opportunity" line skips research-only findings.
+  * **No modelled EV above the payout.** A $1.00 stake at 0.0005 cannot earn
+    $1218.82 - the best possible outcome of one share is $1.00 minus cost - and
+    that number was printed as `netEV`, ranked first, and pushed to execution.
+    Such an EV is now refused, with both numbers on the refusal.
+  * **No book is counted, not priced.** A market whose book is an estimate or
+    absent is skipped by the venue scan with one counted line
+    (*"N market(s) not evaluated - their book is an estimate or absent"*)
+    instead of running the whole stack to `REFUSED: orderbook is not real`.
+
 ## Logins, Venues, And The Sports Lane
 
 **Logins** are saved in the console's Setup tab and kept encrypted in

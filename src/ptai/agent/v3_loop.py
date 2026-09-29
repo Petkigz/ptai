@@ -1814,6 +1814,11 @@ class TradingAgentV3:
         # ...and what it is DOING, so the console is not blank for the minutes
         # a cycle spends working. Written at each step, not at the end.
         self._set_phase("scanning")
+        # A cycle is a fresh read of the venues. The per-market fee and
+        # neg-risk facts the arbitrage engines consult are re-read here, not
+        # carried over from the previous cycle: a fee schedule that changed
+        # must not be traded on this cycle's stale copy.
+        self._arb_facts_cache = {}
         # Hand the console the venue list it cannot build for itself. The .bat
         # starts the agent and the console as two processes, so the console has
         # no registry to read and used to fall back to "the fundable venues" -
@@ -2271,7 +2276,12 @@ class TradingAgentV3:
         scan_result: MultiVenueScanResult = await self.strategy_engine_v3.scan_all_venues(
             markets_by_venue=markets_by_venue,
             context_provider=self,
-            max_final_trades=max_trades
+            max_final_trades=max_trades,
+            # The books this cycle already read, and the venue's own fee rate:
+            # the arbitrage engine costs a pair off executable prices or refuses
+            # it, and the per-venue scan does not re-price markets with no book.
+            book_lookup=lambda mid: (getattr(self, "_cycle_books", {}) or {}).get(mid),
+            fee_rate_lookup=self._arb_fee_rate,
         )
         logger.info(f"Common scoring: {len(scan_result.venue_reports)} venues, {scan_result.total_candidates} candidates, {scan_result.total_tradeable} tradeable after fees/liquidity/uncertainty")
         # WHY nothing traded. A cycle that refused everything used to look
@@ -3707,7 +3717,20 @@ class TradingAgentV3:
             try:
                 opp_a, opp_b = self.multi_venue_executor.arb_leg_opportunities(arb)
             except Exception as e:
-                logger.error(f"Arb lane could not build the legs of {arb}: {e}")
+                # One line, with the consequence: the pair is not attempted and
+                # it is recorded as such. This used to be an ERROR, which reads
+                # in the operator's log like a crash rather than a refused pair.
+                logger.warning(
+                    f"Arb pair {arb.venue_a} vs {arb.venue_b} not attempted: its "
+                    f"legs could not be built ({type(e).__name__}: {e})")
+                summary["results"].append({
+                    "venue_a": arb.venue_a, "venue_b": arb.venue_b,
+                    "attempted": False, "reason": f"leg build failed: {e}"})
+                execution_results.append({
+                    "lane": "arbitrage", "venue": f"{arb.venue_a}+{arb.venue_b}",
+                    "market_id": f"{arb.market_a.id}+{arb.market_b.id}",
+                    "status": "blocked", "reason": f"leg build failed: {e}",
+                    "position_recorded": False})
                 continue
 
             reason = await self._arbitrage_blocked(arb, opp_a, opp_b, free_capital)

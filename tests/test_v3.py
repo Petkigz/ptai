@@ -137,14 +137,24 @@ class TestArbitrageEngine:
         score = engine._same_event_score(m1, m2)
         assert score < 0.5
 
-    def test_arbitrage_detection(self):
+    def test_arbitrage_candidate_needs_books_to_be_tradeable(self):
+        """
+        V52: the same question quoted 0.61 and 0.72 is a CANDIDATE, not a
+        trade. No book was supplied, so there is no cost and no profit - the
+        quote gap is quote data, and `estimated_profit_pct` (the name the
+        ranking and the reports sort on) stays 0 until it is executable.
+        """
         engine = ArbitrageEngine(min_spread=0.03, min_confidence_same_event=0.5)
         m1 = make_market(id="POLY-TRUMP", question="Will Trump win 2024 election?", price=0.61, source=MarketSource.POLYMARKET)
         m2 = make_market(id="KALSHI-TRUMP", question="Will Trump win 2024 election?", price=0.72, source=MarketSource.KALSHI)
         arbs = engine.find_arbitrage([m1, m2])
         assert len(arbs) > 0
         assert arbs[0].spread >= 0.03
-        assert arbs[0].estimated_profit_pct > 0
+        assert arbs[0].identity_verified is True
+        assert arbs[0].should_trade is False
+        assert arbs[0].estimated_profit_pct == 0.0
+        assert arbs[0].indicative_profit_pct > 0
+        assert "no validated executable book" in arbs[0].blocked_reason
 
     def test_no_arbitrage_same_venue(self):
         engine = ArbitrageEngine()
@@ -153,17 +163,38 @@ class TestArbitrageEngine:
         arbs = engine.find_arbitrage([m1, m2])
         assert len(arbs) == 0, "Same venue should not be arbitrage"
 
-    def test_arbitrage_to_venue_opportunity(self):
+    def test_arbitrage_to_venue_opportunity_is_research_only(self):
+        """
+        V52: a pair is two legs on two venues. The directional path can send
+        one order to one adapter, so the converted opportunity is research
+        only - and a pair that is not executable produces no opportunity at
+        all (the operator's log had a refused pair ranked as the best trade).
+        """
         engine = ArbitrageEngine(min_spread=0.03, min_confidence_same_event=0.5)
         m1 = make_market(id="POLY-TRUMP", question="Will Trump win 2024 election?", price=0.61, source=MarketSource.POLYMARKET)
         m2 = make_market(id="KALSHI-TRUMP", question="Will Trump win 2024 election?", price=0.72, source=MarketSource.KALSHI)
+
+        # Not executable (no books): nothing is handed to the single-venue path.
         arbs = engine.find_arbitrage([m1, m2])
-        # Force tradeable for test
-        for arb in arbs:
-            arb.should_trade = True
-        venue_opps = engine.to_venue_opportunities(arbs)
-        assert len(venue_opps) > 0
+        assert arbs[0].should_trade is False
+        assert engine.to_venue_opportunities(arbs) == []
+
+        # Executable: Poly's ask 0.63 + Kalshi's NO at 1 - 0.70 = 0.28, and
+        # both venues' own fees. It converts, still research-only.
+        books = {
+            "POLY-TRUMP": {"bid": 0.59, "ask": 0.63, "is_real": True, "validated": True},
+            "KALSHI-TRUMP": {"bid": 0.70, "ask": 0.74, "is_real": True, "validated": True},
+        }
+        executable = engine.find_arbitrage(
+            [m1, m2], book_lookup=books.get, fee_rate_lookup=lambda m: {"rate": 0.0})
+        assert executable[0].should_trade is True
+        assert executable[0].fee_adjusted_profit == executable[0].estimated_profit_pct > 0
+        venue_opps = engine.to_venue_opportunities(executable)
+        assert len(venue_opps) == 1
         assert venue_opps[0].category == "arbitrage"
+        assert venue_opps[0].should_trade is False
+        assert venue_opps[0].raw["research_only"] is True
+        assert venue_opps[0].venue_id == "polymarket+kalshi"
 
 
 class TestStrategyEngines:

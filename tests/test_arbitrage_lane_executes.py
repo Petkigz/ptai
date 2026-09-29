@@ -93,7 +93,11 @@ def _inject_pair(agent, monkeypatch, arb) -> None:
     )
 
     async def scan_all_venues(self, markets_by_venue, context_provider=None,
-                              max_final_trades=3):
+                              max_final_trades=3, book_lookup=None,
+                              fee_rate_lookup=None):
+        # The real scan now also takes the cycle's books and the venue fee
+        # rates (an arbitrage is only an arbitrage at executable prices); this
+        # double has to accept the same signature it stands in for.
         return result
 
     monkeypatch.setattr(type(agent.strategy_engine_v3), "scan_all_venues",
