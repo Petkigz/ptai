@@ -48,6 +48,14 @@ class VenueScanReport:
     top_opportunity: Optional[VenueOpportunity] = None
     avg_edge: float = 0.0
     avg_score: float = 0.0
+    # WHAT THE SCAN ACTUALLY DID with this venue's markets, as opposed to what
+    # the screen PLANNED. The operator's log said "199 priced on the cheap
+    # context only" while the very next line of the same cycle said 99 markets
+    # were "not evaluated - their book is an estimate or absent". Prices and
+    # plans are different facts and they get different counters.
+    evaluated: int = 0          # markets that reached the pricing stage
+    skipped_no_book: int = 0    # ...of the iterated ones, how many had no usable book
+    beyond_cap: int = 0         # markets the per-venue cap left unpriced
 
 
 @dataclass
@@ -317,6 +325,7 @@ class StrategyEngineV3:
         # Evaluate each market with all strategies
         all_opps: List[VenueOpportunity] = []
         skipped_no_book = 0
+        evaluated = 0
         for market in after_liquidity[:self.evaluate_limit]:  # per-venue cap
             # A market whose book is not real cannot produce a cost or an edge.
             # The operator's 2026-09-29 log ran every one of them through the
@@ -371,6 +380,7 @@ class StrategyEngineV3:
                     "sources": [],
                 }
             
+            evaluated += 1
             opps = self.evaluate_market_with_all_strategies(market, context=context)
             all_opps.extend(opps)
         
@@ -414,7 +424,11 @@ class StrategyEngineV3:
             tradeable=len(tradeable),
             top_opportunity=top_opp,
             avg_edge=avg_edge,
-            avg_score=avg_score
+            avg_score=avg_score,
+            evaluated=evaluated,
+            skipped_no_book=skipped_no_book,
+            # everything the scan read but never iterated because of the cap
+            beyond_cap=max(0, len(after_liquidity) - self.evaluate_limit),
         ), all_opps
 
     def price_opportunity(self, opp: VenueOpportunity,

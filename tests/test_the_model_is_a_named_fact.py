@@ -362,6 +362,9 @@ def _agent_stub(router, screen: Optional[Dict[str, Any]] = None):
 
     class _Agent:
         llm_router = router
+        # a completed scan, so the line can report what was priced
+        _cycle_scan_counts = {"venues": 1, "evaluated": 41, "skipped_no_book": 12,
+                              "beyond_cap": 0, "discovered": 60}
         _screen = screen if screen is not None else {
             "considered": 40, "shortlist": [{}] * 8, "screened_out": 32}
     _Agent._local_model_status = TradingAgentV3._local_model_status
@@ -382,7 +385,11 @@ class TestTheCycleNamesTheModel:
         assert "2 of 2 call(s) answered" in line
         assert "qwen2.5-14b-instruct x2" in line
         assert "NOT USED" not in line
-        assert "model time went to 8 of 40 screened market(s); 32 priced on their measured book alone" in line
+        # V55: the tail is about PRICES, not plans - the screen's numbers stay,
+        # and what was actually priced comes from the venues' own reports.
+        assert "the screen chose 8 of 40 market(s) for deep analysis" in line
+        assert ("venue scan: priced 41 market(s) of the 60 read "
+                "(12 had no usable book, 0 beyond their venue's cap)") in line
 
     def test_a_cycle_with_no_shortlist_says_the_model_was_never_asked(self, monkeypatch):
         _fake_lm_studio(monkeypatch, ["qwen2.5-14b-instruct"])
@@ -517,7 +524,7 @@ class TestARealCycleSaysIt:
             "a cycle that gave the model no work must say so, not look quiet")
         assert result["local_model"]["model"] == "qwen2.5-14b-instruct"
         assert result["local_model"]["used"] is False
-        assert "model time went to" in model_lines[-1]
+        assert "the screen chose" in model_lines[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -555,3 +562,75 @@ class TestTheLogRingSurvivesSomethingCallingLoggerRemove:
         fresh = live_log.tail(after=body["next"], limit=200)
         assert any("after the read" in line["text"] for line in fresh["lines"]), (
             "the ring did not re-attach, so nothing new reaches the page")
+
+
+# ----------------------------------------------------------------------
+# one model per install
+# ----------------------------------------------------------------------
+
+class TestOneModelPerInstall:
+    """Two processes, one model.
+
+    The 16:53 log named `qwen/qwen3-14b` in the router's detection line and
+    `qwen3.8-27b-...` in the cycle's model line, in the same minute: the agent
+    and the console had each made their own auto pick from LM Studio's list,
+    whose order is not stable. The first auto pick is remembered beside the
+    database, so every process in one install calls one model.
+    """
+
+    def test_two_routers_in_one_install_pick_the_same_model(self, tmp_path,
+                                                            monkeypatch):
+        monkeypatch.setenv("PTAI_DB", str(tmp_path / "ptai.db"))
+        monkeypatch.setenv("PTAI_DATA_DIR", str(tmp_path))
+        _fake_lm_studio(monkeypatch, ["qwen3.8-27b-fast",
+                                      "deepseek-r1-distill-qwen-32b"])
+        first = LLMRouter(preferred="lm_studio", model="local-model",
+                          lm_studio_host="http://localhost:1234")
+        second = LLMRouter(preferred="lm_studio", model="local-model",
+                           lm_studio_host="http://localhost:1234")
+        assert first.active_model
+        assert first.active_model == second.active_model
+
+    def test_the_choice_is_remembered_next_to_the_database(self, tmp_path,
+                                                           monkeypatch):
+        monkeypatch.setenv("PTAI_DB", str(tmp_path / "ptai.db"))
+        monkeypatch.setenv("PTAI_DATA_DIR", str(tmp_path))
+        _fake_lm_studio(monkeypatch, ["qwen3.8-27b-fast"])
+        LLMRouter(preferred="lm_studio", model="local-model",
+                  lm_studio_host="http://localhost:1234")
+        from src.ptai.llm.provider import remembered_model
+        assert remembered_model() == "qwen3.8-27b-fast"
+        assert (tmp_path / "llm_selection.json").exists()
+
+    def test_a_pinned_model_is_never_overridden_by_memory(self, tmp_path,
+                                                          monkeypatch):
+        monkeypatch.setenv("PTAI_DB", str(tmp_path / "ptai.db"))
+        monkeypatch.setenv("PTAI_DATA_DIR", str(tmp_path))
+        _fake_lm_studio(monkeypatch, ["qwen3.8-27b-fast", "operator-choice"])
+        from src.ptai.llm.provider import remember_model
+        remember_model("qwen3.8-27b-fast", ["qwen3.8-27b-fast"])
+        router = LLMRouter(preferred="lm_studio", model="operator-choice",
+                           lm_studio_host="http://localhost:1234")
+        assert router.active_model == "operator-choice"
+        assert "pinned" in router.active_model_reason
+
+    def test_the_detection_line_is_said_once_per_process(self, tmp_path,
+                                                         monkeypatch):
+        monkeypatch.setenv("PTAI_DB", str(tmp_path / "ptai.db"))
+        monkeypatch.setenv("PTAI_DATA_DIR", str(tmp_path))
+        _fake_lm_studio(monkeypatch, ["qwen3.8-27b-fast"])
+        from src.ptai.llm import provider as _provider
+        _provider._DETECTIONS_SAID.clear()   # a fresh process for this test
+        lines, done = _captured()
+        try:
+            LLMRouter(preferred="lm_studio", model="local-model",
+                      lm_studio_host="http://localhost:1234")
+            LLMRouter(preferred="lm_studio", model="local-model",
+                      lm_studio_host="http://localhost:1234")
+        finally:
+            done()
+        said = [l for l in lines
+                if "LOCAL MODEL:" in l and "(already reported)" not in l]
+        assert len(said) == 1, (
+            f"the console builds a router per request; the detect line must not "
+            f"repeat: {said}")

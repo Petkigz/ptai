@@ -85,6 +85,31 @@ def _router(**kwargs) -> _StubRouter:
     return r
 
 
+
+class _Capture:
+    """Collect loguru messages for one block of code."""
+
+    def __init__(self):
+        self.lines = []
+
+    def __enter__(self):
+        from loguru import logger
+        self._sink = logger.add(
+            lambda m: self.lines.append((m.record["level"].name,
+                                         m.record["message"])),
+            level="DEBUG")
+        return self
+
+    def __exit__(self, *exc):
+        from loguru import logger
+        logger.remove(self._sink)
+        return False
+
+    def messages(self, level=None):
+        return [msg for lvl, msg in self.lines
+                if level is None or lvl == level]
+
+
 class _Agent:
     """The two methods under test, over a synthetic cycle state."""
 
@@ -167,7 +192,8 @@ class TestAskedAndAnswered:
         agent = _status_agent(router=router, shortlist=8, considered=899,
                               priced=2, deep_priced=2, asked=2, answered=2)
         line = agent._local_model_line()
-        assert "2 of 2 market(s) asked were answered" in line
+        assert "markets asked: 2" in line
+        assert "2 of 2 call(s) answered" in line
         assert "NOT USED" not in line
 
     def test_asked_and_nothing_came_back_names_the_problem(self):
@@ -190,8 +216,7 @@ class TestAskedAndAnswered:
         agent = _status_agent(router=router, shortlist=1, considered=10,
                               priced=1, deep_priced=1, asked=1, answered=0)
         reason = agent._local_model_status()["not_used_reason"]
-        assert "reached the model and the call was never counted by the router" \
-            in reason
+        assert "the ask never reached the provider" in reason
 
 
 # ----------------------------------------------------------------------
@@ -223,6 +248,7 @@ class TestTheEnsembleCountsWhatItWasAsked:
     def test_the_ensemble_counts_a_market_it_was_asked_about(self, monkeypatch):
         ensemble = EnsembleForecaster(llm_router=_router())
         assert ensemble.llm_accounting() == {"asked": 0, "answered": 0,
+                                             "forecasts_run": 0,
                                              "problems": []}
         from src.ptai.markets.base import Market, MarketSource, DataMode
         market = Market(id="m1", source=MarketSource.POLYMARKET,
@@ -242,6 +268,7 @@ class TestTheEnsembleCountsWhatItWasAsked:
         ensemble.llm_answered = 3
         ensemble.reset_llm_accounting()
         assert ensemble.llm_accounting() == {"asked": 0, "answered": 0,
+                                             "forecasts_run": 0,
                                              "problems": []}
 
     def test_a_fallback_answer_is_not_counted_as_an_answer(self):
@@ -421,7 +448,7 @@ class TestTheShortlistReachesTheScan:
         assert status["deep_shortlist"] > 0
         assert status["asked"] == status["deep_shortlist"]
         assert status["used"] is True
-        assert "asked were answered" in agent._local_model_line()
+        assert "markets asked" in agent._local_model_line()
 
     @pytest.mark.asyncio
     async def test_the_screen_says_how_many_the_cap_will_drop(
@@ -467,3 +494,180 @@ class _StubRegistry:
 
     def get_adapter_for_market(self, market):
         return self.adapter
+
+
+# ----------------------------------------------------------------------
+# the second half of the same defect: a plan is not a price
+# ----------------------------------------------------------------------
+
+class TestAPlanIsNotAPrice:
+    """The 16:53 cycle, where the model line was wrong again - in a new way.
+
+    It read:
+
+        NOT USED THIS CYCLE: 1 market(s) were priced in full without the model:
+        this process has no model router wired to the forecast engine
+
+    while the same cycle showed `Priced 4949306 in 0.0s: no trade (fair 0.595
+    vs market 0.595) - Blocked by resolution risk`. The router was wired; the
+    one deep market was refused by a gate BEFORE the forecast, so the model was
+    never reached. And the line's tail said "199 priced on their measured book
+    alone" in a cycle where the venues priced one market - the 199 was the
+    screen's plan.
+    """
+
+    def test_a_deep_market_refused_before_the_forecast_says_so(self):
+        agent = _status_agent(router=_router(), shortlist=1, considered=200,
+                              priced=1, deep_priced=1, asked=0, answered=0)
+        status = agent._local_model_status()
+        status["forecasts_run"] = 0
+        agent._accounting["forecasts_run"] = 0
+        reason = agent._local_model_status()["not_used_reason"]
+        assert "refused before a forecast was built" in reason
+        assert "the model was never asked" in reason
+        assert "no model router wired" not in reason
+
+    def test_a_forecast_that_ran_without_a_router_still_says_that(self):
+        agent = _status_agent(router=_router(), shortlist=1, considered=200,
+                              priced=1, deep_priced=1)
+        agent._accounting["forecasts_run"] = 3
+        reason = agent._local_model_status()["not_used_reason"]
+        assert "no model router wired to the forecast engine" in reason
+
+    def test_the_tail_reports_the_venues_own_counts(self):
+        agent = _status_agent(router=_router(), shortlist=1, considered=200,
+                              priced=1, deep_priced=1)
+        agent._cycle_scan_counts = {"venues": 19, "evaluated": 1,
+                                    "skipped_no_book": 99, "beyond_cap": 100,
+                                    "discovered": 200}
+        line = agent._local_model_line()
+        assert ("venue scan: priced 1 market(s) of the 200 read (99 had no "
+                "usable book, 100 beyond their venue's cap)") in line
+        assert "priced on their measured book alone" not in line
+
+    def test_the_screen_line_does_not_call_a_plan_a_price(self):
+        from src.ptai.agent.v3_loop import TradingAgentV3
+        source = inspect.getsource(TradingAgentV3._prescan_and_rank)
+        assert "none of them has been priced yet" in source
+        assert "priced on the cheap context only" not in source
+        assert "they cannot be priced" in source
+
+    def test_the_scan_report_carries_what_it_actually_did(self):
+        from src.ptai.strategy.strategy_engine import StrategyEngineV3
+
+        class _Ctx:
+            async def get_context(self, market):
+                return {"deep_analysis": True}
+
+        engine = StrategyEngineV3()
+        markets = [self._market(f"m{i}") for i in range(3)]
+
+        async def _scan():
+            return await engine.scan_venue("polymarket", markets,
+                                           context_provider=_Ctx(),
+                                           book_lookup=lambda mid: {
+                                               "is_real": True, "validated": True,
+                                               "spread": 0.02, "depth": 5000})
+
+        import asyncio
+        report, _opps = asyncio.run(_scan())
+        assert report.evaluated == 3
+        assert report.skipped_no_book == 0
+        assert report.beyond_cap == 0
+
+    def test_a_market_with_no_usable_book_is_counted_not_priced(self):
+        from src.ptai.strategy.strategy_engine import StrategyEngineV3
+
+        class _Ctx:
+            async def get_context(self, market):
+                return {"deep_analysis": True}
+
+        engine = StrategyEngineV3()
+        markets = [self._market("a"), self._market("b")]
+
+        async def _scan():
+            return await engine.scan_venue(
+                "polymarket", markets, context_provider=_Ctx(),
+                book_lookup=lambda mid: {"is_real": False, "validated": False})
+
+        import asyncio
+        report, _opps = asyncio.run(_scan())
+        assert report.evaluated == 0
+        assert report.skipped_no_book == 2
+
+    def test_markets_beyond_the_per_venue_cap_are_counted(self):
+        from src.ptai.strategy.strategy_engine import StrategyEngineV3
+
+        class _Ctx:
+            async def get_context(self, market):
+                return {"deep_analysis": True}
+
+        engine = StrategyEngineV3()
+        engine.evaluate_limit = 5
+        markets = [self._market(f"m{i}", volume_24h=40_000 + i)
+                   for i in range(12)]
+
+        async def _scan():
+            return await engine.scan_venue(
+                "polymarket", markets, context_provider=_Ctx(),
+                book_lookup=lambda mid: {"is_real": True, "validated": True,
+                                         "spread": 0.02, "depth": 5000})
+
+        import asyncio
+        report, _opps = asyncio.run(_scan())
+        assert report.evaluated == 5
+        assert report.beyond_cap == 7
+
+    def _market(self, market_id, **overrides):
+        from src.ptai.markets.base import Market, MarketSource, DataMode
+        fields = dict(id=market_id, source=MarketSource.POLYMARKET,
+                      question="Will it happen?", outcome_prices=[0.42],
+                      volume_24h=50_000, liquidity=5_000,
+                      venue_id="polymarket", data_mode=DataMode.LIVE,
+                      raw={"venue_id": "polymarket"})
+        fields.update(overrides)
+        return Market(**fields)
+
+
+# ----------------------------------------------------------------------
+# the counters themselves
+# ----------------------------------------------------------------------
+
+class TestTheCountersCount:
+    def test_a_forecast_is_counted_where_it_runs(self):
+        """forecasts_run separates "reached pricing" from "built a forecast".
+
+        The 16:53 cycle had one deep market, refused by the resolution gate
+        before the ensemble ran. Without this counter the line could only see
+        "1 priced" and blamed the missing router.
+        """
+        from src.ptai.intelligence.ensemble import EnsembleForecaster
+        from src.ptai.markets.base import Market, MarketSource, DataMode
+        ens = EnsembleForecaster()
+        assert ens.llm_accounting()["forecasts_run"] == 0
+        market = Market(id="m1", source=MarketSource.POLYMARKET,
+                        question="Will it happen?", outcome_prices=[0.4],
+                        volume_24h=50_000, liquidity=5_000, venue_id="polymarket",
+                        data_mode=DataMode.LIVE, raw={"venue_id": "polymarket"})
+        ens.forecast_market(market, context={"deep_analysis": True})
+        assert ens.llm_accounting()["forecasts_run"] == 1
+        ens.reset_llm_accounting()
+        assert ens.llm_accounting()["forecasts_run"] == 0
+
+    def test_an_ask_that_was_never_counted_as_a_call_is_named(self):
+        agent = _status_agent(router=_router(), shortlist=1, considered=10,
+                              priced=1, deep_priced=1, asked=3, answered=0)
+        status = agent._local_model_status()
+        assert status["asks_without_calls"] == 3
+        line = agent._local_model_line()
+        assert "WIRING GAP" in line
+        assert "never reached the provider" in line
+
+    def test_no_wiring_gap_is_claimed_when_the_calls_match(self):
+        router = _router()
+        router.usage = {"calls": 3, "answered": 0, "failed": 3, "seconds": 5.0,
+                        "models": {}, "last_model": "", "last_error": "boom"}
+        agent = _status_agent(router=router, shortlist=1, considered=10,
+                              priced=3, deep_priced=3, asked=3, answered=0,
+                              problems=["boom"])
+        assert agent._local_model_status()["asks_without_calls"] == 0

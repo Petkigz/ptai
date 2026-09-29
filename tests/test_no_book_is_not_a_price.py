@@ -218,7 +218,7 @@ class TestNoBookIsARefusal:
 
         summary = [line for line in lines if "Cheap screen:" in line]
         assert len(summary) == 1, lines
-        assert "2 had no venue book at all (not priced)" in summary[0]
+        assert "2 had no venue book at all (they cannot be priced)" in summary[0]
         assert screen["no_book"] == 2
         assert [row["market_id"] for row in screen["shortlist"]] == ["listed-1"]
         assert "ESTIMATED orderbook" not in " ".join(lines)

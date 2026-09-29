@@ -895,9 +895,11 @@ The model id is now a named fact at every point where it is decided or used:
     Brain [LMStudioProvider/qwen3.8-27b-...]: Will the bill pass? | Market 60.0%
       Fair 62.0% Edge +2.0% Conf 0.70 Trade? False | basis research
     Local model: qwen3.8-27b-... (LMStudioProvider at http://localhost:1234/v1) -
-      auto: picked ... | 8 of 8 call(s) answered in 27.1s (qwen3.8-27b-... x8) |
-      model time went to 8 of 200 screened market(s); 192 priced on their
-      measured book alone
+      auto: ... | markets asked: 8 | 8 of 8 call(s) answered in 27.1s
+      (qwen3.8-27b-... x8) | the screen chose 8 of 200 market(s) for deep
+      analysis (a plan: 8 of them reached the pricing stage) | venue scan:
+      priced 41 market(s) of the 200 read (99 had no usable book, 60 beyond
+      their venue's cap)
 
 The per-cycle line is printed by every cycle, including a cycle that discovered
 nothing and takes the early-return path. When the model did no work it says so
@@ -906,8 +908,9 @@ and says why, with the endpoint:
     Local model: none - no local model server answered (lm_studio
       http://localhost:1234, ollama http://localhost:11434); markets are priced
       without a model | NOT USED THIS CYCLE: no local model server answered, so
-      every market was priced without a model | model time went to 0 of 0
-      screened market(s); 0 priced on their measured book alone
+      every market was priced without a model | the screen chose 0 of 0
+      market(s) for deep analysis (a plan: 0 of them reached the pricing stage)
+      | venue scan: priced 0 market(s) of the 0 read
 
   * **One decision, three readers.** The router resolves the model once, at
     detection, with `choose_loaded_model` - the same function the console's
@@ -926,6 +929,95 @@ and says why, with the endpoint:
     (the operator may start LM Studio mid-run) and reports the first miss in
     full; the retries are DEBUG, so a whole scan no longer prints one "no model"
     line per market.
+
+## The Model Line Counts What Happened
+
+The next run's log carried the V55 model line, and it was still wrong - in a new
+way:
+
+    Local model: qwen/qwen3-14b (LMStudioProvider at http://localhost:1234/v1) -
+      auto: first loaded model is qwen/qwen3-14b | NOT USED THIS CYCLE: 1
+      market(s) were priced in full without the model: this process has no model
+      router wired to the forecast engine | model time went to 1 of 200 screened
+      market(s); 199 priced on their measured book alone
+
+Four sentences, four different facts, three of them wrong:
+
+  * **the market was not "priced without the model"** - it was the one market
+    chosen for deep analysis (4949306) and the *resolution* gate refused it
+    before a forecast was ever built, which the same log said two lines later:
+    `Blocked by resolution risk`. The model was not skipped; it was never
+    reached;
+  * **"no model router wired to the forecast engine" was false** - a local model
+    had been detected and named in the same line;
+  * **"model time went to 1 of 200"** - 1 was the deep SHORTLIST, a plan made
+    before any pricing. The router recorded zero calls: no model time went
+    anywhere;
+  * **"199 priced on their measured book alone"** - 199 was the number the
+    screen did not give model time to. The same cycle's scan said most of them
+    were never priced at all.
+
+The line is now built from three counters, kept apart on purpose:
+
+| counter | what it means | where it is incremented |
+|---|---|---|
+| `priced` / `deep_priced` | markets that reached the pricing stage (deep ones separately) | the context provider, once per market it is asked about |
+| `forecasts_run` | forecasts the ensemble actually built | `EnsembleForecaster.forecast_market` |
+| `asked` / `answered_by_model` | markets handed to the model step, and markets the model answered | the ensemble's LLM branch, at the call |
+| `calls` / `answered` / `failed` | calls the provider made | the router, at `chat()` |
+
+...and it says which of the six ways the cycle stopped:
+
+    NOT USED THIS CYCLE: 1 market(s) reached the pricing stage and were refused
+      before a forecast was built, so the model was never asked - the cycle's
+      own refusal line for each one names the gate (resolution risk,
+      contradiction)
+
+The other sentences it can produce: no model server answered; N market(s)
+reached the model step and none was answered (with the reason); the router
+recorded calls but no market reached the model step; N market(s) were chosen for
+deep analysis but none reached the pricing stage (they were filtered out on
+volume, liquidity or an unvalidated book); no market reached the deep shortlist;
+or the shortlist was priced and forecasts were built but not one was handed to
+the model - the actual wiring gap, which is now the *only* reason that sentence
+is reachable. When the two counters disagree - asks that produced no recorded
+call - the line says `WIRING GAP: N of those ask(s) produced no recorded call at
+all, so they never reached the provider`, which is the honest version of "8
+markets were sent to the model but no answer was recorded".
+
+**And the tail is about prices, not plans.** `199 priced on their measured book
+alone` is gone: the screen's line now says `none of them has been priced yet`
+(and names why each was dropped), and what was actually priced comes from the
+venues' own reports: `venue scan: priced N market(s) of the M read (K had no
+usable book, B beyond their venue's cap)`. Those three numbers account for every
+market the screen read - priced, refused for its book, or past the venue's own
+cap.
+
+**One model per install.** The same log named `qwen/qwen3-14b` in the router's
+detection line and `qwen3.8-27b-...` in the cycle's model line, in the same
+minute: the agent and the console had each made their own auto pick from LM
+Studio's list, whose order is not stable. The first auto pick is now remembered
+next to the database (`data/llm_selection.json`) and reused by every process in
+this install while it is still loaded, so one machine calls one model; the
+detection line is printed once per process (the console builds a router per
+request), and a pinned model in Setup still overrides the memory.
+
+**A refusal is one fact.** The same cycle printed
+
+    CLOB orderbook for <id> REJECTED by validation (no usable levels) - refusing
+    to price against it
+
+about forty times, once per market. The refusal is right and stays - a book that
+failed validation never becomes a cost or an edge - but each distinct reason is
+now reported once and then counted, and the cycle's scan line reports the total:
+`polymarket: 40 orderbook(s) refused this cycle and never priced against (no
+usable levels x40)`. Nothing is printed for the repeats at all, not even at
+DEBUG, because DEBUG is on on this machine.
+
+**The screen only shortlists markets the scan will price.** The screen applies
+the same volume and liquidity floors the venue scan does, so model budget cannot
+be spent planning for markets the pricing stage discards - the failure mode
+behind "8 chosen for deep analysis" in a cycle that asked the model nothing.
 
 ## Extending to Other Sites
 

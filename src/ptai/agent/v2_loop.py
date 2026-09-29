@@ -109,7 +109,12 @@ class TradingAgentV2:
         )
         
         # Intelligence
-        self.calibration_engine = CalibrationDB(db_path="./data/calibration.json", storage=self.storage, memory=self.memory)
+        # ...beside the database this loop is actually using, so a console-started
+        # agent and the page cannot read two different calibration files.
+        self.calibration_engine = CalibrationDB(
+            db_path=str(Path(getattr(self.storage, "db_path", "data/ptai.db")).parent
+                        / "calibration.json"),
+            storage=self.storage, memory=self.memory)
         self.uncertainty_engine = UncertaintyEngine()
         self.resolution_analyzer = ResolutionAnalyzer(llm_router=self.llm_router)
         self.contradiction_engine = ContradictionEngine(llm_router=self.llm_router)

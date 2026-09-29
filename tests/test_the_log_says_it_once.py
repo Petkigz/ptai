@@ -315,3 +315,67 @@ class TestAMissingReaderIsSaidOncePerVenue:
         source = inspect.getsource(TradingAgentV3._arb_venue_facts)
         assert 'hasattr(adapter, "get_mechanics")' not in source
         assert "adapter._mechanics_absent_noted" in source
+
+
+# ----------------------------------------------------------------------
+# the refusals a venue reports per market
+# ----------------------------------------------------------------------
+
+class TestARefusalIsOneFact:
+    """The 16:53 cycle printed the same CLOB rejection ~40 times.
+
+        CLOB orderbook for <id> REJECTED by validation (no usable levels) -
+        refusing to price against it
+
+    once per market. The refusal is right - a book that failed validation must
+    never become a cost or an edge - and it is ONE fact about ONE venue, so it
+    is said once and then counted.
+    """
+
+    def _adapter(self):
+        from src.ptai.venues.polymarket_adapter import PolymarketAdapter
+        return PolymarketAdapter(private_key="", funder="")
+
+    def test_the_first_rejection_is_a_warning_and_the_rest_are_silent(self):
+        adapter = self._adapter()
+        cap = _Capture()
+        try:
+            for i in range(40):
+                adapter._note_clob_rejection(f"m{i}", "no usable levels")
+        finally:
+            cap.close()
+        warnings = [m for m in cap.messages("WARNING") if "REJECTED" in m]
+        assert len(warnings) == 1, (
+            f"forty identical refusals must not print forty times: {warnings[:3]}")
+        assert "m0" in warnings[0]
+        # ...and nothing else was printed for them at any level
+        assert not [m for m in cap.messages() if "rejected again" in m]
+
+    def test_the_count_is_kept_and_reset_per_cycle(self):
+        adapter = self._adapter()
+        for i in range(40):
+            adapter._note_clob_rejection(f"m{i}", "no usable levels")
+        for i in range(3):
+            adapter._note_clob_rejection(f"x{i}", "crossed book")
+        assert adapter.clob_rejection_summary() == {"no usable levels": 40,
+                                                   "crossed book": 3}
+        adapter.reset_clob_rejections()
+        assert adapter.clob_rejection_summary() == {}
+
+    def test_the_cycle_reports_the_total_once(self):
+        from src.ptai.agent.v3_loop import TradingAgentV3
+        source = inspect.getsource(TradingAgentV3.run_cycle)
+        assert "clob_rejection_summary" in source
+        assert "orderbook(s) " in source and "refused this cycle" in source
+
+    def test_each_reason_is_reported_separately(self):
+        adapter = self._adapter()
+        cap = _Capture()
+        try:
+            adapter._note_clob_rejection("a", "no usable levels")
+            adapter._note_clob_rejection("b", "crossed book")
+            adapter._note_clob_rejection("c", "no usable levels")
+        finally:
+            cap.close()
+        warnings = [m for m in cap.messages("WARNING") if "REJECTED" in m]
+        assert len(warnings) == 2, "two different reasons are two facts"

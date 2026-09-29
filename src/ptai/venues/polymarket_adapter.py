@@ -382,6 +382,47 @@ class PolymarketAdapter(MarketAdapter):
                           "be computed"),
         }
 
+    # --- one line per fact, not one line per market ----------------------
+    def _note_clob_rejection(self, market_id: str, why: str) -> None:
+        """Report each distinct CLOB rejection reason ONCE, then count it.
+
+        The operator's log carried ~40 identical
+        `CLOB orderbook for <id> REJECTED by validation (no usable levels) -
+        refusing to price against it` WARNING lines in a single cycle. He reads
+        the log as the report, so forty copies of one sentence about one venue
+        is forty lines of nothing: the rejections are one fact, and the count
+        is another. The memory lives on the adapter because the adapter is what
+        sees every market of the cycle.
+        """
+        reason = (why or "no usable levels").strip()
+        counts = getattr(self, "_clob_rejected_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            try:
+                self._clob_rejected_counts = counts
+            except Exception:  # noqa: BLE001 - a frozen adapter may refuse
+                counts = {}
+        seen = counts.get(reason, 0) + 1
+        counts[reason] = seen
+        if seen == 1:
+            logger.warning(
+                f"CLOB orderbook for {market_id} REJECTED by validation "
+                f"({reason}) - refusing to price against it. Every further "
+                f"rejection for this reason this cycle is counted, not repeated; "
+                f"the cycle's scan line reports the total.")
+        # NO LINE AT ALL for the repeats. DEBUG is enabled on the operator's
+        # machine, so "the second one is only DEBUG" would still have put forty
+        # copies of this sentence back into the log. The count is the fact, and
+        # the cycle's scan line prints it once.
+
+    def clob_rejection_summary(self) -> Dict[str, int]:
+        """Distinct rejection reason -> how many markets it refused."""
+        counts = getattr(self, "_clob_rejected_counts", None)
+        return dict(counts) if isinstance(counts, dict) else {}
+
+    def reset_clob_rejections(self) -> None:
+        self._clob_rejected_counts = {}
+
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         """
         Real orderbook intelligence - FIXED V7: Truly real CLOB depth, not mock
@@ -473,10 +514,14 @@ class PolymarketAdapter(MarketAdapter):
                         # failed instead of reading a suspicious spread.
                         why = "; ".join(f"{k}: {v}" for k, v in book["validation"].items()
                                         if isinstance(v, str))
-                        logger.warning(
-                            f"CLOB orderbook for {market.id} REJECTED by validation "
-                            f"({why or 'no usable levels'}) - refusing to price "
-                            f"against it")
+                        # ONE LINE PER FACT. The 16:53 cycle printed this same
+                        # warning ~40 times - one per market - which buried the
+                        # cycle's actual shape under forty copies of one venue
+                        # problem. The refusal is kept exactly as it was (a book
+                        # that failed validation never becomes a cost or an
+                        # edge); the repetition is not. Each distinct reason is
+                        # said once and then counted.
+                        self._note_clob_rejection(market.id, why)
                         return {
                             "market_id": market.id, "venue_id": "polymarket",
                             "token_id": token_id,

@@ -4,6 +4,9 @@ All local, no cloud. LM Studio is primary for this user.
 """
 import re
 import json
+from datetime import datetime, timezone
+import os
+import pathlib
 import time
 from typing import Optional, Dict, Any, Literal, List
 from dataclasses import dataclass
@@ -45,7 +48,52 @@ def is_slow_reasoning_model(model_id: Optional[str]) -> bool:
     return "r1" in segments
 
 
-def choose_loaded_model(models: List[str], configured: Optional[str] = None):
+# One line per detected model per process, not one per detection.
+_DETECTIONS_SAID: set = set()
+
+
+def _selection_file():
+    """Where this install remembers which loaded model it settled on."""
+    try:
+        from ..storage.db import default_data_dir
+        return pathlib.Path(default_data_dir()) / "llm_selection.json"
+    except Exception:  # noqa: BLE001 - remembering is an optimisation, not a need
+        return None
+
+
+def remembered_model() -> str:
+    """The model this install used last time, if it was an auto pick."""
+    path = _selection_file()
+    if path is None:
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - absent or unreadable: no memory, no crash
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("model") or "")
+
+
+def remember_model(model: str, models: Optional[List[str]] = None) -> None:
+    """Record the auto pick, atomically, next to the database."""
+    path = _selection_file()
+    if path is None or not model:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"model": model,
+                   "chosen_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "loaded": list(models or [])[:20]}
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 - a bookkeeping write must never stop a run
+        pass
+
+
+def choose_loaded_model(models: List[str], configured: Optional[str] = None,
+                        remembered: Optional[str] = None):
     """
     Which loaded model the agent will actually call. THE ONE DECISION.
 
@@ -75,6 +123,20 @@ def choose_loaded_model(models: List[str], configured: Optional[str] = None):
                 f"to the first loaded model ({models[0]})")
     fast = [m for m in models if not is_slow_reasoning_model(m)]
     if fast:
+        # ONE MODEL PER INSTALL. LM Studio lists its loaded models in an order
+        # that is not stable, and this decision is made by every process that
+        # builds a router - the agent, the console, the CLI. Two of them could
+        # therefore call two different models, which is exactly what the
+        # operator's log showed: `LOCAL MODEL: qwen/qwen3-14b` from one process
+        # and `Local model: qwen3.8-27b-...` from another, in the same minute.
+        # The first auto pick is remembered beside the database and reused while
+        # it is still loaded, so the whole install speaks to one model. Pinning
+        # a model in Setup still overrides it, and the reason says so.
+        if remembered and remembered in fast:
+            return remembered, (
+                f"auto: {remembered}, the model this install already uses (chosen "
+                f"on an earlier run and still loaded). Pin a model in Setup to "
+                f"change it.")
         if fast[0] != models[0]:
             return fast[0], (
                 f"auto: picked {fast[0]} because it is a fast model, and "
@@ -107,7 +169,16 @@ def probe_local_model(host: str = "http://localhost:1234",
                 "reason": (f"LM Studio is not answering at {where} - start the "
                            f"server in LM Studio (Developer -> Start Server)")}
     models = provider.list_models()
-    model, reason = choose_loaded_model(models, configured_model)
+    _unpinned = not configured_model or configured_model in UNPINNED_MODELS
+    _remembered = remembered_model() if _unpinned else ""
+    model, reason = choose_loaded_model(models, configured_model,
+                                        remembered=_remembered)
+    if _unpinned and model and model != _remembered:
+        # The panel is allowed to MAKE the choice, and when it does it records
+        # it, so the agent's router that starts a minute later calls the same
+        # model. Two processes, two auto picks, two names in one log was the
+        # operator's 16:53 report.
+        remember_model(model, models)
     return {"connected": True, "model": model, "reason": reason,
             "models": models, "where": where}
 
@@ -276,7 +347,8 @@ class LMStudioProvider(BaseLLMProvider):
             if model_to_use in UNPINNED_MODELS:
                 models = self.list_models()
                 if models:
-                    model_to_use, reason = choose_loaded_model(models, self.model)
+                    model_to_use, reason = choose_loaded_model(
+                        models, self.model, remembered=remembered_model())
                     # Resolved once, then remembered: the id this provider calls
                     # from now on is the one it logged, so a later call cannot
                     # silently pick a different model.
@@ -437,16 +509,39 @@ class LLMRouter:
             if lm.is_available():
                 models = lm.list_models()
                 self._last_detected_models = models
-                chosen, reason = choose_loaded_model(models, self.model)
+                _unpinned = not self.model or self.model in UNPINNED_MODELS
+                _remembered = remembered_model() if _unpinned else ""
+                chosen, reason = choose_loaded_model(models, self.model,
+                                                     remembered=_remembered)
                 self.active_model = chosen
                 self.active_model_reason = reason
                 if chosen:
                     # The provider calls THIS model from now on, so the id in
                     # the log is the id being called rather than a placeholder.
                     lm.model = chosen
-                _say("success",
-                     f"LOCAL MODEL: {chosen or 'none'} (lm_studio at {lm.base_url})"
-                     f" - {reason}")
+                    if _unpinned and chosen != _remembered:
+                        # Remember the AUTO pick so the next process - the
+                        # console, the CLI, the agent loop - calls the same
+                        # model instead of whatever LM Studio happens to list
+                        # first. A pinned model is never remembered over.
+                        remember_model(chosen, models)
+                # SAID ONCE PER PROCESS. The console builds a router (and so runs
+                # a detection) per request, and the log filled with the same
+                # "LOCAL MODEL:" line - sometimes naming a different model than
+                # the agent's own line, because each process made its own auto
+                # pick.
+                # Keyed on the MODEL, not on the sentence around it: the fact
+                # is "this process calls X". A second detection that picks the
+                # same model says nothing, whatever its reason now reads.
+                _key = chosen or "none"
+                if _key in _DETECTIONS_SAID:
+                    logger.debug(f"LOCAL MODEL: {chosen or 'none'} (lm_studio at "
+                                 f"{lm.base_url}) - {reason} (already reported)")
+                else:
+                    _DETECTIONS_SAID.add(_key)
+                    _say("success",
+                         f"LOCAL MODEL: {chosen or 'none'} (lm_studio at {lm.base_url})"
+                         f" - {reason}")
                 self.provider = lm
                 return
             else:

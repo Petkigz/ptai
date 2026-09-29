@@ -3075,14 +3075,17 @@ async function runCycle(){
   $('cycleOut').innerHTML = `
     ${lm.describe ? `<div class="note">Local model: ${esc(lm.describe)}
         ${lm.used
-          ? `&middot; ${lm.answered_by_model ?? lm.answered ?? 0} of ${lm.asked ?? lm.calls ?? 0} market(s) asked were answered (${lm.answered||0} of ${lm.calls||0} call(s))`
+          ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} &middot; ${lm.answered||0} of ${lm.calls||0} call(s) answered${lm.answered_by_model!==undefined ? `, ${lm.answered_by_model} market(s) answered` : ''}`
           : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
         ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>` : ''}
     ${body.deep_analysis && body.deep_analysis.considered
-      ? `<div class="note">Model time: ${((body.deep_analysis.shortlist)||[]).length}
-          of ${body.deep_analysis.considered} market(s) deep-analysed
-          (limit ${body.deep_analysis.limit}); ${body.deep_analysis.screened_out||0}
-          priced on their measured book only.</div>` : ''}
+      ? `<div class="note">The screen chose ${((body.deep_analysis.shortlist)||[]).length}
+          of ${body.deep_analysis.considered} market(s) for deep analysis &mdash;
+          a plan, not model time; ${body.deep_analysis.deep_priced||0} of them
+          reached the pricing stage. The venue scan priced
+          ${body.deep_analysis.evaluated||0} of ${body.deep_analysis.discovered||0}
+          market(s) read (${body.deep_analysis.skipped_no_book||0} had no usable
+          book, ${body.deep_analysis.beyond_cap||0} beyond their venue's cap).</div>` : ''}
     <div><b>${body.status||''}</b> &mdash; ${body.executed||0} position(s) recorded,
       ${body.orders_tracked||0} order(s) tracked for reconciliation.</div>
     <div class="note" style="margin-top:7px">
@@ -3230,15 +3233,19 @@ async function loadForecast(){
   const modelLine = lm.describe
     ? `<div class="note">Local model: <b>${esc(lm.model || lm.describe)}</b>
         ${lm.used
-          ? `&middot; ${lm.answered_by_model ?? lm.answered ?? 0} of ${lm.asked ?? lm.calls ?? 0} market(s) asked were answered (${lm.answered||0} of ${lm.calls||0} call(s), ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s)`
+          ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} (${lm.answered||0} of ${lm.calls||0} call(s) answered, ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s)`
           : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
         ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>`
     : '';
   const screenLine = screen.considered
-    ? `<div class="note">Model time went to <b>${(screen.shortlist||[]).length}</b>
-        of ${screen.considered} market(s) this cycle (limit ${screen.limit||'?'},
-        books read in ${screen.seconds||0}s). ${screen.screened_out||0} were priced
-        on their measured book only &mdash; not on model opinion.
+    ? `<div class="note">The screen chose <b>${(screen.shortlist||[]).length}</b>
+        of ${screen.considered} market(s) for deep analysis this cycle (limit
+        ${screen.limit||'?'}, books read in ${screen.seconds||0}s) &mdash; a plan,
+        not model time; ${screen.deep_priced||0} of them reached the pricing stage.
+        The venue scan priced ${screen.evaluated||0} of ${screen.discovered||0}
+        market(s) it read, refused ${screen.skipped_no_book||0} for having no
+        usable book, and left ${screen.beyond_cap||0} beyond their venue's
+        per-venue cap.
         ${screen.dropped_by_scan ? ` ${screen.dropped_by_scan} more sit below their
         venue's own per-venue cap and will not be priced this cycle.` : ''}</div>`
     : `<div class="note">${esc(screen.criteria||'no screen has run yet')}</div>`;

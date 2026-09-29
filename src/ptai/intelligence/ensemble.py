@@ -130,6 +130,14 @@ class EnsembleForecaster:
         self.llm_asked = 0          # markets that reached the model step
         self.llm_answered = 0       # ...of those, markets the model answered
         self.llm_problems: list = []  # why the ones that were not answered were not
+        # ...and how many forecasts this ensemble RAN. A market can reach the
+        # pricing stage and still never get a forecast: the resolution and
+        # contradiction gates refuse it before the ensemble is asked. Without
+        # this counter a cycle whose only deep market was refused before the
+        # forecast printed "this process has no model router wired to the
+        # forecast engine", which was false - the router was there and was
+        # simply never reached.
+        self.forecasts_run = 0
         # Model weights - can be learned from calibration performance
         self.model_weights = {
             "base_rate": 0.15,
@@ -152,11 +160,13 @@ class EnsembleForecaster:
         self.llm_asked = 0
         self.llm_answered = 0
         self.llm_problems = []
+        self.forecasts_run = 0
 
     def llm_accounting(self) -> Dict[str, Any]:
         """What the model was asked this cycle, and what it did not answer."""
         return {"asked": int(self.llm_asked),
                 "answered": int(self.llm_answered),
+                "forecasts_run": int(self.forecasts_run),
                 "problems": list(self.llm_problems[-3:])}
 
     def add_llm_forecast(self, market: Market, llm_result: Dict) -> ModelForecast:
@@ -397,6 +407,10 @@ class EnsembleForecaster:
         """Full forecasting pipeline for one market"""
         context = context or {}
         forecasts = []
+        # COUNTED AT THE DOOR of the pipeline: this is the number of markets the
+        # forecast actually ran for, which is what the cycle's model line needs
+        # to explain a market that was priced but never asked about.
+        self.forecasts_run = int(getattr(self, "forecasts_run", 0)) + 1
 
         # Base rate
         from .forecaster import BaseRateModel, NewsModel, XModel, MarketMicrostructureModel

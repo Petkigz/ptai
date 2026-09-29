@@ -195,6 +195,77 @@ def _credential_source(data_dir: str, tool: str) -> Dict[str, Any]:
 WAIT_SLICE_SECONDS = 60.0
 
 
+def _why_the_model_was_not_used(status: Dict[str, Any], asked: int,
+                                problems: List[str]) -> str:
+    """
+    The one sentence explaining, from evidence, why no market was answered.
+
+    Ordered by where the cycle actually stopped: no router, no server, an ask
+    that never became a call, the model never answering a market it was given,
+    the shortlist never reaching the pricing stage, the pricing stage refusing a
+    market before a forecast was built, or nothing being shortlisted at all.
+    Every branch names a counter the operator can check against the same log,
+    and none of them is a plan.
+
+    A module function rather than a method: the console, the CLI and the tests
+    all read the cycle's model line through objects that are not a full agent,
+    and a reason builder that lives on the agent is reachable by only one of
+    them.
+    """
+    if not status["available"]:
+        return ("no local model server answered, so every market was priced "
+                "without a model")
+    if asked and not status["answered_by_model"]:
+        why = (problems[0] if problems else
+               (f"the router recorded {status['calls']} call(s); none came back "
+                f"with an answer" if status["calls"] else
+                "every one of them reached the model step and the router counted no "
+                "call for them, so the ask never reached the provider"))
+        return (f"{asked} market(s) reached the model step and none was answered "
+                f"({why})")
+    if asked == 0 and status["calls"]:
+        # Calls the router saw that never came from the pricing path
+        # (contradiction, resolution analysis). If every one of them failed, that
+        # is the reason the model is not used - and it is still true that no
+        # MARKET was sent, so both facts are said.
+        why = status["last_error"] or "no reason recorded"
+        if status["failed"] and status["failed"] == status["calls"]:
+            return (f"every model call failed ({why}); no market reached the model "
+                    f"step either")
+        return (f"the router recorded {status['calls']} call(s) but no market "
+                f"reached the model step ({status['failed']} failed): {why}")
+    if status["deep_shortlist"] and not status["deep_priced"]:
+        # The shortlist is a plan. If none of the shortlisted markets ever
+        # reached the pricing stage, the model was never asked - and the line
+        # must not claim otherwise.
+        return (f"{status['deep_shortlist']} market(s) were chosen for deep "
+                f"analysis but none of them reached the pricing stage this cycle, "
+                f"so the model was never asked: they were filtered out (volume, "
+                f"liquidity or an unvalidated book) before any model time was "
+                f"spent")
+    if status["deep_priced"] and not status.get("forecasts_run"):
+        # REACHED THE PRICING STAGE, NEVER REACHED A FORECAST. The gates in front
+        # of the ensemble - resolution wording, contradiction - can refuse a
+        # market on their own. The 16:53 log reported exactly this market as
+        # "this process has no model router wired to the forecast engine", which
+        # was false: the router was wired and was simply never reached.
+        return (f"{status['deep_priced']} market(s) reached the pricing stage and "
+                f"were refused before a forecast was built, so the model was never "
+                f"asked - the cycle's own refusal line for each one names the gate "
+                f"(resolution risk, contradiction)")
+    if status["deep_shortlist"] and not asked:
+        return (f"{status['deep_shortlist']} market(s) were chosen for deep "
+                f"analysis and {status.get('forecasts_run', 0)} forecast(s) were "
+                f"built, but not one of them was handed to the model: this process "
+                f"has no model router wired to the forecast engine")
+    if status["deep_shortlist"] == 0:
+        return (f"no market reached the deep shortlist this cycle "
+                f"({status['considered']} market(s) considered), so the model was "
+                f"never asked")
+    return (f"the model was available ({status['describe']}) and this cycle asked "
+            f"it for {asked} market(s) without a usable answer")
+
+
 class TradingAgentV3:
     """
     PTAI V3 - genuinely multi-venue, multi-strategy
@@ -261,7 +332,8 @@ class TradingAgentV3:
         )
         
         # Intelligence
-        self.calibration_engine = CalibrationDB(db_path="./data/calibration.json", storage=self.storage, memory=self.memory)
+        self.calibration_engine = CalibrationDB(db_path=str(Path(self.data_dir) / "calibration.json"),
+                              storage=self.storage, memory=self.memory)
         self.uncertainty_engine = UncertaintyEngine()
         self.resolution_analyzer = ResolutionAnalyzer(llm_router=self.llm_router)
         self.contradiction_engine = ContradictionEngine(llm_router=self.llm_router)
@@ -893,6 +965,16 @@ class TradingAgentV3:
         self._cycle_books = {}
         self._deep_market_ids = set()
         self._deep_shortlist_active = False
+        self._cycle_scan_counts = {}
+        # ONE COUNT PER CYCLE for the refusals the venues report per market.
+        for _adapter in (getattr(self.venue_registry, "adapters", {}) or {}).values():
+            _reset = getattr(_adapter, "reset_clob_rejections", None)
+            if callable(_reset):
+                try:
+                    _reset()
+                except Exception as e:  # noqa: BLE001 - a counter must never stop a cycle
+                    logger.debug(f"Could not reset {type(_adapter).__name__} "
+                                 f"rejection counter: {e}")
 
         candidates = []
         try:
@@ -986,8 +1068,10 @@ class TradingAgentV3:
             "dropped_by_scan": len(dropped_by_scan),
             "screened_out_reasons": (
                 "deep analysis - X sentiment, web research and the LLM - is limited "
-                "to the shortlist above. Every other market was still read, priced "
-                "on its measured book, and simply not given model time this cycle."),
+                "to the shortlist above. Every other market was read and ranked, and "
+                "was not given model time this cycle. Whether it is priced at all is "
+                "decided by the venue scan, which refuses a market with no usable "
+                "book and counts it."),
             "criteria": ("validated two-sided book, spread inside the tradable "
                          "limit, then liquidity, book quality and volume"),
         }
@@ -997,16 +1081,21 @@ class TradingAgentV3:
         self._screen["no_book_note"] = (
             "markets the venue has no book for. They are not priced, not ranked "
             "and not traded; their cost and edge are absent rather than estimated.")
+        # PLANS AND PRICES ARE DIFFERENT FACTS. This line said "199 priced on the
+        # cheap context only" while the same cycle's scan line said 99 of those
+        # markets were "not evaluated - their book is an estimate or absent".
+        # Nothing here has been priced yet: this is the screen's plan, and it
+        # says so. What was actually priced appears after the scan, in the model
+        # line, from the venues' own counts.
         logger.info(
             f"Cheap screen: {len(candidates)} market(s) read in "
             f"{self._screen['seconds']}s, {len(shortlist)} chosen for deep analysis "
-            f"(limit {self.deep_analysis_limit}), {self._screen['screened_out']} "
-            f"priced on the cheap context only"
-            + (f"; {unreadable} had no venue book at all (not priced)"
+            f"(limit {self.deep_analysis_limit}); the rest are NOT given model time "
+            f"and none of them has been priced yet"
+            + (f"; {unreadable} had no venue book at all (they cannot be priced)"
                if unreadable else "")
-            + (f"; {len(dropped_by_scan)} more sit below their venue's own "
-               f"per-venue cap and will not be priced this cycle"
-               if dropped_by_scan else ""))
+            + (f"; {len(dropped_by_scan)} sit below their venue's own per-venue cap "
+               f"and will not be priced this cycle" if dropped_by_scan else ""))
         for row in self._screen["shortlist"][:5]:
             logger.info(f"  deep {row['market_id']}: {row['why']} "
                         f"(score {row['score']})")
@@ -2406,6 +2495,57 @@ class TradingAgentV3:
             book_lookup=lambda mid: (getattr(self, "_cycle_books", {}) or {}).get(mid),
             fee_rate_lookup=self._arb_fee_rate,
         )
+        # WHAT THE VENUES ACTUALLY PRICED, from their own reports - the number
+        # the model line needs. `evaluated` is markets that reached the pricing
+        # stage; `skipped_no_book` is the ones refused before it; `beyond_cap`
+        # is the ones the per-venue cap left unread. Together they account for
+        # every market the screen read.
+        _reports = list(scan_result.venue_reports or [])
+        self._cycle_scan_counts = {
+            "venues": len(_reports),
+            "evaluated": sum(int(getattr(r, "evaluated", 0) or 0) for r in _reports),
+            "skipped_no_book": sum(int(getattr(r, "skipped_no_book", 0) or 0)
+                                   for r in _reports),
+            "beyond_cap": sum(int(getattr(r, "beyond_cap", 0) or 0) for r in _reports),
+            "discovered": sum(int(getattr(r, "total_discovered", 0) or 0)
+                              for r in _reports),
+        }
+        if isinstance(getattr(self, "_screen", None), dict):
+            self._screen.update(self._cycle_scan_counts)
+            # ...and what the PRICING stage saw, so the console's screen panel
+            # and the log's model line are built from one set of numbers.
+            self._screen.update({
+                "priced": int(getattr(self, "_cycle_context_calls", 0) or 0),
+                "deep_priced": int(getattr(self, "_cycle_deep_context_calls", 0) or 0),
+            })
+        logger.info(
+            f"Venue scan priced {self._cycle_scan_counts['evaluated']} market(s) of "
+            f"{self._cycle_scan_counts['discovered']} read across "
+            f"{self._cycle_scan_counts['venues']} venue(s); "
+            f"{self._cycle_scan_counts['skipped_no_book']} had no usable book and "
+            f"{self._cycle_scan_counts['beyond_cap']} were beyond their venue's "
+            f"per-venue cap")
+        # HOW MANY BOOKS THE VENUES REFUSED, in one line. Each venue said the
+        # first refusal itself (with its reason); this is the count, so forty
+        # identical warnings become one sentence.
+        for _adapter in (getattr(self.venue_registry, "adapters", {}) or {}).values():
+            _summary = getattr(_adapter, "clob_rejection_summary", None)
+            if not callable(_summary):
+                continue
+            try:
+                _counts = _summary() or {}
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not read {type(_adapter).__name__} "
+                             f"rejection counts: {e}")
+                continue
+            if not _counts:
+                continue
+            _total = sum(int(v) for v in _counts.values())
+            _reasons = ", ".join(f"{k} x{int(v)}" for k, v in _counts.items())
+            logger.info(
+                f"{getattr(_adapter, 'venue_id', 'venue')}: {_total} orderbook(s) "
+                f"refused this cycle and never priced against ({_reasons}). The "
+                f"first of each reason was reported where it happened.")
         logger.info(f"Common scoring: {len(scan_result.venue_reports)} venues, {scan_result.total_candidates} candidates, {scan_result.total_tradeable} tradeable after fees/liquidity/uncertainty")
         # WHICH model worked this cycle, and what it did. The operator went
         # looking for their LM Studio model id in the log and found it nowhere:
@@ -4818,7 +4958,11 @@ class TradingAgentV3:
         screen = getattr(self, "_screen", None) or {}
         status["considered"] = int(screen.get("considered") or 0)
         status["deep_shortlist"] = len(screen.get("shortlist") or [])
-        status["priced_without_model"] = int(screen.get("screened_out") or 0)
+        # NAMED FOR WHAT IT IS: markets the screen did not give model time to.
+        # It used to be called `priced_without_model`, and that name is what
+        # printed "199 priced on their measured book alone" in a cycle where one
+        # market was priced.
+        status["screened_out_no_model_time"] = int(screen.get("screened_out") or 0)
         if router is None:
             status["not_used_reason"] = "this agent was built without a model router"
             status["describe"] = "none"
@@ -4848,6 +4992,16 @@ class TradingAgentV3:
         status["models"] = dict(usage.get("models", {}) or {})
         status["last_error"] = str(usage.get("last_error", "") or "")
         # WHAT THE MODEL WAS ASKED, counted where the asking happened.
+        #
+        # THREE COUNTERS, THREE DIFFERENT FACTS, and the line is built from all
+        # three because confusing them is what the operator kept seeing:
+        #   * `priced` / `deep_priced` - markets that reached the pricing stage
+        #     (the ensemble got as far as being asked for a forecast, or the
+        #     gate in front of it refused first);
+        #   * `forecasts_run` - forecasts the ensemble actually built;
+        #   * `asked` / `answered_by_model` - markets handed to the model step
+        #     and markets the model answered.
+        # A shortlist is a PLAN and appears nowhere in this list.
         asked = answered_by_model = 0
         problems = []
         try:
@@ -4855,6 +5009,7 @@ class TradingAgentV3:
             asked = int(accounting.get("asked", 0) or 0)
             answered_by_model = int(accounting.get("answered", 0) or 0)
             problems = [p for p in (accounting.get("problems") or []) if p]
+            status["forecasts_run"] = int(accounting.get("forecasts_run", 0) or 0)
         except Exception:  # noqa: BLE001 - a counter that cannot be read is not a crash
             pass
         status["asked"] = asked
@@ -4863,61 +5018,14 @@ class TradingAgentV3:
         status["deep_priced"] = int(getattr(self, "_cycle_deep_context_calls", 0) or 0)
         status["question_problems"] = problems[-3:]
         status["used"] = answered_by_model > 0 or status["answered"] > 0
+        # AN ASK THAT NEVER BECAME A CALL IS A WIRING DEFECT, and it is visible
+        # only by comparing the two counters. The 16:23 log said "8 market(s)
+        # were sent to the model but no answer was recorded" while the router
+        # had recorded no calls at all: the ask never reached the provider.
+        status["asks_without_calls"] = max(0, asked - int(status["calls"] or 0))
         if not status["used"]:
-            if not status["available"]:
-                status["not_used_reason"] = (
-                    "no local model server answered, so every market was priced "
-                    "without a model")
-            elif asked and not answered_by_model:
-                why = (problems[0] if problems else
-                       (f"the router recorded {status['calls']} call(s); "
-                        "none came back with an answer"
-                        if status["calls"] else
-                        "every one of them reached the model and the call was never "
-                        "counted by the router"))
-                status["not_used_reason"] = (
-                    f"{asked} market(s) reached the model step and none was "
-                    f"answered ({why})")
-            elif asked == 0 and status["calls"]:
-                # Calls the router saw that never came from the pricing path
-                # (contradiction, resolution analysis). If every one of them
-                # failed, that is the reason the model is not used - and it is
-                # still true that no MARKET was sent, so both facts are said.
-                why = status["last_error"] or "no reason recorded"
-                if status["failed"] and status["failed"] == status["calls"]:
-                    status["not_used_reason"] = (
-                        f"every model call failed ({why}); no market reached the "
-                        f"model step either")
-                else:
-                    status["not_used_reason"] = (
-                        f"the router recorded {status['calls']} call(s) but no "
-                        f"market reached the model step "
-                        f"({status['failed']} failed): {why}")
-            elif status["deep_shortlist"] and not status["deep_priced"]:
-                # THE OPERATOR'S EXACT CASE: a shortlist is a plan. If none of the
-                # shortlisted markets ever reached the pricing stage, the model
-                # was never asked - and the line must not claim otherwise.
-                status["not_used_reason"] = (
-                    f"{status['deep_shortlist']} market(s) were chosen for deep "
-                    f"analysis but none of them reached the pricing stage this "
-                    f"cycle, so the model was never asked: they were filtered out "
-                    f"(volume, liquidity or an unvalidated book) before any model "
-                    f"time was spent")
-            elif status["deep_shortlist"] == 0:
-                status["not_used_reason"] = (
-                    f"no market reached the deep shortlist this cycle "
-                    f"({status['considered']} market(s) considered), so the model "
-                    f"was never asked")
-            elif status["deep_priced"]:
-                status["not_used_reason"] = (
-                    f"{status['deep_priced']} market(s) were priced in full without "
-                    f"the model: this process has no model router wired to the "
-                    f"forecast engine")
-            else:
-                status["not_used_reason"] = (
-                    f"no market reached the pricing stage this cycle "
-                    f"({status['considered']} considered, {status['deep_shortlist']} "
-                    f"shortlisted), so the model was never asked")
+            status["not_used_reason"] = _why_the_model_was_not_used(status, asked,
+                                                                    problems)
         # A MODEL THAT CHANGED BETWEEN CYCLES IS A FACT THE OPERATOR NEEDS. The
         # log named qwen3.8-27b in one cycle and qwen/qwen3-14b later with no
         # line connecting them; the answer is a line that says so.
@@ -4940,21 +5048,35 @@ class TradingAgentV3:
             line += (f" | CHANGED since the last cycle: it was "
                      f"{status['model_changed_from']}, and this cycle it is "
                      f"{status['model']}")
-        if status["calls"] or status["answered"] or status.get("asked"):
-            line += (f" | {status.get('answered_by_model', 0)} of "
-                     f"{status.get('asked', 0)} market(s) asked were answered "
-                     f"({status['answered']} of {status['calls']} call(s) answered "
-                     f"in {status['seconds']:.1f}s)"
+        if status.get("asked") or status["calls"]:
+            line += (f" | markets asked: {status.get('asked', 0)} | "
+                     f"{status['answered']} of {status['calls']} call(s) answered "
+                     f"in {status['seconds']:.1f}s"
                      + (f" ({ids})" if ids else ""))
+            if status.get("asks_without_calls"):
+                line += (f" | WIRING GAP: {status['asks_without_calls']} of those "
+                         f"ask(s) produced no recorded call at all, so they never "
+                         f"reached the provider")
         if not status["used"]:
             line += f" | NOT USED THIS CYCLE: {status['not_used_reason']}"
-        line += (f" | model time went to {status['deep_shortlist']} of "
-                 f"{status['considered']} screened market(s); "
-                 f"{status['priced_without_model']} priced on their measured book alone")
+        # THE TAIL IS ABOUT PRICES, NOT PLANS. "199 priced on their measured book
+        # alone" was printed in a cycle where the venues priced one market, and
+        # "model time went to 1 of 200" called a plan model time. The screen's
+        # shortlist is a plan; what was priced comes from the venues' counts.
+        _scan = dict(getattr(self, "_cycle_scan_counts", None) or {})
+        line += (f" | the screen chose {status['deep_shortlist']} of "
+                 f"{status['considered']} market(s) for deep analysis (a plan: "
+                 f"{status.get('deep_priced', 0)} of them reached the pricing stage)")
+        if _scan:
+            line += (f" | venue scan: priced {_scan.get('evaluated', 0)} market(s) "
+                     f"of the {_scan.get('discovered', 0)} read "
+                     f"({_scan.get('skipped_no_book', 0)} had no usable book, "
+                     f"{_scan.get('beyond_cap', 0)} beyond their venue's cap)")
+        else:
+            line += " | venue scan: had not run when this line was written"
         if status["failed"] and status["last_error"]:
             line += f" | last failure: {status['last_error']}"
         return line
-
     def _record_scan_log(self, result: Dict[str, Any], *, markets_scanned: int,
                          opportunities_found: int, avg_edge: float) -> None:
         """
