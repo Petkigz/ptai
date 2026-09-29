@@ -2177,8 +2177,29 @@ class TradingAgentV3:
                         f"market(s) to choose {self.deep_analysis_limit} for deep analysis")
         screen = await self._prescan_and_rank(all_markets_flat)
         try:
-            alpha_results = self.alpha_engine.scan_all_alpha(all_markets_flat[:200])
-            logger.info(f"Alpha scan: {alpha_results}")
+            # The books just read, and the venue's own fee rate, go with the
+            # markets: an arbitrage basket is only an arbitrage at executable
+            # prices (see strategy/combinatorial.py), and this cycle already has
+            # the validated book for every market it screened.
+            alpha_results = self.alpha_engine.scan_all_alpha(
+                all_markets_flat[:200],
+                book_lookup=lambda mid: (getattr(self, "_cycle_books", {}) or {}).get(mid),
+                fee_rate_lookup=self._arb_fee_rate,
+                neg_risk_lookup=self._arb_neg_risk)
+            comb = alpha_results.get("combinatorial") or {}
+            # A summary, not the whole result. The dict holds candidate baskets
+            # with every Market in them, and `logger.info(f"...{alpha_results}")`
+            # wrote one enormous line per cycle that buried the cycle it belonged
+            # to - the operator's own log shows it.
+            logger.info(
+                f"Alpha scan: combinatorial {comb.get('total', 0)} candidate(s) - "
+                f"{comb.get('verified', 0)} verified basket(s), "
+                f"{comb.get('tradeable', 0)} tradeable at executable prices "
+                f"(research only, no orders placed)"
+                + (f"; refused {comb.get('refused', 0)}"
+                   + (f" ({', '.join(f'{k}: {v}' for k, v in list(comb.get('refused_reasons', {}).items())[:2])})"
+                      if comb.get("refused_reasons") else "")
+                   if comb.get("refused") else ""))
         except Exception as e:
             logger.warning(f"Alpha scan failed: {e}")
             alpha_results = {"error": str(e)}
@@ -4707,6 +4728,80 @@ class TradingAgentV3:
             logger.info(f"[sports] paper purse: ${before:.2f} -> "
                         f"${self.storage.get_paper_bankroll():.2f} "
                         f"(stakes returned and P&L applied)")
+
+    def _arb_venue_facts(self, market: Market) -> Dict[str, Any]:
+        """
+        What the VENUE says about this market: its taker fee, and whether it is
+        part of a mutually exclusive basket ("neg risk" in Polymarket's words).
+
+        Both come from the venue's own market info, read once and cached per
+        market, because the arbitrage engine needs both and neither may be
+        assumed:
+
+          * the fee, because `2% x legs x 0.5` was a constant this codebase
+            invented and then called "after fees"; and
+          * the neg-risk answer, because "the ten outcomes of this contest are
+            mutually exclusive" is the premise of the whole basket - it is what
+            makes buying every NO pay n-1 - and a shared event slug does not
+            establish it. Extracting price strikes share a slug and are not
+            exclusive at all.
+
+        Falls back to the venue's declared capability rate for the fee when the
+        per-market info cannot be read, and reports `neg_risk: None` in that case
+        rather than guessing: an unknown answer leaves the basket unverified.
+        """
+        cache = getattr(self, "_arb_facts_cache", None)
+        if cache is None:
+            cache = self._arb_facts_cache = {}
+        key = str(getattr(market, "id", "") or id(market))
+        if key in cache:
+            return cache[key]
+
+        facts: Dict[str, Any] = {"fee": None, "neg_risk": None, "source": None}
+        try:
+            adapter = (self.venue_registry.get_adapter_for_market(market)
+                       if self.venue_registry else None)
+            if adapter is not None:
+                token_id = (getattr(market, "yes_token_id", None) or "")
+                mechanics = None
+                if token_id:
+                    try:
+                        # A shim carrying `.market` so the adapter resolves the
+                        # condition id too - the same path the order flow uses.
+                        from types import SimpleNamespace
+                        mechanics = adapter.get_mechanics(
+                            SimpleNamespace(market=market), token_id=token_id)
+                    except Exception as e:  # noqa: BLE001 - unread falls back
+                        logger.debug(f"Mechanics for {key} unreadable: "
+                                     f"{type(e).__name__}: {e}")
+                if mechanics is not None and getattr(mechanics, "is_real", False):
+                    facts["neg_risk"] = bool(getattr(mechanics, "neg_risk", False))
+                    facts["fee"] = {
+                        "rate": float(getattr(mechanics, "taker_fee_rate", 0.0) or 0.0),
+                        "source": (f"{adapter.venue_id} clob market info "
+                                   f"({getattr(mechanics, 'tick_size', '?')} tick)")}
+                    facts["source"] = "clob_market_info"
+                if facts["fee"] is None:
+                    declared = getattr(adapter.capabilities, "fee_taker_pct", None)
+                    if declared is not None:
+                        facts["fee"] = {
+                            "rate": float(declared),
+                            "source": (f"{adapter.venue_id} declared capability "
+                                       f"fee_taker_pct")}
+                        facts["source"] = facts["source"] or "capability"
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Venue facts for {key} not readable: "
+                         f"{type(e).__name__}: {e}")
+        cache[key] = facts
+        return facts
+
+    def _arb_fee_rate(self, market: Market) -> Optional[Dict[str, Any]]:
+        """The venue's own taker fee, or None when it could not be read."""
+        return self._arb_venue_facts(market).get("fee")
+
+    def _arb_neg_risk(self, market: Market) -> Optional[bool]:
+        """The venue's own answer on whether this market's event is exclusive."""
+        return self._arb_venue_facts(market).get("neg_risk")
 
     def _set_phase(self, phase: str, detail: Optional[str] = None,
                    next_cycle_at: Optional[str] = None) -> None:

@@ -76,6 +76,24 @@ class AlphaOpportunity:
     raw: Dict[str, Any]
 
 
+def _reason_counts(groups) -> Dict[str, int]:
+    """
+    How many baskets were refused, and for which reason.
+
+    The operator's log showed 11 candidates and 7 "tradeable" with no hint that
+    most of them were the same event captured twice over. Counting the reasons
+    turns "0 tradeable" into an answer about the scan rather than a mystery.
+    """
+    counts: Dict[str, int] = {}
+    for g in groups:
+        reason = getattr(g, "blocked_reason", None)
+        if not reason:
+            continue
+        key = reason.split(" - ")[0][:60]
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 class AlphaEngine:
     """Combines all alpha engines for V3 ranking"""
     def __init__(self, bankroll: float = 50.0):
@@ -94,17 +112,45 @@ class AlphaEngine:
         self.slippage = SlippageModel()
         self.whale = WhaleTracker()
 
-    def scan_all_alpha(self, markets: List[Market]) -> Dict[str, Any]:
-        """Scan markets with all alpha engines"""
+    def scan_all_alpha(self, markets: List[Market],
+                       book_lookup=None, fee_rate_lookup=None,
+                       neg_risk_lookup=None) -> Dict[str, Any]:
+        """
+        Scan markets with all alpha engines.
+
+        `book_lookup` and `fee_rate_lookup` are passed straight to the
+        combinatorial engine, which needs a validated book per leg and the
+        venue's own fee rate before it will call a basket an arbitrage. Without
+        them its baskets come back UNVERIFIED with that reason on every one -
+        which is the honest answer, because a basket priced off last-trade prices
+        is a model and not a trade.
+        """
         results = {}
         
         # 1. Combinatorial arbitrage
         try:
-            comb = self.combinatorial.find_combinatorial_arbitrage(markets)
+            comb = self.combinatorial.find_combinatorial_arbitrage(
+                markets, book_lookup=book_lookup,
+                fee_rate_lookup=fee_rate_lookup,
+                neg_risk_lookup=neg_risk_lookup)
+            verified = [c for c in comb if c.verified]
+            tradeable = [c for c in comb if c.should_trade]
+            # `top_profit` is the best VERIFIED net, in dollars. It used to be the
+            # largest percentage in the list, which meant a 33,233% fantasy led
+            # the report whenever the scan had only part of an event's field.
             results["combinatorial"] = {
                 "total": len(comb),
-                "tradeable": len([c for c in comb if c.should_trade]),
-                "top_profit": max([c.estimated_profit_pct for c in comb], default=0),
+                "verified": len(verified),
+                "tradeable": len(tradeable),
+                "top_profit": max([c.estimated_profit_pct for c in verified], default=0),
+                "top_profit_usd": max([(c.net_profit_usd or 0.0) for c in verified],
+                                      default=0.0),
+                "refused": len([c for c in comb if not c.verified]),
+                "refused_reasons": _reason_counts(comb),
+                # Nothing here places an order. Said in the payload so no reader -
+                # log, console or report - can take "tradeable" for "bought".
+                "research_only": True,
+                "places_orders": False,
                 "opps": comb[:5]
             }
         except Exception as e:

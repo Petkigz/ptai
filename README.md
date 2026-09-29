@@ -399,6 +399,54 @@ returning `UNSETTLEABLE`, over a stake) and `MarketMechanics`, which
 `get_mechanics` annotated as its return type while only importing it inside the
 method body.
 
+### An Arbitrage Has To Be One
+
+The scan groups markets by event and adds up their YES prices, because in a group
+where exactly one outcome wins, a sum under $1 is free money and a sum over $1 is
+free money the other way. The arithmetic was right and the premise was missing.
+The 2026-09-29 log shows what the old code printed from 200 real Polymarket
+markets:
+
+    COMBINATORIAL ARB FOUND: MECE group elon-musk-of-tweets...: 10 markets sum
+      YES 0.003 | buy_all_yes cost $0.003 payout $1.000 profit $0.997 (33233.3%)
+      | Exhaustive True Exclusive True | Should trade True
+    COMBINATORIAL ARB FOUND: MECE group bitcoin-above-on-september-29-2026: 10
+      markets sum YES 4.498 | sell_all_yes_buy_all_no ... profit $3.498 (63.6%)
+
+Neither is an arbitrage. The first is a field the 200-market scan only partly
+captured - the sum is missing 99.7% of the candidates, so of course it is small.
+The second is ten Bitcoin price strikes, which are not mutually exclusive at all:
+several win together, so "all but one NO wins" is false and the $3.50 was
+invented. Both were called `Exclusive True` because they shared an event slug
+(`is_exclusive = True  # Assume exclusive if same event_slug`) and `Exhaustive
+True` because a group held three or more markets.
+
+A basket is now an arbitrage only when the evidence supports all five of these,
+and when it does not, the reason names which one failed:
+
+  * **Exclusivity from the venue, not from a slug.** Polymarket's `negRisk` mark
+    (on the event payload, or the venue's own CLOB market info) is the fact that
+    says the outcomes are one mutually exclusive basket. If the two sources
+    disagree, neither is trusted.
+  * **Completeness.** Every outcome of the event must be in the basket - the scan
+    read 10 of the event's 34 is a refusal, with both numbers on it.
+  * **A sum a real basket could be quoted at** (0.75-1.25). Beyond that, the set
+    is not a complete exclusive basket, whatever its slug says.
+  * **Executable prices.** Cost is the ask on every YES leg and (1 - best bid) on
+    every NO leg, from books that validated as real. The venue's mid can show a
+    6% gap while the asks cost more than the $1 payout - that basket is refused
+    with the loss stated.
+  * **The venue's own fee.** The old estimate was the constant `2% x legs x 0.5`;
+    the net now comes from the venue's declared rate, and when it cannot be read
+    the basket is reported as verified with the net **not claimed**.
+
+The engine also says, in its output and on every group, that it places no orders
+(`wired_to_execution: False`, `places_orders: False`): it is research the loop
+records, and nothing downstream trades it. A verified basket is a finding, not a
+position - the execution lane for multi-leg baskets (all-or-nothing fills, no
+unhedged remainder) is not built yet, and the report says so rather than implying
+otherwise.
+
 ## Logins, Venues, And The Sports Lane
 
 **Logins** are saved in the console's Setup tab and kept encrypted in

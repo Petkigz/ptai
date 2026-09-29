@@ -17,7 +17,21 @@ from src.ptai.strategy.alpha_engine import AlphaEngine
 from datetime import datetime, timezone, timedelta
 
 
-def make_market(id="M1", question="Will Trump win?", price=0.6, liquidity=10000, volume=15000, event_slug="trump-win", category="politics"):
+def make_market(id="M1", question="Will Trump win?", price=0.6, liquidity=10000, volume=15000, event_slug="trump-win", category="politics",
+                neg_risk=False, declared_outcomes=None):
+    """
+    A market, with the venue's own evidence about its basket when asked for.
+
+    `neg_risk` is Polymarket's mark that the event's markets are one mutually
+    exclusive basket, and `declared_outcomes` is the number of outcomes the
+    venue lists for the event. Both are read by the arbitrage engine now: they
+    are the difference between a basket and a lookalike (see
+    tests/test_no_fantasy_arbitrage.py).
+    """
+    event = {"slug": event_slug, "negRisk": neg_risk}
+    if declared_outcomes is not None:
+        event["markets"] = [{"id": f"{event_slug}-{i}"}
+                            for i in range(declared_outcomes)]
     return Market(
         id=id,
         question=question,
@@ -30,39 +44,93 @@ def make_market(id="M1", question="Will Trump win?", price=0.6, liquidity=10000,
         end_date=None,
         event_slug=event_slug,
         source=MarketSource.POLYMARKET,
-        raw={"venue": "polymarket", "question": question, "category": category}
+        raw={"venue": "polymarket", "question": question, "category": category,
+             "event": event, "market": {"negRisk": neg_risk}}
     )
 
 
 def test_combinatorial_arbitrage_buy_all_yes():
+    """
+    Sum under 1 in a VERIFIED basket is an arbitrage; the same prices without the
+    venue's evidence are refused. Both halves matter - the second is the fix.
+    """
     markets = [
         make_market(id="M1", question="Will Trump win?", price=0.30, event_slug="election-winner"),
         make_market(id="M2", question="Will Biden win?", price=0.30, event_slug="election-winner"),
         make_market(id="M3", question="Will Other win?", price=0.20, event_slug="election-winner"),
     ]
     engine = CombinatorialArbitrageEngine(min_profit_pct=0.01)
-    opps = engine.find_combinatorial_arbitrage(markets)
+
+    # No venue mark, no permission to call it an arbitrage.
+    bare = engine.find_combinatorial_arbitrage(markets)
+    assert len(bare) >= 1
+    assert bare[0].sum_yes == pytest.approx(0.80, abs=0.01)
+    assert bare[0].verified is False
+    assert bare[0].should_trade is False
+    assert bare[0].blocked_reason
+
+    # Same markets, with the venue's mark, its complete outcome list and a book
+    # per leg: now it is a basket, priced at the prices it would actually pay.
+    verified_markets = [
+        make_market(id="M1", question="Will Trump win?", price=0.30,
+                    event_slug="election-winner", neg_risk=True, declared_outcomes=3),
+        make_market(id="M2", question="Will Biden win?", price=0.30,
+                    event_slug="election-winner", neg_risk=True, declared_outcomes=3),
+        make_market(id="M3", question="Will Other win?", price=0.20,
+                    event_slug="election-winner", neg_risk=True, declared_outcomes=3),
+    ]
+    books = {
+        "M1": {"is_real": True, "validated": True, "best_ask": 0.31, "best_bid": 0.29,
+               "executable_price_yes": 0.31, "executable_price_no": 0.71, "source": "clob_real"},
+        "M2": {"is_real": True, "validated": True, "best_ask": 0.31, "best_bid": 0.29,
+               "executable_price_yes": 0.31, "executable_price_no": 0.71, "source": "clob_real"},
+        "M3": {"is_real": True, "validated": True, "best_ask": 0.32, "best_bid": 0.28,
+               "executable_price_yes": 0.32, "executable_price_no": 0.72, "source": "clob_real"},
+    }
+    opps = engine.find_combinatorial_arbitrage(
+        verified_markets, book_lookup=books.get,
+        fee_rate_lookup=lambda m: {"rate": 0.0, "source": "test"})
     assert len(opps) >= 1
     opp = opps[0]
     assert opp.sum_yes == pytest.approx(0.80, abs=0.01)
     assert opp.arbitrage_type == "buy_all_yes"
-    assert opp.estimated_profit_pct > 0.1
-    assert opp.should_trade
+    assert opp.verified and opp.should_trade
+    assert opp.cost_basis == "executable_asks"
+    assert opp.cost == pytest.approx(0.94, abs=0.001)
+    assert opp.net_profit_usd == pytest.approx(0.06, abs=0.001)
+    assert opp.estimated_profit_pct > 0.01
 
 
 def test_combinatorial_arbitrage_sell_all_yes():
+    """Over 1 in a verified basket: buy every NO, which pays n-1."""
     markets = [
-        make_market(id="M1", question="Will Trump win?", price=0.45, event_slug="election-winner"),
-        make_market(id="M2", question="Will Biden win?", price=0.40, event_slug="election-winner"),
-        make_market(id="M3", question="Will Other win?", price=0.30, event_slug="election-winner"),
+        make_market(id="M1", question="Will Trump win?", price=0.45,
+                    event_slug="election-winner", neg_risk=True, declared_outcomes=3),
+        make_market(id="M2", question="Will Biden win?", price=0.40,
+                    event_slug="election-winner", neg_risk=True, declared_outcomes=3),
+        make_market(id="M3", question="Will Other win?", price=0.30,
+                    event_slug="election-winner", neg_risk=True, declared_outcomes=3),
     ]
+    books = {
+        "M1": {"is_real": True, "validated": True, "best_ask": 0.44, "best_bid": 0.42,
+               "executable_price_yes": 0.44, "executable_price_no": 0.58, "source": "clob_real"},
+        "M2": {"is_real": True, "validated": True, "best_ask": 0.39, "best_bid": 0.37,
+               "executable_price_yes": 0.39, "executable_price_no": 0.63, "source": "clob_real"},
+        "M3": {"is_real": True, "validated": True, "best_ask": 0.29, "best_bid": 0.27,
+               "executable_price_yes": 0.29, "executable_price_no": 0.73, "source": "clob_real"},
+    }
     engine = CombinatorialArbitrageEngine(min_profit_pct=0.01)
-    opps = engine.find_combinatorial_arbitrage(markets)
+    opps = engine.find_combinatorial_arbitrage(
+        markets, book_lookup=books.get,
+        fee_rate_lookup=lambda m: {"rate": 0.0, "source": "test"})
     assert len(opps) >= 1
     opp = opps[0]
     assert opp.sum_yes == pytest.approx(1.15, abs=0.01)
     assert opp.arbitrage_type == "sell_all_yes_buy_all_no"
+    assert opp.payout == pytest.approx(2.0)
     assert opp.should_trade
+    # NO legs cost 1 - best bid: 0.58 + 0.63 + 0.73 = 1.94 for a $2.00 payout.
+    assert opp.cost == pytest.approx(1.94, abs=0.01)
 
 
 def test_reference_odds_engine():
@@ -305,8 +373,19 @@ def test_alpha_engine_combined():
     assert "rag" in results
     assert "dynamic_threshold" in results
     assert "liquidity_rewards" in results
+    # The combinatorial engine now reports candidates AND whether they are real.
+    # These markets share a slug and nothing else: no venue mark for a mutually
+    # exclusive basket, no books, no fee rate - so the basket is refused and the
+    # count says so. (It used to be called tradeable on the slug alone, which is
+    # how the 33,233% "arbitrage" in the operator's log was produced.)
     assert results["combinatorial"]["total"] >= 1
-    assert results["combinatorial"]["tradeable"] >= 1
+    assert results["combinatorial"]["tradeable"] == 0
+    assert results["combinatorial"]["verified"] == 0
+    assert results["combinatorial"]["refused"] >= 1
+    assert results["combinatorial"]["refused_reasons"]
+    # Nothing in this engine places orders; the payload has to say so.
+    assert results["combinatorial"]["research_only"] is True
+    assert results["combinatorial"]["places_orders"] is False
 
 
 def test_alpha_adjusted_score():

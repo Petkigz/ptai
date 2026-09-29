@@ -1857,12 +1857,22 @@ async def api_v3_combinatorial(target_per_venue: int = 100):
         scanner = MarketScanner()
         markets = scanner.scan(target_count=target_per_venue)
         engine = CombinatorialArbitrageEngine(min_profit_pct=0.02)
+        # No book source here, so every basket comes back unverified with that
+        # reason on it. That is the honest answer from this screen: it scans
+        # markets, it does not read order books, and an arbitrage is only an
+        # arbitrage at prices someone can actually trade at. The reasons are
+        # returned so the panel can say so instead of showing a blank list.
         opps = engine.find_combinatorial_arbitrage(markets)
+        verified = [o for o in opps if o.verified]
         return {
             "total_markets": len(markets),
             "groups": len(opps),
+            "verified": len(verified),
             "tradeable": len([o for o in opps if o.should_trade]),
-            "opportunities": [{"group_id": o.group_id, "event_slug": o.event_slug, "sum_yes": o.sum_yes, "type": o.arbitrage_type, "profit_pct": o.estimated_profit_pct, "should_trade": o.should_trade, "reasoning": o.reasoning[:300]} for o in opps[:10]],
+            "places_orders": False,
+            "why_not_tradeable": (opps[0].blocked_reason if opps and not verified
+                                  else None),
+            "opportunities": [{"group_id": o.group_id, "event_slug": o.event_slug, "sum_yes": o.sum_yes, "type": o.arbitrage_type, "profit_pct": o.estimated_profit_pct, "verified": o.verified, "should_trade": o.should_trade, "blocked_reason": o.blocked_reason, "reasoning": o.reasoning[:300]} for o in opps[:10]],
             "report": engine.get_report()
         }
     except Exception as e:
@@ -2289,7 +2299,18 @@ async def api_v3_alpha_all(target_per_venue: int = 50):
         # Combinatorial
         comb_engine = CombinatorialArbitrageEngine()
         comb_opps = comb_engine.find_combinatorial_arbitrage(markets)
-        results["combinatorial"] = {"total_groups": len(comb_opps), "tradeable": len([o for o in comb_opps if o.should_trade]), "top_profit": max([o.estimated_profit_pct for o in comb_opps], default=0)}
+        comb_verified = [o for o in comb_opps if o.verified]
+        results["combinatorial"] = {
+            "total_groups": len(comb_opps),
+            "verified": len(comb_verified),
+            "tradeable": len([o for o in comb_opps if o.should_trade]),
+            # Verified only, and no orders: this screen reads no order books, so
+            # an unverified basket's percentage is not a number worth showing.
+            "top_profit": max([o.estimated_profit_pct for o in comb_verified], default=0),
+            "places_orders": False,
+            "why_not_tradeable": (comb_opps[0].blocked_reason
+                                  if comb_opps and not comb_verified else None),
+        }
         
         # Reference odds
         ref_engine = ReferenceOddsEngine()
