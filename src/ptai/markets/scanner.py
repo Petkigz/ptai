@@ -133,7 +133,12 @@ class MarketScanner:
         order = order_by or self.settings.scan_order_by
 
         start = time.time()
-        logger.info(f"Starting market scan: target={target}, order={order}, use_registry={use_registry} - VenueRegistry SINGLE SOURCE")
+        # One line per scan, at DEBUG. The operator's log carried this per
+        # market-source poll (the console previews markets) and it read like a
+        # cycle report; the cycle's own counts are what report a scan.
+        logger.debug(
+            f"Starting market scan: target={target}, order={order}, "
+            f"use_registry={use_registry}")
 
         markets: List[Market] = []
         discovery_report = {"venues": {}, "total": 0, "source": "registry"}
@@ -229,9 +234,19 @@ class MarketScanner:
                 else:
                     markets = []
         else:
-            # Legacy path only if explicitly requested use_registry=False
+            # Direct Polymarket path, used when the registry would recurse.
+            #
+            # The Polymarket adapter asks this scanner for Polymarket markets
+            # directly - routing that request back through the registry would
+            # call the same adapter again. The old line warned here on EVERY
+            # cycle ("use_registry=False explicitly requested ... NOT
+            # recommended"), so the operator's log carried a scary, repeated
+            # warning about the one correct path; the actual defect (no
+            # registry at all) is warned about where it is detected.
             if not use_registry:
-                logger.warning("use_registry=False explicitly requested - using PolymarketClient legacy path (NOT recommended)")
+                logger.debug(
+                    "scan(): direct Polymarket path (use_registry=False) - the "
+                    "registry's own Polymarket adapter is the caller")
                 markets = self.polymarket.scan_markets(target_count=target, order_by=order)
                 for m in markets:
                     m.venue_id = "polymarket"

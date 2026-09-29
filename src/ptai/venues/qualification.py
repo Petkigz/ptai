@@ -24,6 +24,7 @@ from loguru import logger
 from datetime import datetime, timezone
 import json
 import os
+import time
 from pathlib import Path
 
 @dataclass
@@ -413,8 +414,12 @@ class VenueQualificationEngine:
             # cycle, and the whole qualification record was unreadable, not just
             # the tail. `os.replace` is atomic on both Windows and POSIX: the
             # reader sees the old complete file or the new complete file.
+            # A per-process temp name. One fixed `.tmp` is shared by every
+            # writer, so a console process saving while the agent saves has two
+            # writers on one file - and the loser's os.replace moves the other
+            # process's half-written temp into place.
             tmp = self.qualification_file.with_name(
-                self.qualification_file.name + ".tmp")
+                f"{self.qualification_file.name}.{os.getpid()}.tmp")
             with open(tmp, 'w') as f:
                 json.dump(data, f, indent=2)
                 f.flush()
@@ -422,7 +427,41 @@ class VenueQualificationEngine:
                     os.fsync(f.fileno())
                 except OSError:  # noqa: BLE001 - fsync is best effort
                     pass
-            os.replace(tmp, self.qualification_file)
+            # WINDOWS SHARING, NOT A BUG IN THIS FUNCTION.
+            #
+            # os.replace fails with WinError 5 while ANOTHER process has the
+            # destination open for reading. The operator's 17:27 log hit exactly
+            # that - the console reads this file for its snapshot while the
+            # agent saves it - and the save was simply lost:
+            #   Qualification save failed: [WinError 5] Access is denied:
+            #   'data\venue_qualification.json.tmp' -> 'data\venue_qualification.json'
+            # A reader holds the handle for milliseconds, so a bounded retry
+            # clears it. If it never clears, the record is still written IN
+            # PLACE and the log says which trade-off was made: losing the whole
+            # save is worse than a non-atomic one, and the loader already
+            # salvages or quarantines a truncated file.
+            last_error: Optional[BaseException] = None
+            for attempt in range(6):
+                try:
+                    os.replace(tmp, self.qualification_file)
+                    last_error = None
+                    break
+                except OSError as e:
+                    last_error = e
+                    time.sleep(0.05 * (attempt + 1))
+            if last_error is not None:
+                logger.warning(
+                    f"Qualification save: {self.qualification_file.name} stayed "
+                    f"locked for 6 attempts ({last_error}); writing it in place "
+                    f"so this cycle's record is not lost. Nothing reads a "
+                    f"half-written file as truth: the loader salvages or "
+                    f"quarantines a truncated one.")
+                with open(self.qualification_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+                try:
+                    os.unlink(tmp)
+                except OSError:  # noqa: BLE001 - a leftover temp is not fatal
+                    pass
         except Exception as e:
             logger.warning(f"Qualification save failed: {e}")
 

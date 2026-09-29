@@ -195,6 +195,28 @@ def _credential_source(data_dir: str, tool: str) -> Dict[str, Any]:
 WAIT_SLICE_SECONDS = 60.0
 
 
+def _thinking_note(on: bool) -> str:
+    """
+    One sentence: is the model reasoning before it answers, and why that way.
+
+    The operator asked why thinking was disabled, and the honest answer has two
+    halves: PTAI's own prompt forbade chain-of-thought (a speed decision from a
+    log where one market took ~9 minutes), and the request never asked the
+    server to enable it. Both are now controlled by ONE setting, and this
+    sentence is what the log and the console print, from the same place.
+    """
+    if on:
+        return ("thinking: ON - the model is asked to reason through the market "
+                "before answering (PTAI_LLM_THINKING=1); each forecast takes "
+                "longer, and a call that overruns the call limit gives no "
+                "forecast for that market. Turn it off in Setup > Brain to go "
+                "back to direct answers")
+    return ("thinking: OFF - the model answers directly; PTAI's prompt asks it "
+            "not to think and the request does not ask the server to enable it "
+            "(PTAI_LLM_THINKING=0). Turn it on in Setup > Brain to make the "
+            "model reason first")
+
+
 def _why_the_model_was_not_used(status: Dict[str, Any], asked: int,
                                 problems: List[str]) -> str:
     """
@@ -254,6 +276,13 @@ def _why_the_model_was_not_used(status: Dict[str, Any], asked: int,
                 f"asked - the cycle's own refusal line for each one names the gate "
                 f"(resolution risk, contradiction)")
     if status["deep_shortlist"] and not asked:
+        if status.get("ensemble_has_router"):
+            return (f"{status['deep_shortlist']} market(s) were chosen for deep "
+                    f"analysis and {status.get('forecasts_run', 0)} forecast(s) "
+                    f"were built, but not one of them was handed to the model: "
+                    f"every market the forecast engine priced was marked as "
+                    f"outside the deep shortlist, so the model step was skipped "
+                    f"for all of them")
         return (f"{status['deep_shortlist']} market(s) were chosen for deep "
                 f"analysis and {status.get('forecasts_run', 0)} forecast(s) were "
                 f"built, but not one of them was handed to the model: this process "
@@ -329,6 +358,10 @@ class TradingAgentV3:
             model=self.settings.lm_studio_model,
             timeout_seconds=getattr(self.settings, "llm_timeout_seconds",
                                     180.0),
+            # The model reasons before answering only if the operator asked it
+            # to (PTAI_LLM_THINKING / the console's Brain panel). Sent in the
+            # request, and the cycle says which way it is set and why.
+            thinking=bool(getattr(self.settings, "llm_thinking", False)),
         )
         
         # Intelligence
@@ -4953,7 +4986,9 @@ class TradingAgentV3:
             "available": False, "model": "", "provider": "", "where": "",
             "reason": "", "describe": "", "calls": 0, "answered": 0, "failed": 0,
             "seconds": 0.0, "models": {}, "last_error": "", "used": False,
-            "not_used_reason": "",
+            "not_used_reason": "", "thinking": False, "thinking_note": "",
+            "ensemble_has_router": False, "forecasts_run": 0, "priced": 0,
+            "deep_priced": 0, "asked": 0, "answered_by_model": 0,
         }
         screen = getattr(self, "_screen", None) or {}
         status["considered"] = int(screen.get("considered") or 0)
@@ -5014,9 +5049,17 @@ class TradingAgentV3:
             pass
         status["asked"] = asked
         status["answered_by_model"] = answered_by_model
+        status["thinking"] = bool(getattr(router, "thinking", False))
+        status["thinking_note"] = _thinking_note(status["thinking"])
         status["priced"] = int(getattr(self, "_cycle_context_calls", 0) or 0)
         status["deep_priced"] = int(getattr(self, "_cycle_deep_context_calls", 0) or 0)
         status["question_problems"] = problems[-3:]
+        # WHICH ENGINE PRICED THIS CYCLE, so "not one market was handed to the
+        # model" can say whether the forecast engine HAS a router (a wiring
+        # question) or the markets it priced were simply not marked deep (a
+        # shortlist question). Two different defects, two different sentences.
+        status["ensemble_has_router"] = bool(getattr(
+            getattr(self, "ensemble_forecaster", None), "llm_router", None))
         status["used"] = answered_by_model > 0 or status["answered"] > 0
         # AN ASK THAT NEVER BECAME A CALL IS A WIRING DEFECT, and it is visible
         # only by comparing the two counters. The 16:23 log said "8 market(s)
@@ -5076,6 +5119,16 @@ class TradingAgentV3:
             line += " | venue scan: had not run when this line was written"
         if status["failed"] and status["last_error"]:
             line += f" | last failure: {status['last_error']}"
+        # THINKING, IN THE OPERATOR'S TERMS.
+        #
+        # He asked why thinking was off. It was off by PTAI's own choice - the
+        # prompt forbade chain-of-thought (a speed decision from a 9-minute
+        # market) and the request never asked the server to enable it. The
+        # choice is now his (`PTAI_LLM_THINKING`, or the console's Brain
+        # panel), and the model line says which way it is set and what it
+        # costs, so the question never has to be asked of the log again.
+        line += " | " + str(status.get("thinking_note") or _thinking_note(
+            bool(status.get("thinking"))))
         return line
     def _record_scan_log(self, result: Dict[str, Any], *, markets_scanned: int,
                          opportunities_found: int, avg_edge: float) -> None:

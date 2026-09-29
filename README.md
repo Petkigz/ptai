@@ -669,7 +669,13 @@ cycle's real messages:
     ERROR line for a working paper run reads like a broken agent;
   * a venue that publishes no `get_mechanics` reader is not asked for one. The
     fee falls back to its declared capability, exclusivity stays **unknown**
-    rather than guessed, and the venue is named **once**, at INFO.
+    rather than guessed, and the venue is named **once**, at INFO;
+  * `use_registry=False explicitly requested - using PolymarketClient legacy
+    path (NOT recommended)` is gone from every cycle. That warning fired for the
+    Polymarket adapter's OWN discovery call - the one correct path, since asking
+    the registry from inside the registry would recurse - so it read as a defect
+    in every run. The direct path is now DEBUG with that wording, and the real
+    defect (no registry at all) is still warned about where it is detected.
 
 ### A Save That Is Interrupted Leaves A Whole File
 
@@ -688,6 +694,24 @@ file in place to fail again on every future cycle.
   * a load failure now **names the file**, says the consequence, and moves the
     unreadable file aside as `venue_qualification.json.corrupt` so the record can
     be rebuilt without losing the evidence.
+
+**A save Windows refuses is not a lost record.** The next run reported
+
+    WARNING ptai.venues.qualification:_save:427 - Qualification save failed:
+    [WinError 5] Access is denied: 'data\venue_qualification.json.tmp' ->
+    'data\venue_qualification.json'
+
+`os.replace` cannot move a file Windows has open for reading, and the console
+reads this file for its snapshot while the agent saves it - so the save was lost,
+silently, with the cycle's evidence in it. The save now
+
+  * writes to a temp file named for the writing **process** (`...json.<pid>.tmp`),
+    so two writers cannot move each other's half-written file into place;
+  * retries `os.replace` six times over ~1 s, which clears a reader's
+    milliseconds-long handle;
+  * if it still cannot move the file, writes the record **in place** and says so
+    in the log: losing the whole save is worse than a non-atomic one, and a
+    truncated file is salvaged or quarantined on load anyway.
 
 ### An Arbitrage Has To Be One
 
@@ -899,7 +923,10 @@ The model id is now a named fact at every point where it is decided or used:
       (qwen3.8-27b-... x8) | the screen chose 8 of 200 market(s) for deep
       analysis (a plan: 8 of them reached the pricing stage) | venue scan:
       priced 41 market(s) of the 200 read (99 had no usable book, 60 beyond
-      their venue's cap)
+      their venue's cap) | thinking: OFF - the model answers directly;
+      PTAI's prompt asks it not to think and the request does not ask the
+      server to enable it (PTAI_LLM_THINKING=0). Turn it on in Setup > Brain
+      to make the model reason first
 
 The per-cycle line is printed by every cycle, including a cycle that discovered
 nothing and takes the early-return path. When the model did no work it says so
@@ -1018,6 +1045,67 @@ DEBUG, because DEBUG is on on this machine.
 the same volume and liquidity floors the venue scan does, so model budget cannot
 be spent planning for markets the pricing stage discards - the failure mode
 behind "8 chosen for deep analysis" in a cycle that asked the model nothing.
+
+## Thinking Is A Switch You Own
+
+The operator asked, of a whole run: *"it seems thinking is disabled for the model
+i want to know why"*. It was, and the answer was in two places - neither of them
+the loaded model:
+
+  * **the prompt forbade it.** The system prompt said, unconditionally,
+    `No chain-of-thought, no <think> tag, just direct JSON`. That wording was a
+    speed decision made after a log where ONE market took ~9 minutes with a
+    reasoning model, and it applied even when the operator wanted reasoning;
+  * **the request never asked for it.** Nothing in PTAI ever sent
+    `enable_thinking` - the chat-template kwarg LM Studio honours for Qwen3-style
+    hybrid-thinking models - so whatever the loaded model's own default was,
+    applied. There was no line anywhere saying which of the two had decided.
+
+Both are now one setting, and it is yours:
+
+    PTAI_LLM_THINKING=1     # .env, or Setup > Brain in the console
+
+With it on, the request carries
+
+    extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
+
+and the prompt asks the model to reason first and end with the JSON the parser
+reads. With it off (the default), the request sends no thinking kwarg at all and
+the prompt keeps the speed wording. The kwarg is only sent when it is wanted, so
+a server that does not understand it never sees it.
+
+**The cycle says which way it is set, every time.** The model line ends with one
+sentence, from one place:
+
+    ... | thinking: OFF - the model answers directly; PTAI's prompt asks it not
+      to think and the request does not ask the server to enable it
+      (PTAI_LLM_THINKING=0). Turn it on in Setup > Brain to make the model
+      reason first
+
+    ... | thinking: ON - the model is asked to reason through the market before
+      answering (PTAI_LLM_THINKING=1); each forecast takes longer, and a call
+      that overruns the call limit gives no forecast for that market. Turn it
+      off in Setup > Brain to go back to direct answers
+
+**What it costs.** A reasoning pass is slower per market; that is why the default
+is off. The call limit (`One call waits at most`, `LLM_TIMEOUT_SECONDS`) still
+applies, so a model that thinks for longer than the limit gives NO forecast for
+that market - which the log says - instead of holding the cycle. Turn thinking on
+and raise the call limit together if your model needs more than 180 s per market,
+and expect fewer markets per cycle.
+
+The setting is visible and editable in three places that agree, because they read
+one field: the Brain panel's **Thinking** row, `POST /api/console/brain
+{"thinking": true|false}` (what the button calls), and `PTAI_LLM_THINKING` in
+`.env` / `.env.example`. A change applies **from the agent's next start**, the
+same as the model pin and the call limit.
+
+Verified end to end: a real cycle over stubbed venues against a stand-in LM
+Studio that records what it receives - with the switch off the requests carry no
+`chat_template_kwargs` and the prompt says `No chain-of-thought`; with it on
+every request carries `chat_template_kwargs: {"enable_thinking": true}` and the
+prompt asks for reasoning. The stand-in's recording is the request body, so this
+is PTAI's own wire traffic, not a claim about it.
 
 ## Extending to Other Sites
 

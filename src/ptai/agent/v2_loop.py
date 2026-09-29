@@ -106,6 +106,7 @@ class TradingAgentV2:
             model=self.settings.lm_studio_model,
             timeout_seconds=getattr(self.settings, "llm_timeout_seconds",
                                     180.0),
+            thinking=bool(getattr(self.settings, "llm_thinking", False)),
         )
         
         # Intelligence

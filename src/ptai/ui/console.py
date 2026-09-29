@@ -775,6 +775,11 @@ def _brain_status(force: bool = False) -> Dict[str, Any]:
                 env.get("LLM_TIMEOUT_SECONDS") or 180.0)
         except (TypeError, ValueError):
             value["timeout_seconds"] = 180.0
+        # Whether the model is allowed to reason before it answers. The operator
+        # asked why thinking was off; the screen now says which way this install
+        # is set, and the toggle below changes it.
+        value["thinking"] = str(env.get("PTAI_LLM_THINKING", "0")).strip().lower() \
+            in ("1", "true", "yes", "on")
         value["available"] = True
     except Exception as e:
         value = {"available": False, "connected": False, "models": [],
@@ -867,6 +872,31 @@ async def api_pin_brain(request: Request) -> JSONResponse:
     """
     body = await request.json() if await request.body() else {}
     from ..dashboard import write_env_file
+
+    # THINKING IS THE OPERATOR'S DECISION, NOT A HIDDEN DEFAULT.
+    #
+    # It was off because PTAI chose so (the prompt forbade chain-of-thought
+    # after a 9-minute market, and the request never enabled it). Now it is a
+    # switch here, and the agent says which way it is set in every cycle's
+    # model line.
+    if "thinking" in body:
+        on = bool(body.get("thinking"))
+        write_env_file({"PTAI_LLM_THINKING": "1" if on else "0"})
+        _BRAIN_CACHE["at"] = 0.0
+        return JSONResponse({
+            "thinking": on,
+            "note": ("Thinking ON: the agent asks LM Studio to let the model "
+                     "reason before it answers (chat-template kwarg "
+                     "enable_thinking). Forecasts take longer per market - a "
+                     "model call that overruns the call limit gives no forecast "
+                     "for that market. The running agent picks this up on its "
+                     "next start.")
+                    if on else
+                    ("Thinking OFF: the model answers directly, which is what "
+                     "PTAI's own prompt asks for and what keeps a 10-minute "
+                     "cycle inside its interval. The running agent picks this "
+                     "up on its next start."),
+        })
 
     # The agent's wait for ONE model call. Editable here for the same reason the
     # model is: it is a product setting, not a config file. A call that takes
@@ -1729,11 +1759,20 @@ async def api_run_cycle(request: Request) -> JSONResponse:
             "control": control,
         }))
 
+    # SAID BEFORE THE BUILD, not after. Starting the agent constructs it, and
+    # the construction logs `PTAI V3 initialized` plus one line per venue - so a
+    # press of Run a round after Stop read like the system restarting itself for
+    # no reason. The operator's action comes first in the log, and the build is
+    # then read as its consequence.
+    logger.info("The operator asked for a round and no agent was running, so one "
+                "is being started here; the initialization lines that follow are "
+                "that start, not a restart")
     result = _start_agent_in_process(started_by="Run a round")
     if not result.get("started"):
         return JSONResponse(status_code=409, content=_json_safe({
             "error": result.get("reason"), "control": _controller_status()}))
-    logger.info("The operator asked for a round; the console started the agent here")
+    logger.info("The agent is started in this console and is taking its first "
+                "round now")
     return JSONResponse(status_code=200, content=_json_safe({
         "status": "started",
         "message": ("the agent was not running, so it was started here and is "
@@ -3077,6 +3116,7 @@ async function runCycle(){
         ${lm.used
           ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} &middot; ${lm.answered||0} of ${lm.calls||0} call(s) answered${lm.answered_by_model!==undefined ? `, ${lm.answered_by_model} market(s) answered` : ''}`
           : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
+        ${lm.thinking_note ? ` &middot; ${esc(lm.thinking_note)}` : ''}
         ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>` : ''}
     ${body.deep_analysis && body.deep_analysis.considered
       ? `<div class="note">The screen chose ${((body.deep_analysis.shortlist)||[]).length}
@@ -3235,6 +3275,7 @@ async function loadForecast(){
         ${lm.used
           ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} (${lm.answered||0} of ${lm.calls||0} call(s) answered, ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s)`
           : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
+        ${lm.thinking_note ? ` &middot; ${esc(lm.thinking_note)}` : ''}
         ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>`
     : '';
   const screenLine = screen.considered
@@ -3496,12 +3537,18 @@ function renderBrain(el, b, withPicker){
       <tr><td style="color:var(--dim)">One call waits at most</td>
           <td class="mono">${b.timeout_seconds?Number(b.timeout_seconds).toFixed(0)+'s':'&mdash;'}
             <span class="note"> - a slower model then gives no forecast for that market instead of holding the cycle</span></td></tr>
+      <tr><td style="color:var(--dim)">Thinking</td>
+          <td class="mono">${b.thinking
+              ?'<span class="pos">ON</span> - the model reasons before it answers'
+              :'<span class="neg">OFF</span> - the model answers directly; PTAI\'s prompt says so'}</td></tr>
     </table>`;
   const picker = (withPicker && b.connected && b.models.length) ? `
     <div style="margin-top:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <select id="modelSelect" style="max-width:340px;width:auto">${
         b.models.map(m=>`<option value="${esc(m)}"${m===active?' selected':''}>${esc(m)}</option>`).join('')}</select>
       <button class="primary" onclick="pinModel()">Pin this model</button>
+      <button onclick="setThinking(${b.thinking?'false':'true'})">${
+        b.thinking?'Turn thinking OFF':'Turn thinking ON'}</button>
       <label style="margin:0 0 0 8px;color:var(--dim);font-size:12px">Model call limit (s)</label>
       <input id="timeoutSeconds" type="number" min="10" max="3600" step="10"
              value="${b.timeout_seconds?Number(b.timeout_seconds).toFixed(0):180}"
@@ -3526,6 +3573,15 @@ async function pinModel(){
     ? `<span class="pos">${esc(body.note||'pinned')}</span>`
     : `<span class="neg">${esc(body.error||'could not pin')}</span> ${esc(body.note||'')}`;
   if(ok){ loadBrainSetup(); loadAgent(); }
+}
+
+async function setThinking(on){
+  const {ok, body} = await api('/api/console/brain', {method:'POST',
+    body:JSON.stringify({thinking: !!on})});
+  $('pinMsg').innerHTML = ok
+    ? `<span class="pos">${esc(body.note||'saved')}</span>`
+    : `<span class="neg">${esc(body.error||'could not save')}</span>`;
+  if(ok) loadBrainSetup();
 }
 
 async function saveTimeout(){

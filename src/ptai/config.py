@@ -42,6 +42,14 @@ class LLMConfig(BaseModel):
     lm_studio_host: str = "http://localhost:1234"
     temperature: float = 0.2
     max_tokens: int = 1200
+    # Whether the local model may REASON before it answers.
+    #
+    # The operator asked why thinking was off. Two answers: PTAI's own prompt
+    # told the model "no chain-of-thought, no <think> tag, just direct JSON",
+    # and the request never asked LM Studio to enable it. Both are deliberate
+    # speed decisions from a log where one market took ~9 minutes, and both are
+    # now ONE setting the operator can flip.
+    thinking: bool = False
 
 class SentimentConfig(BaseModel):
     enabled: bool = True
@@ -116,6 +124,11 @@ class Settings(BaseSettings):
     # stalling the loop, and every reader agrees on the bound because it is one
     # setting.
     llm_timeout_seconds: float = Field(default=180.0, alias="LLM_TIMEOUT_SECONDS")
+    # Let the model think before it answers. Off by default because a reasoning
+    # model is slower per market (that is why the prompt used to forbid it); on
+    # means the operator accepts longer cycles for better forecasts. Editable
+    # from the console's Brain panel as well as here.
+    llm_thinking: bool = Field(default=False, alias="PTAI_LLM_THINKING")
     llm_provider: str = Field(default="auto", alias="LLM_PROVIDER")  # auto, ollama, lm_studio, openai_compatible
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="http://localhost:1234/v1", alias="OPENAI_BASE_URL")
@@ -212,6 +225,7 @@ class Settings(BaseSettings):
         host = self.lm_studio_host if provider in ["auto", "lm_studio"] else self.ollama_host
         return LLMConfig(
             provider=provider,
+            thinking=bool(getattr(self, "llm_thinking", False)),
             model=model,
             host=host,
             ollama_host=self.ollama_host,

@@ -228,8 +228,12 @@ class Brain:
                 # Bounded: a slow model must produce NO forecast rather than
                 # hold the cycle. See config.llm_timeout_seconds.
                 timeout_seconds=getattr(self.settings, "llm_timeout_seconds", 180.0),
+                # Whether the model may reason before answering. Off means the
+                # prompt may still say "no chain-of-thought"; on means the
+                # request asks LM Studio to enable it (PTAI_LLM_THINKING).
+                thinking=self.llm_thinking(),
             )
-            logger.info(f"Brain LLM Router: provider={self.llm_router.get_provider_name()} model={self.llm_config.model} lm_studio={self.llm_config.lm_studio_host} ollama={self.llm_config.ollama_host} max_tokens={max_toks} is_r1={is_r1_model}")
+            logger.info(f"Brain LLM Router: provider={self.llm_router.get_provider_name()} model={self.llm_config.model} lm_studio={self.llm_config.lm_studio_host} ollama={self.llm_config.ollama_host} max_tokens={max_toks} is_r1={is_r1_model} thinking={self.llm_thinking()}")
         except Exception as e:
             logger.warning(f"LLM Router init failed: {e}, using heuristic")
             self.llm_router = None
@@ -262,7 +266,18 @@ WEB RESEARCH (local browser/terminal):
 {research_text[:2000]}
 """
 
-        system_prompt = """You are an expert prediction market superforecaster. Be extremely concise. No chain-of-thought, no <think> tag, just direct JSON. You must earn money or shutdown. Calibrated, base-rate aware. SPEED CRITICAL: Respond in <100 tokens JSON only."""
+        # THINKING, SAID OUT LOUD.
+        #
+        # The old system prompt forbade chain-of-thought unconditionally. That
+        # was a speed decision from a log where one market took ~9 minutes, and
+        # it applied even when the operator wanted the model to reason. Now the
+        # instruction follows the ONE setting (`llm_thinking`): off = the old
+        # speed wording; on = the model is told to reason and only the final
+        # JSON answer is read back.
+        if self.llm_thinking():
+            system_prompt = """You are an expert prediction market superforecaster. Reason through the market carefully first, then answer with direct JSON only. Put your reasoning in your own scratch space and end with the JSON object the user asks for. You must earn money or shutdown. Calibrated, base-rate aware."""
+        else:
+            system_prompt = """You are an expert prediction market superforecaster. Be extremely concise. No chain-of-thought, no <think> tag, just direct JSON. You must earn money or shutdown. Calibrated, base-rate aware. SPEED CRITICAL: Respond in <100 tokens JSON only."""
 
         # THE EXAMPLE USED TO CARRY THE ANSWER.
         #
@@ -543,6 +558,18 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
         why = self._last_llm_problem or "the local model gave no usable answer"
         logger.warning(f"Using fallback heuristic for {market.id}: {why}")
         return self._fallback_heuristic(market, sentiment)
+
+    def llm_thinking(self) -> bool:
+        """Whether the local model is allowed to reason before it answers.
+
+        Read from the LLM config first (the CLI and the console both build it
+        from settings) and from the settings object second, so every path that
+        reaches the Brain asks the same question and gets the same answer.
+        """
+        value = getattr(self.llm_config, "thinking", None)
+        if value is None:
+            value = getattr(self.settings, "llm_thinking", False)
+        return bool(value)
 
     def llm_provider_model(self) -> str:
         """

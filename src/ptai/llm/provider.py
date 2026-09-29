@@ -192,8 +192,15 @@ DEFAULT_LLM_TIMEOUT_SECONDS = 180.0
 class BaseLLMProvider:
     def __init__(self, model: str, host: str, temperature: float = 0.2,
                  max_tokens: int = 1200,
-                 timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
+                 timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS,
+                 thinking: bool = False):
         self.model = model or "local-model"
+        # Whether this provider asks the server to let the model reason first.
+        # LM Studio exposes Qwen3-style hybrid thinking as the chat-template
+        # kwarg `enable_thinking`, and nothing in this codebase ever sent it, so
+        # whatever the loaded model's own default was is what happened - with
+        # PTAI's prompt telling the model not to think on top of it.
+        self.thinking = bool(thinking)
         self.host = (host or "http://localhost:1234").rstrip("/")
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -292,8 +299,9 @@ class OllamaProvider(BaseLLMProvider):
 
 class LMStudioProvider(BaseLLMProvider):
     """LM Studio - OpenAI compatible at http://localhost:1234/v1 (default)"""
-    def __init__(self, model: str = "local-model", host: str = "http://localhost:1234", temperature: float = 0.2, max_tokens: int = 1200, api_key: str = "lm-studio", timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
-        super().__init__(model, host, temperature, max_tokens, timeout_seconds)
+    def __init__(self, model: str = "local-model", host: str = "http://localhost:1234", temperature: float = 0.2, max_tokens: int = 1200, api_key: str = "lm-studio", timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS, thinking: bool = False):
+        super().__init__(model, host, temperature, max_tokens, timeout_seconds,
+                         thinking=thinking)
         self.api_key = api_key or "lm-studio"
         if not self.host.endswith("/v1"):
             self.base_url = f"{self.host}/v1"
@@ -355,12 +363,26 @@ class LMStudioProvider(BaseLLMProvider):
                     self.model = model_to_use
                     logger.info(f"LM Studio model choice: {reason}")
 
+            # THINKING IS A REQUEST-SIDE FLAG, NOT A PROMPT.
+            #
+            # The operator asked why thinking was off. Nothing in PTAI ever sent
+            # `enable_thinking`, so the loaded model's own default applied - and
+            # PTAI's prompt then told it "no chain-of-thought, no <think> tag".
+            # Now the one setting `llm_thinking` decides, and the kwarg goes in
+            # the request so LM Studio's template actually honours it. Sent only
+            # when True: a server that does not understand the kwarg must not
+            # reject every call because of a feature it was not using anyway.
+            extra_body = {}
+            if self.thinking:
+                extra_body["chat_template_kwargs"] = {"enable_thinking": True}
+
             started = time.time()
             response = client.chat.completions.create(
                 model=model_to_use,
                 messages=messages,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens
+                max_tokens=self.max_tokens,
+                extra_body=extra_body or None,
             )
             elapsed = time.time() - started
             # The id the SERVER reports, which is the only one that is a fact
@@ -401,9 +423,10 @@ class LMStudioProvider(BaseLLMProvider):
 
 class OpenAICompatibleProvider(BaseLLMProvider):
     """Generic OpenAI compatible (for any local server)"""
-    def __init__(self, model: str, host: str, api_key: str = "not-needed", temperature: float = 0.2, max_tokens: int = 1200, timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
+    def __init__(self, model: str, host: str, api_key: str = "not-needed", temperature: float = 0.2, max_tokens: int = 1200, timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS, thinking: bool = False):
         safe_host = host or "http://localhost:1234"
-        super().__init__(model, safe_host, temperature, max_tokens, timeout_seconds)
+        super().__init__(model, safe_host, temperature, max_tokens, timeout_seconds,
+                         thinking=thinking)
         self.api_key = api_key or "not-needed"
         self.base_url = self.host if self.host.endswith("/v1") else f"{self.host}/v1"
 
@@ -451,8 +474,11 @@ class LLMRouter:
     3. Any OpenAI compatible
     4. Fallback heuristic
     """
-    def __init__(self, preferred: str = "auto", ollama_host: str = "http://localhost:11434", lm_studio_host: str = "http://localhost:1234", model: str = "local-model", temperature: float = 0.2, max_tokens: int = 1200, timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS):
+    def __init__(self, preferred: str = "auto", ollama_host: str = "http://localhost:11434", lm_studio_host: str = "http://localhost:1234", model: str = "local-model", temperature: float = 0.2, max_tokens: int = 1200, timeout_seconds: Optional[float] = DEFAULT_LLM_TIMEOUT_SECONDS, thinking: bool = False):
         self.timeout_seconds = float(timeout_seconds or DEFAULT_LLM_TIMEOUT_SECONDS)
+        # `thinking` reaches every provider this router builds, so the whole
+        # install answers "is the model reasoning first?" the same way.
+        self.thinking = bool(thinking)
         self.preferred = preferred or "auto"
         self.ollama_host = ollama_host or "http://localhost:11434"
         self.lm_studio_host = lm_studio_host or "http://localhost:1234"
@@ -505,7 +531,7 @@ class LLMRouter:
         _say("info", f"LLM Router detecting, preferred={self.preferred}, lm_studio={self.lm_studio_host}, ollama={self.ollama_host}, model={self.model}")
 
         if self.preferred in ["auto", "lm_studio", "lmstudio"]:
-            lm = LMStudioProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens, timeout_seconds=self.timeout_seconds)
+            lm = LMStudioProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens, timeout_seconds=self.timeout_seconds, thinking=self.thinking)
             if lm.is_available():
                 models = lm.list_models()
                 self._last_detected_models = models
@@ -550,7 +576,7 @@ class LLMRouter:
                      f"{self.lm_studio_host}")
 
         if self.preferred in ["auto", "ollama"]:
-            ollama = OllamaProvider(model=self.model if self.model != "local-model" else "llama3.1:8b", host=self.ollama_host, temperature=self.temperature, max_tokens=self.max_tokens)
+            ollama = OllamaProvider(model=self.model if self.model != "local-model" else "llama3.1:8b", host=self.ollama_host, temperature=self.temperature, max_tokens=self.max_tokens, thinking=self.thinking)
             if ollama.is_available():
                 self.active_model = ollama.model
                 self.active_model_reason = "ollama is the detected local model server"
@@ -561,7 +587,7 @@ class LLMRouter:
                 _say("info", f"LOCAL MODEL: none - Ollama is not answering at {self.ollama_host}")
 
         if self.preferred == "auto":
-            generic = OpenAICompatibleProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens, timeout_seconds=self.timeout_seconds)
+            generic = OpenAICompatibleProvider(model=self.model, host=self.lm_studio_host, temperature=self.temperature, max_tokens=self.max_tokens, timeout_seconds=self.timeout_seconds, thinking=self.thinking)
             if generic.is_available():
                 self.active_model = generic.model
                 self.active_model_reason = "an OpenAI-compatible server answered"
@@ -673,6 +699,7 @@ def get_llm_router(preferred: str = "auto", ollama_host: str = None, lm_studio_h
             lm_studio_host=lm_studio_host or settings.lm_studio_host,
             model=model or settings.lm_studio_model or settings.ollama_model,
             temperature=0.2,
-            max_tokens=1200
+            max_tokens=1200,
+            thinking=bool(getattr(settings, "llm_thinking", False)),
         )
     return _router

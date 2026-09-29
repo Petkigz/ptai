@@ -687,14 +687,18 @@ async def api_export():
     import csv
     storage = get_storage()
     trades = storage.get_recent_trades(1000)
-    Path("./data").mkdir(exist_ok=True)
-    with open("./data/dashboard_export.csv", "w", newline="", encoding="utf-8") as f:
+    from .storage.db import default_data_dir
+    export_dir = Path(default_data_dir())
+    export_dir.mkdir(parents=True, exist_ok=True)
+    with open(export_dir / "dashboard_export.csv", "w", newline="",
+              encoding="utf-8") as f:
         if trades:
             writer = csv.DictWriter(f, fieldnames=trades[0].keys())
             writer.writeheader()
             writer.writerows(trades)
     storage.close()
-    return {"exported": len(trades), "path": "./data/dashboard_export.csv"}
+    return {"exported": len(trades),
+            "path": str(export_dir / "dashboard_export.csv")}
 
 # ===== PREMIUM: Teammates, Memory, Vault, Backtest, Users =====
 
@@ -1374,7 +1378,8 @@ async def api_v2_risk():
         bankroll = storage.get_performance_summary().get("bankroll", 50.0)
         storage.close()
         
-        kill = KillSwitch(data_dir="./data")
+        from .storage.db import default_data_dir
+        kill = KillSwitch(data_dir=default_data_dir())
         exposure = ExposureManager(bankroll=bankroll)
         limits = LimitsEngine(bankroll=bankroll)
         
@@ -2051,7 +2056,8 @@ async def api_v3_reference_odds(target_count: int = 50):
 async def api_v3_calibration():
     try:
         from .intelligence.calibration_tracker import CalibrationTracker
-        tracker = CalibrationTracker(data_dir="./data")
+        from .storage.db import default_data_dir
+        tracker = CalibrationTracker(data_dir=default_data_dir())
         report = tracker.get_report()
         return report
     except Exception as e:
@@ -2366,7 +2372,8 @@ async def api_v3_alpha_all(target_per_venue: int = 50):
         results["correlation"] = {"max_cluster_pct": corr_manager.max_cluster_pct*100, "max_positions": corr_manager.max_cluster_positions, "kelly": "1/4 Kelly cap 6% but lower for low confidence"}
         
         # Calibration
-        cal_tracker = CalibrationTracker(data_dir="./data")
+        from .storage.db import default_data_dir
+        cal_tracker = CalibrationTracker(data_dir=default_data_dir())
         results["calibration"] = {"total": len(cal_tracker.predictions), "method": "Brier score + reliability diagrams"}
         
         # Slippage
