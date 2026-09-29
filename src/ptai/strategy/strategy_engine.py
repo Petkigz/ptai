@@ -45,6 +45,57 @@ from .edge import HUNT_MISPRICING_MIN, EdgeCalculator, hunted_mispricing
 EXPLORATION_MISPRICING_MIN = 0.05
 EXPLORATION_EXECUTABLE_EDGE_MIN = 0.02
 
+# How many PAPER/EXPLORATION trades one cycle may place. One was the ceiling
+# while the lane only had to prove it could trade at all; the operator now needs
+# the record to build - "i need to get Polymarket paper record to 100 resolved
+# trades so live unlocks" - and a round that finds three qualifying markets may
+# as well learn from three. Every other part of the lane's bar is unchanged, each
+# trade is $1 (or the sizing the paper bankroll justifies), the exposure manager
+# still caps what can be open at once, and a market already held is still skipped.
+PAPER_TRADES_PER_CYCLE_DEFAULT = 3
+PAPER_TRADES_PER_CYCLE_CEILING = 5
+
+
+def paper_trades_per_cycle_default() -> int:
+    """`PTAI_PAPER_TRADES_PER_CYCLE`, default 3, ceiling 5."""
+    import os
+
+    raw = os.environ.get("PTAI_PAPER_TRADES_PER_CYCLE", "")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return PAPER_TRADES_PER_CYCLE_DEFAULT
+    return max(1, min(PAPER_TRADES_PER_CYCLE_CEILING, value))
+
+
+def resolution_days(market) -> Optional[float]:
+    """
+    Days until this market settles, or None when the market does not say.
+
+    CAPITAL x TIME IS PART OF THE RETURN. A 5% edge that resolves tomorrow is not
+    the same trade as a 5% edge that resolves in three months: the second ties the
+    capital up for a quarter to earn the same money. That is why the fine print of
+    the economic framework puts capital x time x execution risk in the
+    denominator, and why a market with no end date is not treated as if it
+    resolved tomorrow - None means unknown, and unknown sorts last.
+    """
+    end = getattr(market, "end_date", None)
+    if end is None:
+        return None
+    try:
+        if end.tzinfo is None:
+            from datetime import timezone as _tz
+
+            end = end.replace(tzinfo=_tz.utc)
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        now = _dt.now(_tz.utc)
+        seconds = (end - now).total_seconds()
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return max(0.0, seconds / 86400.0)
+
 
 def _refusal_text(fv_result) -> str:
     """The gate's own sentence, without the boolean it is prefixed with."""

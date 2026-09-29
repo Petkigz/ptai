@@ -881,3 +881,214 @@ class VenueQualificationEngine:
             "recommendation": f"Concentrate on {qualified_sorted[0].venue_id} - demonstrated skill {qualified_sorted[0].forecast_skill:.2f} pnl ${qualified_sorted[0].net_pnl:.2f}",
             "principle": "PTAI learns which venue/category combos it is good at and concentrates research there"
         }
+
+
+# ----------------------------------------------------------------------
+# the road to live capital: 100 resolved paper trades, and why it is stuck
+# ----------------------------------------------------------------------
+
+#: The gates the operator is counting toward. These are DISPLAY constants - the
+#: engine's own `requirements` dict is what enforces them - and
+#: `tests/test_the_road_to_a_hundred_resolved_trades.py` asserts the two agree,
+#: so this block can never quietly drift from the gate that actually refuses.
+LIVE_TARGETS = {
+    "min_trades": 100,
+    "min_win_rate": 0.55,
+    "max_brier": 0.25,
+    "min_profit_factor": 1.1,
+}
+
+#: How far back the "how fast is this growing" rate is measured.
+RECORD_WINDOW_DAYS = 7
+
+
+def paper_record_progress(storage, venue_id: str = "polymarket",
+                          targets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    How close this venue is to the live gate, in resolved PAPER trades.
+
+    The operator's ask was exact - "i need to get Polymarket paper record to 100
+    resolved trades so live unlocks" - and the product could not answer it. The
+    count existed per venue but was never shown against the target, the RATE was
+    not measurable at all (nothing recorded WHEN a trade resolved), and a record
+    can pass the count and still fail on win rate, Brier or profit factor, so a
+    bare "12/100" would have been the wrong number to wait on.
+
+    Reads the trades table directly. Every figure here traces to rows:
+      * resolved / wins / net P&L / profit factor - the paper rows that settled;
+      * Brier - the recorded calibration of those trades, when it was measured;
+      * the rate and the median hold time - from `resolved_at`, which is written
+        by `Storage.resolve_trade` and is NULL on rows that settled before it
+        existed (those are counted, never guessed at).
+    """
+    out: Dict[str, Any] = {
+        "venue_id": venue_id,
+        "target": dict(targets or LIVE_TARGETS),
+        "resolved": 0, "wins": 0, "losses": 0, "open_trades": 0,
+        "win_rate": 0.0, "net_pnl_usd": 0.0, "profit_factor": 0.0,
+        "brier": None,
+        "remaining": int((targets or LIVE_TARGETS).get("min_trades", 100)),
+        "rate_per_day": None, "eta_days": None, "median_hold_hours": None,
+        "gates": {}, "ready": False,
+        "note": "",
+    }
+    if storage is None:
+        out["note"] = "no storage"
+        return out
+
+    t = dict(targets or LIVE_TARGETS)
+    try:
+        row = storage.conn.execute(
+            """
+            SELECT COUNT(*) AS resolved,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses,
+                   COALESCE(SUM(pnl), 0) AS net_pnl,
+                   COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0) AS gross_win,
+                   COALESCE(SUM(CASE WHEN pnl < 0 THEN -pnl ELSE 0 END), 0) AS gross_loss
+            FROM trades
+            WHERE venue_id = ? AND resolved = 1
+              AND COALESCE(execution_mode, 'live') = 'paper'
+            """, (venue_id,)).fetchone()
+        open_row = storage.conn.execute(
+            """
+            SELECT COUNT(*) AS open_trades
+            FROM trades
+            WHERE venue_id = ? AND resolved = 0
+            """, (venue_id,)).fetchone()
+    except Exception as e:  # noqa: BLE001 - a panel must still render
+        out["note"] = f"{type(e).__name__}: {e}"
+        return out
+
+    resolved = int(row["resolved"] or 0)
+    wins = int(row["wins"] or 0)
+    losses = int(row["losses"] or 0)
+    gross_win = float(row["gross_win"] or 0.0)
+    gross_loss = float(row["gross_loss"] or 0.0)
+    out.update({
+        "resolved": resolved, "wins": wins, "losses": losses,
+        "open_trades": int(open_row["open_trades"] or 0),
+        "win_rate": (wins / resolved) if resolved else 0.0,
+        "net_pnl_usd": round(float(row["net_pnl"] or 0.0), 4),
+        # Profit factor is only meaningful with a loss to divide by: a record of
+        # pure wins reports 0.0 rather than infinity, and the gate treats "no
+        # loss measured yet" as not-yet-met, which is the honest reading.
+        "profit_factor": round(gross_win / gross_loss, 4) if gross_loss > 0 else 0.0,
+        "remaining": max(0, int(t.get("min_trades", 100)) - resolved),
+    })
+
+    try:
+        brier_row = storage.conn.execute(
+            "SELECT AVG(brier_score) AS brier FROM trade_outcomes "
+            "WHERE venue_id = ? AND brier_score IS NOT NULL", (venue_id,)).fetchone()
+        if brier_row is not None and brier_row["brier"] is not None:
+            out["brier"] = round(float(brier_row["brier"]), 4)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"paper_record_progress: Brier unavailable: {e}")
+
+    # HOW FAST IS IT GROWING. `resolved_at` is the only honest source; rows that
+    # settled before it existed are excluded from the rate rather than assumed to
+    # have settled today.
+    try:
+        rows = storage.conn.execute(
+            """
+            SELECT timestamp, resolved_at, pnl FROM trades
+            WHERE venue_id = ? AND resolved = 1
+              AND COALESCE(execution_mode, 'live') = 'paper'
+              AND resolved_at IS NOT NULL
+            ORDER BY resolved_at ASC
+            """, (venue_id,)).fetchall()
+    except Exception as e:  # noqa: BLE001
+        rows = []
+        logger.debug(f"paper_record_progress: resolution times unavailable: {e}")
+
+    if rows:
+        stamps = []
+        holds = []
+        for r in rows:
+            try:
+                closed = datetime.fromisoformat(str(r["resolved_at"]))
+                if closed.tzinfo is None:
+                    closed = closed.replace(tzinfo=timezone.utc)
+                stamps.append(closed)
+                opened = datetime.fromisoformat(str(r["timestamp"]))
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                holds.append((closed - opened).total_seconds() / 3600.0)
+            except (TypeError, ValueError):
+                continue
+        if stamps:
+            newest = stamps[-1]
+            span_days = max((newest - stamps[0]).total_seconds() / 86400.0,
+                            1.0 / 24.0)
+            # The window is capped so an old record cannot be presented as the
+            # current pace: the rate describes the last RECORD_WINDOW_DAYS at most.
+            window_days = min(span_days, RECORD_WINDOW_DAYS)
+            within = sum(1 for s in stamps
+                         if (newest - s).total_seconds() / 86400.0 <= window_days)
+            out["rate_per_day"] = round(within / window_days, 3)
+            out["rate_window_days"] = round(window_days, 3)
+            if out["rate_per_day"] > 0:
+                out["eta_days"] = round(out["remaining"] / out["rate_per_day"], 2)
+        if holds:
+            holds.sort()
+            out["median_hold_hours"] = round(holds[len(holds) // 2], 2)
+
+    # THE GATES, each with the number that would satisfy it - so a record stuck
+    # on win rate is not read as a record stuck on count.
+    brier = out["brier"]
+    gates = {
+        "resolved_trades": {
+            "have": resolved, "need": int(t.get("min_trades", 100)),
+            "pass": resolved >= int(t.get("min_trades", 100))},
+        "win_rate": {
+            "have": round(out["win_rate"], 4), "need": float(t.get("min_win_rate", 0.55)),
+            "pass": out["win_rate"] >= float(t.get("min_win_rate", 0.55))},
+        "brier": {
+            "have": brier, "need": float(t.get("max_brier", 0.25)),
+            "pass": brier is not None and float(brier) <= float(t.get("max_brier", 0.25))},
+        "profit_factor": {
+            "have": out["profit_factor"],
+            "need": float(t.get("min_profit_factor", 1.1)),
+            "pass": out["profit_factor"] >= float(t.get("min_profit_factor", 1.1))},
+        "net_pnl": {
+            "have": out["net_pnl_usd"], "need": 0.0,
+            "pass": out["net_pnl_usd"] > 0.0},
+    }
+    out["gates"] = gates
+    out["ready"] = all(g["pass"] for g in gates.values())
+
+    failing = [name for name, g in gates.items() if not g["pass"]]
+    if out["ready"]:
+        out["note"] = (f"{venue_id} has met every live gate on its paper record: "
+                       f"{resolved} resolved trades, "
+                       f"{out['win_rate']:.0%} wins, Brier {brier}, profit factor "
+                       f"{out['profit_factor']}. Live capital is unlocked for it - "
+                       f"there is nothing to wait for.")
+    else:
+        first = failing[0]
+        if first == "resolved_trades":
+            pace = (f" at the current pace of {out['rate_per_day']}/day"
+                    f" (~{out['eta_days']}d)" if out.get("rate_per_day") else
+                    " (no resolution times recorded yet, so no pace to measure)")
+            out["note"] = (f"{resolved} of {gates['resolved_trades']['need']} "
+                           f"resolved paper trades{pace}. {out['open_trades']} "
+                           f"position(s) are open and waiting to settle.")
+        elif first == "win_rate":
+            out["note"] = (f"the count is there, but the win rate is "
+                           f"{out['win_rate']:.0%} against the "
+                           f"{gates['win_rate']['need']:.0%} the gate requires.")
+        elif first == "brier":
+            out["note"] = ("the count is there, but Brier is "
+                           + ("not measured yet" if brier is None
+                              else f"{brier} against the {gates['brier']['need']} ceiling")
+                           + " - the model's forecasts must be calibrated, not just right.")
+        elif first == "profit_factor":
+            out["note"] = (f"the count is there, but profit factor is "
+                           f"{out['profit_factor']} against "
+                           f"{gates['profit_factor']['need']}.")
+        else:
+            out["note"] = (f"the count is there, but the record is "
+                           f"${out['net_pnl_usd']:+.2f} - the venue has to make "
+                           f"money before it earns real capital.")
+    return out

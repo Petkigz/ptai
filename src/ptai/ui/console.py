@@ -57,6 +57,7 @@ live_log.install()
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
 from ..validation.rule_bench import validation_block
 from ..venues.inventory import load_inventory
+from ..venues.qualification import VenueQualificationEngine, paper_record_progress
 from ..strategy.venue_selection import (
     MAX_LIVE_VENUES_CEILING,
     max_live_venues_default,
@@ -1316,12 +1317,32 @@ async def api_venue() -> JSONResponse:
         # The build-out queue: which venues are closest to Polymarket, what each
         # one is missing, and whether money could ever reach it from here.
         "reach": inventory.get("reach") or {},
+        # THE NUMBER THE OPERATOR IS WAITING ON: how far the paper record is from
+        # the 100 resolved trades that unlock live capital, how fast it is
+        # building, and which gate is actually binding. Read from the same
+        # requirements the qualification engine enforces, so the panel cannot
+        # promise a bar the gate does not use.
+        "paper_record": paper_record_progress(
+            storage, "polymarket",
+            targets=_live_targets()),
         # What out-of-sample validation says about the rules that are choosing
         # these trades. It can refuse a rule; it can never qualify a venue.
         # ...together with the bench: what the agent DOES about a refused
         # rule. A verdict the operator cannot see acted on reads as decoration.
         "validation": validation_block(storage),
     })
+
+
+def _live_targets() -> Dict[str, Any]:
+    """The qualification engine's own requirements, for the progress panel."""
+    try:
+        engine = VenueQualificationEngine(data_dir=_data_dir())
+        return dict(engine.requirements)
+    except Exception as e:  # noqa: BLE001 - fall back to the published targets
+        logger.debug(f"Could not read the qualification requirements: {e}")
+        from ..venues.qualification import LIVE_TARGETS
+
+        return dict(LIVE_TARGETS)
 
 
 def _data_dir() -> str:
@@ -2199,6 +2220,10 @@ section[id]{scroll-margin-top:132px}
       <div id="validation"></div>
     </div>
     <div class="card" style="margin-top:16px">
+      <h2>Paper record towards live capital</h2>
+      <div id="paperRecord"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
       <h2>Every venue PTAI knows about</h2>
       <div id="venueAll"></div>
     </div>
@@ -2510,6 +2535,59 @@ async function loadVenue(){
       Every other venue is still scanned and paper-traded. It is only the money
       that sits in one place.
     </div>`;
+
+  // ---- the paper record, which is what "live unlocks" waits on ----
+  //
+  // Four gates, not one: the count, the win rate, Brier and the profit factor.
+  // A record can pass the count and fail the rest, and every other surface was
+  // showing the count alone - which reads as "nearly there" for a venue whose
+  // forecasts are unusable.
+  const pr = body.paper_record || {};
+  if(pr.resolved===undefined){
+    $('paperRecord').innerHTML = `<div class="note">${esc(pr.note||'not available yet')}</div>`;
+  } else {
+    const g = pr.gates || {};
+    const gateRow = (name, label) => {
+      const x = g[name]; if(!x) return '';
+      const have = x.have===null||x.have===undefined ? '&mdash;'
+                 : (name==='win_rate' ? (x.have*100).toFixed(1)+'%'
+                    : name==='net_pnl' ? money(x.have)
+                    : x.have);
+      const need = name==='win_rate' ? (x.need*100).toFixed(0)+'%'
+                 : name==='net_pnl' ? 'above $0.00' : x.need;
+      return `<tr><td style="color:var(--dim)">${label}</td>
+        <td class="mono">${have} <span style="color:var(--dim)">/ ${need}</span></td>
+        <td>${x.pass?'<span class="pill ok">met</span>':'<span class="pill wait">not yet</span>'}</td></tr>`;
+    };
+    const pct = Math.min(100, Math.round(100*(pr.resolved||0)/
+      Math.max(1, (g.resolved_trades||{}).need||100)));
+    $('paperRecord').innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <b class="mono">${pr.resolved||0} of ${(g.resolved_trades||{}).need||100} resolved paper trades</b>
+        <span class="pill ${pr.ready?'ok':'wait'}">${pr.ready?'live unlocked':'live still locked'}</span>
+      </div>
+      <div style="height:9px;background:rgba(36,48,64,.6);border-radius:5px;margin:9px 0 4px">
+        <div style="height:9px;width:${pct}%;background:${pr.ready?'var(--pos,#4ade80)':'#6ea8fe'};border-radius:5px"></div>
+      </div>
+      <div class="note">${pr.note||''}</div>
+      <table style="margin-top:11px">
+        <tr><th>Gate (on the resolved paper record)</th><th>Record</th><th></th></tr>
+        ${gateRow('resolved_trades','Resolved trades')}
+        ${gateRow('win_rate','Win rate')}
+        ${gateRow('brier','Brier (calibration)')}
+        ${gateRow('profit_factor','Profit factor')}
+        ${gateRow('net_pnl','Net P&L')}
+      </table>
+      <div class="note" style="margin-top:9px">
+        ${pr.open_trades||0} position(s) open and waiting to settle${pr.median_hold_hours!=null
+          ? ` &middot; median time from entry to settlement ${pr.median_hold_hours}h`:''}${pr.rate_per_day
+          ? ` &middot; building at ${pr.rate_per_day}/day${pr.eta_days!=null
+              ? ` (~${pr.eta_days} day(s) to ${(g.resolved_trades||{}).need||100} on this pace)`:''}`
+          : ''}.
+        Every paper trade that settles counts, and the lane prefers markets that
+        settle soon for exactly this reason.
+      </div>`;
+  }
 
   // ---- why ----
   $('venueWhy').innerHTML = (sel.reasons||[]).length

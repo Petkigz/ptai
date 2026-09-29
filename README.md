@@ -1440,6 +1440,61 @@ own authorised budget and its own qualification record. Today raising the settin
 changes nothing, because exactly one venue can place a real order - which is the
 point: the switch is ready, the capability is not.
 
+## The Road To 100 Resolved Trades
+
+Your words: *"i need to get Polymarket paper record to 100 resolved trades so
+live unlocks."*
+
+That is the number that unlocks real capital, and three things decide how fast it
+moves. All three were against you:
+
+**1. The lane placed one trade a round.** One was the ceiling while the lane only
+had to prove it could trade at all. It is now `PTAI_PAPER_TRADES_PER_CYCLE`,
+default **3** (ceiling 5) - a round that finds three qualifying markets learns
+from three. Everything else about the lane is unchanged: a real two-sided book, a
+model that actually answered, at least 5% mispricing, at least 2% left after the
+price paid and every cash cost, $1 a trade, one position per market, and the
+exposure manager still caps what can be open at once.
+
+**2. Nothing preferred markets that actually SETTLE.** 100 *resolved* trades is
+the goal, and a position that resolves in three months teaches the record next
+quarter. Two changes:
+
+* the cheap screen now gives a **bounded bonus** to markets with a near end date
+  (`+0.15` inside 24h, `+0.10` inside 3 days, `+0.05` inside a week, nothing
+  otherwise) - the same book and volume, sooner, wins the deep slot. This is
+  capital x time, straight from the economic framework, not a paper-mode hack.
+  It is a bonus and never a gate: a market with no book is still refused at -1
+  whatever its date, and a market with no end date is not treated as if it
+  settled tomorrow.
+* the lane itself takes the **soonest-resolving** candidate first: within a day
+  first, then within a week, then the rest, soonest inside each band. Every paper
+  trade's log line now says when it settles - *"It settles in 6h - every one of
+  these counts toward the 100 resolved trades live capital needs."*
+
+**3. The count alone is not the gate.** Live capital needs 100 resolved trades
+**and** win rate ≥ 55% **and** Brier ≤ 0.25 **and** profit factor ≥ 1.1 **and** a
+positive net P&L. A record can pass the count and fail the rest, so a bare "12 of
+100" would have been the wrong number to wait on. The console's Capital & Funding
+tab now carries a **Paper record towards live capital** panel with all five gates,
+a progress bar, the number of open positions waiting to settle, the median time
+from entry to settlement, the current pace, and - when the count is the only thing
+missing - the **ETA at that pace**. The line under it names which gate is actually
+binding: *"37 of 100 resolved paper trades at the current pace of 4.2/day (~15d).
+6 position(s) are open and waiting to settle."*
+
+**Measured, not promised.** A paper position now records `resolved_at` when it
+settles, so the pace and the median hold time are real measurements rather than
+guesses from the entry timestamp; rows that settled before that column existed are
+counted but excluded from the rate. The panel reads the qualification engine's own
+`requirements` - a test asserts the displayed gates equal the enforced ones, so the
+screen can never promise a bar the gate does not use.
+
+**What this means for you:** restart PTAI, leave it running in paper, and watch
+that panel. Each round can now add up to three resolved-in-days learning trades
+instead of one, on the markets most likely to settle. Live unlocks when the panel
+says all five gates are met - not before, and not on the count alone.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

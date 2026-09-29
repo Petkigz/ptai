@@ -26,12 +26,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from src.ptai.agent.v3_loop import TradingAgentV3
 from src.ptai.llm.provider import LLMResponse
 from src.ptai.markets.base import DataMode, Market, MarketSource
+from src.ptai.strategy.strategy_engine import resolution_days
 from src.ptai.venues.adapter import EligibilityStatus, MarketAdapter, VenueType
 
 N = 12
@@ -44,11 +46,15 @@ MARKET_ASK = 0.42
 
 
 def _market(i: int) -> Market:
+    # Real end dates, six hours apart: the paper lane prefers markets that will
+    # actually settle, and the operator's 100-trade record only grows when they
+    # do. pm0 settles first, then pm1, and so on down the venue.
     return Market(id=f"pm{i}", source=MarketSource.POLYMARKET,
                   question=f"Will event {i} happen this year?",
                   outcome_prices=[MARKET_MID, 1 - MARKET_MID], volume_24h=120_000,
                   liquidity=25_000, venue_id="polymarket",
                   data_mode=DataMode.LIVE,
+                  end_date=datetime.now(timezone.utc) + timedelta(hours=6 + 6 * i),
                   raw={"venue_id": "polymarket", "token_id": f"t{i}",
                        "condition_id": f"c{i}"})
 
@@ -224,7 +230,9 @@ class TestThePaperLaneTrades:
         # The venue was asked, and the adapter refused real money itself.
         assert venue.orders, "the paper lane never reached the venue adapter"
 
-    def test_the_round_carries_the_trade_and_a_profit_or_loss(self, paper_round):
+    def test_the_round_carries_the_trade_and_a_profit_or_loss(self, paper_round,
+                                                              monkeypatch):
+        monkeypatch.setenv("PTAI_PAPER_TRADES_PER_CYCLE", "1")
         _agent, _venue, results = paper_round(0.55)
         round_dict = results[0]["round"]
         rows = _trade_rows(round_dict)
@@ -251,6 +259,27 @@ class TestThePaperLaneTrades:
         assert round_dict["verdict"] == "down"
         assert round_dict["realised_pnl"] == pytest.approx(0.0, abs=1e-9)
         assert round_dict["unrealised_pnl"] == pytest.approx(-0.05, abs=0.01)
+
+    def test_three_trades_in_one_round_are_counted_once_each(self, paper_round,
+                                                             monkeypatch):
+        """
+        With the ceiling at three the round's P&L is still ONE number about the
+        account - not the sum of three separate stories - and each $1 stake is
+        counted exactly once.
+        """
+        monkeypatch.setenv("PTAI_PAPER_TRADES_PER_CYCLE", "3")
+        _agent, _venue, results = paper_round(0.55)
+        round_dict = results[0]["round"]
+        rows = _trade_rows(round_dict)
+        assert len(rows) == 3
+        assert round_dict["positions_opened"] == 3
+        assert round_dict["staked_usd"] == pytest.approx(3.0, abs=0.05)
+        assert round_dict["net_usd"] == pytest.approx(
+            round_dict["equity_end"] - round_dict["equity_start"], abs=0.01)
+        # Every stake paid the 2c spread and is marked at the bid: 3 x -0.05.
+        assert round_dict["unrealised_pnl"] == pytest.approx(-0.15, abs=0.02)
+        assert round_dict["net_usd"] < 0
+        assert len({r["market_id"] for r in rows}) == 3
 
     def test_the_closest_call_is_reported_even_when_nothing_qualifies(
             self, paper_round):
@@ -347,6 +376,7 @@ class TestTheModelTimeGoesToPriceableMarkets:
 
     def test_the_round_trades_because_the_model_was_asked(
             self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PTAI_PAPER_TRADES_PER_CYCLE", "1")
         _agent, result = self._run(tmp_path, monkeypatch)
         round_dict = result["round"]
         assert round_dict["positions_opened"] == 1
@@ -379,3 +409,53 @@ class TestThePaperLaneIsNotALicence:
         held = agent._held_market_ids("paper")
         assert first[0]["market_id"] in held
         assert second[0]["market_id"] in held
+
+
+class TestTheLaneCanBuildARecord:
+    """
+    The record the operator is waiting on: up to N paper trades a cycle, each on
+    a DIFFERENT market, soonest-resolving first.
+
+    One trade per round was the ceiling while the lane only had to prove it could
+    trade. Live capital needs 100 resolved trades, and a round that finds several
+    qualifying markets may as well learn from several.
+    """
+
+    def test_one_cycle_places_several_distinct_paper_trades(
+            self, paper_round, monkeypatch):
+        monkeypatch.setenv("PTAI_PAPER_TRADES_PER_CYCLE", "3")
+        _agent, _venue, results = paper_round(0.55)
+        round_dict = results[0]["round"]
+        rows = _trade_rows(round_dict)
+        assert len(rows) == 3, (
+            f"3 candidates cleared the lane's bar but {len(rows)} trade(s) were "
+            f"placed - the record cannot build at one a round")
+        ids = [r["market_id"] for r in rows]
+        assert len(set(ids)) == 3, "the same market must not be bought twice"
+        # One round, one bankroll change: the stakes are counted once.
+        assert round_dict["positions_opened"] == 3
+
+    def test_the_setting_still_bounds_it(self, paper_round, monkeypatch):
+        monkeypatch.setenv("PTAI_PAPER_TRADES_PER_CYCLE", "1")
+        _agent, _venue, results = paper_round(0.55)
+        rows = _trade_rows(results[0]["round"])
+        assert len(rows) == 1, (
+            "PTAI_PAPER_TRADES_PER_CYCLE=1 must still mean one per cycle")
+
+    def test_a_market_that_settles_sooner_is_taken_first(self, paper_round,
+                                                        monkeypatch):
+        """
+        Same bar, same $1 - the one that resolves first teaches first.
+
+        Every stub market has an end date six hours apart, and all of them clear
+        the lane's bar, so with the ceiling at one the trade must be the market
+        that settles soonest: pm0.
+        """
+        monkeypatch.setenv("PTAI_PAPER_TRADES_PER_CYCLE", "1")
+        _agent, _venue, results = paper_round(0.55)
+        rows = _trade_rows(results[0]["round"])
+        assert len(rows) == 1
+        assert rows[0]["market_id"] == "pm0", (
+            "the soonest-resolving candidate must be taken first, or the record "
+            "waits on the calendar instead of the model")
+        assert resolution_days(_market(0)) < resolution_days(_market(5))

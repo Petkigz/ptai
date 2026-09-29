@@ -277,6 +277,10 @@ class Storage:
     # original shape and every insert naming a new column fails.
     _MIGRATIONS = (
         ("trades", "venue_id", "TEXT"),
+        # WHEN the position closed, as opposed to when it was opened. Without it
+        # "how fast is the record building" had no answer at all: the resolved
+        # count is a level, not a rate, and the operator is waiting on a rate.
+        ("trades", "resolved_at", "TEXT"),
         # Resting-order reconciliation. An order that rests in the book, or
         # fills in pieces, has state the trades table cannot express: how much
         # of it is still working, and how much of the requested size has
@@ -893,8 +897,10 @@ class Storage:
         mode = _execution_mode(row["execution_mode"], row["status"])
 
         self.conn.execute(
-            "UPDATE trades SET resolved = 1, outcome = ?, pnl = ?, status = 'settled', notes = ? WHERE id = ?",
-            (outcome, pnl, notes, trade_id))
+            "UPDATE trades SET resolved = 1, outcome = ?, pnl = ?, "
+            "status = 'settled', notes = ?, resolved_at = ? WHERE id = ?",
+            (outcome, pnl, notes, datetime.now(timezone.utc).isoformat(),
+             trade_id))
         self.conn.commit()
 
         if mode == PAPER:

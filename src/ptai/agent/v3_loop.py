@@ -111,7 +111,12 @@ from ..markets.orderbook import OrderbookAnalyzer
 from ..strategy.fair_value import FairValueEngine
 from ..strategy.edge import HUNT_MISPRICING_MIN, EdgeCalculator, hunted_mispricing
 from ..strategy.strategy_selector import StrategySelector
-from ..strategy.strategy_engine import StrategyEngineV3, MultiVenueScanResult
+from ..strategy.strategy_engine import (
+    StrategyEngineV3,
+    MultiVenueScanResult,
+    paper_trades_per_cycle_default,
+    resolution_days,
+)
 from ..strategy.alpha_engine import AlphaEngine
 
 from ..risk.kelly import KellyCalculator
@@ -983,9 +988,30 @@ class TradingAgentV3:
         book_quality = max(0.0, 1.0 - float(spread) / 0.10)
         volume_score = min(1.0, float(market.volume_24h) / 20000.0)
         score = 0.45 * liquidity_score + 0.40 * book_quality + 0.15 * volume_score
+        # CAPITAL x TIME IS PART OF THE RETURN, so a market that settles soon is
+        # worth more of the deep budget than an identical one that settles in
+        # three months - the same edge, a quarter of the capital tied up. This is
+        # a BOUNDED BONUS and never a gate: a market with a good book and no end
+        # date is still shortlisted (it simply gets no bonus), and a market with
+        # no book stays refused at -1 whatever its date. The operator needs
+        # RESOLVED trades to qualify a venue, and an unresolved position teaches
+        # nothing.
+        days = resolution_days(market)
+        if days is None:
+            horizon_bonus, horizon_why = 0.0, "no end date given"
+        elif days <= 1.0:
+            horizon_bonus, horizon_why = 0.15, f"resolves in {days * 24:.0f}h"
+        elif days <= 3.0:
+            horizon_bonus, horizon_why = 0.10, f"resolves in {days:.1f}d"
+        elif days <= 7.0:
+            horizon_bonus, horizon_why = 0.05, f"resolves in {days:.1f}d"
+        else:
+            horizon_bonus, horizon_why = 0.0, f"resolves in {days:.0f}d"
+        score = min(1.0, score + horizon_bonus)
         return round(score, 6), (
             f"liquidity {liquidity_score:.2f}, book quality {book_quality:.2f} "
-            f"(spread {float(spread):.1%}), volume {volume_score:.2f}")
+            f"(spread {float(spread):.1%}), volume {volume_score:.2f}, "
+            f"{horizon_why}")
 
     async def _prescan_and_rank(self, markets: List[Market]) -> Dict[str, Any]:
         """
@@ -2905,9 +2931,37 @@ class TradingAgentV3:
                     f"skipped - this account already holds "
                     f"{len(_held)} market(s) ({', '.join(sorted(_held)[:5])}); "
                     f"re-buying one is the same bet twice, not a new one")
-        exploration_candidates = sorted(
-            _paper_pool, key=lambda x: float(getattr(x, "score", 0.0) or 0.0),
-            reverse=True)[:1] if _paper_pool else []
+        # WHICH CANDIDATE, when several clear the lane's bar: the one that
+        # settles SOONEST. A paper trade that resolves in six hours teaches the
+        # qualification record the same day; one that resolves in three months
+        # teaches it next quarter, and the operator is waiting on exactly that
+        # count. The lane's bar is unchanged - this only orders the markets that
+        # already passed it.
+        def _urgency(opp) -> tuple:
+            days = resolution_days(getattr(opp, "market", None))
+            if days is None:
+                bucket = 0
+            elif days <= 1.0:
+                bucket = 3
+            elif days <= 7.0:
+                bucket = 2
+            else:
+                bucket = 1
+            # Soonest first inside a bucket (None/'' sorts last), then the
+            # screen's own score.
+            return (bucket, -(days if days is not None else 1e9),
+                    float(getattr(opp, "score", 0.0) or 0.0))
+
+        _paper_cap = int(getattr(self, "paper_trades_per_cycle",
+                                 None) or paper_trades_per_cycle_default())
+        _sorted_pool = sorted(_paper_pool, key=_urgency, reverse=True) if _paper_pool else []
+        exploration_candidates = _sorted_pool[:_paper_cap]
+        if _paper_pool and _paper_cap > 1:
+            logger.info(
+                f"Paper/exploration lane: {len(_paper_pool)} candidate(s) cleared "
+                f"the bar, taking up to {_paper_cap} this cycle "
+                f"(PTAI_PAPER_TRADES_PER_CYCLE) - soonest-resolving first, because "
+                f"a resolved trade is the only kind that teaches")
         if exploration_candidates:
             logger.info(
                 f"Exploration lane (paper): {len(exploration_candidates)} "
@@ -3127,6 +3181,11 @@ class TradingAgentV3:
             exploration_trades.append(opp)
             _ev = getattr(opp._expected_ev, "net_ev_usd", None)
             _why = (opp.raw or {}).get("exploration_because", "")
+            _days = resolution_days(getattr(opp, "market", None))
+            _settles = ("no end date given, so its resolution cannot be timed"
+                        if _days is None else
+                        f"settles in {_days:.1f}d" if _days >= 1 else
+                        f"settles in {_days * 24:.0f}h")
             logger.info(
                 f"PAPER/EXPLORATION trade: {opp.market.id} @ {opp.venue_id} "
                 f"{str(opp.side).upper()} ${opp._proposed_amount:.2f} - the "
@@ -3135,7 +3194,9 @@ class TradingAgentV3:
                 f"share costs, which leaves "
                 f"{float(opp.effective_edge or 0.0):+.3f} after the cash costs "
                 f"(net EV ${_ev if _ev is not None else 'unmeasured'}); "
-                f"{_why}. Paper only, no live capital, for learning")
+                f"{_why}. It {_settles} - every one of these counts toward the "
+                f"100 resolved trades live capital needs. Paper only, no live "
+                f"capital, for learning")
             if opp.raw is not None:
                 # The console and the round read this rather than re-deriving it.
                 opp.raw["paper_note"] = (
