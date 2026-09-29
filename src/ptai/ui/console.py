@@ -41,6 +41,8 @@ from ..execution.capital import (
     FUNDING_ROUTES,
     UNFUNDABLE_SMALL,
     authorised_budgets,
+    deposit_options,
+    local_money_entry,
     operator_mode,
     plan_for_budget,
     set_authorised_budget,
@@ -412,12 +414,36 @@ async def api_set_budget(request: Request) -> JSONResponse:
     return JSONResponse({"budget": amount, "venue": venue, "plan": plan})
 
 
+def _recorded_country(storage) -> str:
+    """
+    Which country's funding reality to describe.
+
+    Read from the recorded venue inventory first, because those are the rows the
+    venue table shows eligibility for, and the funding panel must not tell a
+    different story about where the operator is. The fallback is the same
+    default the venue registry carries (VenueRegistry defaults to UG), so this
+    is a shared assumption rather than a new one.
+    """
+    inventory = load_inventory(storage)
+    for row in (inventory.get("venues") or {}).values():
+        code = str(((row.get("eligibility") or {}).get("country")) or "").strip()
+        if code:
+            return code.upper()
+    return "UG"
+
+
 @app.get("/api/console/funding")
 async def api_funding(total: float = 50.0) -> JSONResponse:
     """How money gets in, and what this amount will actually buy."""
+    storage = get_storage()
+    country = _recorded_country(storage)
     return JSONResponse({
         "routes": FUNDING_ROUTES,
         "unfundable": UNFUNDABLE_SMALL,
+        # The step before any deposit: how local money reaches a deposit asset.
+        # None when nothing is recorded for the country - never a guess.
+        "country": country,
+        "local_money": local_money_entry(country),
         "plan": plan_for_budget(total, mode="live"),
         "principle": (
             "There is no account to send money to. The agent trades the venue "
@@ -2896,6 +2922,42 @@ async function loadCapital(){
   }).join('');
 }
 
+// One funding route is not one method. Polymarket takes deposits from several
+// chains and converts them to pUSD on Polygon, so "how do I get money in" has
+// different answers with different minimums, costs and ways to lose the money.
+// When the route records those rails, render them; when it records only the
+// single path (Kalshi), render that.
+function railsHtml(r, body){
+  const rails = (r.deposit_options||[]);
+  const options = rails.length
+    ? `<div class="note" style="margin:16px 0 8px"><b>Ways to get money in.</b>
+         Same account either way &mdash; what changes is the minimum and the cost.</div>`
+      + rails.map(o=>`
+        <div style="border:1px solid rgba(36,48,64,.7);border-radius:8px;padding:11px 12px;margin-bottom:10px">
+          <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+            <b>${esc(o.label)}</b>
+            <span class="mono" style="font-size:12px">min ${money(o.minimum_usd)}</span>
+            <span class="pill dim">${esc(o.asset)} &middot; ${esc(o.network)}</span>
+          </div>
+          <div class="note" style="margin-top:6px"><b>Cost.</b> ${esc(o.cost)}</div>
+          <div class="note" style="margin-top:4px"><b>Best for.</b> ${esc(o.best_for)}</div>
+          <ol style="margin:8px 0 0 18px;padding:0">${(o.steps||[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ol>
+          <div class="warnbox" style="margin-top:9px;margin-bottom:0">${esc(o.watch_out)}</div>
+        </div>`).join('')
+    : `<ol>${(r.deposit_steps||[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ol>`;
+
+  const local = body.local_money
+    ? `<div class="note" style="margin:16px 0 8px"><b>${esc(body.local_money.label)}</b>
+         &mdash; before the deposit, this is the step that turns ${esc(body.local_money.currency)}
+         into something a venue accepts.</div>`
+      + (body.local_money.how||[]).map(x=>`<div class="note" style="margin-bottom:6px">${esc(x)}</div>`).join('')
+      + `<div class="warnbox" style="margin-top:8px">${esc(body.local_money.watch_out)}</div>`
+      + `<div class="note" style="margin-top:6px">Those rails end in Bitcoin or USDC, so they
+         feed the options above.</div>`
+    : '';
+  return options + local;
+}
+
 async function loadFunding(){
   const venue = $('budgetVenue').value;
   const total = parseFloat($('budgetAmount').value) || 0;
@@ -2912,7 +2974,7 @@ async function loadFunding(){
       <div><div style="font-size:11px;color:var(--dim)">Smallest practical</div>
         <div class="mono">${money(r.smallest_practical_usd)}</div></div>
     </div>
-    <ol>${r.deposit_steps.map(s=>`<li>${s}</li>`).join('')}</ol>
+    ${railsHtml(r, body)}
     <div class="note" style="margin-top:12px"><b>Withdrawing.</b> ${r.withdraw_note}</div>
     <div class="note" style="margin-top:7px"><b>Fees.</b> ${r.fees_note}</div>
     <div class="note" style="margin-top:7px"><b>The key.</b> ${r.agent_key_explanation}</div>

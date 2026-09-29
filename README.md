@@ -1495,6 +1495,73 @@ that panel. Each round can now add up to three resolved-in-days learning trades
 instead of one, on the markets most likely to settle. Live unlocks when the panel
 says all five gates are met - not before, and not on the count alone.
 
+## Funding From Uganda: Bitcoin Is A Real Rail
+
+Your words: *"funding the venues is impossible in ugx of course but what if i use
+bitcoin"*. It is not impossible, and Bitcoin is one of the ways in.
+
+Polymarket does not take a deposit in one form only. It runs a **bridge**: you
+send an asset on its own chain, the bridge converts it, and it arrives in your
+Polymarket balance as pUSD (1 pUSD = 1 USDC = $1). Bitcoin is a supported source
+chain, so money that can only reach Bitcoin can still fund a live account. That is
+the part worth knowing, because the thing that was actually impossible was the
+route you were looking at - a USD bank wire or an internationally enabled card.
+
+**The three ways in, and what each one costs:**
+
+| Rail | Minimum | What it costs | Best for |
+| --- | --- | --- | --- |
+| **Bitcoin** through the Polymarket bridge | **$9** | The bridge's conversion cost, plus the Bitcoin network fee. No card fee, no 3-5% spread. | Local money that can reach BTC but not a USD card or bank - mobile money and P2P countries |
+| **USDC on Polygon** from an exchange | **$2** | The exchange's withdrawal fee, usually $0.10-1.00 whatever the size, plus cents of Polygon gas. | The cheapest way in above about $50 - if you can get USDC |
+| **Card on-ramp** (MoonPay / Transak) | **$5** | About 3-5% over the market rate plus card fees. On $50 that is $1.50-2.50 gone before the first trade. | Speed, and an internationally enabled card |
+
+**Getting the asset in the first place is its own step, and it is recorded too.**
+For Uganda the panel says what is actually true: pan-African on-ramps such as
+Yellow Card take MTN/Airtel mobile money or a bank transfer (KYC once, spread
+instead of a fee); escrowed P2P marketplaces - Binance P2P, OKX P2P, NoOnes -
+match you with a seller for UGX and hold the crypto until you confirm the local
+payment. What you cannot do is walk into your bank or send mobile money straight
+to a venue: local banks and mobile-money operators do not convert crypto, and no
+local exchange is licensed. So the two rails above are the practical ones, and
+both end in exactly the assets the deposit rails take.
+
+**The failure modes are stated on the same panel, because they are where the money
+goes:**
+
+* **USDC is Polygon only.** USDC on Ethereum, Solana, BSC or Arbitrum sent to a
+  Polygon address is not credited and may be gone. This remains the single most
+  common way people lose a deposit here, and it is why the panel keeps the warning
+  next to the rail rather than in a docs page. Polymarket runs a recovery tool at
+  `recovery.polymarket.com` for supported tokens sent the wrong way - a wrong
+  *network* is not always recoverable.
+* **Bitcoin has a $9 minimum, and it is real.** A smaller deposit is not processed.
+  And BTC's price moves: the conversion happens when the deposit lands, so the
+  pUSD you get is the value at landing. Buy and send promptly. On a $50 deposit a
+  few dollars of movement is cents to a dollar - still far less than the card fee
+  it replaces.
+* **P2P is a counterparty, not a bank.** Keep the payment proof, never release the
+  crypto before the money is in your account, keep the chat in the platform, and
+  start with an amount small enough that one bad trade does not matter.
+
+**Where to see it:** the console's **Capital & Funding** tab. The funding panel now
+shows *"Ways to get money in"* - each rail with its minimum, cost, steps and
+failure mode - followed by *"Getting from Ugandan shillings to a deposit"*. The
+country is read from the same recorded inventory the venue table makes its
+eligibility verdicts from, so the funding panel and the venue page cannot disagree
+about where you are; a country with nothing recorded gets silence, not a guess.
+
+**Two things this does not change.** Funding an account is not the same as going
+live: the agent still needs the 100-resolved-trade record and the other four gates
+(see *The Road To 100 Resolved Trades*), and a budget you authorise at the venue.
+And PTAI still never touches the money: the deposit address comes from YOUR
+Polymarket deposit screen, the agent never sees it and never needs it, and no
+deposit is ever sent to the agent.
+
+The minimums above are recorded from Polymarket's own bridge documentation
+(2026-09). The live list is `GET https://bridge.polymarket.com/supported-assets`,
+and PTAI's copy is a date-stamped record rather than a guess - re-check it before
+a large deposit.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

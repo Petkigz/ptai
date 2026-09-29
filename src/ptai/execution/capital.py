@@ -61,6 +61,159 @@ from loguru import logger
 # quality of opportunity, it is the cost of getting money in and back out:
 # settling a prediction market returns USDC to the same wallet in minutes, and
 # the deposit path is a USDC transfer rather than a bank wire.
+# ----------------------------------------------------------------------
+# how the money physically gets in, rail by rail
+# ----------------------------------------------------------------------
+# One funding route is not one method. Polymarket runs a bridge that accepts
+# deposits from many chains and converts whatever arrives into pUSD on Polygon,
+# and that is where the operator's question - "funding the venues is impossible
+# in UGX of course but what if I use bitcoin" - has a real answer: Bitcoin is a
+# supported source chain, so money that can only reach Bitcoin can still fund a
+# live account. What decides which rail is right is not which coin is convenient
+# to buy, it is the total cost and the way that rail loses money.
+#
+# Recorded 2026-09 against Polymarket's own bridge documentation. The live list
+# and minimums come from GET https://bridge.polymarket.com/supported-assets, so
+# re-check before trusting a number here.
+POLYMARKET_DEPOSIT_OPTIONS: List[Dict[str, Any]] = [
+    {
+        "id": "usdc_polygon",
+        "label": "USDC on Polygon, sent from an exchange",
+        "asset": "USDC",
+        "network": "Polygon",
+        "minimum_usd": 2.0,
+        "cost": (
+            "The exchange's USDC withdrawal fee, usually $0.10-1.00 whatever "
+            "the amount, plus a cent of Polygon gas. No card fee and no "
+            "conversion spread."
+        ),
+        "best_for": (
+            "the cheapest way in above about $50 - if you can get USDC at all"
+        ),
+        "steps": [
+            "Get USDC on an exchange that withdraws on Polygon (Binance, OKX, "
+            "Kraken, Bybit and most major ones do); swapping from USDT is "
+            "near-free.",
+            "In Polymarket: Deposit -> crypto -> USDC, and copy the Polygon "
+            "address it shows. That address belongs to YOUR Polymarket wallet; "
+            "the agent never sees it and never needs it.",
+            "Withdraw USDC from the exchange to that address, network = Polygon "
+            "or Polygon PoS, whichever your exchange calls it.",
+            "It lands in your Polymarket balance as pUSD (1 pUSD = 1 USDC = "
+            "$1). The Deposit screen tracks it.",
+        ],
+        "watch_out": (
+            "Polygon and nothing else. USDC on Ethereum, Solana, BSC or "
+            "Arbitrum sent to that address is not credited and may be gone - "
+            "this is the most common way people lose a deposit here. Polymarket "
+            "runs a recovery tool at recovery.polymarket.com for supported "
+            "tokens sent the wrong way, but a wrong NETWORK is not always "
+            "recoverable."
+        ),
+    },
+    {
+        "id": "bitcoin_bridge",
+        "label": "Bitcoin, through the Polymarket bridge",
+        "asset": "BTC",
+        "network": "Bitcoin",
+        "minimum_usd": 9.0,
+        "cost": (
+            "The bridge's conversion cost, which is why the minimum is $9 "
+            "rather than $2, plus the Bitcoin network fee. What it avoids is "
+            "the 3-5% a card on-ramp charges."
+        ),
+        "best_for": (
+            "local money that can reach Bitcoin but not a USD card or bank - "
+            "mobile money and P2P countries, which is most of the world "
+            "outside the US and Europe"
+        ),
+        "steps": [
+            "Get BTC with your local money. Two ordinary retail rails do this "
+            "where there is no USD bank account: a pan-African on-ramp that "
+            "pays out from mobile money (Yellow Card and similar - KYC/ID "
+            "once, their spread is the fee), or an escrowed P2P trade on "
+            "Binance/OKX/NoOnes where you pay in the local currency. This is "
+            "how UGX becomes BTC.",
+            "In Polymarket: Deposit -> Bitcoin. It gives you a BTC bridge "
+            "address that is unique to your Polymarket wallet.",
+            "Send plain BTC on the Bitcoin network to that address. One chain, "
+            "so there is no network to get wrong; send BTC and only BTC - no "
+            "wrapped BTC, no other coin, no exchange-drafted altcoin.",
+            "The bridge converts it and credits pUSD to your Polymarket "
+            "balance automatically. The Deposit screen shows the status.",
+        ],
+        "watch_out": (
+            "Mind the $9 minimum: a smaller deposit is not processed. Bitcoin's "
+            "price moves and the conversion happens when the deposit lands, so "
+            "the pUSD you get is the value at landing, not at purchase - buy "
+            "and send promptly. On a $50 deposit a few dollars of movement is "
+            "cents to a dollar, still far less than the card fee it replaces."
+        ),
+    },
+    {
+        "id": "card_onramp",
+        "label": "Card on-ramp (MoonPay / Transak / Coinbase Pay)",
+        "asset": "whatever the provider supports",
+        "network": "handled by the provider",
+        "minimum_usd": 5.0,
+        "cost": (
+            "About 3-5% over the market rate plus card fees - on a $50 deposit "
+            "that is $1.50-2.50 gone before the first trade."
+        ),
+        "best_for": "speed, and an internationally enabled card",
+        "steps": [
+            "In Polymarket: Deposit -> card, or buy on the provider and send "
+            "the USDC on.",
+            "KYC once with the provider, then pay by card; the provider buys "
+            "and deposits the USDC for you.",
+            "Some providers also take BTC/ETH/SOL you already hold and convert "
+            "them - the same 3-5% applies.",
+        ],
+        "watch_out": (
+            "The most expensive rail and the one most likely to be refused: "
+            "many cards block crypto purchases, and a locally issued card "
+            "rarely clears an international crypto on-ramp. Check the total "
+            "quoted before confirming."
+        ),
+    },
+]
+
+
+# Local money is the step before any of those rails, and it is the step the
+# product used to have nothing to say about: "funding is impossible in UGX" is
+# how a real route gets mistaken for no route. Recorded per country, with the
+# same default country the venue registry itself carries (VenueRegistry
+# defaults to UG), so the funding panel and the eligibility verdicts cannot
+# disagree about where the operator is.
+LOCAL_MONEY_ENTRY: Dict[str, Dict[str, Any]] = {
+    "UG": {
+        "country": "UG",
+        "currency": "UGX",
+        "label": "Getting from Ugandan shillings to a deposit",
+        "how": [
+            "Pan-African on-ramps such as Yellow Card take MTN/Airtel mobile "
+            "money or a bank transfer with KYC/ID once, then hold BTC, USDT or "
+            "USDC for you. The rate carries their spread instead of a visible "
+            "fee; the deposit fee is a couple of percent.",
+            "Escrowed P2P marketplaces - Binance P2P, OKX P2P, NoOnes - match "
+            "you with a seller for UGX and hold the crypto until you confirm "
+            "the local payment. Binance P2P usually has the deepest book; "
+            "check the seller's completed trades before dealing.",
+            "A plain bank or mobile-money deposit straight into a venue is not "
+            "available: local banks and mobile-money operators do not convert "
+            "crypto, and no local exchange is licensed. The two rails above "
+            "are the practical ones, and both end in BTC, USDT or USDC.",
+        ],
+        "watch_out": (
+            "P2P is a counterparty, not a bank. Keep the payment proof, never "
+            "release the crypto before the money is in your account, keep the "
+            "chat in the platform, and start with an amount small enough that "
+            "one bad trade does not matter."
+        ),
+        "reaches": ["bitcoin_bridge", "usdc_polygon"],
+    },
+}
+
 FUNDING_ROUTES = {
     "polymarket": {
         "label": "Polymarket",
@@ -102,6 +255,10 @@ FUNDING_ROUTES = {
             "that account - a dedicated wallet, funded with only the budget you "
             "are willing to lose. It never needs your seed phrase."
         ),
+        # Not every deposit is the same deposit: the rails differ in minimum,
+        # cost and failure mode, so they are recorded individually rather than
+        # as one "send crypto" instruction.
+        "deposit_options": POLYMARKET_DEPOSIT_OPTIONS,
     },
     "kalshi": {
         "label": "Kalshi",
@@ -138,6 +295,29 @@ UNFUNDABLE_SMALL = {
     "stock_mock": "simulated data only",
     "afx_dex": "on-chain DEX: needs MATIC for gas and a funded wallet",
 }
+
+def deposit_options(venue_id: str) -> List[Dict[str, Any]]:
+    """
+    The rails this venue accepts, or an empty list.
+
+    Empty means "one route is all that is recorded", never "no way in": callers
+    fall back to the route's own deposit_steps, which is the single-rail case.
+    """
+    route = FUNDING_ROUTES.get(str(venue_id or "").lower()) or {}
+    return [dict(option) for option in (route.get("deposit_options") or [])]
+
+
+def local_money_entry(country_code: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    How a country's money reaches a deposit asset, or None if not recorded.
+
+    None is honest: it means this product has nothing specific to say about
+    that currency, not that the country cannot fund an account.
+    """
+    code = str(country_code or "").strip().upper()
+    entry = LOCAL_MONEY_ENTRY.get(code)
+    return dict(entry) if entry else None
+
 
 
 @dataclass
