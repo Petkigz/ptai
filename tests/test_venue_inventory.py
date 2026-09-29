@@ -76,28 +76,45 @@ class TestACapabilityIsAStatementAboutTheCode:
         """
         `real_order_path` is the honest version of "can hold real money".
 
-        Exactly one adapter submits to a venue - Polymarket - and it is the only
-        one allowed to say so. An adapter that returns a dry-run stub forever may
-        read live markets and be paper-traded, and is not a trading venue.
+        The set is pinned deliberately - it grows only when an adapter is given a
+        real submission path - and each claimant is checked against its own code:
+        an adapter whose place_order still answers "not implemented" may read live
+        markets and be paper-traded, but it is not a trading venue.
         """
+        import inspect
+
         claiming = {vid for vid, adapter in registry.adapters.items()
                     if adapter.capabilities.real_order_path}
-        assert claiming == {"polymarket"}, (
-            "only an adapter whose place_order really submits may claim an order "
-            f"path; these claimed it: {sorted(claiming)}")
+        assert claiming == {"polymarket", "kalshi"}, (
+            "the adapters whose place_order can actually reach the venue")
+        for vid in sorted(claiming):
+            source = inspect.getsource(type(registry.adapters[vid]).place_order).lower()
+            assert "not implemented" not in source, (
+                f"{vid} claims an order path but its place_order is still a stub")
 
     def test_a_credential_cannot_arm_a_venue_with_no_order_path(self):
         """
         The bug this file was written for: an API key must not manufacture a
-        capability. Kalshi's place_order answers "Live trading not implemented
-        for Kalshi yet" however many credentials it is given.
+        capability. A venue whose adapter has no submission path cannot trade
+        however many credentials it is handed.
         """
-        from src.ptai.venues.kalshi_adapter import KalshiAdapter
+        from src.ptai.venues.manifold_adapter import ManifoldAdapter
 
-        adapter = KalshiAdapter(api_key="a-key-that-changes-nothing")
+        adapter = ManifoldAdapter(api_key="a-key-that-changes-nothing")
         adapter.dry_run = False  # even fully armed
+        assert not adapter.capabilities.real_order_path
         assert not adapter.capabilities.supports_trading, (
             "an API key does not create an order path")
+
+    def test_a_key_id_alone_does_not_arm_the_venue_that_can_trade(self):
+        """Kalshi signs with an RSA key: the id without it is half a login, and
+        half a login must not read as armed."""
+        from src.ptai.venues.kalshi_adapter import KalshiAdapter
+
+        adapter = KalshiAdapter(api_key="a-key-id-without-its-key")
+        adapter.dry_run = False
+        assert not adapter.capabilities.supports_trading, (
+            "without the key that signs, nothing can be submitted")
         assert not adapter.can_place_real_orders, (
             "a venue that cannot submit must never report as able to place a "
             "real order")
@@ -191,7 +208,14 @@ class TestTheAnswersAnOperatorNeeds:
         line = inventory_line(inventory)
         assert "19 venues registered" in line
         assert "6 readable now" in line
-        assert "can ever: Polymarket" in line, (
+        # The line names exactly the venues whose adapters have a submission
+        # path, derived from the same rows rather than hardcoded - a venue gains
+        # its name here only by gaining the code.
+        real = sorted(
+            v["label"] for v in inventory["venues"].values()
+            if (v.get("reach") or {}).get("layers", {}).get("places_real_orders"))
+        assert f"{len(real)} can place a real order" in line
+        assert f"can ever: {', '.join(real)}" in line, (
             "the operator has to be able to see which venue real money can ever "
             "go into")
 

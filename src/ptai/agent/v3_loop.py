@@ -529,14 +529,17 @@ class TradingAgentV3:
         
         # Kalshi - CFTC-regulated US event exchange, cross-venue arb highest prob
         # Kalshi was constructed as `KalshiAdapter()` - no arguments - so an
-        # operator's own API key could never reach it. It has no order path yet
-        # (the adapter says so), and the key is what raises the read quota that
-        # builds the record in paper.
+        # operator's own API key could never reach it. It now takes the RSA key
+        # as well: Kalshi signs every authenticated request with it, and without
+        # it the adapter can read public markets but not the account or place
+        # anything.
         _kalshi = credential_store.resolve("kalshi", self.data_dir)
         kalshi_adapter = KalshiAdapter(
             api_key=_kalshi.get("api_key"),
             api_secret=_kalshi.get("api_secret"),
             member_id=_kalshi.get("member_id"),
+            private_key_pem=_kalshi.get("private_key"),
+            environment=_kalshi.get("environment") or "production",
         )
         self.venue_registry.register(kalshi_adapter)
         
@@ -1647,9 +1650,21 @@ class TradingAgentV3:
                 # (which charge nothing) and WhiteBIT (0.1%), and hiding the
                 # difference between venues entirely.
                 try:
-                    caps_fee = getattr(adapter.capabilities, "fee_taker_pct", None)
-                    if caps_fee is not None:
-                        context["fee_taker_pct"] = float(caps_fee)
+                    # A per-market rate first, for venues whose fee is a curve
+                    # rather than a number (Kalshi: 0.07 x P x (1-P), so 3.5% of
+                    # stake at 50c and 6.3% at 10c). The flat field is the
+                    # fallback, not the truth.
+                    rate = None
+                    fee_for_market = getattr(adapter, "fee_rate_for_market", None)
+                    if callable(fee_for_market):
+                        try:
+                            rate = fee_for_market(market)
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug(f"Fee curve for {market.id} failed: {e}")
+                    if rate is None:
+                        rate = getattr(adapter.capabilities, "fee_taker_pct", None)
+                    if rate is not None:
+                        context["fee_taker_pct"] = float(rate)
                     caps_gas = getattr(adapter.capabilities, "order_gas_usd", None)
                     if caps_gas is not None:
                         context["order_gas_usd"] = float(caps_gas)

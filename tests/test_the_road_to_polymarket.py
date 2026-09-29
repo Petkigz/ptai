@@ -325,8 +325,22 @@ class TestThePageShowsTheRoad:
             agent.storage.close()
         body = console_client.get("/api/console/venue").json()
         reach = body["reach"]
-        assert reach["real_orders"] == ["polymarket"], (
-            "exactly one venue can place a real order in this build")
+        # Two adapters now have a submission path: Polymarket and Kalshi. The
+        # list is a ranking, so it is compared as a set - and the money truth is
+        # asserted beside it, because "has an order path" is not "can hold your
+        # money": Kalshi's rail is a US bank account and its adapter marks Uganda
+        # restricted.
+        assert set(reach["real_orders"]) == {"polymarket", "kalshi"}, (
+            "the venues whose adapters can submit a real order")
+        rows = body["inventory"]["venues"]
+        # The money truth, side by side: Kalshi's order path does NOT make it a
+        # venue this operator can fund (US bank rail, restricted for UG), and
+        # Polymarket is not failed by the same test - its funding from here is
+        # unverified rather than impossible.
+        assert rows["kalshi"]["fundable_from_here"] is False, (
+            "an order path must not read as a fundable venue")
+        assert rows["polymarket"]["fundable_from_here"] is not False, (
+            "Polymarket must not be classed as unable to hold the money")
         queue = [r["venue_id"] for r in reach["next_steps"]]
         assert queue and queue[0] in {r["venue_id"] for r in
                                       body["assessments"]}

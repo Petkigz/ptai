@@ -232,7 +232,9 @@ class AccountHealthEngine:
     # listed is reported as "not configured" rather than assumed configured.
     _CREDENTIAL_FIELDS = {
         "polymarket": (("private_key", "funder"), "private_key+funder"),
-        "kalshi": (("api_key",), "api_key"),
+        # The account read AND the order path both need the RSA key, not just
+        # the key id: a half-configured Kalshi login cannot read a balance.
+        "kalshi": (("api_key", "private_key_pem"), "api_key+private_key"),
         "whitebit": (("api_key", "api_secret"), "api_key+secret"),
         "binance": (("api_key", "api_secret"), "api_key+secret"),
         "crypto_binance": (("api_key", "api_secret"), "api_key+secret"),

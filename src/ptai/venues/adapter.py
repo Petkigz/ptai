@@ -299,7 +299,23 @@ class MarketAdapter(ABC):
 
     def calculate_fees(self, market: Market, amount_usd: float) -> float:
         """Calculate taker fees for this venue"""
-        return amount_usd * self.capabilities.fee_taker_pct
+        rate = self.fee_rate_for_market(market)
+        if rate is None:
+            rate = self.capabilities.fee_taker_pct
+        return amount_usd * rate
+
+    def fee_rate_for_market(self, market: Market) -> Optional[float]:
+        """
+        This market's taker fee as a fraction of the stake, when the venue's fee
+        is not a single number.
+
+        Kalshi charges round_up(0.07 x contracts x P x (1-P)), so the cost of a
+        dollar of stake depends on the contract price - 6.3% at 10c, 3.5% at
+        50c, 0.7% at 90c. No flat percentage can express that, and the flat
+        field alone charged either nothing (the old 0.0) or the same 2% to every
+        venue. Adapters whose fee IS flat return None and lose nothing.
+        """
+        return None
 
     def estimate_slippage(self, market: Market, amount_usd: float) -> float:
         """Estimate slippage based on liquidity and orderbook"""

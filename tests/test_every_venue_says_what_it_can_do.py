@@ -239,13 +239,40 @@ class TestNoVenueIsCalledUnusableWhileItIsBeingWorked:
         body = console_client.get("/api/console/venue").json()
         rows = {a["venue_id"]: a for a in body["assessments"]}
         # Manifold and crypto_binance have no funding route in this build and are
-        # read every cycle; they were two of the seventeen "unavailable".
-        for venue_id in ("manifold", "crypto_binance", "kalshi"):
+        # read every cycle; they were two of the seventeen "unavailable". Neither
+        # has an order path, so both are still paper-only.
+        for venue_id in ("manifold", "crypto_binance"):
             a = rows[venue_id]
             assert a["role"] == ROLE_PAPER
             assert a["blockers"], "the money truth must be stated, not implied"
             assert a["use"] == "paper_only"
             assert a["can_run_today"] is True
+
+        # Kalshi gained a REAL order path (the RSA-signed V2 order endpoint), so
+        # "paper_only" is no longer true of it - and the row still has to state
+        # the money truth, because an order path is not a funding route. From
+        # Uganda the venue is restricted and its rail is a US bank account.
+        kalshi = rows["kalshi"]
+        assert kalshi["use"] == "real_money"
+        assert kalshi["blockers"], "an order path must not read as 'funded'"
+
+    def test_a_venue_with_an_order_path_still_says_money_cannot_reach_it(
+            self, console_app, console_client):
+        """
+        The new state has to be visible, not implied: Kalshi has all three code
+        layers and still cannot hold this operator's money from Uganda.
+        """
+        _record(console_app)
+        body = console_client.get("/api/console/venue").json()
+        kalshi = body["inventory"]["venues"]["kalshi"]
+        assert kalshi["use"] == "real_money"
+        assert kalshi["real_order_path"] is True
+        assert kalshi["fundable_from_here"] is False, (
+            "an order path must not read as a fundable venue")
+        assert kalshi["eligibility"]["status"] == "restricted"
+        # And the row says what is left, rather than "nothing".
+        assert kalshi["reach"]["distance"] == 0
+        assert "cannot hold real money from here" in kalshi["reach"]["next_step"]
 
     def test_the_page_says_real_money_is_the_only_thing_that_is_missing(
             self, console_app, console_client):

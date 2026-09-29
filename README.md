@@ -1562,6 +1562,77 @@ The minimums above are recorded from Polymarket's own bridge documentation
 and PTAI's copy is a date-stamped record rather than a guess - re-check it before
 a large deposit.
 
+## The Second Venue That Can Place An Order: Kalshi
+
+Your words: *"so ye now we can implement all venues."* This is the first one done,
+and it is the one that mattered most, because Kalshi is the only other venue the
+money side of PTAI was ever set up to fund.
+
+**What Kalshi was, honestly:** an adapter that read markets and prices, refused
+every order with `"Live trading not implemented for Kalshi yet"`, answered a
+balance request with zeros the moment an API key existed, and stamped every book
+`"ESTIMATION not real Kalshi orderbook"` even when the exchange had answered.
+
+**What its adapter does now:**
+
+1. **It signs the way Kalshi signs.** Kalshi authenticates with an RSA key from
+   your account, not a secret string. The Logins tab asks for it
+   (`KALSHI_PRIVATE_KEY`, the whole PEM) and the adapter signs
+   `timestamp + method + path` with RSA-PSS/SHA-256. One key id without its key,
+   or a key that cannot be read, is a refusal with the reason - never a
+   half-configured attempt at your money.
+2. **A real order path.** `POST /portfolio/events/orders`, Kalshi's current V2
+   shape: `bid`/`ask`, a fixed-point dollar price, a contract count, and a
+   `client_order_id` so a retry cannot become a second order. YES goes out as a
+   `bid`; NO goes out as an `ask` at `1 - price`, which is Kalshi's own
+   documented equivalence (a YES bid at p *is* a NO ask at 1 - p, same size), so
+   the money at risk is identical either way.
+3. **Prices on the market's own grid.** Kalshi now prices in sub-cent ticks that
+   differ per market (`price_ranges`): 0.001 steps near the edges, whole cents in
+   the middle. Off-grid prices are rejected, so the price is snapped - **down**
+   for a buy, **up** for the YES leg of a NO order, because the bound being
+   honoured is your maximum, not a rounding convention.
+4. **A real account read.** `GET /portfolio/balance`, signed, in dollars. A
+   0.00 now means the account is empty; before, it meant "we did not ask".
+5. **The book is the exchange's book.** `orderbook_fp` publishes bids only, best
+   bid last, and the ask is the other side's best bid complemented. When the
+   exchange cannot be read there is **no book at all** - no placeholder spread
+   around the last price.
+6. **Settlement the exchange reports.** `result` (yes/no) plus the market's
+   status and settlement value, so a Kalshi paper trade resolves on a real
+   outcome. That is another honest source of resolutions on the road to 100.
+7. **The fee is a curve, not a zero.** Kalshi charges
+   `round_up(0.07 x contracts x P x (1-P))`: 3.5% of a $1 stake at 50c, 6.3% at
+   10c. The old capability said `0.0` - the same value as "free" - and the code
+   around it even said Kalshi charges nothing. The cost model now asks the
+   adapter for this market's rate and gets the curve.
+8. **An order probe that proves permission.** Place one contract at the lowest
+   price the market allows (it cannot be marketable at that price), then cancel
+   it. Declared as `supports_order_probe`, so the account-health ladder can
+   prove order permission rather than assume it - and it refuses in dry run.
+
+**What is NOT true, and the venue page keeps saying it:** you cannot fund Kalshi
+from Uganda. It requires US residency and KYC, and its deposits are USD by ACH.
+Its own adapter answers `restricted` for UG, and its row reads *"an order path is
+not a funding route"*. What changed is that Kalshi is no longer blocked by
+missing code - it is blocked by geography and a bank, which is a different and
+honest sentence.
+
+Two smaller limits, recorded rather than hidden: the per-market fee multiplier
+some Kalshi series carry is not on the payload this client reads, so 1 is assumed
+(the general schedule) - a market with its own multiplier has its fee
+under-stated, never the order. And no live order has been placed with real money
+from this machine; the path was built against Kalshi's current documented API and
+every response is reported verbatim, so a wrong assumption arrives as a refusal,
+not as a wrong trade. If you are ever in a position to use it, place **one
+contract** first.
+
+**What is next, in the same order the venue page gives:** Manifold and Betfair
+still refuse orders in their adapters (they are the other two distance-1 venues),
+and the crypto venues - Binance, WhiteBIT - cannot ride the probability lane at
+all: their markets are not probability markets, so they need a directional-pricing
+lane before an order path on them would mean anything.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

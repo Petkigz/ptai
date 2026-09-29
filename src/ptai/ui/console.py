@@ -2766,8 +2766,10 @@ async function loadVenue(){
         <b>${c.readable_now||0}</b> readable right now with no account,
         <b>${c.paper_tradable||0}</b> being paper-traded,
         <b>${c.can_place_real_orders||0}</b> armed to place a real order
-        (only ${Object.values(inv.venues||{}).filter(v=>v.real_order_path)
-                .map(v=>esc(v.label)).join(', ')||'none'} has a submission path at all),
+        (${Object.values(inv.venues||{}).filter(v=>v.real_order_path).length||0}
+         ${(Object.values(inv.venues||{}).filter(v=>v.real_order_path).length||0)===1?'venue has':'venues have'}
+         a submission path: ${Object.values(inv.venues||{}).filter(v=>v.real_order_path)
+                .map(v=>esc(v.label)).join(', ')||'none'}),
         <b>${c.no_client||0}</b> with no client written.</div>
       <table style="margin-top:10px">
         <tr><th>Venue</th><th>What PTAI can do with it</th><th>Runs today</th>

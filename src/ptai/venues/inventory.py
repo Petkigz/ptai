@@ -330,11 +330,12 @@ def adapter_row(venue_id: str, adapter: Any,
         if armed:
             what_it_needs = "nothing further - it is armed and funded"
         else:
-            what_it_needs = ("venue credentials and an authorised budget; it is "
-                             "the only adapter that can submit a real order")
+            what_it_needs = ("venue credentials and an authorised budget; its "
+                             "adapter has a real submission path")
         why = ("Reads live markets now and is paper-traded like every other "
-               "venue. It is also the only venue whose orders can be real, "
-               "which is what a funded, armed account unlocks.")
+               "venue. Its adapter can also submit a real order once the login "
+               "is saved, the account is funded, and the account health check "
+               "has proven an order can be placed.")
     elif use == USE_NEEDS_LOGIN:
         can_run_today = False
         _login_name = login.get("label") or login.get("tool") or ""

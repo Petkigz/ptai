@@ -119,15 +119,29 @@ TOOLS: Dict[str, Tool] = {
         label="Kalshi",
         kind="venue",
         venue_id="kalshi",
-        unlocks="authenticated market reads and account/balance reads",
-        then=("PTAI has no Kalshi order path yet (the adapter says so itself), so "
-              "it stays paper even with a key - the key is what earns it the read "
-              "quota to build a record"),
+        unlocks=("the account read (balance, positions) and the real order path: "
+                 "Kalshi signs every request with the RSA key that belongs to the "
+                 "API key you create"),
+        then=("money still has to reach Kalshi through their own USD rails (US "
+              "bank account, ACH), and their adapter marks Uganda restricted - so "
+              "an order path alone does not make it fundable from here"),
+        docs="https://docs.kalshi.com/getting_started/api_keys",
         fields=(
-            Field("api_key", "API key", env="KALSHI_API_KEY"),
-            Field("api_secret", "API secret", env="KALSHI_API_SECRET", required=False),
+            Field("api_key", "API key id", env="KALSHI_API_KEY",
+                  hint="Shown next to the key in your Kalshi account (API keys)."),
+            Field("private_key", "RSA private key (PEM)", env="KALSHI_PRIVATE_KEY",
+                  required=False,
+                  hint=("Paste the whole key, -----BEGIN to -----END. Kalshi "
+                        "shows it once when the API key is created; it is what "
+                        "signs every order, so trading needs it.")),
+            Field("api_secret", "API secret (legacy)", env="KALSHI_API_SECRET",
+                  required=False),
             Field("member_id", "Member id", env="KALSHI_MEMBER_ID",
                   secret=False, required=False),
+            Field("environment", "Environment (production or demo)",
+                  env="KALSHI_ENVIRONMENT", secret=False, required=False,
+                  hint=("'demo' uses Kalshi's demo exchange (separate keys, mock "
+                        "funds) - the safe place to prove the order path first.")),
         ),
     ),
     "betfair": Tool(
@@ -648,11 +662,24 @@ def _apply_kalshi(adapter, data_dir: str) -> List[str]:
     values = resolve("kalshi", data_dir)
     applied = []
     for attr, key in (("api_key", "api_key"), ("api_secret", "api_secret"),
-                      ("member_id", "member_id")):
+                      ("member_id", "member_id"),
+                      ("private_key_pem", "private_key"),
+                      ("environment", "environment")):
         value = values.get(key)
-        if value and getattr(adapter, attr, None) != value:
-            setattr(adapter, attr, value)
-            applied.append(attr)
+        if not value:
+            continue
+        if getattr(adapter, attr, None) == value:
+            continue
+        setattr(adapter, attr, value)
+        applied.append(attr)
+    # The RSA key is what turns the order path on, and the capability flag is
+    # computed at construction from what was known then. A login saved while the
+    # agent is running has to raise it, or the venue keeps reporting "no order
+    # path" until the next restart - the exact stale-flag loop this module ends.
+    if getattr(adapter, "private_key_pem", None) and hasattr(adapter, "capabilities"):
+        adapter.capabilities.supports_trading = bool(
+            getattr(adapter, "api_key", None) and adapter.private_key_pem)
+        applied.append("supports_trading")
     return applied
 
 
