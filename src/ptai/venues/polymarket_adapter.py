@@ -701,7 +701,11 @@ class PolymarketAdapter(MarketAdapter):
         # Source 1: Storage DB
         try:
             from ..storage.db import Storage
-            storage = Storage(db_path="./data/ptai.db")
+            # NOT a hardcoded path. `./data/ptai.db` ignores PTAI_DB, so a
+            # console launched against another database read this venue's
+            # account from a file the agent never wrote - which is how a
+            # funded paper account can be reported as having nothing.
+            storage = Storage()
             perf = storage.get_performance_summary()
             bankroll = perf.get("bankroll", 50.0)
             open_positions = perf.get("open_positions", 0)
@@ -991,7 +995,7 @@ class PolymarketAdapter(MarketAdapter):
         # Fallback - but marked as placeholder, not real
         try:
             from ..storage.db import Storage
-            storage = Storage(db_path="./data/ptai.db")
+            storage = Storage()
             perf = storage.get_performance_summary()
             bankroll = perf.get("bankroll", 50.0)
             storage.close()

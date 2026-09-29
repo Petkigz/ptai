@@ -605,6 +605,119 @@ def set_authorised_budget(storage, venue_id: str, amount_usd: float) -> None:
         logger.warning(f"Could not start a fresh live session for the guard: {e}")
 
 
+# The floor a paper purse is kept at. Paper money is the simulation's own, so
+# running out of it does not mean the operator is out of money - it means the
+# trial stopped, which is the one thing paper mode must never do. The operator
+# asked for it directly: "paper mode has zero balance available but it supposed
+# to operate on capitaal so it need to have at least 20 or 50 dollars".
+PAPER_PURSE_MIN_USD = 20.0
+
+
+def paper_purse_state(storage) -> Dict[str, Any]:
+    """
+    The paper purse: its balance, what is committed, and why it is not empty.
+
+    Read-only. `ensure_paper_purse` is the one that can add paper money, and it
+    is called at a cycle start - never from a read path.
+    """
+    try:
+        current = float(storage.get_paper_bankroll() or 0.0)
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "balance_usd": None, "empty": None,
+                "reason": f"the paper purse could not be read: {type(e).__name__}: {e}"}
+    try:
+        # The SAME marker the position ledger uses to tell a paper position
+        # from a live one: the writer stamps status='paper' for a simulated
+        # execution. Counting by execution_mode instead would miss rows written
+        # before that column existed - and a paper position counted as none is
+        # exactly how a purse in use gets topped up twice.
+        open_positions = int(storage.conn.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE resolved = 0 "
+            "AND lower(COALESCE(status, '')) = 'paper'").fetchone()["n"] or 0)
+    except Exception:  # noqa: BLE001
+        open_positions = None
+    try:
+        resting = float(storage.resting_capital_usd(execution_mode="paper") or 0.0)
+    except Exception:  # noqa: BLE001
+        resting = None
+    state = {
+        "available": True,
+        "balance_usd": round(current, 2),
+        "min_usd": PAPER_PURSE_MIN_USD,
+        "empty": current < PAPER_PURSE_MIN_USD,
+        "open_positions": open_positions,
+        "committed_orders_usd": None if resting is None else round(resting, 2),
+        "reason": "",
+    }
+    if not state["empty"]:
+        state["reason"] = f"the paper purse holds ${current:.2f} of paper money"
+    elif (open_positions or 0) > 0 or (resting or 0.0) > 0:
+        state["reason"] = (
+            f"the paper purse holds ${current:.2f} because "
+            f"{open_positions or 0} open paper position(s) and "
+            f"${(resting or 0.0):.2f} of working paper orders hold the rest; "
+            f"that capital is in the equity figure, so nothing is added")
+    else:
+        state["reason"] = (
+            f"the paper purse holds ${current:.2f} with nothing open - it is "
+            f"re-seeded to at least ${PAPER_PURSE_MIN_USD:.0f} when the agent "
+            f"starts (paper money, and the history records it)")
+    return state
+
+
+def ensure_paper_purse(storage, *, at: str = "cycle start") -> Dict[str, Any]:
+    """
+    Give the paper account the capital it is supposed to operate on.
+
+    Called at a cycle start and when the console starts the agent, never on a
+    read. Three cases, and only the third writes:
+
+      * the purse already has at least the floor -> nothing;
+      * the purse is empty because paper positions or working orders hold it ->
+        nothing (that capital is in the equity figure; adding to it would be
+        double-counting the account's own money);
+      * the purse is empty with NOTHING open -> it is set to the configured
+        bankroll (at least the floor), the top-up is written to the bankroll
+        history so the equity curve shows it as a deposit rather than a profit,
+        and the log says so in those words.
+    """
+    state = paper_purse_state(storage)
+    if not state.get("available"):
+        return state
+    if not state["empty"]:
+        state["topped_up"] = False
+        return state
+    if (state.get("open_positions") or 0) > 0 or (state.get("committed_orders_usd") or 0) > 0:
+        state["topped_up"] = False
+        logger.info(f"Paper purse: ${state['balance_usd']:.2f} with "
+                    f"{state.get('open_positions') or 0} open position(s) - "
+                    f"nothing added (the committed capital is in the equity)")
+        return state
+
+    try:
+        configured = float(storage.get_bankroll() or 0.0)
+    except Exception:  # noqa: BLE001
+        configured = 0.0
+    target = round(max(PAPER_PURSE_MIN_USD, configured or PAPER_PURSE_MIN_USD), 2)
+    try:
+        storage.set_paper_bankroll(target)
+    except Exception as e:  # noqa: BLE001 - a failed top-up must be reported
+        state["topped_up"] = False
+        state["error"] = f"{type(e).__name__}: {e}"
+        logger.warning(f"Could not re-seed the paper purse: {state['error']}")
+        return state
+    was = float(state.get("balance_usd") or 0.0)
+    state.update({"topped_up": True, "balance_usd": target,
+                  "added_usd": round(target - was, 2)})
+    state["reason"] = (f"the paper purse is empty with nothing open, so it was "
+                       f"re-seeded to ${target:.2f} at {at} - paper money, not "
+                       f"capital, and the bankroll history records the top-up")
+    logger.info(f"PAPER PURSE: was ${was:.2f} with no open position; re-seeded to "
+                f"${target:.2f} of paper money at {at} (recorded in the bankroll "
+                f"history, so it cannot be read as profit)")
+    return state
+
+
 def operator_mode(storage, default: str = "paper") -> str:
     """The mode the operator set. Paper unless they have said otherwise."""
     if storage is None:

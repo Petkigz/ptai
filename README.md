@@ -496,6 +496,87 @@ lines. A duplicate handler cannot arise on that path (`_add_sink` is only reache
 when no handler is flagged as the ring's), so there was never a reason to throw
 the history away.
 
+### A Dead Engine Holds Nothing
+
+The operator's report was four symptoms that arrived as one sentence:
+
+    "the logs are not showing whats happening anymor , if i press stop nothing
+     happens , refresh does nothing too . the button for start the agenbt is
+     always greyed out . paper mode has zero balance available but it supposed
+     to operate on capitaal so it need to have at least 20 or 50 dollars"
+
+The first three have one cause, and it is not a rendering bug. Starting the agent
+writes a **lease** - who owns the loop, in which process, on which machine. The
+lease was judged fresh by the age of its heartbeat and by nothing else, so when
+the engine *died* (the window was closed, the console was restarted, the process
+crashed) the claim survived for the rest of the freshness window while the
+process behind it did not exist. Nothing had ever asked whether that pid was
+alive. From the page that looks exactly like the report:
+
+  * **Start** greyed out, and refused with *"already running in the console
+    engine (pid 7444)"* about a pid that is gone;
+  * **Stop** refused with *"the agent is running outside this console (pid
+    7444); close that window to stop it"* - a window that does not exist;
+  * **Refresh** re-reads the same lease and redraws the same thing, so the
+    button appears to do nothing;
+  * the **log** panel showed this process's ring buffer and never said that no
+    engine was running, so a stopped agent and a working one read the same.
+
+Liveness is now part of the answer. `pid_alive()` asks the OS, and a lease whose
+pid is gone on this machine is **abandoned**: it holds nothing, the note names
+the pid and says the engine is gone, Start takes the lease, and Stop cleans the
+record instead of refusing. Two things this deliberately does *not* do:
+
+  * it does not shorten the freshness window - that would declare live engines
+    dead every few minutes instead;
+  * it does not treat "cannot tell" as dead. A pid on another machine is
+    unknown, and unknown is treated as possibly alive, because refusing to start
+    a second engine is the safe error and two engines on one database is the bug
+    the lease exists to prevent.
+
+A live engine in another window is still refused, by name and pid. `Refresh` now
+re-renders a different page because the record itself changed, and the log panel
+states whose log it is (*"Showing the last N line(s) buffered by the console
+engine, pid 3972 - no engine is running the agent"*). Every Start/Stop leaves its
+answer on the page, on its own line, whether it worked or was refused.
+
+### Paper Mode Always Has A Purse
+
+> "paper mode has zero balance available but it supposed to operate on capitaal
+> so it need to have at least 20 or 50 dollars"
+
+A paper account with no purse cannot size a trade, and a trial that stops
+because its simulation ran out of imaginary money is the one thing paper mode
+must never do. The paper purse is checked at every cycle start and when the
+console starts the agent, and:
+
+  * a purse **with** money is left alone;
+  * a purse at zero **because open paper positions or working paper orders hold
+    the capital** is left alone - that money is already in the equity figure,
+    and topping it up would double-count the account's own funds, so the log
+    says which case it is;
+  * a purse at zero **with nothing open** is re-seeded to the configured
+    bankroll (never below $20), the top-up is written to the bankroll history so
+    the equity curve shows it as a deposit rather than a profit, and the log
+    line says so:
+
+        PAPER PURSE: was $0.00 with no open position; re-seeded to $50.00 of
+        paper money at the console start (recorded in the bankroll history, so
+        it cannot be read as profit)
+
+The page never shows a bare zero either. The header used to read
+`$0.00 available`, which is the *live* figures - no venue is funded in paper mode
+because none needs to be - beside an unfunded-looking account. In paper mode the
+header now shows the simulated account: `paper account $50.00 equity · $50.00
+free · paper purse $50.00`, and an empty purse is labelled with what will happen
+to it rather than left to look broken.
+
+Reading the paper balance also turned up a second reader of the same database:
+the Polymarket adapter opened `./data/ptai.db` directly, ignoring `PTAI_DB`, so a
+console pointed at any other database asked a *different file* for the venue's
+balance. That is how a funded account gets reported as having nothing. It now
+uses the one Storage resolver every other entry point uses.
+
 ### An Arbitrage Has To Be One
 
 The scan groups markets by event and adds up their YES prices, because in a group

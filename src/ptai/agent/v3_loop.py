@@ -1826,6 +1826,21 @@ class TradingAgentV3:
             self.llm_router.reset_usage()
         except Exception as e:  # noqa: BLE001 - counting must not stop a cycle
             logger.debug(f"Could not reset the model call count: {e}")
+        # PAPER CAPITAL. A paper account with no purse cannot size a trade, and
+        # the operator's report was exactly that: "paper mode has zero balance
+        # available but it supposed to operate on capitaal". The purse is
+        # re-seeded here - at a cycle start, never on a read - only when it is
+        # empty AND nothing is open, and the log line says which of those it
+        # was. Money committed to open positions is in the equity figure and is
+        # never topped up.
+        try:
+            from ..execution.capital import ensure_paper_purse
+            _purse = ensure_paper_purse(self.storage, at="this cycle's start")
+            self._paper_purse = _purse
+        except Exception as e:  # noqa: BLE001 - a purse problem must not stop the cycle
+            self._paper_purse = {"available": False,
+                                 "reason": f"{type(e).__name__}: {e}"}
+            logger.warning(f"Could not check the paper purse: {type(e).__name__}: {e}")
         # Hand the console the venue list it cannot build for itself. The .bat
         # starts the agent and the console as two processes, so the console has
         # no registry to read and used to fall back to "the fundable venues" -
@@ -3084,6 +3099,9 @@ class TradingAgentV3:
             "deep_analysis": screen or getattr(self, "_screen", {}),
             # WHICH local model, and what it did, this cycle.
             "local_model": self._local_model_status(),
+            # The paper account's own purse: its balance, and whether this cycle
+            # had to re-seed it (and why not, when it did not).
+            "paper_purse": dict(getattr(self, "_paper_purse", None) or {}),
             # Whether the base-rate component had real counted frequencies this
             # cycle, and from how many resolved markets.
             "base_rates": (self.base_rates.status() if self.base_rates is not None

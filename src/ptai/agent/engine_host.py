@@ -58,6 +58,66 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def pid_alive(pid: Any) -> Optional[bool]:
+    """
+    Is that process still running, on THIS machine?
+
+    The lease names a pid, and until now nothing ever checked whether the
+    process behind it existed. The operator's report is what that costs:
+
+        Start   -> greyed out: "already running in the console engine (pid 7444)"
+        Stop    -> "the agent is running outside this console (pid 7444);
+                   close that window to stop it"
+        Refresh -> the same, for up to twenty minutes
+
+    ...about a process that had already died. Returns True, False, or None when
+    the question cannot be answered (a pid on another host, or no permission) -
+    None is "unknown", which is treated as possibly alive because refusing to
+    start a second engine is the safe error.
+    """
+    if pid in (None, ""):
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if os.name == "nt":  # the operator's machine
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                # A live process we cannot open (permissions) reports False
+                # here, which would let a second engine start. Ask the cheaper
+                # question instead: does a process with this pid exist at all?
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
+                return True
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception as e:  # noqa: BLE001 - unknown is not "dead"
+            logger.debug(f"Could not check pid {pid} on Windows: {e}")
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours to signal
+    except OSError:
+        return None
+    return True
+
+
 def _age_seconds(stamp: Optional[str]) -> Optional[float]:
     if not stamp:
         return None
@@ -166,6 +226,9 @@ def engine_lease_status(storage, interval_min: Optional[int] = None,
         "started_at": None, "heartbeat_at": None, "age_seconds": None,
         "released": False, "released_reason": None, "released_at": None,
         "stale_after_seconds": None, "stale": True, "note": None,
+        # Whether the process that claimed this lease still exists. None means
+        # "cannot tell" (another host, or no permission).
+        "holder_alive": None, "abandoned": False,
     }
     if storage is None:
         block["note"] = "no storage to read"
@@ -208,11 +271,28 @@ def engine_lease_status(storage, interval_min: Optional[int] = None,
                             and block["host"] == me["host"])
     block["stale"] = bool(block["age_seconds"] is None
                           or block["age_seconds"] > block["stale_after_seconds"])
+    # A pid on this host is checkable, and a pid that is gone means the engine
+    # is gone - immediately, not after the freshness window. A pid on another
+    # host stays None ("cannot tell") because liveness is not observable there.
+    if block["is_self"]:
+        block["holder_alive"] = True
+    elif block["host"] and block["host"] == me["host"]:
+        block["holder_alive"] = pid_alive(block["pid"])
+    else:
+        block["holder_alive"] = None
+    block["abandoned"] = bool(block["holder_alive"] is False
+                              and not block["released"])
 
     if block["released"]:
         block["held"] = False
         block["note"] = (f"the agent was stopped on purpose at "
                          f"{block['released_at']} ({block['released_reason']})")
+    elif block["abandoned"]:
+        block["held"] = False
+        block["note"] = (f"the {block['kind']} engine that claimed this (pid "
+                         f"{block['pid']} on {block['host']}) is GONE - its "
+                         f"process no longer exists, so nothing is running the "
+                         f"agent. The lease is abandoned; Start takes it.")
     elif block["stale"]:
         block["held"] = False
         block["note"] = (f"an engine ({block['kind']}, pid {block['pid']} on "
@@ -308,7 +388,26 @@ def release_engine_lease(storage, reason: str = "stopped by the operator") -> No
                         and lease.get("host") == mine["host"])
         if lease and not mine_now and not lease.get("released"):
             # Another process owns it; it releases its own lease when it stops.
-            return
+            #
+            # UNLESS that process is gone. A dead holder cannot release its own
+            # lease, so refusing here made the record permanent: the page kept
+            # showing "running (pid 7444)" through every Refresh, and Stop did
+            # nothing, for a pid that no longer existed. Liveness is the same
+            # question the lease reader asks.
+            status = engine_lease_status(storage)
+            if not (status.get("holder_alive") is False
+                    or status.get("abandoned")):
+                return
+            lease["released_from"] = {
+                "kind": status.get("kind"), "pid": status.get("pid"),
+                "host": status.get("host"),
+                "last_seen_seconds_ago": status.get("age_seconds"),
+                "holder_alive": status.get("holder_alive"),
+            }
+            logger.warning(
+                f"Clearing the lease of the {status.get('kind')} engine (pid "
+                f"{status.get('pid')} on {status.get('host')}): its process no "
+                f"longer exists")
         lease.update({"released": True, "released_reason": reason,
                       "released_at": _now(), "heartbeat_at": _now()})
         storage.set_state(LEASE_KEY, json.dumps(lease))

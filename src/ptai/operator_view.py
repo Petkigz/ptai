@@ -119,10 +119,19 @@ def _capital(storage) -> Dict[str, Any]:
             realised = float(row["total"] or 0.0) if row else 0.0
         except Exception:
             realised = 0.0
+        try:
+            from .execution.capital import paper_purse_state
+            purse = paper_purse_state(storage)
+        except Exception as e:  # noqa: BLE001
+            purse = {"available": False, "reason": f"{type(e).__name__}: {e}"}
         return {
             "available": True,
             "source": "position_ledger",
             "account": "paper",
+            # The purse the paper account sizes against, and what it is doing -
+            # "zero balance available" needs a reason on the same screen as the
+            # number, or it reads as a broken account.
+            "paper_purse": purse,
             "equity_usd": round(equity, 2),
             "free_cash_usd": round(free, 2),
             "reserved_capital_usd": round(reserved, 2),

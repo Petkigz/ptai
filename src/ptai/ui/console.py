@@ -547,6 +547,32 @@ def _start_agent_in_process(force: bool = False,
                 "reason": "the agent is already running in this console"}
 
     storage = get_storage()
+    # The paper purse first: the operator's report was "paper mode has zero
+    # balance available", and pressing Start must leave the page showing the
+    # money the agent will actually size against.
+    try:
+        from ..execution.capital import ensure_paper_purse
+        _purse = ensure_paper_purse(storage, at="the console start")
+        _CONTROLLER["purse"] = _purse
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not check the paper purse at start: "
+                       f"{type(e).__name__}: {e}")
+    # An abandoned lease (the holder's process is gone) is not an owner: Start
+    # clears it and takes over, rather than being refused by a dead pid and
+    # leaving the button greyed out forever.
+    try:
+        prior = engine_host.engine_lease_status(storage)
+        if prior.get("abandoned") and not prior.get("held"):
+            engine_host.release_engine_lease(
+                storage, reason=("the engine that held the lease (pid "
+                                 f"{prior.get('pid')}) was gone; the agent was "
+                                 f"started again from the console"))
+            logger.warning(
+                f"The lease was held by a dead engine ({prior.get('kind')}, pid "
+                f"{prior.get('pid')} on {prior.get('host')}); it is cleared and "
+                f"this console is taking the agent")
+    except Exception as e:  # noqa: BLE001 - a bad lease row must not block Start
+        logger.debug(f"Could not check the prior lease: {type(e).__name__}: {e}")
     interval = engine_host.interval_source(storage)
     claim = engine_host.claim_engine_lease(
         storage, "console", interval_min=interval.get("minutes"), force=force)
@@ -633,14 +659,40 @@ def _stop_agent(timeout: float = 20.0) -> Dict[str, Any]:
     agent = _CONTROLLER.get("agent")
     loop = _CONTROLLER.get("loop")
     if agent is None or loop is None:
-        # Not ours: either nobody is running, or the command window owns it. In
-        # the second case the lease still names the holder, which the page shows.
+        # Not ours: either nobody is running, or another process owns it.
         lease = engine_host.engine_lease_status(storage)
-        if lease.get("held") and not lease.get("is_self"):
+        # `held` is FALSE for an abandoned lease - a dead pid holds nothing -
+        # so testing `held` here would send the cleanup down the "nobody was
+        # running" path and lose the fact that the button was pressed to clear
+        # a dead engine's claim. Both states go through the branch, and the
+        # abandoned one is the case that must not refuse.
+        if (lease.get("held") or lease.get("abandoned")) \
+                and not lease.get("is_self"):
+            if lease.get("abandoned") or lease.get("holder_alive") is False:
+                # The holder's process is gone. Clearing the lease is not
+                # "stopping an agent", it is cleaning up after a dead one - and
+                # refusing here is what made Stop look broken: the page said
+                # "the agent is running outside this console (pid 7444)" about a
+                # pid that no longer existed, and the button did nothing.
+                engine_host.release_engine_lease(
+                    storage, reason=("the operator pressed Stop; the engine that "
+                                     "held the lease is gone"))
+                return {"stopped": True, "abandoned": True,
+                        "reason": (f"the {lease.get('kind')} engine that held the "
+                                   f"agent (pid {lease.get('pid')} on "
+                                   f"{lease.get('host')}) is gone - nothing was "
+                                   f"running, and the record is clean now")}
             return {"stopped": False,
-                    "reason": (f"the agent is running outside this console "
+                    "reason": (f"the agent is running in ANOTHER process "
                                f"({lease.get('kind')} engine, pid {lease.get('pid')} "
-                               f"on {lease.get('host')}); close that window to stop it")}
+                               f"on {lease.get('host')}, alive "
+                               f"{lease.get('age_seconds')}s ago). Nothing was "
+                               f"stopped: that process is not this one. Close its "
+                               f"window (or press Stop there) and press Start here "
+                               f"- or use Start to take it over after it stops."),
+                    "holder": {"kind": lease.get("kind"), "pid": lease.get("pid"),
+                               "host": lease.get("host"),
+                               "age_seconds": lease.get("age_seconds")}}
         engine_host.release_engine_lease(storage,
                                          reason="the operator pressed Stop")
         return {"stopped": True,
@@ -973,6 +1025,32 @@ async def api_status() -> JSONResponse:
                     if int(paper.get("settled_trades") or 0)
                     else "no simulated trade has settled yet")},
     ]
+    # The paper purse travels with the plan: a capital figure with no purse
+    # beside it cannot say whether the paper account can still size a trade.
+    #
+    # ...and so does the paper ACCOUNT, because `total_available_usd` is about
+    # live venues. In paper mode it reads $0.00 - no venue is funded because
+    # none needs to be - and the operator read that, correctly, as "paper mode
+    # has zero balance". The header now shows the simulated account's own
+    # equity and free cash instead.
+    if state.mode == "paper":
+        plan = dict(plan)
+        try:
+            from ..execution.capital import paper_purse_state
+            plan["paper_purse"] = paper_purse_state(storage)
+        except Exception as e:  # noqa: BLE001 - never break the status page for a note
+            plan["paper_purse"] = {"available": False,
+                                   "reason": f"{type(e).__name__}: {e}"}
+        account = snapshot.get("capital") if isinstance(snapshot, dict) else None
+        if isinstance(account, dict):
+            plan["paper_account"] = {
+                "account": account.get("account"),
+                "equity_usd": account.get("equity_usd"),
+                "free_cash_usd": account.get("free_cash_usd"),
+                "deployed_usd": account.get("deployed_usd"),
+                "source": account.get("source"),
+                "warnings": account.get("warnings") or [],
+            }
     out["capital"] = plan
     return JSONResponse(out)
 
@@ -1799,6 +1877,12 @@ section[id]{scroll-margin-top:132px}
     reading which engine owns the agent&hellip;
   </div>
   <!--
+    What the last Start/Stop actually did. "If i press stop nothing happens" is
+    a page that answered a press with silence, so every press leaves its answer
+    here, on its own line, whether it worked or was refused.
+  -->
+  <div id="engineBox" style="flex-basis:100%"></div>
+  <!--
     One page, jump links. The sections are all on this page and all visible;
     these only scroll to them, so nothing can be hidden from the operator by a
     navigation state they forgot they set. The active one is highlighted as the
@@ -2202,8 +2286,33 @@ async function loadStatus(){
 
   const cap = body.capital || {};
   const st = body.storage || {};
-  $('hdrCapital').textContent = money(cap.total_available_usd) + ' available \u00b7 '
-    + money(cap.total_reserved_usd) + ' reserved';
+  // ...and the paper purse beside it, because the operator's reading of a bare
+  // "$0.00 available" in paper mode was, correctly, that the account could not
+  // trade. The purse is the paper account's own money and it is re-seeded at
+  // Start, and the header has to say which of those it is.
+  const purse = cap.paper_purse || null;
+  const acct = cap.paper_account || null;
+  // In paper mode the live "available / reserved" pair is about venues that do
+  // not need funding, and it printed $0.00 beside a funded simulated account.
+  // The paper figures are the truthful ones there.
+  let head = (STATE.mode === 'paper' && acct)
+    ? 'paper account ' + money(acct.equity_usd) + ' equity \u00b7 '
+      + money(acct.free_cash_usd) + ' free'
+    : money(cap.total_available_usd) + ' available \u00b7 '
+      + money(cap.total_reserved_usd) + ' reserved';
+  if(purse && purse.available){
+    head += ' \u00b7 paper purse ' + (purse.empty
+      ? '<span class="neg">' + money(purse.balance_usd) + ' (empty - re-seeded when the agent starts)</span>'
+      : money(purse.balance_usd));
+  }
+  const hdr = $('hdrCapital');
+  if(purse && purse.available && purse.empty){
+    hdr.innerHTML = head;
+    hdr.title = String(purse.reason || '');
+  } else {
+    hdr.textContent = head.replace(/<[^>]+>/g, '');
+    hdr.title = (purse && purse.available) ? String(purse.reason || '') : '';
+  }
 
   // The KPI row lives on the Agent tab, fed by /api/console/agent - which reads
   // the same snapshot these steps do. Rendering it twice is how two screens end
@@ -2806,14 +2915,26 @@ function paintEngine(body){
     bits.push('<span class="neg">the last engine error: ' +
       esc(String(body.agent_error)) + '</span>');
   }
+  if(lease.abandoned){
+    bits.push('<span class="neg">the engine that claimed this lease (' +
+      esc(String(lease.kind||'')) + ', pid ' + esc(String(lease.pid)) +
+      ') is gone - nothing is running the agent. Start takes it</span>');
+  }
   el.innerHTML = bits.join(' &middot; ');
   const start = $('startBtn'), stop = $('stopBtn'), run = $('runBtn');
   if(start && stop && run){
     const busy = body.agent_state==='starting';
-    start.disabled = body.console_hosting || busy || lease.held;
-    stop.disabled = !body.console_hosting && !lease.held;
+    // A lease whose holder process is gone owns nothing, so it must not keep
+    // Start greyed out. `lease.held` is already false for an abandoned lease;
+    // this keeps the page honest if an older payload says otherwise.
+    const held = !!lease.held && lease.holder_alive !== false;
+    start.disabled = body.console_hosting || busy || held;
+    stop.disabled = !body.console_hosting && !held;
     run.disabled = false;
-    start.textContent = body.console_hosting ? 'Agent is running here' : 'Start the agent';
+    start.textContent = body.console_hosting
+      ? 'Agent is running here'
+      : (held ? 'Agent runs in another process' : 'Start the agent');
+    stop.textContent = (held && !body.console_hosting) ? 'Stop (another process)' : 'Stop';
   }
 }
 
@@ -2824,17 +2945,31 @@ async function agentAction(what){
   const {ok, body} = await api('/api/console/agent-control', {method:'POST',
     body:JSON.stringify({action:what})});
   btn.textContent = was;
-  const box = $('cycleOut');
+  // What the action DID, in the engine box (where the buttons are) as well as
+  // the round card. "I press stop and nothing happens" was partly this: the
+  // outcome - including a refusal with its reason - was printed somewhere the
+  // operator was not looking.
+  const stopped_nothing = (what==='stop' && body.stopped === false);
   const text = ok ? (what==='start' ? 'The agent is starting here; its first cycle ' +
         'begins immediately and the round card and log will fill in.'
-      : 'The agent was stopped on purpose, and the record says so.')
+      : (body.abandoned
+          ? 'Nothing was running: the engine that held the agent was gone, so the ' +
+            'record was cleaned. Press Start to run the agent here.'
+          : 'The agent was stopped on purpose, and the record says so.'))
     : (body.error || body.reason || 'that did not work');
-  if(box) box.innerHTML = '<div class="' + (ok?'note':'errbox') + '"><b>' +
+  const html = '<div class="' + (ok && !stopped_nothing?'note':'errbox') + '"><b>' +
     esc(String(text)) + '</b>' + (!ok && body.holder && body.holder.pid
       ? '<div class="note" style="margin-top:5px">held by the ' +
         esc(String(body.holder.kind||'')) + ' engine, pid ' +
         esc(String(body.holder.pid)) + ' on ' + esc(String(body.holder.host||'')) +
         ', alive ' + esc(ageText(body.holder.age_seconds)) + ' ago</div>' : '') + '</div>';
+  const box = $('cycleOut');
+  if(box) box.innerHTML = html;
+  const eng = $('engineBox');
+  if(eng){
+    eng.insertAdjacentHTML('afterbegin', html);
+    while(eng.children.length > 2) eng.removeChild(eng.lastElementChild);
+  }
   await loadAll(); await loadControl();
 }
 
@@ -2869,9 +3004,22 @@ async function loadLogs(){
     const file = body.log_file && body.log_file.name
       ? ' The durable log file is <b>' + esc(body.log_file.name) + '</b> (' +
         esc(String(body.log_file.size_kb)) + ' kB).' : '';
+    // WHOSE log this is, and whether the agent is running at all. Lines from
+    // this process only, with no engine running, is exactly what "the logs are
+    // not showing what is happening" looks like from the outside.
+    const c = (ENGINE.control || {}), lease = (c.lease || {});
+    const running = !!c.console_hosting || (!!lease.held);
+    const stateWord = c.console_hosting
+      ? '<b>the agent is running in this console</b>'
+      : (lease.held
+          ? 'the agent is running in another process (pid ' + esc(String(lease.pid)) + ')'
+          : (lease.abandoned
+              ? '<span class="neg"><b>no engine is running the agent</b> - the one that held it (pid ' +
+                esc(String(lease.pid)) + ') is gone</span>'
+              : '<b>no engine is running the agent</b> (press Start)'));
     where.innerHTML = 'Showing the last ' + esc(String(body.buffered)) + ' line(s) ' +
       'buffered by the ' + esc(String(body.role)) + ' engine, pid ' +
-      esc(String(body.pid)) + '.' + file;
+      esc(String(body.pid)) + ' &middot; ' + stateWord + '.' + file;
   }
   const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
   const fresh = body.lines.filter(l=>l.seq > ENGINE.logSeq);
