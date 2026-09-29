@@ -119,7 +119,43 @@ def _label(venue_id: str, adapter: Any) -> str:
     return _LABELS.get(venue_id, venue_id)
 
 
-def adapter_row(venue_id: str, adapter: Any) -> Dict[str, Any]:
+def _login_state(venue_id: str, data_dir: Optional[str]) -> Dict[str, Any]:
+    """
+    The login this venue's adapter reads, and whether the operator has saved it.
+
+    Betfair publishes no public market feed: with no login it returns nothing at
+    all. The classification used to ask only "does this adapter require
+    credentials" - so a venue whose login HAD been saved still read "needs a
+    login" on the panel, and a saved login looked like it had done nothing. The
+    operator's report was exactly that: "i cant even connect my credentials to
+    most of them". Whether a login is still NEEDED is a fact about the vault, not
+    about the adapter.
+    """
+    state: Dict[str, Any] = {"tool": "", "label": "", "configured": False}
+    try:
+        from .credentials import TOOL_FOR_VENUE, describe  # noqa: WPS433
+    except Exception as e:  # noqa: BLE001 - the panel must still render
+        logger.debug(f"Credential module unavailable: {type(e).__name__}: {e}")
+        return state
+    tool = TOOL_FOR_VENUE.get(venue_id)
+    if not tool:
+        return state
+    state["tool"] = tool
+    if not data_dir:
+        # A caller with no vault to read: name the login, claim nothing about it.
+        return state
+    try:
+        info = describe(tool, data_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Could not read the {tool} login state: {type(e).__name__}: {e}")
+        return state
+    state["label"] = info.get("label") or tool
+    state["configured"] = bool(info.get("configured"))
+    return state
+
+
+def adapter_row(venue_id: str, adapter: Any,
+                login: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     One venue, described by what its code can do - not by what it might.
 
@@ -127,13 +163,21 @@ def adapter_row(venue_id: str, adapter: Any) -> Dict[str, Any]:
     flags beside it are read from the same AdapterCapability the runtime gates
     consult, so this row cannot say "can trade" while `can_place_real_orders`
     says otherwise.
+
+    `login` is the saved-credential state from `_login_state`. It decides whether
+    a venue that requires credentials is still BLOCKED by them or merely WAS:
+    a saved login is what turns "needs a login" into "runs today".
     """
     caps = getattr(adapter, "capabilities", None)
     status = getattr(caps, "implementation_status", STATUS_UNIMPLEMENTED)
-    reads_now = (status != STATUS_UNIMPLEMENTED
-                 and bool(getattr(caps, "supports_market_discovery", False))
-                 and not bool(getattr(caps, "requires_credentials", False)))
-    needs_login = bool(getattr(caps, "requires_credentials", False))
+    requires_creds = bool(getattr(caps, "requires_credentials", False))
+    login = dict(login or {})
+    login_configured = bool(login.get("configured"))
+    # A login the operator has already saved is not still needed.
+    needs_login = requires_creds and not login_configured
+    supported = bool(getattr(caps, "supports_market_discovery", False))
+    reads_now = (status != STATUS_UNIMPLEMENTED and supported
+                 and not needs_login)
     real_path = bool(getattr(caps, "real_order_path", False))
     armed = bool(getattr(adapter, "can_place_real_orders", False))
 
@@ -173,14 +217,22 @@ def adapter_row(venue_id: str, adapter: Any) -> Dict[str, Any]:
                "which is what a funded, armed account unlocks.")
     elif use == USE_NEEDS_LOGIN:
         can_run_today = False
-        what_it_needs = ("an account and credentials; it returns no markets "
-                         "until it is logged in")
+        _login_name = login.get("label") or login.get("tool") or ""
+        what_it_needs = (
+            f"an account and credentials for the {_login_name} login; it "
+            f"returns no markets until it is logged in" if _login_name else
+            "an account and credentials; it returns no markets until it is "
+            "logged in")
         why = ("Its public feed is closed. Credentials let it be scanned and "
                "paper-traded; it still cannot place a real order, because no "
                "submission path exists in the adapter.")
     else:  # USE_PAPER_ONLY
         can_run_today = True
-        what_it_needs = "nothing - it reads public data with no account"
+        if requires_creds and login_configured:
+            what_it_needs = ("nothing - the saved login is read at the start of "
+                             "every cycle")
+        else:
+            what_it_needs = "nothing - it reads public data with no account"
         why = ("Scanned and paper-traded every cycle at no cost. It cannot hold "
                "real money: the adapter has no way to submit an order.")
 
@@ -191,6 +243,12 @@ def adapter_row(venue_id: str, adapter: Any) -> Dict[str, Any]:
         "implementation_status": status,
         "reads_live_markets_now": reads_now,
         "needs_credentials": needs_login,
+        # The login this venue reads, and whether it is already saved. Present on
+        # every row - an empty tool means this venue reads no login at all - so
+        # "why can I not connect this one?" is answerable per venue rather than
+        # guessed at from a panel that lists seven logins beside nineteen venues.
+        "login": login,
+        "logged_in": login_configured,
         # "Paper-tradable" means it can be filled in simulation TODAY: a real
         # market feed, reachable without a login. A venue that needs credentials
         # before it returns a single market is not tradable yet - it is
@@ -209,10 +267,19 @@ def adapter_row(venue_id: str, adapter: Any) -> Dict[str, Any]:
     }
 
 
-def build_inventory(registry: Any) -> Dict[str, Any]:
-    """Every registered adapter, as the operator's answer table."""
+def build_inventory(registry: Any,
+                    data_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Every registered adapter, as the operator's answer table.
+
+    `data_dir` is where the saved logins live. With it, a venue whose login the
+    operator saved is classified by what it can DO now rather than by what its
+    adapter needs in principle. Without it (a caller that only wants the code's
+    own view) the login named on the row is unclaimed, exactly as before.
+    """
     adapters = getattr(registry, "adapters", None) or {}
-    rows = {venue_id: adapter_row(venue_id, adapter)
+    rows = {venue_id: adapter_row(venue_id, adapter,
+                                  login=_login_state(venue_id, data_dir))
             for venue_id, adapter in sorted(adapters.items())}
 
     def count(pred) -> int:
@@ -224,7 +291,10 @@ def build_inventory(registry: Any) -> Dict[str, Any]:
         "paper_tradable": count(lambda r: r["paper_tradable"]),
         "can_place_real_orders": count(lambda r: r["can_place_real_orders"]),
         "real_order_path": count(lambda r: r["real_order_path"]),
+        # Venues STILL blocked by a login (not: venues whose adapter could read
+        # one), and venues whose login is already saved and in use.
         "need_credentials": count(lambda r: r["needs_credentials"]),
+        "logins_configured": count(lambda r: r["logged_in"]),
         "no_client": count(lambda r: r["use"] == USE_NO_CLIENT),
     }
     return {
@@ -247,7 +317,7 @@ def record_inventory(storage: Any, registry: Any) -> Optional[Dict[str, Any]]:
     if storage is None or registry is None:
         return None
     try:
-        payload = build_inventory(registry)
+        payload = build_inventory(registry, data_dir=data_dir_for(storage))
         storage.set_state(VENUE_INVENTORY_KEY, json.dumps(payload))
         return payload
     except Exception as e:  # noqa: BLE001 - never break a cycle over a screen
@@ -306,6 +376,8 @@ def inventory_line(inventory: Dict[str, Any]) -> str:
     return (f"{counts.get('registered', 0)} venues registered: "
             f"{counts.get('readable_now', 0)} readable now, "
             f"{counts.get('paper_tradable', 0)} paper-tradable, "
+            f"{counts.get('need_credentials', 0)} still needs a login "
+            f"({counts.get('logins_configured', 0)} login(s) saved), "
             f"{counts.get('can_place_real_orders', 0)} armed for real orders "
             f"(can ever: {can_be_real}), "
             f"{counts.get('no_client', 0)} with no client written")

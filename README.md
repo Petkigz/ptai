@@ -1320,6 +1320,55 @@ bar is unchanged: this restores the opportunity flow, it does not lower what
 counts as an edge. A market that is genuinely 4.4% mispriced is still refused,
 and says so.
 
+## Nineteen Venues: Which Ones Run, And Where A Login Goes
+
+Your words: *"i have alot of venues but all of them except two are saying
+unavailable even in paper mode which doesnt make sense unless they require login
+but it seems i cant even connect my credentials to most of them."*
+
+Both halves of that were true, and they had different causes.
+
+**"Unavailable" meant the wrong thing.** A venue was badged *unavailable* when
+there was no way to fund it from here - but that is a statement about REAL
+capital, and it was printed on a page whose mode was paper. Manifold, PredictIt,
+Binance and WhiteBIT were being scanned and paper-traded every single cycle while
+reading as broken, because they have no deposit route in this build. The word
+now means what it says: **no client is written**, so there is nothing to read and
+nothing a login could unlock. The money truth did not disappear - it is printed
+under the row as the blocker ("play-money only", "needs an exchange account, KYC
+and API keys"), and the page says outright that it is about real capital only.
+
+**A saved login looked like it had done nothing.** Betfair's classification asked
+whether its adapter *requires* credentials, not whether they were still missing -
+so saving the Betfair login changed nothing on the panel, which is exactly what
+"i cant even connect my credentials" looks like from the outside. Whether a login
+is still needed is now read from the vault: save it and the venue flips from
+*needs a login / not running* to *paper + live data / runs today* on the next
+cycle, no restart.
+
+**And there was no way to tell which venues take a login at all.** Seven forms
+sat beside nineteen venues; "no form" read as broken. The Logins panel now
+answers it per venue, in four states:
+
+```
+login saved       1   your saved login is read at the start of every cycle
+login needed      1   Betfair: closed without a login - the form is below
+login available   2   Polymarket, Kalshi: public data reads without it,
+                      the login is for authenticated reads and real orders
+no login needed   5   public data, paper-traded for free - nothing to connect
+no client yet    11   a login would unlock nothing, so none is offered
+```
+
+The only state that is a defect - a venue that requires a login and has no form to
+enter it - is called a defect on the page (`missing_form`, zero in this build).
+
+**Verified** against the real nineteen-adapter registry: 8 venues report as
+scanned-and-paper-traded (with the funding blocker beside them), 11 as no-client
+with the client that is missing named, 0 as "unavailable" while usable, and the
+coverage counts add up to 19. Saving a Betfair login moves the venue from
+`needs_login / can_run_today False` to `paper_only / can_run_today True` and the
+counts from 6 readable venues to 7.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

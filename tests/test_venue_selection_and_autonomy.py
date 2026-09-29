@@ -196,13 +196,40 @@ def test_unfunded_means_not_live(selector, storage):
     assert sel.verdict.startswith("no venue holds live capital yet")
 
 
-def test_a_venue_that_cannot_be_funded_is_unavailable(selector):
-    """No funding route at all: scanned, but never described as a place to put
-    money."""
-    sel = selector.select(selector.assess(["manifold", "crypto_binance"],
-                                         labels=_labels()))
-    assert all(x.role == ROLE_UNAVAILABLE for x in sel.assessments)
-    assert all(x.blockers for x in sel.assessments), "say WHY it is unavailable"
+def test_a_venue_that_cannot_be_funded_is_not_called_unavailable(selector):
+    """
+    No funding route at all: still scanned and paper-traded, and never badged
+    with a word that means "cannot be used".
+
+    The operator's report was "i have alot of venues but all of them except two
+    are saying unavailable even in paper mode". Both of these venues were being
+    scanned and paper-traded every cycle; what was true is only that real capital
+    cannot be funded there from here, and that belongs in the blockers.
+    """
+    sel = selector.select(selector.assess(
+        ["manifold", "crypto_binance"], labels=_labels(),
+        unfundable={"manifold": "play-money only: no real capital can be deployed",
+                    "crypto_binance": "needs an exchange account, KYC, and API keys"}))
+    assert all(x.role == ROLE_PAPER for x in sel.assessments)
+    assert all(x.blockers for x in sel.assessments), "say WHY it cannot hold money"
+    assert any("play-money only" in b for a in sel.assessments for b in a.blockers)
+
+
+def test_unavailable_is_reserved_for_a_venue_that_cannot_be_used_at_all(selector):
+    """
+    The word is kept for the real thing: no client written, so there is nothing
+    for the agent to read or a login to unlock.
+    """
+    sel = selector.select(selector.assess(
+        ["manifold", "simmer"], labels=_labels(),
+        unusable={"simmer": "no Simmer SDK client; neither the virtual-currency "
+                            "test path nor live trading is implemented"},
+        unfundable={"manifold": "play-money only: no real capital can be deployed"}))
+    roles = {a.venue_id: a.role for a in sel.assessments}
+    assert roles["simmer"] == ROLE_UNAVAILABLE
+    assert roles["manifold"] == ROLE_PAPER
+    simmer = next(a for a in sel.assessments if a.venue_id == "simmer")
+    assert "no Simmer SDK client" in simmer.blockers[0]
 
 
 # ----------------------------------------------------------------------

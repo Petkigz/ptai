@@ -471,6 +471,96 @@ def describe_all(data_dir: str = "./data") -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
+# which venues these logins even cover
+# ----------------------------------------------------------------------
+
+def coverage(venues: Dict[str, Dict[str, Any]],
+             data_dir: str = "./data") -> Dict[str, Any]:
+    """
+    Every venue, against the logins that exist: connected, needed, or not used.
+
+    The operator's report: "i have alot of venues but all of them except two are
+    saying unavailable even in paper mode which doesnt make sense unless they
+    require login but it seems i cant even connect my credentials to most of
+    them". Two separate truths sit behind that sentence, and neither was visible:
+
+      * most venues take NO login at all - their markets are public, and PTAI
+        reads and paper-trades them with no account. There is nothing to connect
+        because nothing is missing;
+      * some venues have NO client written yet, so a login would unlock nothing.
+        Offering a form for them would be theatre;
+      * and exactly one venue in this build (Betfair) is closed without a login -
+        a form that does exist, and that the operator can use.
+
+    So "no form" and "broken" are not the same thing, and this function is what
+    lets the screen say which is which instead of leaving the operator to guess.
+    `venues` is the recorded inventory keyed by venue id (see inventory.py).
+
+    Returns counts plus one row per venue. `missing_form` is the only bucket that
+    is ever a defect: a venue that REQUIRES credentials and has no way to enter
+    them. It is reported rather than silently dropped.
+    """
+    rows: List[Dict[str, Any]] = []
+    for venue_id, row in sorted((venues or {}).items()):
+        use = str((row or {}).get("use") or "")
+        needs = bool((row or {}).get("needs_credentials"))
+        label = str((row or {}).get("label") or venue_id)
+        tool = TOOL_FOR_VENUE.get(venue_id, "")
+        configured = False
+        if tool:
+            try:
+                configured = bool(describe(tool, data_dir).get("configured"))
+            except Exception as e:  # noqa: BLE001 - a screen must still render
+                logger.debug(f"Could not read the {tool} login: "
+                             f"{type(e).__name__}: {e}")
+
+        if use == "no_client":
+            state = "no_client"
+            why = ("PTAI has no client for this venue yet, so there is nothing "
+                   "for a login to unlock.")
+        elif tool and configured:
+            state = "login_saved"
+            why = "Your saved login is read at the start of every cycle."
+        elif tool and needs:
+            state = "login_required"
+            why = (f"Closed without a login: save the {label} login here and it "
+                   f"returns markets on the next cycle.")
+        elif tool:
+            state = "login_available"
+            why = ("Reads public data with no account; the login is for "
+                   "authenticated reads and real orders.")
+        elif needs:
+            state = "missing_form"
+            why = ("This adapter requires credentials and no login form exists "
+                   "for it - a defect, not a setting.")
+        else:
+            state = "no_login_needed"
+            why = ("Reads public data with no account and is paper-traded for "
+                   "free. There is nothing to connect.")
+        rows.append({"venue_id": venue_id, "label": label, "tool": tool,
+                     "configured": configured, "state": state, "why": why})
+
+    def _n(state: str) -> int:
+        return sum(1 for r in rows if r["state"] == state)
+
+    return {
+        "venues": rows,
+        "counts": {
+            "registered": len(rows),
+            "logins_saved": _n("login_saved"),
+            "logins_required": _n("login_required"),
+            "logins_available": _n("login_available"),
+            "no_login_needed": _n("no_login_needed"),
+            "no_client": _n("no_client"),
+            "missing_form": _n("missing_form"),
+        },
+        "note": ("A login exists only where an adapter reads one. Venues with no "
+                 "client built yet say so rather than offering a form that would "
+                 "unlock nothing."),
+    }
+
+
+# ----------------------------------------------------------------------
 # handing them to the agent
 # ----------------------------------------------------------------------
 

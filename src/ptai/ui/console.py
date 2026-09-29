@@ -1242,18 +1242,49 @@ async def api_venue() -> JSONResponse:
         registered = sorted(inv_venues)
     else:
         registered = sorted(set(labels) | set(selector.known_venues()))
+    # WHAT PTAI CAN AND CANNOT DO WITH EACH ONE, from the same recorded inventory
+    # the table below renders. Nineteen venues were showing as seventeen
+    # "unavailable" because a venue with no funding route was badged with a word
+    # that means "cannot be used", while six of them were being scanned and
+    # paper-traded every cycle. `unusable` is the honest short list: no client
+    # written, so nothing a login could unlock.
+    unusable = {vid: (row.get("what_it_needs")
+                      or "PTAI has no client for this venue, so it returns no markets")
+                for vid, row in inv_venues.items()
+                if row.get("use") == "no_client"}
+    unfundable = {vid: (row.get("reason_unfundable")
+                        or "no funding route is recorded for this venue, so it "
+                           "cannot hold real money from here")
+                  for vid, row in inv_venues.items()
+                  if row.get("fundable") is False}
     assessments = selector.assess(
         registered,
         accounts=plan.get("accounts", []),
         qualified_ids=qualified,
         labels=labels,
+        unusable=unusable,
+        unfundable=unfundable,
     )
     selection = selector.select(assessments, total_budget_usd=plan.get("total_budget_usd") or 0.0)
+
+    def _with_capability(a) -> Dict[str, Any]:
+        """The assessment, plus what the inventory says PTAI can do with it."""
+        out = a.to_dict()
+        row = inv_venues.get(a.venue_id) or {}
+        for key in ("use", "why", "what_it_needs", "can_run_today",
+                    "paper_tradable", "reads_live_markets_now",
+                    "needs_credentials", "logged_in", "login",
+                    "real_order_path", "can_place_real_orders",
+                    "reason_unfundable", "minimum_deposit_usd", "currency"):
+            if key in row:
+                out[key] = row[key]
+        out["detail_known"] = bool(row) or bool(adapters.get(a.venue_id))
+        return out
 
     return JSONResponse({
         "mode": state.mode,
         "selection": selection.to_dict(),
-        "assessments": [a.to_dict() for a in assessments],
+        "assessments": [_with_capability(a) for a in assessments],
         "ranking_basis": selection.ranking_basis,
         "min_sample_for_evidence": MIN_SAMPLE_FOR_EVIDENCE,
         "one_live_venue_cap": True,
@@ -1296,8 +1327,17 @@ async def api_logins() -> JSONResponse:
     don't always have to log in when the system is running automatically" - and
     before this there was no way to put a credential into the product at all.
     Masked values only; a secret never leaves this process in the clear.
+
+    The seven logins are not the whole story: nineteen venues are registered, and
+    most of them take no login at all while some have no client to log into.
+    `coverage` says which is which, per venue, so "I cannot connect my
+    credentials to most of them" has an answer on the page instead of a puzzle.
     """
-    return JSONResponse(credential_store.describe_all(_data_dir()))
+    storage = get_storage()
+    payload = credential_store.describe_all(_data_dir())
+    payload["coverage"] = credential_store.coverage(
+        (load_inventory(storage).get("venues") or {}), _data_dir())
+    return JSONResponse(payload)
 
 
 @app.post("/api/console/logins")
@@ -2469,23 +2509,49 @@ async function loadVenue(){
                        : `<span class="${a.pnl_per_trade>=0?'pos':'neg'} mono">${money(a.pnl_per_trade)}</span>`;
       const tot = noEv ? '&mdash;'
                        : `<span class="mono ${a.net_pnl_usd>=0?'pos':'neg'}">${money(a.net_pnl_usd)}</span>`;
-      // The role column says what each venue is FOR. In paper mode nothing is
-      // deploying real money, so a venue the selection marks "live" must not be
-      // badged live here - the same contradiction the headline was fixed for,
-      // one table down.
+      // The role column says what each venue is FOR, in the same words as the
+      // "every venue" table below. A venue the agent is scanning and paper-trading
+      // must not be badged "unavailable" just because there is no way to fund it
+      // from here - that word means PTAI cannot use it, and it is reserved for
+      // venues with no client written. The money truth is printed underneath.
+      const useTxt = u => u==='real_money'
+          ? '<span class="pill ok">can hold real money</span>'
+          : u==='paper_only' ? '<span class="pill dim">paper + live data</span>'
+          : u==='needs_login' ? '<span class="pill wait">needs a login</span>'
+          : u==='scanner' ? '<span class="pill dim">scanner only</span>'
+          : u==='no_client' ? '<span class="pill wait">no client built</span>'
+          : null;
+      const pill = useTxt(a.use);
       const roleTxt = a.role==='live'
                     ? (mode==='paper'
                        ? '<span class="pill wait">funded &mdash; paper mode</span>'
                        : '<span class="pill ok">live</span>')
-                    : a.role==='paper' ? '<span class="pill dim">paper</span>'
-                    : '<span class="pill wait">unavailable</span>';
+                    : (pill || (a.role==='paper'
+                       ? '<span class="pill dim">paper</span>'
+                       : '<span class="pill wait">not used</span>'));
+      // Why it cannot hold real money, when that is the case. A blocker is a
+      // statement about capital, not about the venue's usefulness.
+      const why = (a.blockers||[]).length
+        ? `<div class="note" style="margin-top:4px">${esc(a.blockers[0])}</div>` : '';
+      const canRun = a.can_run_today===true
+        ? '<div class="note" style="margin-top:4px">runs today</div>'
+        : (a.can_run_today===false
+           ? `<div class="note" style="margin-top:4px">not running: ${esc(a.what_it_needs||'')}</div>`
+           : '');
       return `<tr>
-        <td><b>${esc(a.label)}</b>${a.qualified?' <span class="pill ok">qualified</span>':''}</td>
-        <td>${roleTxt}</td>
+        <td><b>${esc(a.label)}</b>${a.qualified?' <span class="pill ok">qualified</span>':''}${why}</td>
+        <td>${roleTxt}${canRun}</td>
         <td class="mono">${a.resolved_trades}${noEv?` <span style="color:var(--dim)">/ ${body.min_sample_for_evidence} to score</span>`:''}</td>
         <td>${pnl}</td><td>${tot}</td>
       </tr>`;
-    }).join('') + '</table>';
+    }).join('') + '</table>'
+    + (mode==='paper' ? `<div class="note" style="margin-top:10px">
+        "Cannot hold real money" is about real capital only: every venue here is
+        still scanned and paper-traded with the simulated account, and a venue
+        earns its place in the live list by doing exactly that.</div>` : '')
+    + ((rows.filter(a=>a.use==='no_client').length) ? `<div class="note" style="margin-top:6px">
+        ${rows.filter(a=>a.use==='no_client').length} venue(s) have no client written
+        yet. A login cannot help those - there is nothing to connect it to.</div>` : '');
 
   // ---- out-of-sample validation ----
   //
@@ -3186,7 +3252,39 @@ async function loadLogins(){
     return;
   }
   $('vaultPath').textContent = body.vault || 'data/vault.json';
-  $('logins').innerHTML = tools.map(([name, t]) => {
+  // Which venues these logins even cover. Seven forms sit beside nineteen
+  // registered venues, and the operator read that as "I cannot connect my
+  // credentials to most of them". Most venues take no login at all; some have no
+  // client to log into. Both are printed here, and the one venue that IS closed
+  // without a login is named with the form to use.
+  const cov = body.coverage || null;
+  const covRow = v => `<tr><td><b>${esc(v.label)}</b>
+      <div class="note" style="margin-top:3px">${esc(v.why||'')}</div></td>
+      <td>${v.state==='login_saved' ? '<span class="pill ok">login saved</span>'
+          : v.state==='login_required' ? '<span class="pill wait">login needed &mdash; form below</span>'
+          : v.state==='login_available' ? '<span class="pill dim">login available</span>'
+          : v.state==='missing_form' ? '<span class="pill neg">needs a login, no form</span>'
+          : v.state==='no_client' ? '<span class="pill dim">no client yet</span>'
+          : '<span class="pill dim">no login needed</span>'}</td></tr>`;
+  const covHtml = !cov ? '' : (() => {
+    const c = cov.counts || {};
+    return `<div style="padding:11px 0;border-bottom:1px solid rgba(36,48,64,.5)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <b>Which venues these logins cover</b>
+        <span class="pill dim">${c.registered||0} venue(s) registered</span></div>
+      <div class="note" style="margin-top:5px">
+        ${c.logins_saved||0} login(s) saved &middot; ${c.logins_required||0} still
+        needs one &middot; ${c.logins_available||0} reads public data (a login is
+        only for real orders) &middot; ${c.no_login_needed||0} needs no login at
+        all &middot; ${c.no_client||0} has no client written yet.
+      </div>
+      ${cov.counts && cov.counts.missing_form ? `<div class="warn" style="margin-top:6px">
+        ${cov.counts.missing_form} venue(s) require a login and have no form for
+        it - that is a defect, not a setting.</div>` : ''}
+      <table style="margin-top:8px"><tr><th>Venue</th><th>Login</th></tr>${
+        (cov.venues||[]).map(covRow).join('')}</table></div>`;
+  })();
+  $('logins').innerHTML = covHtml + tools.map(([name, t]) => {
     const rows = (t.fields||[]).map(f => `
       <tr>
         <td style="max-width:210px">${esc(f.label)}${f.required?'':' <span class="pill dim">optional</span>'}</td>

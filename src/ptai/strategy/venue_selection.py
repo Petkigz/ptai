@@ -66,7 +66,13 @@ MAX_TRADES_TO_RECOUP_MOVE = LIVE_QUALIFICATION_SAMPLE
 
 ROLE_LIVE = "live"          # holds real capital and is allowed to deploy it
 ROLE_PAPER = "paper"        # scanned and simulated, no real capital
-ROLE_UNAVAILABLE = "unavailable"  # cannot be funded from here
+# CANNOT BE USED AT ALL - no client, or a feed that cannot be read even with the
+# operator's login. This role is NOT "cannot hold real money from here": a venue
+# with no funding route is scanned and paper-traded like every other one, and
+# badging those "unavailable" is what made an operator with nineteen registered
+# venues read seventeen of them as broken. Funding truth lives in `fundable` and
+# `blockers`; this role answers "is PTAI using it".
+ROLE_UNAVAILABLE = "unavailable"
 
 
 @dataclass
@@ -120,6 +126,14 @@ class VenueAssessment:
     evidence_basis: str = "no resolved trades"
     blockers: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    # Why this venue cannot be used AT ALL, when that is the case (no client, or
+    # a feed that stays closed). Set by the caller that knows - the console reads
+    # it from the recorded venue inventory. Empty means "usable".
+    unusable_reason: str = ""
+    # Why this venue cannot HOLD REAL MONEY, when that is the case (no funding
+    # route from here). Separate from the above: a venue in this state is still
+    # scanned and paper-traded.
+    unfundable_reason: str = ""
 
     @property
     def pnl_per_trade(self) -> float:
@@ -178,6 +192,8 @@ class VenueAssessment:
             "gates_remaining": self.gates_remaining,
             "blockers": self.blockers,
             "notes": self.notes,
+            "unusable_reason": self.unusable_reason,
+            "unfundable_reason": self.unfundable_reason,
         }
 
 
@@ -647,14 +663,24 @@ class VenueSelector:
                accounts: Optional[List[Dict[str, Any]]] = None,
                qualified_ids: Optional[List[str]] = None,
                tracker=None,
-               labels: Optional[Dict[str, str]] = None) -> List[VenueAssessment]:
+               labels: Optional[Dict[str, str]] = None,
+               unusable: Optional[Dict[str, str]] = None,
+               unfundable: Optional[Dict[str, str]] = None) -> List[VenueAssessment]:
         """
         One assessment per venue.
 
         A venue with no recorded trades still gets an assessment - it is simply
         marked "no resolved trades" and cannot be chosen. Dropping it would make
         an untested venue look the same as a venue that is not registered at all.
+
+        `unusable` names the venues PTAI cannot use AT ALL, with the reason (no
+        client, or a feed that stays closed) - the caller knows this from the
+        recorded venue inventory. `unfundable` names those that cannot hold real
+        money FROM HERE, with the reason; they are still scanned and paper-traded
+        and are NOT reported as unavailable.
         """
+        unusable = unusable or {}
+        unfundable = unfundable or {}
         stats = self._per_venue_stats()
         brier = self._brier_by_venue(tracker)
         accounts_by_venue = {str(a.get("venue_id")): a for a in (accounts or [])}
@@ -712,6 +738,8 @@ class VenueSelector:
                 reported_balance_usd=float(account.get("reported_balance_usd") or 0.0),
                 authorised_usd=float(account.get("budget_usd", 0.0) or 0.0),
                 available_usd=float(account.get("available_usd", 0.0) or 0.0),
+                unusable_reason=str(unusable.get(venue_id) or ""),
+                unfundable_reason=str(unfundable.get(venue_id) or ""),
             )
             self._fill_gates(assessed, row)
             self._fill_entry_cost(assessed)
@@ -889,11 +917,27 @@ class VenueSelector:
         return selection
 
     def _assign_role(self, a: VenueAssessment) -> None:
-        if not a.fundable:
+        """
+        What the agent is DOING with this venue - and never more than the truth.
+
+        `unavailable` is reserved for a venue PTAI cannot use at all. A venue
+        that reads live data and is paper-traded is ROLE_PAPER even when there is
+        no way to fund it from here, because that is what it is doing: the
+        operator's nineteen registered venues were rendering as seventeen
+        "unavailable" while six of them were being scanned and paper-traded every
+        cycle. The money truth is not lost - it goes in `blockers`, which the
+        console shows under the row.
+        """
+        if a.unusable_reason:
             a.role = ROLE_UNAVAILABLE
+            a.blockers.append(a.unusable_reason)
+        elif not a.fundable:
+            a.role = ROLE_PAPER
             a.blockers.append(
-                "no way to fund this venue from here: the agent cannot place "
-                "real orders on an account it cannot hold capital in")
+                a.unfundable_reason
+                or ("no way to fund this venue from here: the agent cannot place "
+                    "real orders on an account it cannot hold capital in"))
+            a.notes.append("scanned and paper-traded with the simulated account")
         elif a.deployable_live:
             a.role = ROLE_LIVE
         else:
@@ -933,9 +977,23 @@ class VenueSelector:
 
         selection.verdict = ("no venue holds live capital yet - the agent runs "
                              "in paper, on the same live data, until one does")
+        # Say what the other venues ARE doing, so a venue with no funding route
+        # cannot read as a venue that does nothing.
+        paper_names = [a.label for a in selection.assessments
+                       if a.role == ROLE_PAPER]
+        dead_names = [a.label for a in selection.assessments
+                      if a.role == ROLE_UNAVAILABLE]
+        if paper_names:
+            r.append(f"Scanned every cycle with the simulated account, and "
+                     f"paper-traded where the venue can hold a position: "
+                     f"{', '.join(sorted(paper_names))}.")
+        if dead_names:
+            r.append(f"Cannot be used at all yet (no client, or a feed that "
+                     f"stays closed): {', '.join(sorted(dead_names))}.")
         if not ranked:
             r.append("No venue can be funded from here, so there is nothing to "
-                     "trade live and nothing to choose between.")
+                     "trade live and nothing to choose between - the venues "
+                     "above still run in paper.")
             return
         best = ranked[0]
         if not best.has_evidence:
