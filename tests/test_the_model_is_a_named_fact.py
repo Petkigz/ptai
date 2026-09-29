@@ -389,7 +389,11 @@ class TestTheCycleNamesTheModel:
         # and what was actually priced comes from the venues' own reports.
         assert "the screen chose 8 of 40 market(s) for deep analysis" in line
         assert ("venue scan: priced 41 market(s) of the 60 read "
-                "(12 had no usable book, 0 beyond their venue's cap)") in line
+                "(12 had no usable book, 0 beyond their venue's cap, "
+                "7 in venues or below the floors this cycle does not price") \
+                in line, (
+            "the four numbers have to account for every market the scan read: "
+            "41 + 12 + 0 + 7 = 60")
 
     def test_a_cycle_with_no_shortlist_says_the_model_was_never_asked(self, monkeypatch):
         _fake_lm_studio(monkeypatch, ["qwen2.5-14b-instruct"])

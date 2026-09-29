@@ -39,6 +39,12 @@ class ModelForecast:
         self.confidence = max(0.0, min(1.0, self.confidence))
 
 
+# One line per PROCESS. The model is built per forecast, so a per-instance flag
+# printed this warning once per deep market - three times in the operator's
+# 18:14 run, and eight with a full shortlist.
+_NO_DATA_WARNED = False
+
+
 class BaseRateModel:
     """
     Statistical/base-rate model:
@@ -96,8 +102,10 @@ class BaseRateModel:
             # No data, no opinion. The probability is still the prior so the
             # object is well formed, but confidence 0 removes its weight from
             # the ensemble and the reasoning says why.
-            if not self._warned_no_data:
+            global _NO_DATA_WARNED
+            if not self._warned_no_data and not _NO_DATA_WARNED:
                 self._warned_no_data = True
+                _NO_DATA_WARNED = True
                 logger.warning(
                     "Base-rate model has no historical data loaded: its category "
                     "constants (politics 0.52, sports 0.50, ...) are not evidence "

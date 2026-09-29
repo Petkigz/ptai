@@ -846,7 +846,9 @@ class TradingAgentV3:
         eligibility = self.venue_registry.check_all_eligibility()
         for venue_id, status in eligibility.items():
             if status == EligibilityStatus.RESTRICTED:
-                logger.warning(f"Venue {venue_id} restricted for {self.country_code}")
+                # The registry's eligibility check already warned about this
+                # venue and country in the same second; this is the same fact.
+                logger.debug(f"Venue {venue_id} restricted for {self.country_code}")
         return eligibility
 
     async def discover_all_venues(self, target_per_venue: int = 300, qualified_only: bool = False, qualified_ids: List[str] = None) -> Dict[str, List[Market]]:
@@ -2551,13 +2553,19 @@ class TradingAgentV3:
                 "priced": int(getattr(self, "_cycle_context_calls", 0) or 0),
                 "deep_priced": int(getattr(self, "_cycle_deep_context_calls", 0) or 0),
             })
+        _sc = self._cycle_scan_counts
+        _unpriced = max(0, int(_sc.get("discovered", 0) or 0)
+                        - int(_sc.get("evaluated", 0) or 0)
+                        - int(_sc.get("skipped_no_book", 0) or 0)
+                        - int(_sc.get("beyond_cap", 0) or 0))
+        _sc["unpriced_venues"] = _unpriced
         logger.info(
-            f"Venue scan priced {self._cycle_scan_counts['evaluated']} market(s) of "
-            f"{self._cycle_scan_counts['discovered']} read across "
-            f"{self._cycle_scan_counts['venues']} venue(s); "
-            f"{self._cycle_scan_counts['skipped_no_book']} had no usable book and "
-            f"{self._cycle_scan_counts['beyond_cap']} were beyond their venue's "
-            f"per-venue cap")
+            f"Venue scan priced {_sc['evaluated']} market(s) of "
+            f"{_sc['discovered']} read across {_sc['venues']} venue(s); "
+            f"{_sc['skipped_no_book']} had no usable book, "
+            f"{_sc['beyond_cap']} were beyond their venue's per-venue cap, and "
+            f"{_unpriced} were read in venues or below the floors this cycle "
+            f"does not price (their own lines say which)")
         # HOW MANY BOOKS THE VENUES REFUSED, in one line. Each venue said the
         # first refusal itself (with its reason); this is the count, so forty
         # identical warnings become one sentence.
@@ -5118,6 +5126,21 @@ class TradingAgentV3:
                          f"reached the provider")
         if not status["used"]:
             line += f" | NOT USED THIS CYCLE: {status['not_used_reason']}"
+        else:
+            # THE MODEL WAS USED, BUT NOT FOR EVERY DEEP MARKET.
+            #
+            # The 18:14 run asked the model about 3 markets while 5 reached the
+            # pricing stage: two were refused by the resolution gate before a
+            # forecast existed. The line said "markets asked: 3" and "5 reached
+            # the pricing stage" with nothing connecting them, which reads like
+            # two markets disappeared. It is one fact and it is named here.
+            _deep = int(status.get("deep_priced") or 0)
+            _asked = int(status.get("asked") or 0)
+            if _deep > _asked:
+                line += (f" | {_deep - _asked} of the {_deep} deep market(s) "
+                         f"were refused before a forecast was built, so the "
+                         f"model was not asked about them (the per-market "
+                         f"refusal lines name the gate)")
         # THE TAIL IS ABOUT PRICES, NOT PLANS. "199 priced on their measured book
         # alone" was printed in a cycle where the venues priced one market, and
         # "model time went to 1 of 200" called a plan model time. The screen's
@@ -5127,10 +5150,24 @@ class TradingAgentV3:
                  f"{status['considered']} market(s) for deep analysis (a plan: "
                  f"{status.get('deep_priced', 0)} of them reached the pricing stage)")
         if _scan:
-            line += (f" | venue scan: priced {_scan.get('evaluated', 0)} market(s) "
-                     f"of the {_scan.get('discovered', 0)} read "
-                     f"({_scan.get('skipped_no_book', 0)} had no usable book, "
-                     f"{_scan.get('beyond_cap', 0)} beyond their venue's cap)")
+            # THE FOUR NUMBERS ADD UP TO THE TOTAL. The 18:14 line said "priced
+            # 5 market(s) of the 900 read (95 had no usable book, 100 beyond
+            # their venue's cap)" - which leaves 700 markets unaccounted for,
+            # and a reader is right to ask where they went. The remainder is
+            # the markets this cycle never priced at all: venues that quote
+            # prices rather than probabilities, restricted venues, and markets
+            # below the scan's floors. Named, and counted, so the sentence adds
+            # up in front of the operator.
+            _read = int(_scan.get("discovered", 0) or 0)
+            _priced = int(_scan.get("evaluated", 0) or 0)
+            _nobook = int(_scan.get("skipped_no_book", 0) or 0)
+            _cap = int(_scan.get("beyond_cap", 0) or 0)
+            _unpriced = max(0, _read - _priced - _nobook - _cap)
+            line += (f" | venue scan: priced {_priced} market(s) of the {_read} "
+                     f"read ({_nobook} had no usable book, {_cap} beyond their "
+                     f"venue's cap, {_unpriced} in venues or below the floors "
+                     f"this cycle does not price - each line says why)")
+            _scan["unpriced_venues"] = _unpriced
         else:
             line += " | venue scan: had not run when this line was written"
         if status["failed"] and status["last_error"]:

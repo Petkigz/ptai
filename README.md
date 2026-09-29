@@ -670,6 +670,15 @@ cycle's real messages:
   * a venue that publishes no `get_mechanics` reader is not asked for one. The
     fee falls back to its declared capability, exclusivity stays **unknown**
     rather than guessed, and the venue is named **once**, at INFO;
+  * the same fact is not printed twice. From the 18:14 run: snscrape's failure
+    line carried its whole ~1.5 KB GraphQL URL (three times a cycle), so it now
+    names the query and the failure count and puts the URL at DEBUG; ESPN's
+    HTTP 403 printed once per league inside a window that was already open, so
+    the second request in the window is DEBUG; the base-rate model's "no
+    historical data loaded" warning lived on an object built per forecast, so it
+    printed once per deep market - it is once per PROCESS now; and the agent's
+    `Venue kalshi restricted for UG` no longer repeats the registry's own
+    eligibility warning in the same second;
   * `use_registry=False explicitly requested - using PolymarketClient legacy
     path (NOT recommended)` is gone from every cycle. That warning fired for the
     Polymarket adapter's OWN discovery call - the one correct path, since asking
@@ -1040,6 +1049,25 @@ now reported once and then counted, and the cycle's scan line reports the total:
 `polymarket: 40 orderbook(s) refused this cycle and never priced against (no
 usable levels x40)`. Nothing is printed for the repeats at all, not even at
 DEBUG, because DEBUG is on on this machine.
+
+**The sentence adds up, and nothing goes missing from it.** The 18:14 run
+printed `markets asked: 3` beside `5 of them reached the pricing stage`, with no
+clause connecting them: two of those deep markets were refused by the resolution
+gate before a forecast was ever built. The line now says so. The venue-scan tail
+also accounts for every market the scan read:
+
+    venue scan: priced 5 market(s) of the 900 read (95 had no usable book,
+      100 beyond their venue's cap, 700 in venues or below the floors this
+      cycle does not price - each line says why)
+
+5 + 95 + 100 + 700 = 900. The old sentence stopped at "100 beyond their
+venue's cap" and left 700 markets unexplained.
+
+And a venue's own `tradeable` count is now printed as **`tradeable at the
+venue's own bar`**, because it is a different measure from the cycle's
+`After fees/liquidity/uncertainty/risk: N actually tradeable` - the 18:14 log
+showed `polymarket: ... tradeable 1` and `0 actually tradeable` in the same
+report, which read as a contradiction rather than as two gates.
 
 **The screen only shortlists markets the scan will price.** The screen applies
 the same volume and liquidity floors the venue scan does, so model budget cannot

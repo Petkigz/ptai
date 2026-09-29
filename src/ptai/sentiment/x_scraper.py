@@ -102,9 +102,21 @@ class XScraper:
         except ImportError:
             logger.warning("snscrape not installed, pip install snscrape")
             self.consecutive_failures += 1
+            return tweets
         except Exception as e:
-            logger.warning(f"snscrape failed for query '{query}': {e} (failure {self.consecutive_failures+1}/3)")
+            # THE URL IS NOT THE MESSAGE. The raw exception carries the whole
+            # GraphQL request - ~1.5 KB of query string per line, three times a
+            # cycle - and it buried the two facts that matter: which query
+            # failed and how many times. The full text goes to DEBUG.
             self.consecutive_failures += 1
+            reason = str(e)
+            if " to http" in reason:
+                reason = reason.split(" to http")[0]
+            reason = reason.strip().rstrip(":").strip()
+            logger.debug(f"snscrape error detail for '{query}': {str(e)[:2000]}")
+            logger.warning(
+                f"snscrape failed for query '{query}' "
+                f"(failure {self.consecutive_failures}/3): {reason[:120]}")
             # Circuit breaker: after 3 consecutive fails, assume X blocking
             if self.consecutive_failures >= 3:
                 logger.error(f"X BLOCKING DETECTED: snscrape failed {self.consecutive_failures} times consecutively (blocked 404). Opening circuit breaker for 10 min. Use browser method or disable X sentiment.")

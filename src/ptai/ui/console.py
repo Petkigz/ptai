@@ -3285,8 +3285,11 @@ async function loadForecast(){
         not model time; ${screen.deep_priced||0} of them reached the pricing stage.
         The venue scan priced ${screen.evaluated||0} of ${screen.discovered||0}
         market(s) it read, refused ${screen.skipped_no_book||0} for having no
-        usable book, and left ${screen.beyond_cap||0} beyond their venue's
-        per-venue cap.
+        usable book, left ${screen.beyond_cap||0} beyond their venue's
+        per-venue cap, and read ${Math.max(0, (screen.discovered||0) -
+        (screen.evaluated||0) - (screen.skipped_no_book||0) -
+        (screen.beyond_cap||0))} in venues it does not price here (prices not
+        probabilities) or below the scan's floors.
         ${screen.dropped_by_scan ? ` ${screen.dropped_by_scan} more sit below their
         venue's own per-venue cap and will not be priced this cycle.` : ''}</div>`
     : `<div class="note">${esc(screen.criteria||'no screen has run yet')}</div>`;

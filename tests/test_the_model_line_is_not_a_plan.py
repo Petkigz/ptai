@@ -542,7 +542,8 @@ class TestAPlanIsNotAPrice:
                                     "discovered": 200}
         line = agent._local_model_line()
         assert ("venue scan: priced 1 market(s) of the 200 read (99 had no "
-                "usable book, 100 beyond their venue's cap)") in line
+                "usable book, 100 beyond their venue's cap, 0 in venues or "
+                "below the floors this cycle does not price") in line
         assert "priced on their measured book alone" not in line
 
     def test_the_screen_line_does_not_call_a_plan_a_price(self):

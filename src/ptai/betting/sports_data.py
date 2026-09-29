@@ -196,11 +196,21 @@ class BaseProvider:
         return True
 
     def _mark_blocked(self, status: int, url: str) -> None:
+        was_blocked = bool(self.blocked_reason)
         self.blocked_reason = (
             f"{self.name} refuses this network with HTTP {status} "
             f"({url.split('/scoreboard')[0].split('//')[-1]})")
         self.blocked_until = datetime.now(timezone.utc) + timedelta(
             seconds=BLOCKED_RETRY_SECONDS)
+        if was_blocked:
+            # ONE FACT, ONE LINE. A second league of the same feed inside the
+            # same window is not news - the operator's 18:14 log printed this
+            # warning twice within a second, and its wording was already on the
+            # betting lane's own skip line.
+            logger.debug(
+                f"[{self.name}] HTTP {status} again; still blocked until "
+                f"{self.blocked_until.isoformat(timespec='seconds')}")
+            return
         logger.warning(
             f"[{self.name}] HTTP {status} - this feed is refusing this machine. "
             f"Skipping it for {BLOCKED_RETRY_SECONDS/60:.0f} min; the sports lane "

@@ -604,9 +604,9 @@ class StrategyEngineV3:
         
         # Build reasoning report
         venue_summary = "\n".join([
-            f"{r.venue_id}: discovered {r.total_discovered}, candidates {r.candidates}, tradeable {r.tradeable}, "
+            f"{r.venue_id}: discovered {r.total_discovered}, candidates {r.candidates}, tradeable at the venue's own bar {r.tradeable}, "
             f"avg_edge {r.avg_edge:.3f}, top_score {r.top_opportunity.score:.3f} {r.top_opportunity.side} edge {r.top_opportunity.effective_edge:.3f} | {r.top_opportunity.market.question[:60]}" 
-            if r.top_opportunity else f"{r.venue_id}: discovered {r.total_discovered}, candidates {r.candidates}, tradeable {r.tradeable}"
+            if r.top_opportunity else f"{r.venue_id}: discovered {r.total_discovered}, candidates {r.candidates}, tradeable at the venue's own bar {r.tradeable}"
             for r in venue_reports
         ])
         
@@ -630,7 +630,7 @@ class StrategyEngineV3:
             f"{venue_summary}\n"
             f"Strategies evaluated: {strategy_summary}\n"
             f"Arbitrage candidates: {len([a for a in arbitrage_opps if a.should_trade])} tradeable out of {len(arbitrage_opps)}\n"
-            f"After fees/liquidity/uncertainty/risk: {len(tradeable)} actually tradeable opportunities\n"
+            f"After fees/liquidity/uncertainty/risk: {len(tradeable)} actually tradeable opportunities (a venue's own count above is before these gates)\n"
             f"{best_line}\n"
             f"Final selected {len(final_selected)} trades (max {max_final_trades}) | Time {elapsed:.1f}s"
         )
