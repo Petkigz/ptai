@@ -28,6 +28,72 @@ class LLMResponse:
 UNPINNED_MODELS = ("local-model", "", "auto", None)
 
 
+def _first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """The first BALANCED {...} in `text` that actually parses as an object."""
+    start = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    parsed = json.loads(text[start:i + 1])
+                except Exception:  # noqa: BLE001 - try the next object, if any
+                    start = None
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+                start = None
+    return None
+
+
+def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    The answer, whatever the model wrapped around it.
+
+    A model with thinking ON writes its reasoning first - in `<think>` tags, in
+    a bare thinking block, or as plain prose - and a model cut off by
+    `max_tokens` mid-thought writes reasoning and NO JSON. Both were parse
+    failures before: the old extractor only understood a closed
+    `<think>...</think>` pair followed by clean JSON, and the Brain's fallback
+    used a greedy `\{.*\}` over raw text, which happily matched from the first
+    brace of the reasoning to the last brace of the answer and failed to parse.
+
+    This strips reasoning wrappers and code fences, tries the whole remainder,
+    then scans for the first balanced object that parses. `None` means the
+    answer really had no JSON in it (truncated, or an error page).
+    """
+    if not text:
+        return None
+    cleaned = re.sub(r"<\s*(think|thinking|reasoning)\s*>.*?<\s*/\s*\1\s*>", "",
+                     text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"```(?:json)?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "").strip()
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:  # noqa: BLE001 - fall through to the balanced scan
+        pass
+    return _first_json_object(cleaned)
+
+
 def is_slow_reasoning_model(model_id: Optional[str]) -> bool:
     """
     Is this SPECIFIC model an R1-style reasoning model?
@@ -219,23 +285,8 @@ class BaseLLMProvider:
         raise NotImplementedError
 
     def extract_json(self, text: str) -> Optional[Dict]:
-        """Extract JSON from LLM response - handles R1 <think> tags"""
-        if not text:
-            return None
-        # Strip <think>...</think> for R1 models
-        cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        cleaned = cleaned.strip()
-        try:
-            return json.loads(cleaned)
-        except:
-            pass
-        try:
-            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-        except Exception as e:
-            logger.debug(f"JSON extract failed: {e}")
-        return None
+        """Extract JSON from a model's answer, reasoning wrappers and all."""
+        return extract_json_object(text)
 
 class OllamaProvider(BaseLLMProvider):
     """Ollama - http://localhost:11434"""

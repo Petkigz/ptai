@@ -193,7 +193,7 @@ class TestAskedAndAnswered:
                               priced=2, deep_priced=2, asked=2, answered=2)
         line = agent._local_model_line()
         assert "markets asked: 2" in line
-        assert "2 of 2 call(s) answered" in line
+        assert "2 of 2 call(s) returned" in line
         assert "NOT USED" not in line
 
     def test_asked_and_nothing_came_back_names_the_problem(self):

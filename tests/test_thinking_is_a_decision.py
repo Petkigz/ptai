@@ -134,16 +134,34 @@ class TestTheRequestCarriesTheDecision:
 class TestThePromptFollowsTheSetting:
     def test_the_off_prompt_asks_for_no_chain_of_thought(self):
         brain = Brain(llm_config=LLMConfig(model=MODEL, thinking=False))
-        system, _user = brain._build_prompt(_market(), None)
+        system, user = brain._build_prompt(_market(), None)
         assert "No chain-of-thought" in system
+        assert "NO <think> reasoning tags" in user, (
+            "both turns say the same thing when thinking is off")
 
     def test_the_on_prompt_asks_for_reasoning_first(self):
         brain = Brain(llm_config=LLMConfig(model=MODEL, thinking=True))
-        system, _user = brain._build_prompt(_market(), None)
+        system, user = brain._build_prompt(_market(), None)
         assert "Reason through the market" in system
         assert "No chain-of-thought" not in system, (
             "the prompt and the request must not disagree about whether the "
             "model may think")
+        assert "NO <think> reasoning tags" not in user, (
+            "the user turn used to forbid the reasoning the system turn asked "
+            "for, in the same request - the model was told both things")
+        assert "Think it through" in user
+
+    def test_both_turns_agree_with_the_switch(self):
+        for thinking in (True, False):
+            system, user = Brain(
+                llm_config=LLMConfig(model=MODEL,
+                                     thinking=thinking))._build_prompt(_market(),
+                                                                       None)
+            asked = "Reason through the market" in system
+            allowed = "NO <think> reasoning tags" not in user
+            assert asked is thinking and allowed is thinking, (
+                f"thinking={thinking}: system asked={asked} user allowed="
+                f"{allowed} - the two turns disagree")
 
     def test_the_brain_reads_the_setting_from_its_config(self):
         assert Brain(llm_config=LLMConfig(thinking=True)).llm_thinking() is True
@@ -402,3 +420,92 @@ class TestTheNoiseAroundTheAnswer:
         assert "No chain-of-thought" in readme
         assert "enable_thinking" in readme
         assert "PTAI_LLM_THINKING" in readme
+
+
+# ---------------------------------------------------------------------------
+# 7. is OFF weaker, and does ON break the answer?
+# ---------------------------------------------------------------------------
+
+class TestTheAnswerSurvivesTheReasoning:
+    """
+    The operator's question, one step on: "does it have the same capability when
+    thinking is off or are there errors".
+
+    OFF changes nothing about the pipeline - same prompt shape, same schema, same
+    parser, same timeout, same accounting - and every run in the suites and the
+    live acceptance goes through it. ON is the one that can break an answer, in
+    two ways this class pins shut: the budget (a reasoning pass is paid for out
+    of `max_tokens`, so the answer must still fit) and the parser (a model that
+    reasons first must still have its JSON read).
+    """
+
+    def test_the_budget_follows_the_switch(self, monkeypatch):
+        off = Brain(llm_config=LLMConfig(model=MODEL, thinking=False))
+        assert off.llm_router.max_tokens == LLMConfig(model=MODEL).max_tokens, (
+            "thinking OFF must not change the call the agent already makes")
+        on = Brain(llm_config=LLMConfig(model=MODEL, thinking=True))
+        assert on.llm_router.max_tokens >= 2048, (
+            "a reasoning pass plus the JSON has to fit in one call, or the "
+            "model is cut off mid-thought and no answer parses")
+
+    def test_a_reasoning_answer_still_parses(self):
+        from src.ptai.llm.provider import extract_json_object
+        answer = '{"fair_value": 0.61, "confidence": 0.7}'
+        assert extract_json_object(answer)["fair_value"] == 0.61
+        assert extract_json_object(
+            f"<think>the market looks cheap because...</think>{answer}"
+        )["fair_value"] == 0.61, "a closed thinking block must not hide the JSON"
+        assert extract_json_object(
+            f"<thinking>step one {{not json}}</thinking>\n{answer}"
+        )["fair_value"] == 0.61
+        assert extract_json_object(
+            f"Let me think about this. The price is 0.55.\n{answer}\nHope that helps."
+        )["fair_value"] == 0.61, "prose before and after the object is normal"
+        assert extract_json_object(
+            f"```json\n{answer}\n```"
+        )["fair_value"] == 0.61, "a fenced block is not a reason to give up"
+        assert extract_json_object(
+            '{"reasoning": "a } brace in a string", "fair_value": 0.4}'
+        )["fair_value"] == 0.4
+
+    def test_a_truncated_thought_is_not_read_as_an_answer(self):
+        from src.ptai.llm.provider import extract_json_object
+        assert extract_json_object(
+            "<think>the home side has won four of its last five, and the "
+            "market prices them at 0.62, which looks") is None, (
+            "no JSON means no answer - the caller must fall back and SAY so "
+            "rather than parse half a thought")
+
+    def test_the_brain_reads_a_wrapped_answer_instead_of_giving_up(self):
+        from src.ptai.llm.provider import LLMResponse
+
+        class _Router:
+            active_model = MODEL
+
+            def chat(self, prompt, system=""):
+                return LLMResponse(
+                    content=("<think>weighing the base rate</think>"
+                             '{"fair_value": 0.58, "confidence": 0.66, '
+                             '"side": "YES", "reasoning": "reasons first"}'),
+                    model=MODEL, provider="lm_studio", parsed_json=None)
+
+            def usage_report(self):
+                return {"last_model": MODEL, "last_error": ""}
+
+        brain = Brain(llm_router=_Router())
+        parsed = brain._call_llm("system", "user")
+        assert parsed and parsed["fair_value"] == 0.58, (
+            "the V55 extractor only understood clean JSON or a closed </think> "
+            "tag directly before it, so a wrapped answer was logged as "
+            "'no usable JSON' and priced by the heuristic instead")
+
+    def test_off_and_on_read_the_same_fields(self, monkeypatch):
+        sent = _stub_openai(monkeypatch)
+        off = LMStudioProvider(model=MODEL, thinking=False)
+        on = LMStudioProvider(model=MODEL, thinking=True)
+        assert off.chat("q", "s") is not None
+        assert on.chat("q", "s") is not None
+        assert sent[0]["messages"] == sent[1]["messages"], (
+            "the prompt is the same request in both modes; only the reasoning "
+            "instruction and the server-side kwarg differ")
+        assert sent[0]["max_tokens"] == sent[1]["max_tokens"]

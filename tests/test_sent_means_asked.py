@@ -161,6 +161,62 @@ class TestTheOperatorsCase:
 # an ask that was never a call
 # ----------------------------------------------------------------------
 
+class TestAResponseIsNotAnAnswer:
+    """
+    The 17:25 run's shape, one step further on: every call came back - HTTP 200,
+    a body, `8 of 8 call(s) answered` - and not one of them had a parseable
+    answer in it (a reasoning model cut off mid-thought, or prose). The model
+    line called that "used" and said nothing, so a cycle that priced every
+    market on the heuristic read exactly like a cycle the model priced.
+    """
+
+    def test_a_response_with_no_json_is_not_a_model_answer(self):
+        agent = _status_agent(router=_Router(), shortlist=8, considered=40,
+                              priced=8, deep_priced=8, asked=8, answered=0,
+                              calls=8, answered_calls=8, forecasts_run=8,
+                              problems=["'qwen/qwen3-14b' answered, but its "
+                                        "answer had no usable JSON"])
+        status = agent._local_model_status()
+        assert status["calls"] == 8 and status["answered"] == 8
+        assert status["answered_by_model"] == 0
+        assert status["used"] is False, (
+            "a 200 response is not an answer; calling it 'used' is the lie this "
+            "round exists to remove")
+        assert "no usable JSON" in status["not_used_reason"]
+
+    def test_the_line_says_returned_for_calls_and_asked_for_answers(self):
+        agent = _status_agent(router=_Router(), shortlist=8, considered=40,
+                              priced=8, deep_priced=8, asked=8, answered=0,
+                              calls=8, answered_calls=8, forecasts_run=8,
+                              problems=["no usable JSON in the answer"])
+        line = agent._local_model_line()
+        assert "8 of 8 call(s) returned" in line, (
+            "the router counts responses; only the ensemble can count answers")
+        assert "NOT USED THIS CYCLE" in line
+
+    def test_calls_that_answer_are_still_used(self):
+        agent = _status_agent(router=_Router(), shortlist=8, considered=40,
+                              priced=8, deep_priced=8, asked=8, answered=8,
+                              calls=8, answered_calls=8, forecasts_run=8)
+        status = agent._local_model_status()
+        assert status["used"] is True
+        assert status["not_used_reason"] == ""
+
+    def test_calls_outside_the_pricing_lane_still_count_as_the_model_working(self):
+        # contradiction and resolution analysis call the model on their own; no
+        # market was handed to it, but the model did answer something.
+        from src.ptai.agent.v3_loop import _why_the_model_was_not_used
+        status = {"available": True, "describe": "qwen", "calls": 2,
+                  "answered": 2, "failed": 0, "last_error": "",
+                  "deep_shortlist": 0, "deep_priced": 0, "forecasts_run": 0,
+                  "considered": 40, "answered_by_model": 0}
+        reason = _why_the_model_was_not_used(status, 0, [])
+        assert "the router recorded 2 call(s) but no market reached the model " \
+               "step" in reason, (
+            "the model answered, but nothing was asked about a market - both "
+            "halves of that are true and both are said")
+
+
 class TestAnAskThatNeverBecameACall:
     def test_the_disagreement_is_named_not_smoothed_over(self):
         agent = _status_agent(router=_Router(), shortlist=8, considered=899,

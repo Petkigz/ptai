@@ -382,7 +382,7 @@ class TestTheCycleNamesTheModel:
         line = _agent_stub(router)._local_model_line()
         assert line.startswith("Local model: qwen2.5-14b-instruct")
         assert "http://localhost:1234/v1" in line
-        assert "2 of 2 call(s) answered" in line
+        assert "2 of 2 call(s) returned" in line
         assert "qwen2.5-14b-instruct x2" in line
         assert "NOT USED" not in line
         # V55: the tail is about PRICES, not plans - the screen's numbers stay,

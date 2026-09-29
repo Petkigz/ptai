@@ -5060,7 +5060,19 @@ class TradingAgentV3:
         # shortlist question). Two different defects, two different sentences.
         status["ensemble_has_router"] = bool(getattr(
             getattr(self, "ensemble_forecaster", None), "llm_router", None))
-        status["used"] = answered_by_model > 0 or status["answered"] > 0
+        # A CALL THAT CAME BACK IS NOT A MODEL ANSWER.
+        #
+        # It used to be `answered_by_model > 0 or status["answered"] > 0`, and
+        # the router's `answered` only means the HTTP call returned a response.
+        # A model that reasons and is cut off mid-thought - or answers with
+        # prose - returns 200 with nothing parseable, so every market fell back
+        # to the heuristic while the line said the model was used and printed
+        # "8 of 8 call(s) answered". If markets were asked and none of them got
+        # a model answer, the model was not used FOR PRICING and the line says
+        # so; the router's own answers still count when no market was asked
+        # (contradiction and resolution analysis make calls of their own).
+        status["used"] = (answered_by_model > 0
+                          or (asked == 0 and status["answered"] > 0))
         # AN ASK THAT NEVER BECAME A CALL IS A WIRING DEFECT, and it is visible
         # only by comparing the two counters. The 16:23 log said "8 market(s)
         # were sent to the model but no answer was recorded" while the router
@@ -5092,8 +5104,12 @@ class TradingAgentV3:
                      f"{status['model_changed_from']}, and this cycle it is "
                      f"{status['model']}")
         if status.get("asked") or status["calls"]:
+            # "returned", not "answered": the router counts responses, and a
+            # response with no JSON in it is not a model answer. The two facts
+            # are counted separately (see `answered_by_model`), so the sentence
+            # must not read as though both were the same thing.
             line += (f" | markets asked: {status.get('asked', 0)} | "
-                     f"{status['answered']} of {status['calls']} call(s) answered "
+                     f"{status['answered']} of {status['calls']} call(s) returned "
                      f"in {status['seconds']:.1f}s"
                      + (f" ({ids})" if ids else ""))
             if status.get("asks_without_calls"):

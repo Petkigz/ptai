@@ -1094,6 +1094,36 @@ that market - which the log says - instead of holding the cycle. Turn thinking o
 and raise the call limit together if your model needs more than 180 s per market,
 and expect fewer markets per cycle.
 
+**What changes, and what does not.** Nothing about the pipeline changes with the
+switch: same question, same market and evidence blocks, same schema, same parser,
+same timeout, same accounting. Only three things follow the flag, and each one is
+there so the switch cannot quietly cost you an answer:
+
+  * the request (the `enable_thinking` kwarg - sent only when on);
+  * the two sentences that tell the model what you want (reason first, or answer
+    straight - they can never disagree, and they used to: the system turn asked
+    for reasoning while the user turn said `BE CONCISE - NO <think> reasoning
+    tags`);
+  * the token budget. A reasoning pass is paid for out of `max_tokens`, so with
+    thinking on the budget is at least 2048 - otherwise the model is cut off
+    mid-thought and there is no JSON left to read, which looks like a model
+    failure while the model is doing exactly what it was asked.
+
+A reasoning model that answers through its thinking - `<think>...</think>`, a
+bare thinking block, prose, or a fenced code block - is parsed the same as a
+direct answer: the extractor strips the wrapper, then reads the first balanced
+JSON object. (This was a real failure: the old extractor only understood a
+closed `</think>` tag with clean JSON after it, so a wrapped answer was logged as
+"no usable JSON" and the market was priced by the heuristic.)
+
+And **"the model was used" now means a model ANSWERED**, not that an HTTP call
+came back. In the 17:25 run every call returned 200 with nothing parseable in it,
+the cycle's own line said `8 of 8 call(s) answered`, and every market was priced
+by the heuristic - which read exactly like a cycle the model had priced. The
+router's count is now printed as `call(s) returned`, and `NOT USED THIS CYCLE`
+names the reason (`'qwen/qwen3-14b' answered, but its answer had no usable
+JSON`) whenever markets were asked and none of them produced a model answer.
+
 The setting is visible and editable in three places that agree, because they read
 one field: the Brain panel's **Thinking** row, `POST /api/console/brain
 {"thinking": true|false}` (what the button calls), and `PTAI_LLM_THINKING` in

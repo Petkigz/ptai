@@ -3114,7 +3114,7 @@ async function runCycle(){
   $('cycleOut').innerHTML = `
     ${lm.describe ? `<div class="note">Local model: ${esc(lm.describe)}
         ${lm.used
-          ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} &middot; ${lm.answered||0} of ${lm.calls||0} call(s) answered${lm.answered_by_model!==undefined ? `, ${lm.answered_by_model} market(s) answered` : ''}`
+          ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} &middot; ${lm.answered||0} of ${lm.calls||0} call(s) returned${lm.answered_by_model!==undefined ? `, ${lm.answered_by_model} market(s) answered` : ''}`
           : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
         ${lm.thinking_note ? ` &middot; ${esc(lm.thinking_note)}` : ''}
         ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>` : ''}
@@ -3273,7 +3273,7 @@ async function loadForecast(){
   const modelLine = lm.describe
     ? `<div class="note">Local model: <b>${esc(lm.model || lm.describe)}</b>
         ${lm.used
-          ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} (${lm.answered||0} of ${lm.calls||0} call(s) answered, ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s)`
+          ? `&middot; markets asked: ${lm.asked ?? lm.calls ?? 0} (${lm.answered||0} of ${lm.calls||0} call(s) returned, ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s)`
           : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
         ${lm.thinking_note ? ` &middot; ${esc(lm.thinking_note)}` : ''}
         ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>`

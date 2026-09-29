@@ -217,6 +217,15 @@ class Brain:
             max_toks = 500 if is_r1_model else self.llm_config.max_tokens
             if is_r1_model:
                 logger.warning(f"Detected R1 reasoning model ({self.llm_config.model}) - setting max_tokens=500 for faster trading (was {self.llm_config.max_tokens}). R1 thinks 1000+ tokens internally, so 6-8 min per market unavoidable. For 10-min cycle, use non-R1 qwen/qwen3-32b or set MAX_DEEP_ANALYZE=5")
+            if self.llm_thinking():
+                # A REASONING PASS IS PAID FOR OUT OF max_tokens, and the model
+                # is cut off mid-thought if the budget only fits the answer.
+                # With thinking on, the configured 1200 (or the 500-token R1
+                # squeeze) could be spent entirely on reasoning, leaving no JSON
+                # to parse - which reads as "no usable answer" while the model
+                # is doing exactly what it was asked. The budget follows the
+                # switch, and the init line prints the effective number.
+                max_toks = max(int(max_toks or 0), 2048)
 
             self.llm_router = LLMRouter(
                 preferred=self.llm_config.provider,
@@ -292,6 +301,18 @@ WEB RESEARCH (local browser/terminal):
         # The schema is still given (the parser needs a shape), but the numbers
         # are placeholders the model cannot mistake for an answer, and the
         # instruction says so explicitly.
+        #
+        # The user turn states the same rule as the system turn. It used to read
+        # "BE CONCISE - NO <think> reasoning tags" unconditionally, so a model
+        # asked to reason first was forbidden to reason in the same request.
+        if self.llm_thinking():
+            thinking_line = (
+                "Think it through, then END with the JSON object below - only "
+                "the JSON is read back. Keep it tight.")
+        else:
+            thinking_line = ("BE CONCISE - NO <think> reasoning tags, direct "
+                             "JSON only (<90 tokens).")
+
         user_prompt = f"""MARKET: {market.question[:200]}
 YES price: {market.yes_price:.3f} ({market.yes_price:.1%}) NO: {market.no_price:.3f}
 Vol24h ${market.volume_24h:,.0f} Liq ${market.liquidity:,.0f} End {market.end_date}
@@ -309,7 +330,7 @@ question. Then answer.
   has to come from that market's own evidence.
 - The values in the schema below are PLACEHOLDERS showing the shape only. They are
   not answers, not a target, and not a default.
-BE CONCISE - NO <think> reasoning tags, direct JSON only (<90 tokens).
+{thinking_line}
 Respond ONLY JSON, with your own numbers:
 {{"fair_value":<your probability>,"edge":<fair minus the YES price>,"confidence":<your confidence>,"side":"YES"|"NO","basis":"<base_rate|news|research|sentiment|market>","should_trade":<true|false>,"reasoning":"<one line, name the evidence you used>"}}
 Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES price and low confidence.
@@ -343,16 +364,20 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
                     f"edge={response.parsed_json.get('edge')}")
                 return response.parsed_json
             elif response:
-                # Try to extract JSON from content
-                import re, json
+                # The SAME extractor the provider uses. This fallback used to
+                # run its own greedy `\{.*\}` over the raw text, so an answer
+                # that reasoned first (in <think> tags or in prose) failed to
+                # parse here even when the JSON was complete and correct.
+                from ..llm.provider import extract_json_object
                 content = response.content
-                # Try to find JSON
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    try:
-                        return json.loads(json_match.group())
-                    except:
-                        pass
+                parsed = extract_json_object(content)
+                if parsed is not None:
+                    logger.info(
+                        f"LLM {response.provider} "
+                        f"['{self._last_llm_model}'] parsed JSON from a wrapped "
+                        f"answer: fair={parsed.get('fair_value')} "
+                        f"edge={parsed.get('edge')}")
+                    return parsed
                 logger.warning(
                     f"LLM {response.provider} ['{self._last_llm_model}'] returned "
                     f"no JSON: {content[:500]}")
