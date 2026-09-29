@@ -93,7 +93,7 @@ class CryptoAdapter(MarketAdapter):
                         slug=symbol.lower(),
                         event_slug=f"crypto-{self.exchange}",
                         market_type="binary",
-                        raw={"venue": f"crypto_{self.exchange}", "symbol": symbol, "last_price": last_price, "change_pct": price_change_pct, "real": True, "data_mode": "live", "data_source": "binance_api"},
+                        raw={"venue": f"crypto_{self.exchange}", "symbol": symbol, "last_price": last_price, "change_pct": price_change_pct, "real": True, "data_mode": "live", "data_source": "binance_api", "probability_market": False, "quote_scale": "currency"},
                         venue_id=f"crypto_{self.exchange}",
                         venue_type="financial",
                         data_mode=DataMode.LIVE,

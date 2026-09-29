@@ -79,7 +79,7 @@ class WhiteBITAdapter(MarketAdapter):
                             active=True,
                             closed=False,
                             event_slug=symbol,
-                            raw={"venue": "whitebit", "symbol": symbol, "last_price": last, "type": "spot", "category": "crypto", "data_mode": "live", "data_source": "whitebit_api", "is_mock": False},
+                            raw={"venue": "whitebit", "symbol": symbol, "last_price": last, "type": "spot", "category": "crypto", "data_mode": "live", "data_source": "whitebit_api", "probability_market": False, "quote_scale": "currency", "is_mock": False},
                             venue_id="whitebit",
                             venue_type="financial",
                             data_mode=DataMode.LIVE,
@@ -102,9 +102,44 @@ class WhiteBITAdapter(MarketAdapter):
         return []
         return markets
 
+    def _not_a_probability_book(self, market: Market, symbol: str,
+                                bid: Any = None, ask: Any = None) -> Dict[str, Any]:
+        """
+        The refusal for a quote that is a price, not a probability.
+
+        The operator's log carried `whitebit-BCH_TRY ... spread 6300.0%` and
+        `whitebit-ADA_PERP ... pay 0.748` against a 'fair 0.100', because a
+        crypto order book (TRY, or a perpetual's price in dollars) was handed to
+        the probability pricing stack. This venue is an exchange: what it quotes
+        is the price of a coin, and no Yes share exists to buy at that price.
+        The book is REAL - it is simply not the kind of book the question needs.
+        """
+        return {
+            "market_id": market.id,
+            "venue_id": "whitebit",
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "source": "not_a_probability_book",
+            "scale": "currency",
+            "is_real": True,
+            "validated": False,
+            "executable": False,
+            "is_mock": False,
+            "warning": (
+                f"WhiteBIT is a crypto exchange: it quotes the price of a coin "
+                f"(bid {bid} / ask {ask}), not a probability in 0-1, so there is "
+                f"no Yes share to buy and no edge is computed from this book."),
+        }
+
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         # V9 FIX #1 & #3: Real vs mock orderbook with is_real flag
         symbol = market.raw.get("symbol", market.event_slug)
+        # ASKED FIRST, BEFORE ANY FETCH: a market whose price is not a
+        # probability gets the refusal whether or not the venue answers, so a
+        # 6300% spread can never be computed from a currency quote again.
+        if not getattr(market, "is_probability_market", True):
+            return self._not_a_probability_book(market, symbol)
         # Try real API for LIVE markets
         is_mock_market = getattr(market, 'is_mock', False) or "MOCK" in market.id
         if not is_mock_market:
@@ -117,6 +152,11 @@ class WhiteBITAdapter(MarketAdapter):
                     asks = data.get("asks", [])
                     best_bid = float(bids[0][0]) if bids else market.best_price - 0.001
                     best_ask = float(asks[0][0]) if asks else market.best_price + 0.001
+                    # A book whose quotes are not in 0-1 is not a probability
+                    # book, whatever the market says.
+                    if max(abs(best_bid), abs(best_ask)) > 1.0:
+                        return self._not_a_probability_book(
+                            market, symbol, best_bid, best_ask)
                     return {
                         "market_id": market.id,
                         "venue_id": "whitebit",

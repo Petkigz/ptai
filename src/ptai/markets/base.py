@@ -134,6 +134,24 @@ class Market:
             self.raw["is_mock"] = self.is_mock
 
     @property
+    def is_probability_market(self) -> bool:
+        """
+        Is a share here a PROBABILITY, or a quoted price?
+
+        A prediction venue sells a Yes share that settles at 1 or 0, so its
+        price is a probability and an edge against a forecast means something.
+        A crypto exchange quotes a currency price: 'ADA_PERP at 0.748' is
+        $0.748, not a 74.8% chance, and there is no Yes share to buy. The
+        operator's log priced those as probabilities and produced spreads of
+        1400-6300% and a line comparing 'fair 0.100' with 'the 0.748 a share
+        actually costs'. Adapters that quote prices set this False in raw.
+        """
+        raw = getattr(self, "raw", None)
+        if not isinstance(raw, dict):
+            return True
+        return raw.get("probability_market", True) is not False
+
+    @property
     def best_price(self) -> float:
         """Get YES price if binary"""
         if self.outcome_prices:

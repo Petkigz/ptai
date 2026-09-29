@@ -448,7 +448,13 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
             sentiment_summary=sentiment.summary if sentiment else None,
             should_trade=should_trade,
             side=side,
-            raw={"method": "heuristic"},
+            # WHY there is no LLM opinion travels with the result. The cycle's
+            # model line reads it, so "no answer was recorded" is followed by
+            # the router's own words instead of by silence.
+            raw={"method": "heuristic",
+                 "llm_problem": (self._last_llm_problem
+                                  or "the local model gave no usable answer"),
+                 "llm_asked": True},
             llm_provider="heuristic"
         )
 
@@ -513,6 +519,8 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
                     should_trade=should_trade,
                     side=side,
                     raw={**llm_result,
+                         "llm_problem": "",
+                         "llm_asked": True,
                          "anchored": bool(anchored),
                          "anchoring_reason": anchored or "",
                          "basis": llm_result.get("basis", "")},

@@ -122,7 +122,7 @@ class EventTradingEngine:
         
         opp = VenueOpportunity(
             market=market,
-            venue_id=getattr(market, 'source', 'unknown').value if hasattr(getattr(market, 'source', ''), 'value') else str(getattr(market, 'source', 'unknown')),
+            venue_id=str(getattr(market, 'venue_id', '') or (getattr(market, 'raw', {}) or {}).get('venue_id') or (getattr(market, 'raw', {}) or {}).get('venue') or getattr(getattr(market, 'source', 'unknown'), 'value', getattr(market, 'source', 'unknown'))).lower(),
             venue_type=VenueType.PREDICTION,
             side="YES" if signal.estimated_edge > 0 else "NO",
             market_price=market.best_price,

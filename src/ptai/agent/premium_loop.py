@@ -59,12 +59,12 @@ class PremiumTradingAgent:
                 logger.info(f"Premium agent for user {user_id} ({user.email}) bankroll ${user.bankroll}")
             else:
                 # Fallback to default paths
-                self.storage = Storage(db_path="./data/ptai.db")
+                self.storage = Storage()
                 self.vault = Vault()
                 self.memory = Memory()
                 self.browser_profile = self.settings.browser_persistent_dir
         else:
-            self.storage = Storage(db_path="./data/ptai.db")
+            self.storage = Storage()
             self.vault = Vault()
             self.memory = Memory()
             self.browser_profile = self.settings.browser_persistent_dir

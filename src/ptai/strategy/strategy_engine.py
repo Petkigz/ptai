@@ -124,6 +124,19 @@ class StrategyEngineV3:
         self.min_liquidity = 100
         self.max_spread = 0.10
 
+    # THE MARKETS A VENUE SCAN ACTUALLY EVALUATES. The screen (stage 1) and the
+    # scan (stage 2) each had their own idea of which markets matter: the screen
+    # ranked on book quality and depth, the scan took the top 100 by volume and
+    # liquidity. So the operator's cycle chose 8 markets for deep analysis and
+    # then dropped all 8 at the per-venue cap, spent no model time at all, and
+    # printed a model line that blamed the model. One method, used by both, is
+    # how the two cannot drift apart again.
+    evaluate_limit: int = 100
+
+    def markets_that_will_be_evaluated(self, markets: List[Market]) -> List[Market]:
+        """(cheap filters -> liquidity order -> per-venue cap) as the scan does it."""
+        return self.liquidity_filter(self.cheap_filters(markets))[:self.evaluate_limit]
+
     def cheap_filters(self, markets: List[Market]) -> List[Market]:
         filtered = []
         for m in markets:
@@ -285,10 +298,26 @@ class StrategyEngineV3:
         after_cheap = self.cheap_filters(markets)
         after_liquidity = self.liquidity_filter(after_cheap)
         
+        # NOT A PROBABILITY, NOT A TRADE HERE. A crypto exchange quotes
+        # currency prices; pricing them as Yes probabilities produced 6300%
+        # spreads and 'fair 0.100 vs the 0.748 a share actually costs'. Refused
+        # at the door, counted, and said out loud - once per venue, not once per
+        # market.
+        not_probability = [m for m in after_liquidity
+                           if not getattr(m, "is_probability_market", True)]
+        if not_probability:
+            after_liquidity = [m for m in after_liquidity
+                               if getattr(m, "is_probability_market", True)]
+            logger.info(
+                f"{venue_id}: {len(not_probability)} market(s) not evaluated - this "
+                f"venue quotes PRICES, not probabilities, so there is no Yes share "
+                f"to buy and no edge to compute (they stay visible in the venue "
+                f"inventory; they are not priced here)")
+
         # Evaluate each market with all strategies
         all_opps: List[VenueOpportunity] = []
         skipped_no_book = 0
-        for market in after_liquidity[:100]:  # Limit per venue for performance
+        for market in after_liquidity[:self.evaluate_limit]:  # per-venue cap
             # A market whose book is not real cannot produce a cost or an edge.
             # The operator's 2026-09-29 log ran every one of them through the
             # whole stack - resolution analysis, contradiction, forecaster,

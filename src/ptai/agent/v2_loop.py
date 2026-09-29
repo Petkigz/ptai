@@ -94,7 +94,7 @@ class TradingAgentV2:
         self.country_code = country_code
         
         # Storage
-        self.storage = Storage(db_path="./data/ptai.db")
+        self.storage = Storage()
         self.vault = Vault()
         self.memory = Memory()
         

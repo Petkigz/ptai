@@ -205,6 +205,9 @@ class PolymarketAdapter(MarketAdapter):
         self._scanner = None
         # (read_at, payload). See PORTFOLIO_CACHE_SECONDS.
         self._portfolio_cache = None
+        # The last LOCAL STATE portfolio that was announced, so an unchanged
+        # read is not announced again on every console poll.
+        self._local_state_logged = None
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
@@ -982,10 +985,21 @@ class PolymarketAdapter(MarketAdapter):
                     f"Portfolio venue-confirmed: balance ${bankroll:.2f} "
                     f"available ${bankroll - total_exposure_usd:.2f}")
             else:
-                logger.info(
-                    f"Portfolio from LOCAL STATE: balance ${bankroll:.2f} "
-                    f"(PTAI's own bookkeeping, NOT verified with Polymarket - "
-                    f"the venue has not confirmed this account or this amount)")
+                # ONCE PER CHANGE, not once per poll. The console asks for the
+                # portfolio every 15 seconds and the cache expires between asks,
+                # so this line repeated unchanged for hours and crowded out the
+                # agent's own messages. The same sentence is still printed the
+                # first time - and again whenever the numbers actually move.
+                signature = (round(float(bankroll), 2), len(positions),
+                             len(open_orders), round(float(total_pnl), 2))
+                if getattr(self, "_local_state_logged", None) != signature:
+                    self._local_state_logged = signature
+                    logger.info(
+                        f"Portfolio from LOCAL STATE: balance ${bankroll:.2f} "
+                        f"(PTAI's own bookkeeping, NOT verified with Polymarket - "
+                        f"the venue has not confirmed this account or this "
+                        f"amount). Unchanged since the last read, so this is not "
+                        f"repeated on every poll.")
             return portfolio
             
         except Exception as e:

@@ -762,7 +762,7 @@ def teammates(
         from .config import get_settings
         
         settings = get_settings()
-        storage = Storage(db_path="./data/ptai.db")
+        storage = Storage()
         vault = Vault()
         memory = Memory()
         brain = Brain()

@@ -23,6 +23,7 @@ from ..learning.evidence import FORECAST_BEHIND_PRICE
 from loguru import logger
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 
 @dataclass
@@ -211,32 +212,139 @@ class VenueQualificationEngine:
             "max_trades_since_evaluation": 150,
         }
 
+    def _salvage_truncated(self, text: str) -> Optional[dict]:
+        """
+        Read every COMPLETE venue record out of a file that was cut short.
+
+        The operator's file failed with `Expecting value: line 507 column 18
+        (char 23042)` - a write that stopped in the middle of the JSON, which is
+        what a process killed during a save leaves behind. The venues whose
+        records finished before the cut are still readable evidence, so they are
+        kept; only the half-written tail is dropped. Returns None when nothing
+        can be salvaged.
+        """
+        depth = 0
+        in_string = False
+        escaped = False
+        last_good = -1
+        for index, ch in enumerate(text):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                # depth 1 is a completed venue record inside the outer object
+                if depth == 1:
+                    last_good = index
+        if last_good < 0:
+            return None
+        try:
+            return json.loads(text[:last_good + 1] + "}")
+        except Exception:  # noqa: BLE001 - salvage is best effort, never fatal
+            return None
+
+    def _quarantine(self, why: str) -> None:
+        """Move an unreadable file aside, named, so the evidence is not lost."""
+        try:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            target = self.qualification_file.with_name(
+                self.qualification_file.name + f".corrupt-{stamp}")
+            self.qualification_file.replace(target)
+            logger.warning(
+                f"Qualification file was unreadable ({why}). It has been kept as "
+                f"{target.name} and a fresh record will be written; no venue is "
+                f"counted as qualified on unreadable evidence.")
+        except Exception as e:  # noqa: BLE001 - quarantining must not raise
+            logger.warning(f"Qualification file unreadable ({why}) and could not be "
+                           f"moved aside: {type(e).__name__}: {e}")
+
     def _load(self):
         if self.qualification_file.exists():
             try:
                 with open(self.qualification_file, 'r') as f:
-                    data = json.load(f)
-                    for venue_id, qual_data in data.items():
-                        if qual_data.get("qualification_date"):
-                            qual_data["qualification_date"] = datetime.fromisoformat(qual_data["qualification_date"])
-                        # Handle old format without new fields
-                        for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage", "real_evidence_coverage", "executable_value_coverage", "market_skill", "market_skill_ci_low", "market_skill_ci_high", "market_skill_p_value", "recent_market_skill", "rows_at_evaluation", "qualified_on_trades", "market_skill_samples", "market_improvement"]:
-                            if field not in qual_data:
-                                qual_data[field] = 0.0
-                        # Strings keep their own defaults, or a loaded record
-                        # would claim a verdict of 0.0.
-                        for field in ["market_skill_verdict", "market_skill_reason", "recent_market_skill_verdict", "recent_market_skill_reason"]:
-                            if field not in qual_data:
-                                qual_data[field] = ("unmeasured" if field.endswith("verdict") else "")
-                        # Booleans default to unknown, not to a number: a record
-                        # written before these existed must read "never measured"
-                        # and not "measured and failed".
-                        for field in ["beats_the_price", "not_drifting"]:
-                            if field not in qual_data:
-                                qual_data[field] = None
-                        self.qualifications[venue_id] = QualificationResult(**qual_data)
-            except Exception as e:
-                logger.warning(f"Qualification load failed: {e}")
+                    text = f.read()
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError as e:
+                    # A truncated write is the common case (the agent is often
+                    # stopped mid-cycle) and it is recoverable up to the last
+                    # complete record; anything else is kept as evidence and
+                    # replaced. Either way the file stops breaking every load.
+                    salvaged = self._salvage_truncated(text)
+                    if salvaged:
+                        logger.warning(
+                            f"Qualification file was cut short at line {e.lineno} "
+                            f"column {e.colno} (char {e.pos}): recovered "
+                            f"{len(salvaged)} complete venue record(s) from it and "
+                            f"dropped the incomplete tail.")
+                        data = salvaged
+                    else:
+                        self._quarantine(f"{e.msg} at line {e.lineno} column "
+                                         f"{e.colno}, char {e.pos}")
+                        data = {}
+                if not isinstance(data, dict):
+                    self._quarantine("the file does not contain a JSON object")
+                    data = {}
+                for venue_id, qual_data in data.items():
+                  # ONE BAD RECORD MUST NOT ERASE THE OTHERS. This loop used to
+                  # share the file's try/except, so a single venue whose record
+                  # was written by an older version - or salvaged from a
+                  # truncated file - aborted the whole load and every good
+                  # record went with it. Each venue is now read on its own.
+                  try:
+                      if qual_data.get("qualification_date"):
+                          qual_data["qualification_date"] = datetime.fromisoformat(qual_data["qualification_date"])
+                      # Handle old format without new fields
+                      for field in ["net_pnl", "expected_value", "fees_total", "slippage_total", "drawdown_max", "profit_factor", "calibration_ece", "log_loss", "execution_quality_avg", "sample_size", "ev_coverage", "real_evidence_coverage", "executable_value_coverage", "market_skill", "market_skill_ci_low", "market_skill_ci_high", "market_skill_p_value", "recent_market_skill", "rows_at_evaluation", "qualified_on_trades", "market_skill_samples", "market_improvement"]:
+                          if field not in qual_data:
+                              qual_data[field] = 0.0
+                      # Strings keep their own defaults, or a loaded record
+                      # would claim a verdict of 0.0.
+                      for field in ["market_skill_verdict", "market_skill_reason", "recent_market_skill_verdict", "recent_market_skill_reason"]:
+                          if field not in qual_data:
+                              qual_data[field] = ("unmeasured" if field.endswith("verdict") else "")
+                      # Booleans default to unknown, not to a number: a record
+                      # written before these existed must read "never measured"
+                      # and not "measured and failed".
+                      for field in ["beats_the_price", "not_drifting"]:
+                          if field not in qual_data:
+                              qual_data[field] = None
+                      self.qualifications[venue_id] = QualificationResult(**qual_data)
+                  except Exception as e:  # noqa: BLE001 - one record, not the file
+                    logger.warning(
+                        f"Qualification record for {venue_id} could not be read "
+                        f"({type(e).__name__}: {e}); that venue is treated as "
+                        f"never measured, and the other records are kept.")
+            except Exception as e:  # noqa: BLE001 - a bad file must not stop the agent
+                # SAY WHICH FILE, WHAT HAPPENED, AND THAT IT IS BEING KEPT. The
+                # old line named neither the file nor the consequence, repeated
+                # every cycle, and left the broken file in place to fail the
+                # next load too. It is moved aside now (so a fresh record can be
+                # written), and the moved copy is named so nothing is lost.
+                _why = f"{type(e).__name__}: {e}"
+                _where = ""
+                try:
+                    quarantine = self.qualification_file.with_name(
+                        self.qualification_file.name + ".corrupt")
+                    if self.qualification_file.exists():
+                        os.replace(self.qualification_file, quarantine)
+                        _where = (f" The unreadable file was kept as "
+                                  f"{quarantine.name}.")
+                except Exception:  # noqa: BLE001 - quarantine is best effort
+                    pass
+                logger.warning(
+                    f"Qualification record at {self.qualification_file} could not "
+                    f"be read ({_why}) - every venue starts from no measured "
+                    f"record until outcomes are recorded again.{_where}")
 
     def _save(self):
         try:
@@ -297,8 +405,24 @@ class VenueQualificationEngine:
                     "rows_at_evaluation": qual.rows_at_evaluation,
                     "qualified_on_trades": qual.qualified_on_trades,
                 }
-            with open(self.qualification_file, 'w') as f:
+            # WRITE, THEN REPLACE: one step, and never a half-file. The old
+            # `open(..., 'w')` truncated the file first, so a process stopped
+            # while saving - which is what Stop does - left the JSON cut off in
+            # the middle. The operator's log then read "Qualification load
+            # failed: Expecting value: line 507 column 18 (char 23042)" on every
+            # cycle, and the whole qualification record was unreadable, not just
+            # the tail. `os.replace` is atomic on both Windows and POSIX: the
+            # reader sees the old complete file or the new complete file.
+            tmp = self.qualification_file.with_name(
+                self.qualification_file.name + ".tmp")
+            with open(tmp, 'w') as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:  # noqa: BLE001 - fsync is best effort
+                    pass
+            os.replace(tmp, self.qualification_file)
         except Exception as e:
             logger.warning(f"Qualification save failed: {e}")
 

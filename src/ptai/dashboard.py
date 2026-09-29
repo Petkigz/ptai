@@ -130,7 +130,7 @@ def verify_auth_token(request: Request) -> bool:
     return False
 
 def get_storage():
-    return Storage(db_path="./data/ptai.db")
+    return Storage()
 
 def mask_key(key: str) -> str:
     if not key or len(key) < 10:
@@ -712,7 +712,7 @@ async def api_teammates_status():
         from .config import get_settings
         
         settings = get_settings()
-        storage = Storage(db_path="./data/ptai.db")
+        storage = Storage()
         vault = Vault()
         memory = Memory()
         brain = Brain()
@@ -765,7 +765,7 @@ async def api_teammates_run(request: Request):
         import asyncio
         
         settings = get_settings()
-        storage = Storage(db_path="./data/ptai.db")
+        storage = Storage()
         vault = Vault()
         memory = Memory()
         brain = Brain()
@@ -1370,7 +1370,7 @@ async def api_v2_risk():
         from .risk.exposure import ExposureManager
         from .risk.limits import LimitsEngine
         from .storage.db import Storage
-        storage = Storage(db_path="./data/ptai.db")
+        storage = Storage()
         bankroll = storage.get_performance_summary().get("bankroll", 50.0)
         storage.close()
         

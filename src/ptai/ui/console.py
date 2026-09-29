@@ -3075,8 +3075,9 @@ async function runCycle(){
   $('cycleOut').innerHTML = `
     ${lm.describe ? `<div class="note">Local model: ${esc(lm.describe)}
         ${lm.used
-          ? `&middot; ${lm.answered||0} of ${lm.calls||0} call(s) answered`
-          : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}</div>` : ''}
+          ? `&middot; ${lm.answered_by_model ?? lm.answered ?? 0} of ${lm.asked ?? lm.calls ?? 0} market(s) asked were answered (${lm.answered||0} of ${lm.calls||0} call(s))`
+          : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
+        ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>` : ''}
     ${body.deep_analysis && body.deep_analysis.considered
       ? `<div class="note">Model time: ${((body.deep_analysis.shortlist)||[]).length}
           of ${body.deep_analysis.considered} market(s) deep-analysed
@@ -3229,15 +3230,17 @@ async function loadForecast(){
   const modelLine = lm.describe
     ? `<div class="note">Local model: <b>${esc(lm.model || lm.describe)}</b>
         ${lm.used
-          ? `&middot; ${lm.answered||0} of ${lm.calls||0} call(s) answered in
-             ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s`
-          : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}</div>`
+          ? `&middot; ${lm.answered_by_model ?? lm.answered ?? 0} of ${lm.asked ?? lm.calls ?? 0} market(s) asked were answered (${lm.answered||0} of ${lm.calls||0} call(s), ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s)`
+          : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}
+        ${lm.model_changed_from ? ` &middot; <b>changed</b>: it was ${esc(lm.model_changed_from)}` : ''}</div>`
     : '';
   const screenLine = screen.considered
     ? `<div class="note">Model time went to <b>${(screen.shortlist||[]).length}</b>
         of ${screen.considered} market(s) this cycle (limit ${screen.limit||'?'},
         books read in ${screen.seconds||0}s). ${screen.screened_out||0} were priced
-        on their measured book only &mdash; not on model opinion.</div>`
+        on their measured book only &mdash; not on model opinion.
+        ${screen.dropped_by_scan ? ` ${screen.dropped_by_scan} more sit below their
+        venue's own per-venue cap and will not be priced this cycle.` : ''}</div>`
     : `<div class="note">${esc(screen.criteria||'no screen has run yet')}</div>`;
 
   const cats = Object.entries(br.categories||{}).filter(e => e[1].usable);

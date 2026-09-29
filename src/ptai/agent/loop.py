@@ -47,7 +47,7 @@ class TradingAgent:
             self.settings.dry_run = dry_run
 
         # Core components
-        self.storage = Storage(db_path="./data/ptai.db")
+        self.storage = Storage()
         if bankroll:
             current = self.storage.get_bankroll()
             if current == 50.0 and bankroll != 50.0:

@@ -143,9 +143,20 @@ class MomentumEngine:
             fair = market.best_price + signal.estimated_edge
             fair = max(0.01, min(0.99, fair))
             
+            # THE VENUE IS THE MARKET'S VENUE. This read `market.source`, which
+            # is a MarketSource enum with three prediction values
+            # (polymarket/kalshi/predictit) - so a Binance crypto pair labelled
+            # itself 'predictit' and the operator's log read
+            # "Best opportunity: predictit YES edge 0.093 ... | Will 0GUSDT close
+            # higher in 24h?". A venue id that does not route is not a venue.
+            _venue_id = (getattr(market, 'venue_id', '') or
+                         (market.raw or {}).get('venue_id') or
+                         (market.raw or {}).get('venue') or
+                         getattr(market, 'source', 'unknown'))
+            _venue_id = getattr(_venue_id, 'value', _venue_id)
             opp = VenueOpportunity(
                 market=market,
-                venue_id=getattr(market, 'source', 'unknown').value if hasattr(getattr(market, 'source', ''), 'value') else str(getattr(market, 'source', 'unknown')),
+                venue_id=str(_venue_id).lower(),
                 venue_type=VenueType.FINANCIAL,
                 side="YES" if signal.estimated_edge > 0 else "NO",
                 market_price=market.best_price,

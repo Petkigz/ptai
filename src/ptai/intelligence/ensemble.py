@@ -119,6 +119,17 @@ class EnsembleForecaster:
         self.calibration_engine = calibration_engine
         self.uncertainty_engine = uncertainty_engine
         self.llm_router = llm_router
+        # WHAT THE MODEL WAS ACTUALLY ASKED, this cycle.
+        #
+        # The cycle's model line used to build its sentence from the deep
+        # shortlist - a PLAN written before pricing - and then say "8 market(s)
+        # were sent to the model but no answer was recorded" when the router's
+        # own counter read 0 calls. Both numbers were in the same log line and
+        # they contradicted each other, which is how the operator saw it. A
+        # market counts as SENT here, at the call, and nowhere else.
+        self.llm_asked = 0          # markets that reached the model step
+        self.llm_answered = 0       # ...of those, markets the model answered
+        self.llm_problems: list = []  # why the ones that were not answered were not
         # Model weights - can be learned from calibration performance
         self.model_weights = {
             "base_rate": 0.15,
@@ -135,6 +146,18 @@ class EnsembleForecaster:
     # the floor weight used for unrecognised models, not the 0.30 of
     # llm_reasoning: a heuristic that is not an LLM must not be weighted like one.
     HEURISTIC_MODEL_WEIGHT_NAME = "heuristic_reasoning"
+
+    def reset_llm_accounting(self) -> None:
+        """Start a fresh count of what the model was asked, for one cycle."""
+        self.llm_asked = 0
+        self.llm_answered = 0
+        self.llm_problems = []
+
+    def llm_accounting(self) -> Dict[str, Any]:
+        """What the model was asked this cycle, and what it did not answer."""
+        return {"asked": int(self.llm_asked),
+                "answered": int(self.llm_answered),
+                "problems": list(self.llm_problems[-3:])}
 
     def add_llm_forecast(self, market: Market, llm_result: Dict) -> ModelForecast:
         """
@@ -440,11 +463,21 @@ class EnsembleForecaster:
                 #
                 # `sentiment` is handed over as V3 built it; Brain accepts the
                 # dict or the structured object.
+                self.llm_asked += 1
                 llm_res = brain.estimate_fair_value(
                     market=market,
                     sentiment=context.get("sentiment"),
                     research_text=context.get("research") or "",
                 )
+                # Did the model produce the estimate, or did the heuristic ?
+                # The result says which: an answer carries the model id the
+                # server reported, a fallback does not.
+                if getattr(llm_res, "llm_model", ""):
+                    self.llm_answered += 1
+                else:
+                    problem = (getattr(llm_res, "raw", {}) or {}).get(
+                        "llm_problem") or "no answer was recorded for this market"
+                    self.llm_problems.append(str(problem))
                 forecasts.append(self.add_llm_forecast(market, {
                     "fair_value": llm_res.fair_value,
                     "confidence": llm_res.confidence,

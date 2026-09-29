@@ -40,7 +40,16 @@ class Vault:
     Secure vault for tool sign-ins - premium product feature
     Each teammate can sign in to tools, credentials stored locally encrypted
     """
-    def __init__(self, vault_path: str = "./data/vault.json", master_key: Optional[str] = None):
+    def __init__(self, vault_path: Optional[str] = None, master_key: Optional[str] = None):
+        # No hardcoded path: the vault lives beside the database this process is
+        # actually using (see Storage.default_data_dir). An explicit path still
+        # wins, which is what the agent passes.
+        if not vault_path:
+            try:
+                from ..storage.db import default_data_dir
+                vault_path = str(Path(default_data_dir()) / "vault.json")
+            except Exception:  # noqa: BLE001 - a vault path must not stop startup
+                vault_path = "./data/vault.json"
         self.vault_path = Path(vault_path)
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
         self.master_key = master_key or os.getenv("VAULT_MASTER_KEY", "ptai-local-vault-key-2024")

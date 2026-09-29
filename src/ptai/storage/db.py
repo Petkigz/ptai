@@ -223,6 +223,28 @@ def _execution_mode(value, status=None) -> str:
     return PAPER
 
 
+# Paths already announced in this process (see Storage.__init__).
+_LOGGED_DB_PATHS: set = set()
+
+
+def default_data_dir() -> str:
+    """
+    The folder the database and the vault both live in.
+
+    ONE resolver, for the same reason Storage has one. The agent put its vault
+    beside its database (data_dir/vault.json) while the console, the CLI and the
+    older loops each built `Vault()` with the hardcoded './data/vault.json'. With
+    PTAI_DB or PTAI_DATA_DIR set, a login saved in one surface was invisible to
+    the other - so \"I saved my login\" and \"the agent has no credentials\" were
+    both true. A saved login is the operator's ONLY touchpoint; it has to be one
+    file.
+    """
+    explicit = os.environ.get("PTAI_DATA_DIR")
+    if explicit:
+        return explicit
+    return str(Path(os.environ.get("PTAI_DB") or "./data/ptai.db").parent)
+
+
 class Storage:
     def __init__(self, db_path: Optional[str] = None):
         # ONE reader of the environment, in the one place every entry point goes
@@ -236,7 +258,19 @@ class Storage:
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
-        logger.info(f"Storage initialized at {self.db_path}")
+        # ONCE PER PATH PER PROCESS. The console used to build a Storage per
+        # HTTP request, so this line appeared 34 times in three seconds and the
+        # operator's log was mostly the console talking to itself. That specific
+        # bug is fixed, but the line is still the first thing to flood if any
+        # other code path builds one per call - so a repeat of the same path is
+        # DEBUG from now on, and the first open still says where the data is.
+        global _LOGGED_DB_PATHS
+        key = str(self.db_path)
+        if key in _LOGGED_DB_PATHS:
+            logger.debug(f"Storage opened again at {self.db_path}")
+        else:
+            _LOGGED_DB_PATHS.add(key)
+            logger.info(f"Storage initialized at {self.db_path}")
 
     # Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
     # does nothing on an existing database, so an older data/ptai.db keeps its

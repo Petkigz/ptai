@@ -113,7 +113,17 @@ class VenueRegistry:
         
         adapter = self.adapters.get(venue_id)
         if adapter:
-            logger.debug(f"Routing market {market.id} venue_id {venue_id} -> exact adapter {adapter.venue_id}")
+            # ONCE PER VENUE, not once per market. The operator's log was mostly
+            # this line repeated for all 899 markets - DEBUG is enabled on their
+            # machine, so a per-market fact buried the per-cycle facts. The first
+            # routing of a venue still says which exact adapter it went to, which
+            # is the evidence worth keeping; after that it is noise.
+            routed = self.__dict__.setdefault("_routed_venues", set())
+            if venue_id not in routed:
+                routed.add(venue_id)
+                logger.debug(f"Routing {venue_id} -> exact adapter "
+                             f"{adapter.venue_id} (first market: {market.id}); "
+                             f"every later market routes the same way silently")
             return adapter
         
         logger.error(f"Routing FAILED: market {market.id} venue_id {venue_id} not found in adapters {list(self.adapters.keys())} - ABORT, never fallback to first eligible")

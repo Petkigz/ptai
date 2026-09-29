@@ -577,6 +577,118 @@ console pointed at any other database asked a *different file* for the venue's
 balance. That is how a funded account gets reported as having nothing. It now
 uses the one Storage resolver every other entry point uses.
 
+### The Model Line Is A Record, Not A Plan
+
+> `Local model: qwen3.8-27b-... | NOT USED THIS CYCLE: 8 market(s) were sent to
+> the model but no answer was recorded`
+
+The router's own counter in that same cycle read **zero calls**. Both numbers
+came from the same dict, and the sentence was built from the wrong one: 8 was
+the deep shortlist - a plan the screen writes *before* pricing - and the line
+called it a record of sends. A run that used no model time said it had sent
+eight markets to a model, and blamed the model for the silence.
+
+Three fixes, because there were three defects:
+
+  * **the count moved to where the asking happens.** The forecast ensemble counts
+    a market when it actually calls the model, and reports whether the answer
+    came from the model or from the heuristic fallback. "Asked" and "shortlisted"
+    are now different keys, so the line cannot confuse them;
+  * **the line says which of three facts is true**: the model was asked and
+    answered (*"8 of 8 market(s) asked were answered"*), the model was asked and
+    nothing came back (*"...none was answered (APITimeoutError...)"*), or the
+    shortlist never reached the pricing stage (*"8 market(s) were chosen for deep
+    analysis but none of them reached the pricing stage this cycle, so the model
+    was never asked"*). A model that CHANGED between cycles is named with the
+    model it changed from, because the operator's log showed two different model
+    ids in one session with no line connecting them;
+  * **the starvation itself is fixed.** The screen and the scan each had their
+    own idea of which markets matter: the screen ranked on book quality and
+    depth, the scan took the top 100 per venue by volume. The operator's cycle
+    chose eight markets for deep analysis and the scan dropped every one at its
+    own cap - so no model time was spent at all, on a machine with a model
+    loaded. Both stages now call one method
+    (`markets_that_will_be_evaluated`), and the screen says how many markets the
+    cap will drop before pricing.
+
+The same cycle's per-market line claimed "*192 ranked below it*" for every one
+of 192 markets - a per-market ranking the screen never computed. It now says
+what the number is: how many markets were priced on their book alone this cycle.
+
+### A Price Is Not A Probability
+
+> `Best opportunity: predictit YES edge 0.093 | Will 0GUSDT close higher in 24h?`
+> `whitebit-ADA_PERP ... Executable: pay 0.748 -> -0.953 REFUSED: no executable
+> edge: fair 0.100 vs the 0.748 a share actually costs`
+> `whitebit-BCH_TRY ... spread 6300.0% = 6302.0% cost must exceed to break even`
+
+A crypto exchange quotes the price of a coin. `ADA_PERP at 0.748` is $0.748, not
+a 74.8% chance, and there is no Yes share to buy at that price - so a "spread"
+computed against a 0-1 probability is meaningless, which is where 6300% came
+from. The venue label was wrong the same way: the market is a Binance pair, and
+its venue was read from `market.source`, a three-value prediction enum, which
+printed "predictit" for a coin.
+
+  * the crypto adapters mark their markets **not a probability market**
+    (`raw["probability_market"] = False`), because that is a fact about the
+    instrument, not a preference;
+  * the screen and the venue scan refuse them with the reason in words - *"this
+    venue quotes PRICES, not probabilities, so there is no Yes share to buy and
+    no edge to compute"* - counted once per venue, and they stay visible in the
+    venue inventory;
+  * the WhiteBIT order book refuses **before it fetches anything**, with
+    `source: "not_a_probability_book"` and the actual quotes in its warning, so a
+    currency quote can never become a 0-1 spread again;
+  * `venue_id` on an opportunity comes from the market's own venue
+    (momentum, event trading, market making all changed), never from the
+    `MarketSource` enum.
+
+### One Line Per Fact
+
+> `Storage initialized at data\ptai.db` ... every fifteen seconds
+> `Portfolio from LOCAL STATE: balance $50.00 ...` ... every fifteen seconds
+> `Routing market 4052413 venue_id polymarket -> exact adapter polymarket` x899
+> `ERROR ... Could not read Polymarket credentials` ... in a PAPER run
+> `Mechanics for predictit-8544-33624 unreadable: AttributeError:
+>  'PredictItAdapter' object has no attribute 'get_mechanics'` ... per market
+
+Each of these is one fact printed many times, and together they buried the
+cycle's real messages:
+
+  * every hardcoded `Storage(db_path="./data/ptai.db")` is gone (dashboard, CLI,
+    the two old loops, the premium loop, the Polymarket adapter). One reader of
+    `PTAI_DB`; the vault now defaults to the database's own folder too, so a
+    login saved in the console is the file the agent reads. The "Storage
+    initialized" line prints **once per path per process** and is DEBUG after
+    that, whatever future code builds one per request;
+  * the LOCAL STATE portfolio line prints when the numbers **change**, not on
+    every poll;
+  * routing is printed once per venue (first market), not once per market;
+  * a paper process states plainly that credentials are not configured - at
+    INFO, with "this process is in PAPER mode, which needs no credentials". An
+    ERROR line for a working paper run reads like a broken agent;
+  * a venue that publishes no `get_mechanics` reader is not asked for one. The
+    fee falls back to its declared capability, exclusivity stays **unknown**
+    rather than guessed, and the venue is named **once**, at INFO.
+
+### A Save That Is Interrupted Leaves A Whole File
+
+> `Qualification load failed: Expecting value: line 507 column 18 (char 23042)`
+
+`_save()` opened `data/venue_qualification.json` with `"w"` - which truncates -
+and then streamed JSON into it, so a process stopped during a save left half a
+document. The load then failed, discarded the whole record, and left the broken
+file in place to fail again on every future cycle.
+
+  * writes go to a sibling temp file and are moved into place with
+    `os.replace`, so a reader sees the old complete file or the new complete
+    file and never a half one;
+  * one unreadable venue record no longer aborts the load for every other venue -
+    it is named and skipped, and that venue reads as "never measured";
+  * a load failure now **names the file**, says the consequence, and moves the
+    unreadable file aside as `venue_qualification.json.corrupt` so the record can
+    be rebuilt without losing the evidence.
+
 ### An Arbitrage Has To Be One
 
 The scan groups markets by event and adds up their YES prices, because in a group
