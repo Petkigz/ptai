@@ -481,6 +481,21 @@ it was requested, setting the interval to 2 minutes produced
 running loop, Stop released the lease with *"the operator pressed Stop"*, and a
 `main.py run` in another process was refused with the console's pid.
 
+### The Log Ring Survives Anything
+
+The page reads the agent's log through a ring buffer of the last 800 lines. That
+ring is a loguru sink, and `import ptai.cli` calls `logger.remove()` at import
+time (a CLI process wants a clean slate) - which takes every handler with it.
+After that, the ring never came back: the page showed an empty log with no
+explanation, permanently, and the next re-attach *cleared the buffer*, deleting
+the lines the operator was already reading. Found by a test that imported the CLI
+for a source assertion and then watched an unrelated page test fail.
+
+A read of the log now re-attaches the sink if it is gone, and keeps the buffered
+lines. A duplicate handler cannot arise on that path (`_add_sink` is only reached
+when no handler is flagged as the ring's), so there was never a reason to throw
+the history away.
+
 ### An Arbitrage Has To Be One
 
 The scan groups markets by event and adds up their YES prices, because in a group
@@ -661,6 +676,63 @@ Both fully local, no cloud. PTAI auto-detects:
 PTAI tries LM Studio first (1234) then Ollama (11434). Set `LLM_PROVIDER=auto` for auto-detect.
 
 See `README_LMSTUDIO.md` for detailed LM Studio setup.
+
+## Which Model Is Running
+
+The operator asked, after reading a whole run: *"the lm studio model id is
+nowhere to be found in any of these runs, whats happening, why is it not being
+used"*. All four holes were real:
+
+  * the startup line printed the **configured** value - `model=local-model`, the
+    placeholder - and the actual choice was made lazily inside the first model
+    call, where nothing printed it;
+  * `LMStudioProvider.chat()` logged nothing on success - no model id, no time;
+  * `LLMResponse.model`, the id the **server** says answered, was read nowhere in
+    the codebase;
+  * a market the model was never asked about logged
+    `Using fallback heuristic for {market.id}` with no reason and no model.
+
+The model id is now a named fact at every point where it is decided or used:
+
+    LOCAL MODEL: qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp (lm_studio at
+      http://localhost:1234/v1) - auto: picked ... because it is a fast model,
+      and deepseek-r1-distill-qwen-32b is R1-style (~minutes per market)
+    LM Studio answered with 'qwen3.8-27b-...' in 3.4s
+    LLM lm_studio ['qwen3.8-27b-...'] parsed JSON: fair=0.62 edge=0.02
+    Brain [LMStudioProvider/qwen3.8-27b-...]: Will the bill pass? | Market 60.0%
+      Fair 62.0% Edge +2.0% Conf 0.70 Trade? False | basis research
+    Local model: qwen3.8-27b-... (LMStudioProvider at http://localhost:1234/v1) -
+      auto: picked ... | 8 of 8 call(s) answered in 27.1s (qwen3.8-27b-... x8) |
+      model time went to 8 of 200 screened market(s); 192 priced on their
+      measured book alone
+
+The per-cycle line is printed by every cycle, including a cycle that discovered
+nothing and takes the early-return path. When the model did no work it says so
+and says why, with the endpoint:
+
+    Local model: none - no local model server answered (lm_studio
+      http://localhost:1234, ollama http://localhost:11434); markets are priced
+      without a model | NOT USED THIS CYCLE: no local model server answered, so
+      every market was priced without a model | model time went to 0 of 0
+      screened market(s); 0 priced on their measured book alone
+
+  * **One decision, three readers.** The router resolves the model once, at
+    detection, with `choose_loaded_model` - the same function the console's
+    Brain panel and the startup panel use - and the provider then calls *that*
+    id, so no surface can name a model the provider does not call. The startup
+    panel prints `LLM: auto -> <model> @ <endpoint>`, not just the preference.
+  * **Why the model may not be used**, stated per cycle: the server is not
+    answering; no model is loaded; every loaded model is R1-style; the market was
+    not in the cycle's deep shortlist (model time deliberately goes to a bounded
+    shortlist - see *Two-stage scan*); or every call failed, with the error.
+  * **The record carries it.** Each forecast result carries `llm_model`, the
+    ensemble's component row carries it (the console's forecast trace prints
+    `llm_reasoning <model-id>`), and the cycle report and the console's forecast
+    evidence carry the whole `local_model` block.
+  * **A dead server is probed on a leash.** Detection is retried once a minute
+    (the operator may start LM Studio mid-run) and reports the first miss in
+    full; the retries are DEBUG, so a whole scan no longer prints one "no model"
+    line per market.
 
 ## Extending to Other Sites
 

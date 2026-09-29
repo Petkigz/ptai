@@ -114,6 +114,11 @@ class FairValueResult:
     side: str = "YES"  # YES or NO
     raw: Dict = None
     llm_provider: str = "heuristic"
+    # WHICH model produced this answer. `llm_provider` was the provider CLASS
+    # ("LMStudioProvider"), and the model id was nowhere on the result - so a
+    # trade's record could not say whether a 27B model or a rule of thumb priced
+    # it, and neither the log nor the page could name it.
+    llm_model: str = ""
 
 @dataclass
 class _SentimentView:
@@ -185,6 +190,10 @@ class Brain:
         # A caller that already has one (the ensemble) passes it in, because a
         # detector per market can never see the repetition it exists to catch.
         self.answer_repetition = answer_repetition or AnswerRepetitionDetector()
+        # Set by _call_llm on every call: which model, and what went wrong when
+        # nothing came back.
+        self._last_llm_model = ""
+        self._last_llm_problem = ""
         # Initialize LLM Router (supports LM Studio, Ollama, etc)
         if self.llm_router is not None:
             # Supplied by the caller: use it as-is rather than building a second
@@ -196,7 +205,10 @@ class Brain:
                 name = self.llm_router.get_provider_name()
             except Exception:
                 name = type(self.llm_router).__name__
-            logger.info(f"Brain reusing the supplied LLM router ({name})")
+            # DEBUG, not INFO: the ensemble builds a Brain per market, so this
+            # printed once per market and buried the one line that matters -
+            # the router's LOCAL MODEL line, which names the model.
+            logger.debug(f"Brain reusing the supplied LLM router ({name})")
             return
         try:
             from ..llm.provider import LLMRouter
@@ -291,14 +303,29 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
         return system_prompt, user_prompt
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> Optional[Dict]:
-        """Call LLM via router (supports LM Studio, Ollama)"""
+        """
+        Call the local model through the router, and say WHICH model answered.
+
+        `self._last_llm_model` and `self._last_llm_problem` are set here so the
+        caller can name the model in its own line and, when no answer came back,
+        say why - "Using fallback heuristic" with no reason was how a whole
+        cycle of model timeouts could read like a working heuristic system.
+        """
+        self._last_llm_model = ""
+        self._last_llm_problem = ""
         if not self.llm_router:
+            self._last_llm_problem = "no model router is configured for this process"
             return None
 
         try:
             response = self.llm_router.chat(prompt=user_prompt, system=system_prompt)
+            if response is not None:
+                self._last_llm_model = getattr(response, "model", "") or ""
             if response and response.parsed_json:
-                logger.info(f"LLM {response.provider} parsed JSON: fair={response.parsed_json.get('fair_value')} edge={response.parsed_json.get('edge')}")
+                logger.info(
+                    f"LLM {response.provider} ['{self._last_llm_model}'] parsed "
+                    f"JSON: fair={response.parsed_json.get('fair_value')} "
+                    f"edge={response.parsed_json.get('edge')}")
                 return response.parsed_json
             elif response:
                 # Try to extract JSON from content
@@ -311,11 +338,56 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
                         return json.loads(json_match.group())
                     except:
                         pass
-                logger.warning(f"LLM {response.provider} returned no JSON: {content[:500]}")
+                logger.warning(
+                    f"LLM {response.provider} ['{self._last_llm_model}'] returned "
+                    f"no JSON: {content[:500]}")
+                self._last_llm_problem = (
+                    f"'{self._last_llm_model}' answered, but its answer had no "
+                    f"usable JSON")
+            else:
+                self._last_llm_problem = self._model_failure_reason()
             return None
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
+            self._last_llm_problem = f"the model call failed ({type(e).__name__}: {e})"
+            logger.error(f"LLM call failed: {type(e).__name__}: {e}")
             return None
+
+    def _model_failure_reason(self) -> str:
+        """Why no model answer arrived - with the model id and the last error."""
+        usage = {}
+        try:
+            usage = self.llm_router.usage_report()
+        except Exception:  # noqa: BLE001 - a router that cannot report still has to be described
+            usage = {}
+        model = (usage.get("last_model") or self._last_llm_model
+                 or (self.llm_router.active_model if hasattr(self.llm_router, "active_model") else "")
+                 or "no model")
+        error = usage.get("last_error") or ""
+        if not getattr(self, "llm_router", None) or not hasattr(self.llm_router, "is_available"):
+            return f"'{model}' produced no answer"
+        try:
+            available = bool(self.llm_router.is_available())
+        except Exception:  # noqa: BLE001
+            available = False
+        if not available:
+            # Name WHERE the server is not answering: "no model" plus the
+            # endpoint is the fact the operator can act on (start the server),
+            # and the verdict sentence is left for the startup line.
+            hosts = []
+            for attr in ("lm_studio_host", "ollama_host"):
+                host = getattr(self.llm_router, attr, "")
+                if host:
+                    hosts.append(str(host))
+            where = (" / ".join(hosts) if hosts
+                     else (self.llm_router.active_model_reason
+                           if hasattr(self.llm_router, "active_model_reason")
+                           else "no endpoint recorded"))
+            which = f"'{model}'" if model and model != "no model" else "no model"
+            return (f"no local model server is answering at {where}, so {which} "
+                    f"was called; every market is priced by the rule-based fallback")
+        if error:
+            return f"'{model}' gave no answer ({error})"
+        return f"'{model}' gave no answer"
 
     def _fallback_heuristic(self, market: Market, sentiment: Optional[SentimentResult]) -> FairValueResult:
         """
@@ -426,6 +498,7 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
                     reasoning = f"ANCHORED ANSWER (no weight): {anchored} | {reasoning}"
 
                 provider_name = self.llm_router.get_provider_name() if self.llm_router else "unknown"
+                model_name = self._last_llm_model or self.llm_provider_model()
 
                 result = FairValueResult(
                     market_id=market.id,
@@ -443,10 +516,11 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
                          "anchored": bool(anchored),
                          "anchoring_reason": anchored or "",
                          "basis": llm_result.get("basis", "")},
-                    llm_provider=provider_name
+                    llm_provider=provider_name,
+                    llm_model=model_name,
                 )
                 logger.info(
-                    f"Brain [{provider_name}]: {market.question[:60]} | "
+                    f"Brain [{provider_name}/{model_name or '?'}]: {market.question[:60]} | "
                     f"Market {market_price:.1%} Fair {fair_value:.1%} "
                     f"Edge {edge:+.1%} Conf {confidence:.2f} "
                     f"Trade? {should_trade}"
@@ -458,8 +532,25 @@ Rules: fair 0.01-0.99; side YES if fair>YES price else NO; if unsure, fair~YES p
             except Exception as e:
                 logger.error(f"Failed to parse LLM result {llm_result}: {e}")
 
-        logger.warning(f"Using fallback heuristic for {market.id}")
+        why = self._last_llm_problem or "the local model gave no usable answer"
+        logger.warning(f"Using fallback heuristic for {market.id}: {why}")
         return self._fallback_heuristic(market, sentiment)
+
+    def llm_provider_model(self) -> str:
+        """
+        The model id this process will call, from the router if it can say.
+
+        The startup lines already name it; this is for a result that has to
+        carry it even when the answer did not come back.
+        """
+        try:
+            model = getattr(self.llm_router, "active_model", None)
+            if model:
+                return str(model)
+            provider = getattr(self.llm_router, "provider", None)
+            return str(getattr(provider, "model", "") or "")
+        except Exception:  # noqa: BLE001 - naming the model must never raise
+            return ""
 
     def anchoring_report(self) -> Dict[str, Any]:
         """How many answers this process refused as repetitions, and why."""

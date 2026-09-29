@@ -115,9 +115,19 @@ def install(level: str = "INFO") -> bool:
     if state.installed and _sink_is_attached():
         return False
     if state.installed:
-        # Our sink is gone (something called logger.remove()). Start the ring
-        # again rather than appending to a buffer the sink can no longer reach.
-        state.buffer.clear()
+        # Our sink is gone: something called `logger.remove()`, which is what
+        # `import ptai.cli` does at import time. Re-attach and KEEP the buffer.
+        #
+        # It used to clear the buffer here, on the theory that a re-attach
+        # could duplicate lines. It cannot: `_add_sink` is only reached when no
+        # handler is flagged as ours, so there is never a second ring sink.
+        # What clearing did do was delete the lines the operator was reading -
+        # a page that silently loses its log the moment the CLI is imported in
+        # the same process is exactly the "things are missing" complaint this
+        # module exists to answer.
+        logger.debug(
+            f"Log ring re-attaching after the sink was removed; keeping "
+            f"{len(state.buffer)} buffered line(s)")
     try:
         _add_sink(level)
         return True
@@ -131,7 +141,12 @@ def tail(after: int = 0, limit: int = 200) -> Dict[str, Any]:
 
     `after=0` returns the most recent `limit` lines: the page's first paint wants
     the tail, not the beginning of the buffer.
+
+    A READ also re-attaches the sink when it is gone, so the page can never end
+    up showing an empty log because some library - `ptai.cli` does it on import -
+    called `logger.remove()` in this process.
     """
+    install()
     try:
         wanted = max(1, min(int(limit), MAX_LINES))
     except (TypeError, ValueError):

@@ -1819,6 +1819,13 @@ class TradingAgentV3:
         # carried over from the previous cycle: a fee schedule that changed
         # must not be traded on this cycle's stale copy.
         self._arb_facts_cache = {}
+        # ...and a fresh count of what the local model did, so "this cycle
+        # called qwen 8 times and 8 answers came back" is a statement about
+        # this cycle rather than about the process's lifetime.
+        try:
+            self.llm_router.reset_usage()
+        except Exception as e:  # noqa: BLE001 - counting must not stop a cycle
+            logger.debug(f"Could not reset the model call count: {e}")
         # Hand the console the venue list it cannot build for itself. The .bat
         # starts the agent and the console as two processes, so the console has
         # no registry to read and used to fall back to "the fundable venues" -
@@ -2092,6 +2099,10 @@ class TradingAgentV3:
                              "nothing was priced on a model opinion either"),
             }
             self._store_forecast_evidence([])
+            # A cycle that discovered nothing still says which model it had and
+            # why the model did no work - "nowhere to be found in any of these
+            # runs" is exactly what an early-returning cycle used to look like.
+            logger.info(self._local_model_line())
             # A round that found nothing still closes: the book from earlier
             # rounds is marked, so the operator sees the account value either
             # way instead of a button that reports only that it was quiet.
@@ -2160,6 +2171,7 @@ class TradingAgentV3:
                                   "screened_out": 0,
                                   "criteria": "no market was discovered, so no "
                                               "screen ran"},
+                "local_model": self._local_model_status(),
                 "betting": {
                     "ok": bool(sports_block.get("opportunities")),
                     "events": sports_block.get("opportunities") and None or 0,
@@ -2284,6 +2296,12 @@ class TradingAgentV3:
             fee_rate_lookup=self._arb_fee_rate,
         )
         logger.info(f"Common scoring: {len(scan_result.venue_reports)} venues, {scan_result.total_candidates} candidates, {scan_result.total_tradeable} tradeable after fees/liquidity/uncertainty")
+        # WHICH model worked this cycle, and what it did. The operator went
+        # looking for their LM Studio model id in the log and found it nowhere:
+        # the only startup line named the CONFIGURED value (the "local-model"
+        # placeholder), the per-forecast line named the provider CLASS, and a
+        # market the model never saw was indistinguishable from one it priced.
+        logger.info(self._local_model_line())
         # WHY nothing traded. A cycle that refused everything used to look
         # identical to a cycle that found nothing, which is how a resolution
         # rule blocking a whole category stayed invisible for a week.
@@ -3064,6 +3082,8 @@ class TradingAgentV3:
             "strategy_breakdown": scan_result.strategy_breakdown,
             # Where the cycle's model time went, and what it did not look at.
             "deep_analysis": screen or getattr(self, "_screen", {}),
+            # WHICH local model, and what it did, this cycle.
+            "local_model": self._local_model_status(),
             # Whether the base-rate component had real counted frequencies this
             # cycle, and from how many resolved markets.
             "base_rates": (self.base_rates.status() if self.base_rates is not None
@@ -4636,6 +4656,10 @@ class TradingAgentV3:
             self.storage.set_state("intelligence.last_forecast_evidence", json.dumps({
                 "at": datetime.now(timezone.utc).isoformat(),
                 "deep_analysis": getattr(self, "_screen", {}) or {},
+                # Which model was asked, which answered, and what it was not
+                # asked to look at - the same dict the cycle's log line is
+                # printed from.
+                "local_model": self._local_model_status(),
                 "base_rates": (self.base_rates.status()
                                if self.base_rates is not None else {"available": False}),
                 "base_rate_refresh": self._base_rate_refresh,
@@ -4660,6 +4684,95 @@ class TradingAgentV3:
                          "explain": (opp.raw or {}).get("explain", ""),
                          "components": (opp.raw or {}).get("components", [])})
         return rows
+
+    def _local_model_status(self) -> Dict[str, Any]:
+        """
+        What the local model is, and what it did this cycle.
+
+        One dict, read by the cycle's log line, by the console's forecast
+        evidence and by the cycle report, so the three cannot describe the same
+        cycle differently. Everything is read from the router that actually made
+        the calls - never from settings, which name what was ASKED for.
+        """
+        router = getattr(self, "llm_router", None)
+        status: Dict[str, Any] = {
+            "available": False, "model": "", "provider": "", "where": "",
+            "reason": "", "describe": "", "calls": 0, "answered": 0, "failed": 0,
+            "seconds": 0.0, "models": {}, "last_error": "", "used": False,
+            "not_used_reason": "",
+        }
+        screen = getattr(self, "_screen", None) or {}
+        status["considered"] = int(screen.get("considered") or 0)
+        status["deep_shortlist"] = len(screen.get("shortlist") or [])
+        status["priced_without_model"] = int(screen.get("screened_out") or 0)
+        if router is None:
+            status["not_used_reason"] = "this agent was built without a model router"
+            status["describe"] = "none"
+            return status
+        try:
+            status["describe"] = router.describe()
+        except Exception as e:  # noqa: BLE001
+            status["describe"] = f"unknown ({type(e).__name__}: {e})"
+        status["provider"] = router.get_provider_name() if hasattr(router, "get_provider_name") else ""
+        status["model"] = str(getattr(router, "active_model", "") or "")
+        status["reason"] = str(getattr(router, "active_model_reason", "") or "")
+        provider = getattr(router, "provider", None)
+        if provider is not None:
+            status["where"] = str(getattr(provider, "base_url", None)
+                                  or getattr(provider, "host", "") or "")
+            if not status["model"]:
+                status["model"] = str(getattr(provider, "model", "") or "")
+        status["available"] = bool(provider is not None and status["model"])
+        try:
+            usage = router.usage_report()
+        except Exception:  # noqa: BLE001 - a router that cannot report is still described
+            usage = {}
+        status["calls"] = int(usage.get("calls", 0) or 0)
+        status["answered"] = int(usage.get("answered", 0) or 0)
+        status["failed"] = int(usage.get("failed", 0) or 0)
+        status["seconds"] = float(usage.get("seconds", 0.0) or 0.0)
+        status["models"] = dict(usage.get("models", {}) or {})
+        status["last_error"] = str(usage.get("last_error", "") or "")
+        status["used"] = status["answered"] > 0
+        if not status["used"]:
+            if not status["available"]:
+                status["not_used_reason"] = (
+                    "no local model server answered, so every market was priced "
+                    "without a model")
+            elif status["calls"] and not status["answered"]:
+                why = status["last_error"] or "no reason recorded"
+                status["not_used_reason"] = f"every model call failed ({why})"
+            elif status["deep_shortlist"] == 0:
+                status["not_used_reason"] = (
+                    f"no market reached the deep shortlist this cycle "
+                    f"({status['considered']} market(s) considered), so the model "
+                    f"was never asked")
+            else:
+                status["not_used_reason"] = (
+                    f"{status['deep_shortlist']} market(s) were sent to the model "
+                    f"but no answer was recorded")
+        return status
+
+    def _local_model_line(self) -> str:
+        """The cycle's model line, from the status dict. Never raises."""
+        try:
+            status = self._local_model_status()
+        except Exception as e:  # noqa: BLE001 - reporting must not stop a cycle
+            return f"Local model: unknown - could not be read ({type(e).__name__}: {e})"
+        ids = ", ".join(f"{k} x{v}" for k, v in (status["models"] or {}).items())
+        line = f"Local model: {status['describe']}"
+        if status["calls"] or status["answered"]:
+            line += (f" | {status['answered']} of {status['calls']} call(s) answered "
+                     f"in {status['seconds']:.1f}s"
+                     + (f" ({ids})" if ids else ""))
+        if not status["used"]:
+            line += f" | NOT USED THIS CYCLE: {status['not_used_reason']}"
+        line += (f" | model time went to {status['deep_shortlist']} of "
+                 f"{status['considered']} screened market(s); "
+                 f"{status['priced_without_model']} priced on their measured book alone")
+        if status["failed"] and status["last_error"]:
+            line += f" | last failure: {status['last_error']}"
+        return line
 
     def _record_scan_log(self, result: Dict[str, Any], *, markets_scanned: int,
                          opportunities_found: int, avg_edge: float) -> None:

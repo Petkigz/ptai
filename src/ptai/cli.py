@@ -400,13 +400,33 @@ def run(
         logger.warning(f"Could not read the saved interval: {type(e).__name__}: {e}")
         _interval = {"minutes": interval or 10, "source": "the command line"}
 
+    # WHICH model, not just which provider was asked for. The panel used to
+    # print "LLM: auto (LM Studio http://localhost:1234)" - the preference and the
+    # host, never the model id, which is why the operator could read a whole run
+    # and not find their model anywhere. Same decision function the agent's
+    # router uses, so the panel cannot name a different model than the one the
+    # process will call.
+    local_model_line = f"LLM: {llm} -> no model answering ({settings.lm_studio_host})"
+    try:
+        from .llm.provider import probe_local_model
+        _local = probe_local_model(settings.lm_studio_host,
+                                   settings.lm_studio_model)
+        if _local.get("model"):
+            local_model_line = (f"LLM: {llm} -> {_local['model']} "
+                                f"@ {_local['where']}")
+        else:
+            local_model_line = (f"LLM: {llm} -> {_local.get('reason') or 'no model'}")
+    except Exception as e:  # noqa: BLE001 - a probe must not stop the run
+        local_model_line = (f"LLM: {llm} -> could not be probed "
+                            f"({type(e).__name__}: {e})")
+
     console.print(Panel(
         f"[bold]Bankroll: ${bankroll or settings.bankroll}\n"
         f"Interval: {_interval['minutes']}min ({_interval['source']})\n"
         f"Dry Run: {dry_run}\n"
         f"Country: {country}\n"
         f"Headless: {headless}\n"
-        f"LLM: {llm} (LM Studio {settings.lm_studio_host} / Ollama {settings.ollama_host})\n"
+        f"{local_model_line}\n"
         f"Objective: grow capital under a risk budget[/bold]",
         title="PTAI Autonomous Agent"
     ))

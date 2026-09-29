@@ -161,6 +161,8 @@ class EnsembleForecaster:
                 conf = min(float(conf), 0.4)
                 reasoning = f"[NOT AN LLM ANSWER - provider={provider or 'none'}] {reasoning}"
 
+            model_id = (llm_result.get("llm_model", "") if isinstance(llm_result, dict)
+                        else getattr(llm_result, "llm_model", "")) or ""
             anchored = bool(llm_result.get("anchored", False)
                             if isinstance(llm_result, dict) else False)
             basis = (llm_result.get("basis", "") if isinstance(llm_result, dict)
@@ -173,7 +175,11 @@ class EnsembleForecaster:
                 confidence=float(conf),
                 uncertainty=1.0 - float(conf),
                 reasoning=reasoning[:500],
-                sources=["lm_studio", "local_llm"],
+                # The actual id, plus the provider, so the trace can print
+                # "llm_reasoning (lm_studio: qwen2.5-14b-instruct)".
+                sources=[str(provider or "local_llm"),
+                         f"{provider}:{model_id}" if model_id else "local_llm"],
+                model_id=str(model_id),
                 anchored=anchored,
             )
         except Exception as e:
@@ -237,6 +243,10 @@ class EnsembleForecaster:
                 note = "weighted to zero"
             component_rows.append({
                 "model": f.model_name,
+                # The id that answered, when there is one: the row is what the
+                # console's forecast trace prints, and "llm_reasoning" alone
+                # named the weight, never the model.
+                "model_id": getattr(f, "model_id", "") or "",
                 "probability": round(float(f.probability), 4),
                 "confidence": round(float(f.confidence), 4),
                 "uncertainty": round(float(f.uncertainty), 4),
@@ -442,6 +452,9 @@ class EnsembleForecaster:
                     # Carried through, or the ensemble cannot tell an LLM answer
                     # from a heuristic one.
                     "llm_provider": getattr(llm_res, "llm_provider", ""),
+                    # ...and which model answered, so the component row and the
+                    # console's trace can name it.
+                    "llm_model": getattr(llm_res, "llm_model", ""),
                     # ...and whether the answer was a repeated one, so it can be
                     # shown as such instead of as a confident forecast.
                     "anchored": bool((llm_res.raw or {}).get("anchored", False)),

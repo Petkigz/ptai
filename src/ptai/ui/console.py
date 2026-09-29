@@ -2923,7 +2923,12 @@ async function runCycle(){
         ${(sp.blockers||[]).length
           ? 'Why: '+(sp.blockers||[]).map(b=>esc(b)).join(' &middot; ')
           : 'The lane prices fixtures but only bets where it has its own view and a price to beat, and it only settles on a result a feed reported.'}</div>`;
+  const lm = body.local_model || {};
   $('cycleOut').innerHTML = `
+    ${lm.describe ? `<div class="note">Local model: ${esc(lm.describe)}
+        ${lm.used
+          ? `&middot; ${lm.answered||0} of ${lm.calls||0} call(s) answered`
+          : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}</div>` : ''}
     ${body.deep_analysis && body.deep_analysis.considered
       ? `<div class="note">Model time: ${((body.deep_analysis.shortlist)||[]).length}
           of ${body.deep_analysis.considered} market(s) deep-analysed
@@ -3072,6 +3077,14 @@ async function loadForecast(){
   const br = body.base_rates || {};
   const rows = body.pricing || [];
 
+  const lm = body.local_model || {};
+  const modelLine = lm.describe
+    ? `<div class="note">Local model: <b>${esc(lm.model || lm.describe)}</b>
+        ${lm.used
+          ? `&middot; ${lm.answered||0} of ${lm.calls||0} call(s) answered in
+             ${(lm.seconds||0).toFixed ? (lm.seconds||0).toFixed(1) : lm.seconds}s`
+          : `&middot; <b>NOT USED</b>: ${esc(lm.not_used_reason||'no reason recorded')}`}</div>`
+    : '';
   const screenLine = screen.considered
     ? `<div class="note">Model time went to <b>${(screen.shortlist||[]).length}</b>
         of ${screen.considered} market(s) this cycle (limit ${screen.limit||'?'},
@@ -3088,7 +3101,8 @@ async function loadForecast(){
 
   const trace = rows.length ? rows.map(r => {
     const comps = (r.components||[]).map(c => `
-      <tr><td class="mono">${esc(c.model)}</td>
+      <tr><td class="mono">${esc(c.model)}${c.model_id
+            ? `<span style="opacity:.6"> ${esc(c.model_id)}</span>` : ''}</td>
           <td class="mono">${Number(c.probability).toFixed(3)}</td>
           <td class="mono">${Number(c.confidence).toFixed(2)}</td>
           <td class="mono">${c.contributes
@@ -3105,7 +3119,7 @@ async function loadForecast(){
       cycle, so there is no chain to show. That is a statement about discovery,
       not about the models.</div>`;
 
-  $('forecast').innerHTML = screenLine + baseLine
+  $('forecast').innerHTML = modelLine + screenLine + baseLine
     + `<div class="note" style="margin:7px 0 11px">${esc(screen.criteria||'')}</div>`
     + trace;
 }

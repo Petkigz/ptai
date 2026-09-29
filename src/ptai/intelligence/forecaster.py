@@ -20,6 +20,11 @@ class ModelForecast:
     reasoning: str
     sources: List[str]
     timestamp: datetime = None
+    # WHICH model, by id, answered - "" for every component that is not a model
+    # call. The trace used to name this component "llm_reasoning" and nothing
+    # else, so the page and the log could not say whether a 27B local model or a
+    # rule of thumb produced the number wearing the LLM's weight.
+    model_id: str = ""
     # Set when the LLM's answer was caught repeating itself across materially
     # different markets. The flag rides with the component so the trace can say
     # "this is the answer the prompt was echoing" rather than showing a
