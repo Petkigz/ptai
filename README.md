@@ -1260,6 +1260,66 @@ trade (2.38 shares at 0.42, $1.00), records the position, and the round reports
 -$0.05 is the book at current prices (marked, not settled)`. A model that agrees
 with the market trades nothing and never reaches the venue.
 
+## The Model Meets The Markets That Can Actually Be Priced
+
+Your 2026-09-29 19:30 and 19:43 cycles, verbatim from your console:
+
+```
+Cheap screen: 200 market(s) read in 38.7s, 2 chosen for deep analysis (limit 8);
+  57 had no venue book; 100 sit below their venue's own per-venue cap
+1 of the 2 deep market(s) were refused before a forecast was built
+Local model: ... markets asked: 1
+closest: 2772194 - model 0.046 against the 0.002 mid, +0.043 a share after every
+  cash cost (conservative +0.008) - refused: Mispricing 0.044 < 8% threshold
+Final selected 0 trades
+```
+
+Two hundred markets read, a deep budget of eight, and the model was asked about
+**one**. The round could not have traded: even a perfect funnel would have found
+that best candidate 4.4% mispriced, under the 5% paper bar. But the funnel was
+starving on its own, for two reasons that are now fixed.
+
+**The per-venue cap was eating the deep budget.** The screen chooses on book
+quality (does this market have a validated two-sided book?). The venue scan caps
+on volume, and it applied that cap *before* any book was known. So the 100
+slots went to markets whose books the venue then refused - the same cycle shows
+69 CLOB order-book refusals - and the shortlist could only draw from the handful
+of priceable markets that happened to sit inside the volume top-100. Two chosen
+out of two hundred.
+
+* The cap now applies to markets that can actually be priced: a market with no
+  validated book cannot consume a pricing slot it would only be refused from.
+* The screen's shortlist is priced **first**. The two stages used to disagree
+  about which markets matter (book quality vs. volume); now the markets given
+  model time are the markets the scan reaches first, and the rest of the
+  eligible list fills the remaining slots.
+
+**The screen's own arithmetic did not add up.** The line named chosen, no-book
+and below-cap; 41 of the 200 markets in your 19:33 cycle vanished from it. Every
+market read now falls into exactly one of four buckets - chosen for deep
+analysis, below the scan's per-venue cap, refused by the screen itself, or
+priceable but not shortlisted - and the console's screen panel shows all four
+plus `unaccounted`, which is zero when the numbers are honest. You read this
+line to answer "how long do I have to run this", so it has to add up.
+
+**Verified**, on a 200-market venue built to your log's shape - the top 100 by
+volume have no usable book, the rest price fine:
+
+```
+screen    considered 200 | priceable 100 | refused_at_screen 100 |
+          dropped_by_scan 0 | priceable_not_shortlisted 92 | unaccounted 0 |
+          shortlist 8
+model     asked 8 | answered_by_model 8 | calls 8 | deep priced 8
+result    PAPER/EXPLORATION pm100 YES $1.00 -> ROUND 50.00 -> 49.95 = -0.05,
+          1 opened, 1 held
+```
+
+Before the fix the same scenario asked the model about two markets and priced
+one; now the whole deep budget is spent on markets that have a real book. The
+bar is unchanged: this restores the opportunity flow, it does not lower what
+counts as an edge. A market that is genuinely 4.4% mispriced is still refused,
+and says so.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

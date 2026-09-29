@@ -264,6 +264,96 @@ class TestThePaperLaneTrades:
         assert closest["refusal"]
 
 
+class _FunnelVenue(_StubVenue):
+    """
+    200 markets, and only the lower-volume half has a usable book.
+
+    This is the shape of the operator's 2026-09-29 19:33 cycle: the volume
+    leaders were the multi-outcome markets whose CLOB books the venue refused
+    (69 rejections, 98 with no book at all), while the mid-volume markets priced
+    fine.
+    """
+
+    BOOKLESS = 100
+
+    async def discover_markets(self, target_count=200):
+        out = []
+        for i in range(200):
+            market = _market(i)
+            # volume descends with i, so pm0..pm99 are the volume leaders
+            market.volume_24h = float(200_000 - i * 900)
+            out.append(market)
+        return out
+
+    async def get_orderbook(self, market):
+        index = int(str(market.id).replace("pm", ""))
+        if index < self.BOOKLESS:
+            return {"market_id": market.id, "venue_id": "polymarket",
+                    "bids": [], "asks": [], "is_real": False,
+                    "validated": False, "source": "clob",
+                    "validation": {"identity": "no usable levels"}}
+        return _book(index)
+
+
+# ---------------------------------------------------------------------------
+# 3. model time goes to the markets the venue can actually price
+# ---------------------------------------------------------------------------
+
+class TestTheModelTimeGoesToPriceableMarkets:
+    def _run(self, tmp_path, monkeypatch, fair: float = 0.55):
+        monkeypatch.setenv("PTAI_DB", str(tmp_path / "ptai.db"))
+        monkeypatch.setenv("LM_STUDIO_HOST", "http://127.0.0.1:9")
+        monkeypatch.delenv("LM_STUDIO_MODEL", raising=False)
+        agent = TradingAgentV3(country_code="UG", dry_run=True)
+        agent.venue_registry.adapters = {"polymarket": _FunnelVenue()}
+        agent.venue_registry._routed_venues = set()
+        router = _StubRouter(fair)
+        agent.llm_router = router
+        agent.ensemble_forecaster.llm_router = router
+        if getattr(agent, "brain", None) is not None:
+            agent.brain.llm_router = router
+        if getattr(agent, "fair_value_engine", None) is not None:
+            agent.fair_value_engine.llm_router = router
+        result = asyncio.run(agent.run_cycle(target_per_venue=200, max_trades=3))
+        return agent, result
+
+    def test_a_bookless_volume_leader_does_not_eat_a_pricing_slot(
+            self, tmp_path, monkeypatch):
+        agent, _result = self._run(tmp_path, monkeypatch)
+        screen = agent._screen or {}
+        # The screen read 200, and the four kinds of outcome add up to 200:
+        # chosen 8, below the scan's cap 0, refused here 100 (no usable book),
+        # priceable but not shortlisted 92.
+        assert screen.get("considered") == 200
+        assert screen.get("refused_at_screen") == 100
+        assert screen.get("dropped_by_scan") == 0
+        assert screen.get("unaccounted") == 0, (
+            "every market the screen read must be accounted for - the operator "
+            "reads these numbers to answer 'how long do I have to run this'")
+
+    def test_the_shortlist_uses_the_deep_budget_and_the_model_is_called(
+            self, tmp_path, monkeypatch):
+        agent, result = self._run(tmp_path, monkeypatch)
+        status = result.get("local_model") or {}
+        assert agent._screen.get("shortlist"), "nothing was shortlisted"
+        assert len(agent._screen["shortlist"]) == agent.deep_analysis_limit, (
+            "the deep budget is 8 and 100 markets had a validated book; a "
+            "shortlist of 1-2 is the funnel defect that produced no trades")
+        assert status.get("asked") >= len(agent._screen["shortlist"]), (
+            "the markets given model time must be the markets handed to the "
+            "model")
+        assert status.get("answered_by_model") >= 1
+        assert status.get("deep_priced") >= len(agent._screen["shortlist"])
+
+    def test_the_round_trades_because_the_model_was_asked(
+            self, tmp_path, monkeypatch):
+        _agent, result = self._run(tmp_path, monkeypatch)
+        round_dict = result["round"]
+        assert round_dict["positions_opened"] == 1
+        assert len(round_dict["trades"]) == 1
+        assert round_dict["net_usd"] < 0  # the spread paid, marked
+
+
 # ---------------------------------------------------------------------------
 # 2. the lane has a bar: no disagreement, no trade
 # ---------------------------------------------------------------------------

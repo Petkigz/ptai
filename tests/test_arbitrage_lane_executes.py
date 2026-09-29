@@ -94,10 +94,12 @@ def _inject_pair(agent, monkeypatch, arb) -> None:
 
     async def scan_all_venues(self, markets_by_venue, context_provider=None,
                               max_final_trades=3, book_lookup=None,
-                              fee_rate_lookup=None):
-        # The real scan now also takes the cycle's books and the venue fee
-        # rates (an arbitrage is only an arbitrage at executable prices); this
-        # double has to accept the same signature it stands in for.
+                              fee_rate_lookup=None, **kwargs):
+        # The real scan now also takes the cycle's books, the venue fee rates
+        # (an arbitrage is only an arbitrage at executable prices) and the
+        # markets the deep budget must price first; this double has to accept
+        # the same call it stands in for. **kwargs keeps this double standing
+        # in for the signature as it grows, instead of pinning yesterday's.
         return result
 
     monkeypatch.setattr(type(agent.strategy_engine_v3), "scan_all_venues",

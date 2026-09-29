@@ -456,8 +456,19 @@ class StrategyEngineV3:
         return opportunities
 
     async def scan_venue(self, venue_id: str, markets: List[Market], context_provider=None,
-                         book_lookup=None) -> VenueScanReport:
-        """Scan single venue with all strategies"""
+                         book_lookup=None,
+                         must_price: Optional[set] = None) -> VenueScanReport:
+        """
+        Scan single venue with all strategies.
+
+        `must_price` is the screen's shortlist: the markets this cycle has
+        already given model time to because they have a validated book. They are
+        priced FIRST, and the rest of the eligible list fills the remaining
+        slots. Without it the two stages disagreed in practice: the screen
+        chooses on book quality, the scan caps on volume, and the cap was
+        applied before the books were known - so on 2026-09-29 19:33 the model
+        was asked about ONE market out of 900 while 74 had a validated book.
+        """
         start_total = len(markets)
         
         after_cheap = self.cheap_filters(markets)
@@ -485,7 +496,16 @@ class StrategyEngineV3:
         priced_records: List[Dict[str, Any]] = []
         skipped_no_book = 0
         evaluated = 0
-        for market in after_liquidity[:self.evaluate_limit]:  # per-venue cap
+        # THE MARKETS GIVEN MODEL TIME ARE THE ONES PRICED FIRST, then the
+        # venue's own cap decides the rest. Both stages now target one set.
+        _must = {str(x) for x in (must_price or set())}
+        if _must:
+            _priority = [m for m in after_liquidity if str(m.id) in _must]
+            _rest = [m for m in after_liquidity if str(m.id) not in _must]
+            to_price = (_priority + _rest)[:self.evaluate_limit]
+        else:
+            to_price = after_liquidity[:self.evaluate_limit]
+        for market in to_price:  # per-venue cap
             # A market whose book is not real cannot produce a cost or an edge.
             # The operator's 2026-09-29 log ran every one of them through the
             # whole stack - resolution analysis, contradiction, forecaster,
@@ -611,7 +631,7 @@ class StrategyEngineV3:
             evaluated=evaluated,
             skipped_no_book=skipped_no_book,
             # everything the scan read but never iterated because of the cap
-            beyond_cap=max(0, len(after_liquidity) - self.evaluate_limit),
+            beyond_cap=max(0, len(after_liquidity) - len(to_price)),
         ), all_opps
 
     def price_opportunity(self, opp: VenueOpportunity,
@@ -675,7 +695,8 @@ class StrategyEngineV3:
 
     async def scan_all_venues(self, markets_by_venue: Dict[str, List[Market]], context_provider=None,
                               max_final_trades: int = 3,
-                              book_lookup=None, fee_rate_lookup=None) -> MultiVenueScanResult:
+                              book_lookup=None, fee_rate_lookup=None,
+                              must_price: Optional[set] = None) -> MultiVenueScanResult:
         """
         Main V3 entry: scan all venues, evaluate all strategies, rank on common basis
         Returns report like:
@@ -698,7 +719,7 @@ class StrategyEngineV3:
             try:
                 report, opps = await self.scan_venue(
                     venue_id, markets, context_provider=context_provider,
-                    book_lookup=book_lookup)
+                    book_lookup=book_lookup, must_price=must_price)
                 venue_reports.append(report)
                 all_opportunities.extend(opps)
                 # ...and the paper candidates, which travel on the report: they

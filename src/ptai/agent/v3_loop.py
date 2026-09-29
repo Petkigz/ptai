@@ -1061,17 +1061,6 @@ class TradingAgentV3:
                       (market.raw or {}).get("venue") or
                       getattr(market, "source", "unknown") or "unknown").lower()
             by_venue.setdefault(key, []).append(market)
-        will_evaluate = set()
-        engine = self.strategy_engine_v3
-        _scope = getattr(engine, "markets_that_will_be_evaluated", None)
-        if callable(_scope):
-            for venue_markets in by_venue.values():
-                for market in _scope(venue_markets):
-                    will_evaluate.add(market.id)
-        else:  # a caller with no such helper: every market, as it was before
-            will_evaluate = {market.id for market, _b, _e in results}
-        dropped_by_scan = [market for market, _book, _error in results
-                           if will_evaluate and market.id not in will_evaluate]
 
         ranked = []
         for market, book, error in results:
@@ -1082,6 +1071,41 @@ class TradingAgentV3:
                 why = error
             ranked.append((score, market, why))
         ranked.sort(key=lambda row: row[0], reverse=True)
+
+        def _venue_key(market: Market) -> str:
+            return str(getattr(market, "venue_id", "") or
+                       (market.raw or {}).get("venue_id") or
+                       (market.raw or {}).get("venue") or
+                       getattr(market, "source", "unknown") or "unknown").lower()
+
+        engine = self.strategy_engine_v3
+        _scope = getattr(engine, "markets_that_will_be_evaluated", None)
+        # THE CAP IS APPLIED TO MARKETS THAT CAN ACTUALLY BE PRICED.
+        #
+        # It used to be applied to every market the venue returned, ranked by
+        # volume, BEFORE any book was known. The slots then went to markets
+        # whose books the venue refused (69 CLOB rejections in the operator's
+        # 2026-09-29 19:33 cycle) and the shortlist was starved: two markets
+        # chosen from two hundred, the model asked about ONE, and no trade. The
+        # book is already read here - a market with no validated book cannot
+        # consume a pricing slot, because the scan would refuse it anyway.
+        priceable_by_venue: Dict[str, List[Market]] = {}
+        refused_at_screen = 0
+        for score, market, _why in ranked:
+            if score < 0:
+                refused_at_screen += 1
+                continue
+            priceable_by_venue.setdefault(_venue_key(market), []).append(market)
+        will_evaluate = set()
+        if callable(_scope):
+            for venue_markets in priceable_by_venue.values():
+                for market in _scope(venue_markets):
+                    will_evaluate.add(market.id)
+        else:  # a caller with no such helper: every priceable market
+            will_evaluate = {market.id for _s, market, _w in ranked
+                             if _s >= 0}
+        dropped_by_scan = [market for score, market, _why in ranked
+                           if score >= 0 and market.id not in will_evaluate]
 
         shortlist = [row for row in ranked
                      if row[0] >= 0 and row[1].id in will_evaluate][
@@ -1098,6 +1122,13 @@ class TradingAgentV3:
                            "score": score, "why": why}
                           for score, m, why in shortlist],
             "screened_out": len(ranked) - len(shortlist),
+            # EVERY MARKET READ IS ACCOUNTED FOR, because the operator reads
+            # these numbers to answer "how long do I have to run this".
+            #   read = chosen + dropped by the scan's cap + refused at the
+            #          screen (no validated book, wide spread, below the
+            #          volume/liquidity floors).
+            "refused_at_screen": refused_at_screen,
+            "priceable": sum(len(v) for v in priceable_by_venue.values()),
             # How many markets the venue scan's own per-venue cap will drop
             # before pricing. Named, because a screen that ignores it shortlists
             # markets that can never be priced.
@@ -1117,6 +1148,23 @@ class TradingAgentV3:
         self._screen["no_book_note"] = (
             "markets the venue has no book for. They are not priced, not ranked "
             "and not traded; their cost and edge are absent rather than estimated.")
+        # The screen's own line must ADD UP, because the operator reads these
+        # numbers to answer "how long do I have to run this". Four kinds of
+        # market come out of one read:
+        #
+        #   chosen for deep analysis ... 8
+        #   below the scan's per-venue cap (priceable, no model time) ... M
+        #   refused here (no validated book, spread, floors) ... R
+        #   priceable but not shortlisted (the scan still prices them) ... P
+        #
+        # and 8 + M + R + P = what was read. The 19:31 cycle named only two of
+        # the four and 41 markets vanished from the arithmetic.
+        _priceable = sum(len(v) for v in priceable_by_venue.values())
+        self._screen["priceable_not_shortlisted"] = max(
+            0, _priceable - len(shortlist) - len(dropped_by_scan))
+        self._screen["unaccounted"] = max(
+            0, len(ranked) - len(shortlist) - len(dropped_by_scan)
+            - refused_at_screen - self._screen["priceable_not_shortlisted"])
         # PLANS AND PRICES ARE DIFFERENT FACTS. This line said "199 priced on the
         # cheap context only" while the same cycle's scan line said 99 of those
         # markets were "not evaluated - their book is an estimate or absent".
@@ -1131,7 +1179,11 @@ class TradingAgentV3:
             + (f"; {unreadable} had no venue book at all (they cannot be priced)"
                if unreadable else "")
             + (f"; {len(dropped_by_scan)} sit below their venue's own per-venue cap "
-               f"and will not be priced this cycle" if dropped_by_scan else ""))
+               f"and will not be priced this cycle" if dropped_by_scan else "")
+            + (f"; {refused_at_screen} were refused by the screen itself (no "
+               f"validated book, a spread wider than it will trade, or below the "
+               f"volume/liquidity floors) - the reasons are counted in the "
+               f"console's screen panel" if refused_at_screen else ""))
         for row in self._screen["shortlist"][:5]:
             logger.info(f"  deep {row['market_id']}: {row['why']} "
                         f"(score {row['score']})")
@@ -2595,6 +2647,12 @@ class TradingAgentV3:
             # it, and the per-venue scan does not re-price markets with no book.
             book_lookup=lambda mid: (getattr(self, "_cycle_books", {}) or {}).get(mid),
             fee_rate_lookup=self._arb_fee_rate,
+            # THE SCREEN'S SHORTLIST IS PRICED FIRST. The two stages used to
+            # disagree in practice (the screen chose on book quality, the scan
+            # capped on volume), and the model line then counted markets that
+            # were never priced - the operator's 19:33 cycle asked the model
+            # about one market of nine hundred.
+            must_price=set(getattr(self, "_deep_market_ids", None) or set()),
         )
         # WHAT THE VENUES ACTUALLY PRICED, from their own reports - the number
         # the model line needs. `evaluated` is markets that reached the pricing
