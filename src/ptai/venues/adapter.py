@@ -279,14 +279,36 @@ class MarketAdapter(ABC):
     def real_order_refusal(self, max_spend_usd: float, max_price: float, side: str,
                            market_id: str) -> Dict[str, Any]:
         """
-        The standard paper-mode response. Returned whenever an order would have
-        been real but the adapter is in dry run, so the caller gets an explicit
-        dry_run status it can settle and learn from rather than an error.
+        The standard refusal for an order this adapter will not place.
+
+        Two different facts used to share one message. "Dry run is on, set
+        dry_run=False" is true for a venue with a submission path and FALSE for
+        every venue whose adapter has none (play-money, read-only, stubbed):
+        flipping the switch there would change nothing, and telling the operator
+        to flip it is the product lying about what the code does. So the live-mode
+        refusal names the real reason, and the dry-run text never promises that
+        the switch would help.
         """
+        if not self.capabilities.supports_trading:
+            return {
+                "status": "refused",
+                "venue_id": self.venue_id,
+                "simulated": True,
+                "market_id": market_id,
+                "message": (
+                    f"{self.venue_id} has no order path in this code: nothing was "
+                    f"sent for {side} ${max_spend_usd:.2f} @ {max_price} ({market_id})"
+                ),
+                "reason": (
+                    "this adapter has no submission path at this venue, so live "
+                    "mode cannot place an order here"
+                ),
+            }
         return {
             "status": "dry_run",
             "venue_id": self.venue_id,
             "simulated": True,
+            "market_id": market_id,
             "message": (
                 f"DRY RUN - would place {side} ${max_spend_usd:.2f} @ {max_price} "
                 f"for {market_id}; no order sent"

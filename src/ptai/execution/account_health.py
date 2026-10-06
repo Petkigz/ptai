@@ -100,6 +100,11 @@ _VENUE_AUTH_SOURCES = frozenset({
     # the account's collateral and allowance. The venue's own number.
     "clob_balance_allowance",
     "whitebit_api_real",
+    # ManifoldExecutor-free: ManifoldAdapter.get_portfolio() answers from
+    # GET /v0/me with the operator's key. Mana is not money and this venue can
+    # never hold capital, but the provenance is what it says it is: the venue
+    # answered an authenticated request.
+    "manifold_api_real",
     "polymarket_data_api",
     "binance_api_real",
 })

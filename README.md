@@ -1715,6 +1715,69 @@ it serves, it decides who it serves, and its own eligibility check answers
 real money from here: funds by card or bank transfer in the countries Betfair
 serves"*. An order path is still not a funding route.
 
+## Manifold: Real Prices, Real Resolutions, No Money
+
+Manifold trades in **Mana**, and Mana cannot be cashed out. So this venue will
+never hold your money, and nothing below claims otherwise - its row is
+`paper_only`, its funding line says `play-money only: no real capital can be
+deployed`, and its adapter refuses every order at every setting with the word
+*play money* in the reason.
+
+What it did have was a made-up spread. `get_orderbook` answered with
+`bid = price - 1.5%` and `ask = price + 1.5%` - a spread nobody quoted, on the one
+venue whose mechanism is completely specified and published. Every Manifold paper
+trade was priced from that fiction.
+
+1. **The book is now the venue's own AMM curve.** Manifold binary markets
+   (`mechanism: cpmm-1`) hold `y^p · n^(1-p) = k` constant, where `pool.YES` and
+   `pool.NO` are published and `p` is the creator's weight. A bet adds mana to
+   both pools and removes shares of the side bought until the invariant holds
+   again, so the shares received, the price paid and the price impact are all
+   computable from the venue's numbers. A 100/100 pool at `p=0.5` with a 10-mana
+   YES bet returns **19.09 shares** and moves the market to **54.75%** - Manifold's
+   own worked example, pinned to four decimals in the tests.
+2. **The ladder walks the curve.** Each level is one slice of a bet (1, 2, 5, 10,
+   25, 50, 100, 250 mana): the average price paid inside that slice and the shares
+   it buys. A $1 paper trade sees the touch; a $250 one sees the price impact. The
+   paper lane reads those levels like any other book, so a Manifold fill is the
+   mechanism's own fill instead of a 1.5% guess.
+3. **A NO is priced in YES space.** Everywhere else in PTAI a book is YES-token
+   prices, so the NO ladder is published flipped - buying NO at 0.52 reads as a
+   YES bid of 0.48 - and `bids`/`asks` sort the way the paper parser expects.
+4. **The numbers must agree with each other, or nothing is published.** The
+   weight implied by the pool and probability is compared with the `p` the venue
+   publishes; the curve must also reproduce the market's own probability. If they
+   disagree, the book carries **no levels** and a reason naming both numbers. A
+   curve from contradictory inputs is a plausible-looking guess.
+5. **Settlement is the venue's record.** `GET /v0/market/{id}` is public, so a
+   Manifold paper trade now settles on the venue's real resolution - YES → 1.0,
+   NO → 0.0 - and reaches the resolved count that unlocks live trading. `MKT`
+   (a percentage payout) and `CANCEL` (a void) are **refused**, not rounded to
+   0 or 1; a non-binary market is refused with its type.
+6. **The account read needs a key, and now has a form.** Manifold's markets and
+   resolutions are public, so the market feed needs no login at all. The Mana
+   balance does: `GET /v0/me` with `Authorization: Key …`. There is now a Manifold
+   login in the same vault as every other venue, the agent reads it at startup and
+   refreshes it mid-run, and the inventory's next step for this venue is *"save the
+   Manifold login: the account read needs it"* - a form to fill in, not missing code.
+   With no key, the account read says there is no key; it used to return
+   `balance: 0`, which read as an empty funded account instead of an unauthenticated
+   one.
+7. **An optional login is not a missing one.** A tool whose fields are all optional
+   used to report `configured` from the moment it existed, so Manifold's unsaved key
+   showed as saved. Coverage now requires a value to call a login configured, and a
+   venue whose markets are public and whose login only adds the account read reads
+   `no_login_needed` - with the optional form still visible, because it exists.
+
+**Still NOT true, and the row says so:** Manifold cannot hold your money, cannot
+place an order PTAI settles in dollars, and cannot be funded from anywhere -
+Mana is play money. Its API does accept bets (`POST /v0/bet` with a Mana API key),
+and PTAI deliberately does **not** send them: an order path that spends Mana would
+have to be labelled a real order path, and the venue page would then claim a
+capital route this venue does not have. The honest use of Manifold is the one now
+implemented - a real venue with real prices and real resolutions feeding the paper
+record.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

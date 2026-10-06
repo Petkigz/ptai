@@ -544,7 +544,12 @@ class TradingAgentV3:
         self.venue_registry.register(kalshi_adapter)
         
         # Manifold - play money zero-cost testing ground for fair-value engine
-        manifold_adapter = ManifoldAdapter()
+        # Manifold - play money. Its market feed needs no key; the Mana ACCOUNT
+        # read does, and the key comes from the same vault/env store as every
+        # other login, so the panel can offer it and the row can tell the truth
+        # about whether an account read is possible.
+        _manifold = credential_store.resolve("manifold", self.data_dir)
+        manifold_adapter = ManifoldAdapter(api_key=_manifold.get("api_key"))
         self.venue_registry.register(manifold_adapter)
 
         # PredictIt - public read-only feed heavy limits, sentiment source US politics only

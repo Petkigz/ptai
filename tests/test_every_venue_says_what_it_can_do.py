@@ -313,3 +313,36 @@ class TestNoVenueIsCalledUnusableWhileItIsBeingWorked:
         betfair = next(r for r in cov["venues"] if r["venue_id"] == "betfair")
         assert betfair["state"] in ("login_required", "login_saved")
         assert betfair["tool"] == "betfair"
+
+
+    def test_a_play_money_venue_can_price_and_settle_without_holding_money(
+            self, console_app, console_client):
+        """
+        Manifold's depth is derived from its own AMM pool and its resolutions come
+        back YES/NO, so a paper trade there is evidence rather than an estimate.
+        Two things must still hold on the row: it must not read as a venue that
+        can hold the operator's money or submit an order, and its optional Mana
+        key must not read as a missing login - nor be hidden, because the account
+        read uses it.
+        """
+        _record(console_app)
+        body = console_client.get("/api/console/venue").json()
+        manifold = body["inventory"]["venues"]["manifold"]
+        assert manifold["use"] == "paper_only"
+        assert manifold["real_order_path"] is False
+        assert manifold["paper_tradable"] is True
+        assert manifold["reads_live_markets_now"] is True
+        assert manifold["can_run_today"] is True
+        assert manifold["fundable_from_here"] is False
+        assert manifold["reach"]["layers"]["reads_markets"] is True
+        assert manifold["reach"]["layers"]["places_real_orders"] is False
+        assert manifold["reason_unfundable"].startswith("play-money")
+        assert "optional" in manifold["what_it_needs"]
+        assert "account read" in manifold["what_it_needs"]
+
+        cov = console_client.get("/api/console/logins").json()["coverage"]
+        row = next(r for r in cov["venues"] if r["venue_id"] == "manifold")
+        assert row["state"] == "no_login_needed", (
+            "an optional key on a public venue is not a missing login")
+        assert row["tool"] == "manifold"
+        assert cov["counts"]["missing_form"] == 0

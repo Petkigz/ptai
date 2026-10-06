@@ -156,8 +156,17 @@ def _reach_layers(caps: Any, status: str, note: str, requires_creds: bool,
     if not layers["reads_markets"]:
         next_step = (note or "write the client: this venue returns no markets yet")
     elif not layers["reads_account"]:
-        next_step = ("write the account read (balance and open positions) - the "
-                     "adapter has no portfolio call")
+        # Two different reasons share one flag, and the difference matters to the
+        # operator: an adapter with no portfolio call is work for the code, an
+        # adapter whose portfolio call needs a login is a form to fill in. The
+        # login named on this row is what tells them apart.
+        _login_name = login.get("label") or login.get("tool") or ""
+        if _login_name:
+            next_step = (f"save the {_login_name} login: the account read needs it "
+                         f"before the venue will report a balance")
+        else:
+            next_step = ("write the account read (balance and open positions) - the "
+                         "adapter has no portfolio call")
     elif not layers["places_real_orders"]:
         next_step = (note or "write the order path: the adapter has no submission "
                              "path, so it can be read and paper-traded only")
@@ -370,9 +379,15 @@ def adapter_row(venue_id: str, adapter: Any,
                "submission path exists in the adapter.")
     else:  # USE_PAPER_ONLY
         can_run_today = True
-        if requires_creds and login_configured:
+        _login_name = login.get("label") or login.get("tool") or ""
+        if login_configured:
             what_it_needs = ("nothing - the saved login is read at the start of "
                              "every cycle")
+        elif _login_name:
+            # Its markets are free and its login is optional, but it exists - and
+            # "nothing" would hide a form the operator can use for the account read.
+            what_it_needs = (f"nothing for its markets - the optional "
+                             f"{_login_name} login adds the account read")
         else:
             what_it_needs = "nothing - it reads public data with no account"
         why = ("Scanned and paper-traded every cycle at no cost. It cannot hold "

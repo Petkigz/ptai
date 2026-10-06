@@ -199,6 +199,21 @@ TOOLS: Dict[str, Tool] = {
                   secret=True, required=False, setting="x_bearer_token"),
         ),
     ),
+    "manifold": Tool(
+        name="manifold",
+        label="Manifold Markets (play money)",
+        kind="venue",
+        venue_id="manifold",
+        unlocks=("the Mana account read: the balance behind the market feed, and "
+                 "a real outcome for every paper trade this venue resolves"),
+        then=("optional. Manifold's markets are read without any key, and its "
+              "resolution is too, so this only adds the account read. Mana "
+              "cannot be cashed out: this venue can never hold your money."),
+        docs="https://docs.manifold.markets/api (API key in your profile, edit)",
+        fields=(
+            Field("api_key", "API key", env="MANIFOLD_API_KEY", required=False),
+        ),
+    ),
     "apify": Tool(
         name="apify",
         label="Apify (paid arb scanner)",
@@ -446,10 +461,12 @@ def describe(tool_name: str, data_dir: str = "./data") -> Dict[str, Any]:
     saved = _vault_read(tool, data_dir)
     fields: List[Dict[str, Any]] = []
     configured = True
+    any_set = False
     for f in tool.fields:
         saved_value = saved.get(f.name)
         env_value = None if saved_value else _env_read(f)
         value = saved_value or env_value
+        any_set = any_set or bool(value)
         if f.required and not value:
             configured = False
         fields.append({
@@ -465,10 +482,16 @@ def describe(tool_name: str, data_dir: str = "./data") -> Dict[str, Any]:
                       else (str(value) if value and saved_value else
                             (_mask(str(value)) if value else ""))),
         })
+    optional = bool(tool.fields) and not any(f.required for f in tool.fields)
+    # A login with no REQUIRED field used to read as "configured" from the moment
+    # it existed, because the loop never saw a missing requirement. An optional
+    # key that nobody typed in is not a key, so it must not be reported as saved.
+    configured = configured and (any_set or not tool.fields)
     return {
         "name": tool.name, "label": tool.label, "kind": tool.kind,
         "venue_id": tool.venue_id, "unlocks": tool.unlocks, "then": tool.then,
         "docs": tool.docs, "fields": fields,
+        "optional": optional,
         "configured": configured,
         "how_it_gets_used": ("the agent reads saved logins when it starts and "
                              "refreshes them at the top of every cycle"),
@@ -543,10 +566,19 @@ def coverage(venues: Dict[str, Dict[str, Any]],
             state = "login_required"
             why = (f"Closed without a login: save the {label} login here and it "
                    f"returns markets on the next cycle.")
-        elif tool:
+        elif tool and bool((row or {}).get("real_order_path")):
             state = "login_available"
             why = ("Reads public data with no account; the login is for "
                    "authenticated reads and real orders.")
+        elif tool:
+            # The login exists but unlocks nothing transactional here: this
+            # venue's markets - and Manifold's resolutions - are public. An
+            # optional key that adds the account read is not a missing login, and
+            # saying "login needed" would send the operator to fill in a form
+            # that changes nothing about what the venue can do.
+            state = "no_login_needed"
+            why = ((f"Reads public data with no account and is paper-traded for "
+                    f"free. An optional {label} login adds the account read only."))
         elif needs:
             state = "missing_form"
             why = ("This adapter requires credentials and no login form exists "
@@ -627,6 +659,7 @@ def refresh_adapters(registry, settings=None, data_dir: str = "./data") -> Dict[
         "polymarket": lambda adapter: _apply_polymarket(adapter, data_dir),
         "kalshi": lambda adapter: _apply_kalshi(adapter, data_dir),
         "betfair": lambda adapter: _apply_betfair(adapter, data_dir),
+        "manifold": lambda adapter: _apply_manifold(adapter, data_dir),
     }
     changed: Dict[str, Any] = {}
     for venue_id, apply_fn in appliers.items():
@@ -649,6 +682,34 @@ def refresh_adapters(registry, settings=None, data_dir: str = "./data") -> Dict[
         logger.info("Credential refresh applied to running adapters: "
                     + ", ".join(f"{k}: {', '.join(v)}" for k, v in changed.items()))
     return changed
+
+
+def _apply_manifold(adapter, data_dir: str) -> List[str]:
+    """
+    A Mana API key saved while the agent is running, applied to the client.
+
+    The key is a header, so the session is rebuilt with it and the capability
+    flag - computed at construction from what was known then - is raised, or the
+    account read would keep reporting "no key" until a restart.
+    """
+    values = resolve("manifold", data_dir)
+    key = values.get("api_key")
+    if not key or getattr(adapter, "api_key", None) == key:
+        return []
+    applied = []
+    adapter.api_key = key
+    session = getattr(adapter, "session", None)
+    if session is not None:
+        session.headers.update({"Authorization": f"Key {key}"})
+        applied.append("session_header")
+    if hasattr(adapter, "capabilities"):
+        if not adapter.capabilities.supports_portfolio:
+            adapter.capabilities.supports_portfolio = True
+            applied.append("supports_portfolio")
+    if hasattr(adapter, "last_error"):
+        adapter.last_error = ""
+    applied.append("api_key")
+    return applied
 
 
 def _apply_polymarket(adapter, data_dir: str) -> List[str]:
