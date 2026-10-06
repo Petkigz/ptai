@@ -274,6 +274,26 @@ class TestNoVenueIsCalledUnusableWhileItIsBeingWorked:
         assert kalshi["reach"]["distance"] == 0
         assert "cannot hold real money from here" in kalshi["reach"]["next_step"]
 
+    def test_an_order_path_and_a_closed_feed_are_two_different_facts(
+            self, console_app, console_client):
+        """
+        Betfair gained a real submission path while its market feed stays closed.
+        Both facts belong on the row: "it can place a real order" must not read as
+        "it is running now", and a venue that returns nothing until a login is
+        saved must not be described as paper-traded every cycle.
+        """
+        _record(console_app)
+        body = console_client.get("/api/console/venue").json()
+        betfair = body["inventory"]["venues"]["betfair"]
+        assert betfair["use"] == "real_money"
+        assert betfair["real_order_path"] is True
+        assert betfair["reads_live_markets_now"] is False
+        assert betfair["needs_credentials"] is True
+        assert betfair["can_run_today"] is False
+        assert betfair["fundable_from_here"] is False
+        assert "no markets until the login" in betfair["why"]
+        assert "cannot hold real money from here" in betfair["reach"]["next_step"]
+
     def test_the_page_says_real_money_is_the_only_thing_that_is_missing(
             self, console_app, console_client):
         _record(console_app)

@@ -290,6 +290,14 @@ FUNDING_ROUTES = {
 # empty row.
 UNFUNDABLE_SMALL = {
     "kalshi": "US-regulated: needs KYC and a US bank account",
+    # Betfair funds by card or bank transfer in the currencies and countries it
+    # serves, and it decides who it serves: the exchange does not accept
+    # customers from every jurisdiction, and no route into it from Uganda is
+    # recorded here. The adapter's own eligibility check says the same thing
+    # ("requires verification") for UG rather than implying a yes.
+    "betfair": ("funds by card or bank transfer in the countries Betfair serves; "
+                "whether it accepts you is the exchange's own eligibility decision, "
+                "and no deposit route from here is recorded"),
     "manifold": "play-money only: no real capital can be deployed",
     "crypto_binance": "needs an exchange account, KYC, and API keys",
     "stock_mock": "simulated data only",

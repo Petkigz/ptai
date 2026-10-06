@@ -22,6 +22,8 @@ it against the wrong facts.
 """
 from __future__ import annotations
 
+import math
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -121,6 +123,112 @@ PLAYER_MARKET_TYPES: Tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# The exchange's own rules, which an order has to obey
+# ---------------------------------------------------------------------------
+
+# Betfair's price ladder. An order must sit ON one of these increments or the
+# exchange rejects it, and the increments widen as the odds lengthen - the same
+# job Kalshi's price_ranges does on the other venue. The grid is part of the
+# contract, so it is written down rather than assumed to be one cent.
+BETFAIR_PRICE_LADDER: Tuple[Tuple[float, float], ...] = (
+    (1.01, 0.01), (2.0, 0.02), (3.0, 0.05), (4.0, 0.1), (6.0, 0.2),
+    (10.0, 0.5), (20.0, 1.0), (30.0, 2.0), (50.0, 5.0), (100.0, 10.0),
+)
+BETFAIR_MIN_PRICE = 1.01
+BETFAIR_MAX_PRICE = 1000.0
+
+# The exchange's take-out is charged on NET WINNINGS, and only when the bet
+# wins: c x stake x (1-p)/p at a back price of p. UK/Ireland accounts commonly
+# pay 2%; the international Market Base Rate is 5%, and 5% is what PTAI charges,
+# because understating a fee inflates every edge that is measured with it.
+BETFAIR_COMMISSION_RATE = 0.05
+
+# The smallest order the exchange accepts, and the size the order probe uses.
+BETFAIR_MIN_STAKE = 1.0
+
+# A runner is finished when its status is one of these. WINNER is the one that
+# decides a binary market; a market with no winner (void) resolves nothing.
+BETFAIR_TERMINAL_RUNNER_STATUSES = frozenset({"WINNER", "LOSER", "REMOVED"})
+BETFAIR_VOID_RUNNER_STATUSES = frozenset({"REMOVED"})
+
+
+def _snake(name: str) -> str:
+    return "".join("_" + c.lower() if c.isupper() else c for c in str(name))
+
+
+def _camel(name: str) -> str:
+    head, *rest = str(name).split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest)
+
+
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    """
+    Read a field from an exchange response, which may be an object or a dict.
+
+    betfairlightweight returns lightweight dicts in one mode and resource
+    objects in the other, and the two spell the same field differently
+    (`instructionReports` vs `instruction_reports`). Every read of a response
+    goes through here and tries all three spellings, so neither shape can
+    silently produce None where the exchange actually answered.
+    """
+    if obj is None:
+        return default
+    for name in (key, _snake(key), _camel(_snake(key))):
+        if isinstance(obj, dict):
+            if name in obj:
+                return obj[name]
+        elif hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def _num(value: Any) -> Optional[float]:
+    """A number from a response field, or None. Never a fabricated zero."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def snap_odds(price: float, direction: str = "up") -> Optional[float]:
+    """
+    Move a decimal price onto Betfair's ladder.
+
+    `direction="up"` is the safe direction for a BACK price (longer odds = a
+    cheaper entry), and "down" is the safe direction for a constraint expressed
+    as a maximum price. Returning None for a price outside the ladder is
+    deliberate: a price the exchange cannot accept is not orderable, and
+    rounding it into range would trade at a price nobody authorised.
+    """
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return None
+    if not (BETFAIR_MIN_PRICE <= value <= BETFAIR_MAX_PRICE):
+        return None
+    step = BETFAIR_PRICE_LADDER[0][1]
+    for start, band_step in BETFAIR_PRICE_LADDER:
+        if value >= start:
+            step = band_step
+        else:
+            break
+    if direction == "down":
+        snapped = math.floor((value + 1e-9) / step) * step
+        if snapped < BETFAIR_MIN_PRICE:
+            return None
+        # The widened bands start AT their first price (2.0 is on the 0.02 band),
+        # so a floored value that lands just under a band boundary belongs to the
+        # band below it - already handled, because the band was chosen by `value`.
+        return round(snapped, 2)
+    snapped = math.ceil((value - 1e-9) / step) * step
+    if snapped > BETFAIR_MAX_PRICE:
+        return None
+    return round(snapped, 2)
+
+
 @dataclass
 class BetfairRunner:
     """One selectable outcome with both sides of the exchange price."""
@@ -133,6 +241,10 @@ class BetfairRunner:
     last_price: Optional[float] = None
     total_matched: float = 0.0
     status: str = ""
+    # The full ladders, best price first, as [(price, size), ...]. `back_size`
+    # above is only the top level, and an order of any size needs the depth.
+    back_ladder: List[Tuple[float, float]] = field(default_factory=list)
+    lay_ladder: List[Tuple[float, float]] = field(default_factory=list)
 
     @property
     def has_both_sides(self) -> bool:
@@ -191,6 +303,9 @@ class BetfairClient:
         self._logged_in = False
         self.last_error: str = ""
         self.unknown_market_types: Dict[str, int] = {}
+        # Markets this client refused to publish, and why - reported through
+        # health() so a market that vanishes is visible rather than silent.
+        self.skipped_markets: Dict[str, int] = {}
 
     # -- connection ---------------------------------------------------------
 
@@ -308,6 +423,73 @@ class BetfairClient:
             logger.warning(f"[betfair] {self.last_error}")
             return {}
 
+    # -- order path ---------------------------------------------------------
+    #
+    # Three thin wrappers, and nothing above them guesses: each returns the
+    # exchange's own object (or None plus a reason), because `place_orders` is
+    # the one call in this module that can move money.
+
+    def place_orders(self, market_id: str, instructions: Sequence[Dict[str, Any]],
+                     customer_ref: str = "") -> Optional[Any]:
+        """
+        Submit instructions to the exchange. Returns the report, or None.
+
+        The caller gets the exchange's own per-instruction status, bet id and
+        matched size. Nothing here is translated into a "success" before the
+        report says so.
+        """
+        if not self.login():
+            return None
+        try:
+            report = self._client.betting.place_orders(
+                market_id=str(market_id),
+                instructions=list(instructions),
+                customer_ref=customer_ref or None,
+                lightweight=self.lightweight,
+            )
+            return report
+        except Exception as e:
+            self.last_error = f"place_orders failed: {type(e).__name__}: {e}"
+            logger.error(f"[betfair] {self.last_error}")
+            return None
+
+    def cancel_orders(self, market_id: str,
+                      instructions: Sequence[Dict[str, Any]],
+                      customer_ref: str = "") -> Optional[Any]:
+        """Cancel orders by bet id. Returns the report, or None."""
+        if not self.login():
+            return None
+        try:
+            return self._client.betting.cancel_orders(
+                market_id=str(market_id),
+                instructions=list(instructions),
+                customer_ref=customer_ref or None,
+                lightweight=self.lightweight,
+            )
+        except Exception as e:
+            self.last_error = f"cancel_orders failed: {type(e).__name__}: {e}"
+            logger.error(f"[betfair] {self.last_error}")
+            return None
+
+    def current_orders(self, market_ids: Optional[Sequence[str]] = None) -> Optional[Any]:
+        """
+        The account's current (unmatched and partially matched) orders.
+
+        An exchange holds bets, not positions: what can be read without pricing
+        every market is the open order list, and that is what this returns.
+        """
+        if not self.login():
+            return None
+        try:
+            return self._client.betting.list_current_orders(
+                market_ids=list(market_ids) if market_ids else None,
+                lightweight=self.lightweight,
+            )
+        except Exception as e:
+            self.last_error = f"list_current_orders failed: {type(e).__name__}: {e}"
+            logger.warning(f"[betfair] {self.last_error}")
+            return None
+
     # -- parsing ------------------------------------------------------------
 
     def _parse_catalogue(self, c: Any) -> BetfairMarket:
@@ -373,6 +555,21 @@ class BetfairClient:
                 size = tg(key_size, 0.0) or 0.0
                 return (float(price) if price else None), float(size)
 
+            def _ladder(levels, key_price, key_size) -> List[Tuple[float, float]]:
+                """Every level, best first, skipping anything unreadable."""
+                out_levels: List[Tuple[float, float]] = []
+                for level in levels or []:
+                    lg = (lambda k, d=None: level.get(k, d)) if isinstance(level, dict) else (
+                        lambda k, d=None: getattr(level, k, d))
+                    price, size = lg(key_price), lg(key_size)
+                    if price in (None, "") or size in (None, ""):
+                        continue
+                    try:
+                        out_levels.append((float(price), float(size)))
+                    except (TypeError, ValueError):
+                        continue
+                return out_levels
+
             bp, bs = _top(back_levels, "price", "size")
             lp, ls = _top(lay_levels, "price", "size")
 
@@ -383,8 +580,55 @@ class BetfairClient:
                 last_price=(float(rg("lastPriceTraded")) if rg("lastPriceTraded") else None),
                 total_matched=float(rg("totalMatched", 0.0) or 0.0),
                 status=str(rg("status") or ""),
+                back_ladder=_ladder(back_levels, "price", "size"),
+                lay_ladder=_ladder(lay_levels, "price", "size"),
             ))
         return out, total_matched
+
+    # -- exchange odds in the project's probability space -------------------
+
+    @staticmethod
+    def odds_to_probability(odds: Optional[float]) -> Optional[float]:
+        """Decimal odds -> the probability basis the rest of PTAI prices in."""
+        try:
+            value = float(odds)
+        except (TypeError, ValueError):
+            return None
+        if value <= 1.0:
+            return None
+        return round(1.0 / value, 6)
+
+    @staticmethod
+    def ladder_to_probabilities(ladder: Sequence[Tuple[float, float]],
+                                direction: str) -> List[Dict[str, float]]:
+        """
+        A back or lay ladder, in the terms the rest of the system trades in.
+
+        Two conversions happen here and both are needed:
+
+          * price: decimal odds become the probability 1/odds, because every
+            other venue in this project prices a binary outcome in 0..1 and the
+            paper broker sizes fills against a book in that space.
+          * size: the exchange quotes the BACKER'S STAKE available at a price, so
+            the number of $1 contracts at that level is size x odds. Without this
+            a 2.50 back with GBP 100 available reads as 100 contracts of a
+            $0.40 asset, which understates the book by 2.5x.
+
+        `direction` is "back" for the ladder you buy from and "lay" for the
+        ladder you sell into; the levels come back best-price-first either way.
+        """
+        out: List[Dict[str, float]] = []
+        for price, size in ladder or []:
+            probability = BetfairClient.odds_to_probability(price)
+            if probability is None or size <= 0:
+                continue
+            out.append({
+                "price": probability,
+                "size": round(float(size) * float(price), 4),
+                "odds": float(price),
+                "stake": float(size),
+            })
+        return out
 
     # -- Market bridging ----------------------------------------------------
 
@@ -402,6 +646,27 @@ class BetfairClient:
             return None
         if mf.unknown_type:
             # Refuse rather than settle an unknown market against wrong facts.
+            return None
+        # WHY THE FIRST PUBLISHED OUTCOME MUST BE THE EXCHANGE'S FIRST RUNNER.
+        #
+        # Settlement asks the exchange which runner won and maps that onto
+        # outcome index 0 (YES) or not. That mapping is only exact if the index
+        # the trade was placed against is the same index the settlement reads,
+        # and the only order both sides share is the exchange's own. A market
+        # whose first runner is unpriced on one side would publish the SECOND
+        # runner as index 0 - and a later settlement would then read the first
+        # runner's win as a win for the first PUBLISHED outcome. A wrong outcome
+        # is written into calibration permanently, so such a market is not
+        # published here at all, and the reason is counted in the coverage report
+        # rather than passed over in silence.
+        canonical_first = mf.runners[0].selection_id if mf.runners else None
+        if canonical_first is not None and bookable[0].selection_id != canonical_first:
+            self.skipped_markets["first runner unpriced"] = \
+                self.skipped_markets.get("first runner unpriced", 0) + 1
+            logger.info(f"[betfair] {mf.market_id} ({mf.market_name}) skipped: its "
+                        f"first runner {canonical_first} has no two-sided price, so "
+                        f"the published outcome order would not match the "
+                        f"exchange's settlement order")
             return None
 
         labels = [r.name for r in bookable]
@@ -433,6 +698,12 @@ class BetfairClient:
                 "back_sizes": [r.back_size for r in bookable],
                 "lay_sizes": [r.lay_size for r in bookable],
                 "spreads": [r.spread for r in bookable],
+                # The PUBLISHED order of the outcomes, by exchange selection id.
+                # Settlement maps the winning runner back onto an outcome index
+                # through this list and through nothing else, so a settlement can
+                # never be attributed to the wrong selection.
+                "selection_ids": [r.selection_id for r in bookable],
+                "runner_names": labels,
                 "is_exchange": True, "lay_available": True,
                 "data_mode": data_mode.value,
                 "data_source": "betfair_exchange_live" if data_mode.can_deploy_live_capital
@@ -453,6 +724,7 @@ class BetfairClient:
             "last_error": self.last_error,
             "unknown_market_types": dict(sorted(self.unknown_market_types.items(),
                                                 key=lambda kv: -kv[1])[:10]),
+            "skipped_markets": dict(self.skipped_markets),
             "market_types_mapped": len(BETFAIR_MARKET_MAP),
         }
 
@@ -552,12 +824,28 @@ class BetfairExchangeAdapter(MarketAdapter):
         self.capabilities = AdapterCapability(
             supports_market_discovery=True,
             supports_orderbook=True,
-            # Order placement is not implemented - see place_order.
-            supports_trading=False,
+            # The submission path below places a real BACK bet through the
+            # exchange, so trading is declared only when the login that signs it
+            # is present. All three fields are needed for both reading and
+            # ordering, which is why one check covers both.
+            supports_trading=bool(username and password and app_key),
+            real_order_path=True,
+            # The order probe is implemented below: one pound at the shortest
+            # price on the ladder, then cancel. AccountHealthEngine refuses to
+            # certify an account without this rung, and an unproven permission is
+            # unproven rather than assumed. It refuses in dry_run.
+            supports_order_probe=True,
             requires_credentials=True,
             supports_portfolio=True,
             supports_history=False,
-            fee_taker_pct=0.02,   # Betfair charges commission on net winnings
+            # NOT a flat take-out. Betfair charges commission on NET WINNINGS
+            # and only on a winning bet, so the cost as a fraction of the stake
+            # depends on the price: c x (1-p)/p if it wins, nothing if it loses.
+            # This field is the ceiling - the commission rate itself (5%, the
+            # international Market Base Rate) - so a consumer that can only read
+            # a flat number over-charges rather than under-charges, and
+            # `fee_rate_for_market` below carries the curve the runtime uses.
+            fee_taker_pct=BETFAIR_COMMISSION_RATE,
             fee_maker_pct=0.0,
             min_order_usd=2.0,
             implementation_status=STATUS_LIVE,
@@ -565,10 +853,51 @@ class BetfairExchangeAdapter(MarketAdapter):
         )
         self._card: Dict[str, List[BetfairMarket]] = {}
         self.last_error: str = ""
+        self.last_order_probe: Dict[str, Any] = {"attempted": False, "reason": ""}
+        # Read once: the account's currency decides what unit `filled_usd` is in.
+        self._currency: Optional[str] = None
 
     @property
     def configured(self) -> bool:
         return self.client.configured
+
+    # ------------------------------------------------------------------
+    # fees: the venue's own commission curve
+    # ------------------------------------------------------------------
+
+    def fee_rate_for_market(self, market: Market) -> Optional[float]:
+        """
+        Betfair's cost as a fraction of the STAKE, for this market.
+
+        The exchange's take-out is commission on NET WINNINGS, charged only when
+        the bet wins: at a back price of p, a winning bet pays c x stake x
+        (1-p)/p. A flat "2% of stake" - which is what this adapter used to
+        declare - under-charges badly: at odds 2.50 (p = 0.40) the commission on
+        a winning bet is 7.5% of the stake, nearly four times the number the EV
+        engine was costing.
+
+        Two honest simplifications, both in the conservative direction:
+
+          * the cost model charges money against the stake, not against the
+            outcome, so the conditional fee is converted to a per-stake number
+            using the market's OWN probability that the fee is charged: c x (1-p);
+          * the side is not known at this point, so the worse of the two legs is
+            charged - the same convention Kalshi's curve uses.
+
+        At p = 0.50 with c = 5% that is 2.5% of the stake; at p = 0.90 it is
+        4.5%, because the bet that pays is the one that gets charged.
+        """
+        # Read a price the venue actually published. `Market.best_price` falls
+        # back to 0.50 for a market that carries no price at all, and charging a
+        # commission computed from that placeholder would be a number nobody
+        # measured - the market gets no rate instead, and the cost model reports
+        # the assumption it made.
+        prices = [p for p in (getattr(market, "outcome_prices", None) or [])
+                  if isinstance(p, (int, float)) and 0.0 < float(p) < 1.0]
+        if not prices:
+            return None
+        price = float(prices[0])
+        return round(BETFAIR_COMMISSION_RATE * max(price, 1.0 - price), 6)
 
     def check_eligibility(self, country_code: str = "UG") -> EligibilityStatus:
         """
@@ -633,77 +962,623 @@ class BetfairExchangeAdapter(MarketAdapter):
 
     async def get_orderbook(self, market: Market) -> Dict[str, Any]:
         """
-        Real exchange depth for one market.
+        Real exchange depth for one market, in the project's own price space.
 
-        Returns the back and lay ladders as the venue reports them, not a
-        derived spread: on an exchange the lay price is a genuine tradable
-        price rather than the inverse of the back.
+        Returns the back and lay ladders exactly as the venue reports them (in
+        decimal odds) AND the same book converted to probabilities, because
+        everything downstream - the paper broker, the EV engine's spread read,
+        the execution-quality score - prices a binary outcome in 0..1. On an
+        exchange the lay price is a genuine tradable price rather than the
+        inverse of the back, so both sides are carried.
+
+        The primary outcome's ladders become `bids` and `asks`, which is what
+        makes this book usable by the paper lane rather than merely readable:
+        buying the primary outcome is backing it, and selling it is laying it.
         """
         market_id = market.raw.get("market_id") or market.slug
         if not market_id:
-            return {"available": False, "reason": "no betfair market_id on this market"}
+            return self._empty_book(market, "no betfair market_id on this market")
         if not self.configured:
-            return {"available": False, "reason": "Betfair credentials not configured"}
+            return self._empty_book(market, "Betfair credentials not configured")
         if not self.client.login():
-            return {"available": False, "reason": self.client.last_error}
+            return self._empty_book(market, self.client.last_error or "login failed")
 
         try:
             books = self.client.market_books([market_id])
         except Exception as e:
-            return {"available": False, "reason": f"{type(e).__name__}: {e}"}
+            return self._empty_book(market, f"{type(e).__name__}: {e}")
 
         book = books.get(market_id)
         if book is None:
-            return {"available": False, "reason": "market book not returned by the exchange"}
+            return self._empty_book(market, "market book not returned by the exchange")
 
         runners, total_matched = BetfairClient.parse_runners(book)
+        # A market book may arrive as a resource object or as a dict, and BOTH
+        # shapes are read through `_field`: the first version of this used
+        # getattr(), which silently answered "unknown" for a dict and made an
+        # open market look unorderable.
+        in_play = bool(_field(book, "inplay", False))
+        status = str(_field(book, "status", "") or "")
+
+        # The published outcome order, so the ladders line up with `outcomes`.
+        published = [int(s) for s in (market.raw.get("selection_ids") or [])]
+        ordered = sorted(
+            runners,
+            key=lambda r: published.index(r.selection_id) if r.selection_id in published else 999,
+        )
+
+        runner_books: List[Dict[str, Any]] = []
+        for runner in ordered:
+            runner_books.append({
+                "selection_id": runner.selection_id,
+                "name": runner.name,
+                "status": runner.status,
+                "back": BetfairClient.ladder_to_probabilities(runner.back_ladder, "back"),
+                "lay": BetfairClient.ladder_to_probabilities(runner.lay_ladder, "lay"),
+                "back_odds": [price for price, _ in runner.back_ladder],
+                "lay_odds": [price for price, _ in runner.lay_ladder],
+            })
+
+        primary = runner_books[0] if runner_books else {"back": [], "lay": []}
+        # The primary outcome's tradable book: buying it = backing it, selling it
+        # = laying it. Levels are already best-price-first on each side.
+        asks = [{"price": level["price"], "size": level["size"]} for level in primary["back"]]
+        bids = [{"price": level["price"], "size": level["size"]} for level in primary["lay"]]
+        best_ask = asks[0] if asks else None
+        best_bid = bids[0] if bids else None
+        spread = (round(best_bid["price"] - best_ask["price"], 6)
+                  if best_ask and best_bid else None)
+
         return {
             "available": True,
             "market_id": market_id,
-            "back": [{"price": r.back_price, "size": r.back_size} for r in runners if r.back_price],
-            "lay": [{"price": r.lay_price, "size": r.lay_size} for r in runners if r.lay_price],
+            "venue_id": "betfair",
+            "token_id": market.yes_token_id,
+            # Probability space, for every consumer that prices a binary market.
+            "bids": bids,
+            "asks": asks,
+            "bid": best_bid["price"] if best_bid else None,
+            "ask": best_ask["price"] if best_ask else None,
+            "bid_size": best_bid["size"] if best_bid else 0.0,
+            "ask_size": best_ask["size"] if best_ask else 0.0,
+            "spread": spread,
+            "spread_pct": spread,
+            "depth": sum(level["size"] for r in runner_books
+                         for level in r["back"] + r["lay"]),
+            "executable": bool(asks),
+            "is_real": True,
+            "is_mock": False,
+            "data_mode": "live",
+            "assumed_fields": [],
+            # The exchange's own view, undeformed: odds and stakes.
+            "back": [{"price": r.back_price, "size": r.back_size}
+                     for r in ordered if r.back_price],
+            "lay": [{"price": r.lay_price, "size": r.lay_size}
+                    for r in ordered if r.lay_price],
+            "runners": runner_books,
             "total_matched": total_matched,
-            "in_play": getattr(book, "inplay", False),
+            "in_play": in_play,
+            "status": status,
             "source": "betfair_exchange_live",
+            "price_basis": ("decimal odds converted to probability (1/odds); a back "
+                            "price is a genuine tradable price, not a derived spread"),
+            "note": ("bids are lay prices and asks are back prices: on an exchange "
+                     "the two sides are separate tradable prices."),
+        }
+
+    def _empty_book(self, market: Market, reason: str) -> Dict[str, Any]:
+        """
+        No book, and no invented one either.
+
+        A fabricated exchange spread is priced by the arbitrage module as a real
+        lay opportunity, so the only honest answer when the venue has not
+        answered is an empty book that says so.
+        """
+        return {
+            "available": False,
+            "market_id": getattr(market, "id", ""),
+            "venue_id": "betfair",
+            "token_id": getattr(market, "yes_token_id", None),
+            "bids": [], "asks": [],
+            "bid": None, "ask": None,
+            "spread": None, "spread_pct": None,
+            "depth": 0,
+            "executable": False,
+            "is_real": False,
+            "is_mock": False,
+            "data_mode": "live",
+            "assumed_fields": [],
+            "source": "betfair_unavailable",
+            "warning": "no Betfair book was read; no spread is published here",
+            "reason": reason,
         }
 
     async def get_portfolio(self) -> Dict[str, Any]:
+        """
+        The account as the exchange reports it: funds, and open orders.
+
+        `positions` is empty on purpose and says why. On an exchange a matched
+        bet is a position, and valuing it needs the live price of every market
+        the account has ever touched - that is a portfolio view this adapter does
+        not fabricate. Open orders ARE readable and are read, because that is
+        what tells the executor whether an order it placed is still resting.
+        """
         if not self.configured or not self.client.login():
             return {"available": False, "balance": None, "positions": [],
                     "reason": self.client.last_error or "not configured"}
         try:
             account = self.client._client.account
             funds = account.get_account_funds()
-            return {
-                "available": True,
-                "balance": float(getattr(funds, "available_to_bet_balance", 0.0) or 0.0),
-                "currency": getattr(funds, "currency", ""),
-                "positions": [],
-                "source": "betfair_account_api",
-            }
+            balance = float(getattr(funds, "available_to_bet_balance", 0.0) or 0.0)
+            currency = str(getattr(funds, "currency", "") or "")
         except Exception as e:
             return {"available": False, "balance": None, "positions": [],
                     "reason": f"{type(e).__name__}: {e}"}
 
+        open_orders = self._read_current_orders()
+        return {
+            "available": True,
+            "balance": balance,
+            "currency": currency,
+            "positions": [],
+            "positions_note": ("an exchange holds matched BETS, not a position list; "
+                               "the account's own balance already includes their "
+                               "settled effect"),
+            "orders": open_orders,
+            "open_orders": len(open_orders),
+            "source": "betfair_account_api",
+        }
+
+    def _read_current_orders(self) -> List[Dict[str, Any]]:
+        """Open orders, as plain dicts. Empty plus last_error when unreadable."""
+        report = self.client.current_orders()
+        if report is None:
+            return []
+        rows = (report.get("currentOrders") if isinstance(report, dict)
+                else getattr(report, "orders", None)) or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            rg = (lambda k, d=None: row.get(k, d)) if isinstance(row, dict) else (
+                lambda k, d=None: getattr(row, k, d))
+            out.append({
+                "bet_id": str(rg("betId") or rg("bet_id") or ""),
+                "market_id": str(rg("marketId") or rg("market_id") or ""),
+                "selection_id": rg("selectionId") or rg("selection_id"),
+                "side": str(rg("side") or ""),
+                "price": rg("price") or rg("averagePriceMatched"),
+                "size": rg("sizeRemaining") if rg("sizeRemaining") is not None
+                        else rg("size"),
+                "size_matched": rg("sizeMatched"),
+                "status": str(rg("status") or ""),
+                "placed_date": str(rg("placedDate") or ""),
+            })
+        return out
+
+    # ------------------------------------------------------------------
+    # the order path
+    # ------------------------------------------------------------------
+
+    def _runner_for_side(self, market: Market, side: str) -> Tuple[Optional[int], str]:
+        """
+        Which exchange selection a YES or NO view is a bet on, or why not.
+
+        YES is the market's first published outcome (the exchange's own first
+        runner - see `to_market` for why that alignment is enforced at publish
+        time). NO is the OTHER outcome, and that is only a single bet on a
+        two-outcome market: on a 1X2 market "not the home win" is "the draw or
+        the away win", which the exchange has no single selection for. PTAI will
+        not synthesise it out of a lay whose liability the risk layer never
+        sized, so it refuses and says so.
+        """
+        published = [int(s) for s in (market.raw.get("selection_ids") or [])]
+        if not published:
+            return None, "this market carries no exchange selection ids"
+        if side == "YES":
+            return published[0], ""
+        if side == "NO":
+            if len(published) != 2:
+                return None, (f"a NO view on a {len(published)}-outcome Betfair market "
+                              f"is not one selection, and this order path will not "
+                              f"synthesise it from a lay")
+            return published[1], ""
+        return None, f"this order path speaks YES/NO; got {side!r}"
+
     async def place_order(self, opportunity: VenueOpportunity, max_spend_usd: float,
                           max_price: float) -> Dict[str, Any]:
         """
-        Refused, deliberately.
+        Submit a real BACK bet to the exchange, or say exactly why not.
 
-        Placing a real Betfair order needs the back/lay side, the price, the
-        size, persistence type and a liability check against the wallet. None
-        of that is built, and an order path that half-exists is more dangerous
-        than one that does not: it would place bets the risk layer never sized.
+        WHAT IS BUILT, in the order the exchange requires it:
+
+          * the selection, from the side: YES is the market's first published
+            outcome, NO is the other runner of a two-outcome market;
+          * the price, snapped onto Betfair's OWN ladder (the increments widen
+            with the odds), and never longer than the authorised maximum: the
+            cap is a probability, so the minimum acceptable odds are 1/cap,
+            rounded UP to the ladder - the safe direction for a back price;
+          * the size, floored at the exchange minimum and capped by the money
+            actually available at that price, so a thin market produces a smaller
+            bet rather than a rejected one;
+          * persistence LAPSE, so an order the agent forgot about is cancelled by
+            the exchange when the market goes in play instead of being matched
+            unattended at a stale price;
+          * a customer_ref, so a retry is recognisable at the venue.
+
+        WHAT IS NOT BUILT, and is refused rather than guessed: a LAY. A lay risks
+        size x (odds - 1), which is not the quantity this executor sizes
+        (`max_spend_usd` is money paid), and a NO on a market with more than two
+        outcomes is a multi-selection position, not a bet. Both refusals are
+        stated with their reason.
+
+        Nothing here assumes a fill: status, bet id, matched size and the
+        exchange's own order status are reported verbatim.
         """
-        logger.error("[betfair] place_order refused - order placement is not implemented")
-        return {
-            "status": "unimplemented",
-            "success": False,
-            "venue_id": "betfair",
-            "error": "Betfair order placement is not implemented. Market data and real "
-                     "exchange prices are available; execution is not.",
-            "message": "Refusal, not a fill. No order was placed.",
+        market = getattr(opportunity, "market", None)
+        market_id = str((getattr(market, "raw", {}) or {}).get("market_id")
+                        or getattr(market, "slug", "") or "")
+        side = str(getattr(opportunity, "side", "") or "").upper()
+        name = getattr(market, "question", "") or market_id
+
+        def refusal(reason: str, status: str = "refused") -> Dict[str, Any]:
+            return {"status": status, "success": False, "venue": "betfair",
+                    "venue_id": "betfair", "market_id": getattr(market, "id", ""),
+                    "side": side, "reason": reason,
+                    "message": "Refusal, not a fill. No order was placed."}
+
+        if getattr(self, "dry_run", True):
+            return self.real_order_refusal(max_spend_usd, max_price, side,
+                                           getattr(market, "id", ""))
+        # Credentials before the request is examined at all: without the login
+        # nothing can be signed, so that is the answer whatever was asked for.
+        if not self.configured:
+            return refusal("Betfair credentials not configured (username, password, "
+                           "app_key); nothing can be signed for submission")
+        if max_spend_usd <= 0 or not 0 < max_price < 1:
+            return refusal("invalid guard params: max_spend_usd and max_price must "
+                           "be positive, and max_price is a probability", "rejected")
+        if max_spend_usd > 1000:
+            return refusal("exceeds the absolute maximum of $1000", "rejected")
+        if market is None:
+            return refusal("no market on this opportunity", "rejected")
+        if market_id == "":
+            return refusal("no betfair market_id on this market", "rejected")
+        if getattr(market, "closed", False) or (
+                (market.raw or {}).get("in_play") is True):
+            return refusal(f"{market_id} is in play or closed; the exchange would "
+                           f"refuse a pre-play limit order", "rejected")
+
+        selection_id, why = self._runner_for_side(market, side)
+        if selection_id is None:
+            return refusal(why, "rejected")
+
+        # The price the exchange will accept, and the price we are allowed to
+        # pay. `max_price` is a probability, so the odds floor is 1/cap.
+        floor = snap_odds(1.0 / float(max_price), "up")
+        if floor is None:
+            return refusal(f"${max_price:.4f} is not a price Betfair can quote",
+                           "rejected")
+
+        # Fresh depth for the exact selection: a book read at discovery time is
+        # not what the exchange would match against now.
+        try:
+            books = self.client.market_books([market_id])
+            book = books.get(market_id)
+            if book is None:
+                return refusal(f"the exchange returned no market book for {market_id}"
+                               f"{(': ' + self.client.last_error) if self.client.last_error else ''}")
+            runners, _ = BetfairClient.parse_runners(book)
+        except Exception as e:  # noqa: BLE001
+            return refusal(f"could not read the book for {market_id}: "
+                           f"{type(e).__name__}: {e}", "error")
+
+        runner = next((r for r in runners if r.selection_id == selection_id), None)
+        if runner is None:
+            return refusal(f"selection {selection_id} is not in the book for "
+                           f"{market_id}", "rejected")
+        book_status = str(_field(book, "status", "") or "")
+        if book_status.upper() != "OPEN":
+            return refusal(f"{market_id} is {book_status or 'unknown'} at the "
+                           f"exchange; it is not accepting orders", "rejected")
+        if not runner.back_ladder:
+            return refusal(f"the exchange is showing no back price for "
+                           f"{runner.name or selection_id}", "rejected")
+
+        best_odds, best_stake = runner.back_ladder[0]
+        # The order price: take the offered price when it is at least as long as
+        # we require, otherwise rest AT our own limit - a back bet below the
+        # market does not match, which is the honest outcome when the market is
+        # offering worse odds than the trade was authorised at.
+        crosses = best_odds >= floor
+        price = best_odds if crosses else floor
+        available_contracts = best_stake * best_odds if crosses else 0.0
+        stake = round(min(float(max_spend_usd), available_contracts), 2) if crosses \
+            else round(float(max_spend_usd), 2)
+        if stake < BETFAIR_MIN_STAKE:
+            return refusal(f"${stake:.2f} is below the exchange minimum stake of "
+                           f"£{BETFAIR_MIN_STAKE:.2f} (or ${available_contracts:.2f} "
+                           f"is all that is offered at {best_odds})", "rejected")
+
+        customer_ref = f"ptai{uuid.uuid4().hex[:20]}"
+        instruction = {
+            "selectionId": selection_id,
+            "handicap": 0,
+            "side": "BACK",
+            "orderType": "LIMIT",
+            "limitOrder": {
+                "size": stake,
+                "price": price,
+                # LAPSE: the exchange cancels it at the off, so no order of ours
+                # can be matched in play at a price chosen for a pre-play market.
+                "persistenceType": "LAPSE",
+            },
+            "customerOrderRef": customer_ref[:32],
         }
+        logger.info(f"[betfair] submitting BACK {stake:.2f} @ {price} on "
+                    f"{runner.name or selection_id} in {market_id} "
+                    f"(cap p<=${max_price:.4f}, market {'crosses' if crosses else 'does not cross'})")
+
+        report = self.client.place_orders(market_id, [instruction], customer_ref)
+        if report is None:
+            return {"status": "error", "success": False, "venue": "betfair",
+                    "market_id": getattr(market, "id", ""),
+                    "reason": self.client.last_error or "the exchange did not answer",
+                    "message": ("The order was not confirmed by the exchange. Treat "
+                                "it as unplaced until it is checked.")}
+        status = str(_field(report, "status") or "").upper()
+        reports = _field(report, "instruction_reports") or _field(report, "instructionReports") or []
+        first = reports[0] if reports else None
+        if status != "SUCCESS" or first is None:
+            error = _field(first, "error_code") or _field(report, "error_code") or ""
+            logger.error(f"[betfair] order rejected: {status} {error}")
+            return {"status": "rejected", "success": False, "venue": "betfair",
+                    "market_id": getattr(market, "id", ""),
+                    "exchange_status": status, "error_code": str(error),
+                    "reason": str(error) or f"exchange reported {status}",
+                    "message": "Refusal, not a fill. No order was placed."}
+
+        instruction_status = str(_field(first, "status") or "").upper()
+        bet_id = _field(first, "bet_id") or _field(first, "betId")
+        matched = _num(_field(first, "size_matched") or _field(first, "sizeMatched")) or 0.0
+        avg_price = _num(_field(first, "average_price_matched")
+                         or _field(first, "averagePriceMatched"))
+        order_status = str(_field(first, "order_status") or _field(first, "orderStatus") or "")
+        if instruction_status != "SUCCESS" or not bet_id:
+            error = _field(first, "error_code") or _field(first, "errorCode") or ""
+            return {"status": "rejected", "success": False, "venue": "betfair",
+                    "market_id": getattr(market, "id", ""),
+                    "exchange_status": instruction_status or status,
+                    "error_code": str(error),
+                    "reason": str(error) or "the exchange refused the instruction",
+                    "message": "Refusal, not a fill. No order was placed."}
+
+        remaining = round(max(0.0, stake - matched), 2)
+        if matched <= 0:
+            fill_status, filled = "submitted", False
+        elif remaining > 0:
+            fill_status, filled = "partial", False
+        else:
+            fill_status, filled = "filled", True
+        payoff_if_wins = round(matched * ((avg_price or price) - 1.0), 2)
+        currency = self._account_currency()
+        note = ("Submitted to Betfair. size_matched is the money the exchange "
+                "actually matched, and the rest of the order is resting until the "
+                "off (persistence LAPSE). Nothing here assumes a fill.")
+        if currency and currency.upper() != "USD":
+            note += (f" The account is denominated in {currency}: the ledger reads "
+                     f"these amounts as dollars, which is wrong by the exchange rate.")
+        return {
+            "status": fill_status,
+            "success": True,
+            "venue": "betfair",
+            "market_id": getattr(market, "id", ""),
+            "betfair_market_id": market_id,
+            "side": side,
+            "side_sent": "BACK",
+            "selection_id": selection_id,
+            "selection_name": runner.name,
+            "order_id": str(bet_id),
+            "client_order_id": customer_ref,
+            "price": price,
+            "odds": price,
+            "probability": BetfairClient.odds_to_probability(price),
+            "limit_price": BetfairClient.odds_to_probability(price),
+            "size": stake,
+            "original_size": stake,
+            "size_matched": matched,
+            "filled_usd": matched,
+            "average_price_matched": avg_price,
+            "payoff_if_wins": payoff_if_wins,
+            "remaining_size": remaining,
+            "exchange_order_status": order_status,
+            "resting": order_status.upper() == "EXECUTABLE" or remaining > 0,
+            "filled": filled,
+            "currency": currency,
+            "persisted": "LAPSE until the market goes in play",
+            "message": note,
+        }
+
+    def _account_currency(self) -> str:
+        """The account's own currency, read once, for honest units. "" if unread."""
+        if self._currency is not None:
+            return self._currency
+        try:
+            funds = self.client._client.account.get_account_funds()
+            self._currency = str(getattr(funds, "currency", "") or "")
+        except Exception:  # noqa: BLE001
+            self._currency = ""
+        return self._currency
+
+    async def probe_order_permission(self, opportunity=None) -> bool:
+        """
+        Prove this account can submit AND withdraw an order - by doing both.
+
+        AccountHealthEngine refuses to certify an account for real capital
+        without this rung, and its rule is that an unproven permission is
+        unproven rather than assumed. So the probe BACKS the minimum stake at the
+        SHORTEST price on Betfair's ladder - a back at 1.01 needs the lay side to
+        be offering 1.01 as well, which it effectively never is, so the order
+        queues instead of matching - and then cancels it:
+
+          * refuses in dry_run: a probe places a real order, so it must never run
+            while the agent believes it is simulating;
+          * always attempts the cancel, including when the place half-succeeded,
+            because an order left resting is exposure nobody told the caller
+            about;
+          * returns True only when the exchange created the bet AND the cancel
+            was confirmed.
+        """
+        self.last_order_probe = {"attempted": False, "reason": ""}
+        if self.dry_run:
+            self.last_order_probe["reason"] = "adapter is in dry_run; a probe places a real order"
+            logger.warning("Betfair order probe refused: adapter is in dry_run.")
+            return False
+        if not self.configured:
+            self.last_order_probe["reason"] = "Betfair credentials not configured"
+            return False
+        market = getattr(opportunity, "market", None) if opportunity is not None else None
+        if market is None:
+            self.last_order_probe["reason"] = "no tradeable market supplied"
+            return False
+        market_id = str((market.raw or {}).get("market_id") or market.slug or "")
+        published = [int(s) for s in (market.raw or {}).get("selection_ids") or []]
+        if not market_id or not published:
+            self.last_order_probe["reason"] = "market has no exchange market or selection id"
+            return False
+        if (market.raw or {}).get("in_play") is True or getattr(market, "closed", False):
+            self.last_order_probe["reason"] = f"{market_id} is in play or closed"
+            return False
+
+        self.last_order_probe["attempted"] = True
+        customer_ref = f"ptaiprobe{uuid.uuid4().hex[:16]}"
+        instruction = {
+            "selectionId": published[0],
+            "handicap": 0,
+            "side": "BACK",
+            "orderType": "LIMIT",
+            "limitOrder": {"size": BETFAIR_MIN_STAKE, "price": BETFAIR_MIN_PRICE,
+                           "persistenceType": "LAPSE"},
+            "customerOrderRef": customer_ref[:32],
+        }
+        report = self.client.place_orders(market_id, [instruction], customer_ref)
+        bet_id = ""
+        if report is not None:
+            reports = (_field(report, "instruction_reports")
+                       or _field(report, "instructionReports") or [])
+            first = reports[0] if reports else None
+            bet_id = str(_field(first, "bet_id") or _field(first, "betId") or "")
+        self.last_order_probe["bet_id"] = bet_id
+        if not bet_id:
+            reports = (_field(report, "instruction_reports")
+                       or _field(report, "instructionReports") or [])
+            first = reports[0] if reports else None
+            error = (_field(first, "error_code") or _field(first, "errorCode")
+                     or _field(report, "error_code") or "")
+            self.last_order_probe["error_code"] = str(error)
+            self.last_order_probe["reason"] = (
+                self.client.last_error
+                or str(error)
+                or f"the exchange did not create a probe bet (status "
+                   f"{_field(report, 'status') if report is not None else 'no report'})")
+            logger.warning(f"Betfair order probe failed: {self.last_order_probe['reason']}")
+            return False
+
+        cancel_ref = f"ptaiprobecancel{uuid.uuid4().hex[:12]}"
+        cancel_report = self.client.cancel_orders(
+            market_id, [{"betId": bet_id}], cancel_ref)
+        cancel_status = str(_field(cancel_report, "status") or "").upper() if cancel_report is not None else ""
+        cancel_reports = (_field(cancel_report, "instruction_reports")
+                          or _field(cancel_report, "instructionReports") or []) if cancel_report is not None else []
+        cancel_first = cancel_reports[0] if cancel_reports else None
+        cancel_instr_status = str(_field(cancel_first, "status") or "").upper() if cancel_first else ""
+        confirmed = cancel_status == "SUCCESS" and cancel_instr_status == "SUCCESS"
+        self.last_order_probe["cancelled"] = confirmed
+        if not confirmed:
+            self.last_order_probe["reason"] = (
+                f"the probe bet {bet_id} was placed but the cancel was NOT confirmed "
+                f"(status {cancel_status or 'no report'}); it may still be resting")
+            logger.error(f"Betfair order probe: {self.last_order_probe['reason']}")
+            return False
+        self.last_order_probe["reason"] = "order placed and cancelled"
+        logger.info(f"[betfair] order probe succeeded: bet {bet_id} placed and cancelled")
+        return True
+
+    async def get_settlement(self, market_id: str) -> Dict[str, Any]:
+        """
+        Which outcome the exchange settled this market to, if it has settled.
+
+        The exchange reports a CLOSED market with each runner marked WINNER,
+        LOSER or REMOVED. Index 0 is the market's first runner, which `to_market`
+        guarantees is the first outcome it published - so the mapping from "who
+        won" to "did YES win" is exact rather than inferred. A market with no
+        single winner (a void market, a dead heat) is NOT resolved: an outcome
+        that cannot be stated plainly is not an outcome, and calibration must not
+        learn from a guess.
+        """
+        raw_id = str(market_id or "").strip()
+        if raw_id.lower().startswith("betfair-"):
+            raw_id = raw_id[len("betfair-"):]
+        if not raw_id:
+            return {"settled": False, "outcome": None, "is_real": False,
+                    "source": "no_market_id", "reason": "empty Betfair market id"}
+        if not self.configured or not self.client.login():
+            return {"settled": False, "outcome": None, "is_real": False,
+                    "source": "betfair_not_configured",
+                    "reason": self.client.last_error or "Betfair credentials not configured"}
+        try:
+            books = self.client.market_books([raw_id])
+        except Exception as e:  # noqa: BLE001
+            return {"settled": False, "outcome": None, "is_real": False,
+                    "source": "betfair_market_book_error",
+                    "reason": f"{type(e).__name__}: {e}"}
+        book = books.get(raw_id)
+        if book is None:
+            return {"settled": False, "outcome": None, "is_real": False,
+                    "source": "betfair_no_market_book",
+                    "reason": f"the exchange returned no market book for {raw_id}"}
+
+        status = str(_field(book, "status", "") or "").upper()
+        runners, _ = BetfairClient.parse_runners(book)
+        names = {r.selection_id: r.name for r in runners}
+        winner = next((r for r in runners
+                       if str(r.status or "").upper() == "WINNER"), None)
+        if status != "CLOSED":
+            return {"settled": False, "outcome": None, "is_real": True,
+                    "source": "betfair_exchange_live", "market_id": raw_id,
+                    "raw_status": status,
+                    "reason": f"the market is {status or 'in an unknown state'}, not closed"}
+        if not runners:
+            return {"settled": False, "outcome": None, "is_real": True,
+                    "source": "betfair_exchange_live", "market_id": raw_id,
+                    "raw_status": status, "reason": "closed with no runners read"}
+        if winner is None:
+            statuses = sorted({str(r.status or "").upper() for r in runners})
+            return {"settled": False, "outcome": None, "is_real": True,
+                    "source": "betfair_exchange_live", "market_id": raw_id,
+                    "raw_status": status, "runner_statuses": statuses,
+                    "reason": (f"the market closed with no single winner "
+                               f"(runner statuses {', '.join(statuses)}); a void or "
+                               f"dead-heat market resolves nothing")}
+        terminal = all(str(r.status or "").upper() in BETFAIR_TERMINAL_RUNNER_STATUSES
+                       for r in runners)
+        if not terminal:
+            return {"settled": False, "outcome": None, "is_real": True,
+                    "source": "betfair_exchange_live", "market_id": raw_id,
+                    "raw_status": status,
+                    "reason": "a runner's status is not terminal yet; the market is "
+                              "still settling"}
+        first = runners[0].selection_id
+        return {"settled": True,
+                "outcome": 1.0 if winner.selection_id == first else 0.0,
+                "is_real": True, "source": "betfair_exchange_live",
+                "market_id": raw_id, "raw_status": status,
+                "mapping": "exchange runner order; index 0 is the first published outcome",
+                "winner_selection_id": winner.selection_id,
+                "winner_name": names.get(winner.selection_id, ""),
+                "runner_statuses": {r.selection_id: str(r.status or "").upper()
+                                    for r in runners},
+                "reason": (f"{winner.name or winner.selection_id} won, and it is "
+                           f"{'the first' if winner.selection_id == first else 'not the first'} "
+                           f"published outcome")}
 
     def full_card(self) -> Dict[str, List[BetfairMarket]]:
         """The last fetched card, grouped by catalogue key."""

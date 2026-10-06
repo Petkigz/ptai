@@ -151,8 +151,12 @@ TOOLS: Dict[str, Tool] = {
         venue_id="betfair",
         unlocks=("the sports exchange feed: football fixtures priced across "
                  "match odds, goals, corners and cards"),
-        then=("PTAI's Betfair adapter reads and prices; order placement is not "
-              "written yet, so it runs in paper"),
+        then=("reads and prices those markets, reads the account balance and open "
+              "orders, and can submit a real back bet and cancel it - so the "
+              "account-health check can prove order permission instead of assuming "
+              "it. Whether Betfair accepts you as a customer is the venue's own "
+              "decision: an account in a jurisdiction it does not serve cannot be "
+              "funded, and the venue panel says so."),
         docs="https://www.betfair.com/exchange (app key via your Betfair account)",
         fields=(
             Field("username", "Username", env="BETFAIR_USERNAME", secret=False),
@@ -702,4 +706,22 @@ def _apply_betfair(adapter, data_dir: str) -> List[str]:
             if value and getattr(target, attr, None) != value:
                 setattr(target, attr, value)
                 applied.append(f"{type(target).__name__}.{attr}")
+    # A login saved while the agent is running has to take effect now: the client
+    # object holds the session that was built with the old credentials, and the
+    # capability flag was computed at construction from what was known then.
+    # Without this the venue keeps reporting "cannot trade" until a restart, and
+    # the operator who just saved the login sees the old answer.
+    if client is not None and hasattr(client, "_client"):
+        if getattr(client, "_client", None) is not None:
+            client._client = None
+            applied.append("client_session_reset")
+        client._logged_in = False
+    configured = all(getattr(target, field, None)
+                     for target in targets
+                     for field in ("username", "password", "app_key"))
+    if hasattr(adapter, "capabilities"):
+        caps = adapter.capabilities
+        if bool(caps.supports_trading) != bool(configured):
+            caps.supports_trading = bool(configured)
+            applied.append("supports_trading")
     return applied

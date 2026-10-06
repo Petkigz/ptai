@@ -252,18 +252,34 @@ class TestBetfairExchangeAdapter:
         a = BetfairExchangeAdapter(username="u", password="p", app_key="k")
         assert a.check_eligibility("US").value == "restricted"
 
-    def test_order_placement_is_declared_unimplemented(self):
+    def test_order_placement_is_declared_and_refuses_without_a_login(self):
         """
-        Market data is real; execution is not. A half-built order path would
-        place bets the risk layer never sized.
+        Market data is real, and so is the order path - but it is reachable only
+        with the login, in live mode, on a market the exchange will accept. An
+        unconfigured adapter refuses and names the missing piece rather than
+        advertising a capability it cannot exercise.
         """
         from src.ptai.venues.betfair_exchange import BetfairExchangeAdapter
         a = BetfairExchangeAdapter()
-        assert a.capabilities.supports_trading is False
+        assert a.capabilities.supports_trading is False, "no login, no trading"
+        assert a.capabilities.real_order_path is True
         assert a.capabilities.supports_orderbook is True
-        res = asyncio.run(a.place_order(None, max_spend_usd=10.0, max_price=0.5))
+        # dry_run is the outer gate: a configured adapter still refuses here.
+        configured = BetfairExchangeAdapter(username="u", password="p", app_key="k")
+        configured.dry_run = True
+        res = asyncio.run(configured.place_order(None, max_spend_usd=10.0,
+                                                 max_price=0.5))
+        # The standard dry-run refusal: a status the executor sizes and settles
+        # from, and no order sent anywhere.
+        assert res["status"] == "dry_run"
+        assert res["simulated"] is True
+        # And in live mode without credentials, the refusal names the login.
+        unconfigured = BetfairExchangeAdapter()
+        unconfigured.dry_run = False
+        res = asyncio.run(unconfigured.place_order(None, max_spend_usd=10.0,
+                                                   max_price=0.5))
         assert res["success"] is False
-        assert res["status"] == "unimplemented"
+        assert "credentials not configured" in res["reason"]
 
     def test_unknown_sport_is_reported_not_guessed(self):
         from src.ptai.venues.betfair_exchange import (BETFAIR_EVENT_TYPE_IDS,

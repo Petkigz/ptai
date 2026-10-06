@@ -85,7 +85,7 @@ class TestACapabilityIsAStatementAboutTheCode:
 
         claiming = {vid for vid, adapter in registry.adapters.items()
                     if adapter.capabilities.real_order_path}
-        assert claiming == {"polymarket", "kalshi"}, (
+        assert claiming == {"polymarket", "kalshi", "betfair"}, (
             "the adapters whose place_order can actually reach the venue")
         for vid in sorted(claiming):
             source = inspect.getsource(type(registry.adapters[vid]).place_order).lower()
@@ -162,12 +162,21 @@ class TestTheAnswersAnOperatorNeeds:
             "or claim they need credentials first")
 
     def test_a_venue_that_needs_a_login_says_so(self, inventory):
-        """Betfair's feed is closed: no credentials means no markets at all."""
+        """
+        Betfair's feed is closed: no credentials means no markets at all. It also
+        has an order path, and the two facts must both appear - an order path
+        does not make an unreadable feed readable, and a closed feed does not
+        make the submission path imaginary.
+        """
         row = inventory["venues"]["betfair"]
-        assert row["use"] == USE_NEEDS_LOGIN
+        assert row["use"] == USE_REAL_MONEY, "its adapter can submit, and the row says so"
+        assert row["real_order_path"] is True
         assert not row["reads_live_markets_now"]
-        assert not row["can_run_today"]
-        assert "credentials" in row["what_it_needs"]
+        assert not row["can_run_today"], "nothing to run until the login is saved"
+        assert row["needs_credentials"] is True
+        assert "login" in row["what_it_needs"]
+        assert "no markets until the login" in row["why"], (
+            "the row must not describe a closed feed as if it were being scanned")
 
     def test_no_client_venues_are_named_as_such(self, inventory):
         """

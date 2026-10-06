@@ -1627,11 +1627,93 @@ every response is reported verbatim, so a wrong assumption arrives as a refusal,
 not as a wrong trade. If you are ever in a position to use it, place **one
 contract** first.
 
-**What is next, in the same order the venue page gives:** Manifold and Betfair
-still refuse orders in their adapters (they are the other two distance-1 venues),
-and the crypto venues - Binance, WhiteBIT - cannot ride the probability lane at
-all: their markets are not probability markets, so they need a directional-pricing
-lane before an order path on them would mean anything.
+**What is next, in the same order the venue page gives:** Manifold still refuses
+orders in its adapter, and the crypto venues - Binance, WhiteBIT - cannot ride
+the probability lane at all: their markets are not probability markets, so they
+need a directional-pricing lane before an order path on them would mean anything.
+(Betfair was the second of the distance-1 venues and is done - see below.)
+
+## The Third Venue That Can Place An Order: Betfair
+
+Betfair is the venue with the widest tradable catalogue PTAI knows about: match
+odds, goals, corners, cards, correct score, half-time, Asian handicaps - the
+derivative markets the pricing models were actually written for. Its adapter
+read all of that and then refused every order on purpose, with a good reason:
+
+> Placing a real Betfair order needs the back/lay side, the price, the size,
+> persistence type and a liability check against the wallet.
+
+**The stranger fault was underneath.** The exchange's prices were being read and
+then thrown away before they reached the paper fill. Everything downstream prices
+a binary outcome in 0..1 (`bids`/`asks`); Betfair's book came back in decimal
+odds under `back`/`lay`, so the paper lane looked for `bids`, found none, and
+priced the trade from an **assumed 2% spread** instead of the exchange's real
+prices. The venue with the best prices was the one whose prices the simulator
+trusted least. The book is now published in both spaces: the exchange's own odds
+and stakes, side by side with the same book converted to probability and contract
+counts (`size x odds`, because the exchange quotes the *backer's stake*, not
+contracts).
+
+**What its adapter does now:**
+
+1. **A real order path, through the exchange's own client.** `place_orders` with
+   a `LIMIT`/`BACK` instruction on a specific selection, persistence `LAPSE` (the
+   exchange cancels it at the off, so an order the agent forgot cannot be matched
+   in play at a pre-play price), and a `customer_ref` so a retry is recognisable
+   at the venue.
+2. **Prices on Betfair's own ladder.** Its increments are not one cent - they
+   widen with the odds (0.01 up to 2.0, then 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5,
+   10). An off-ladder price is rejected, so prices are snapped onto the ladder,
+   and the authorised maximum is a probability: a cap of 0.40 means odds of
+   2.50 at the shortest, rounded **up**, so rounding can never buy above your
+   limit. When the market is offering worse odds than the cap, the order rests at
+   the cap instead of paying more.
+3. **The size is what the market actually offers.** A thin market produces a
+   smaller bet, not a rejected one - the stake is capped by the money available
+   at that price, and anything below the exchange minimum is refused with the
+   number.
+4. **A side is a selection, and nothing is synthesised.** YES is the market's
+   first published outcome; NO is the other runner of a **two-outcome** market.
+   A NO on a 1X2 market is "the draw or the away win" - two selections, not one
+   bet - so it is refused rather than turned into a lay whose liability the risk
+   layer never sized. **Lays are not built at all** for the same reason: a lay
+   risks `size x (odds - 1)`, which is not the quantity this executor sizes.
+5. **An order probe that proves permission.** One pound at the shortest price on
+   the ladder (1.01, which cannot match), then cancelled, with the cancel
+   confirmed before the probe reports success. If the cancel is not confirmed,
+   the probe fails and names the bet id that may still be resting.
+6. **Settlement the exchange reports.** A closed market with one runner marked
+   WINNER resolves; a void market or a dead heat resolves **nothing**. And to
+   make that mapping exact, a market whose first runner has no two-sided price is
+   not published at all - because the settlement reads the exchange's runner
+   order, and a market published with a different order would attribute a win to
+   the wrong outcome for good. Those markets are counted in the coverage report,
+   not passed over in silence.
+7. **The fee is commission, not 2% of stake.** Betfair charges on **net
+   winnings**, only when the bet wins: at odds 2.50 that is 7.5% of the stake,
+   nearly four times the flat "2%" the capability used to declare. The per-market
+   rate the cost model uses is `5% x (1 - p)` - the exchange's Market Base Rate,
+   converted to a per-stake number with the market's own probability of the
+   charge, and the worse leg when the side is not yet known. The flat field keeps
+   the ceiling, so a consumer that can only read a number over-charges rather
+   than under-charges.
+8. **The account read is the venue's own.** Available balance, and the open
+   orders list, under `betfair_account_api`. `positions` stays empty with a note,
+   because an exchange holds matched **bets** and valuing them needs the live
+   price of every market the account has touched - that is not a number to make
+   up. The account's currency is reported too, and a non-USD account says plainly
+   that the ledger reads its amounts as dollars, which is wrong by the exchange
+   rate.
+
+**What is NOT true, and the venue page now says it in one sentence:** Betfair's
+feed is **closed**. Without the login it returns no markets at all, so its row is
+"real money path, waiting for a login" rather than "scanned every cycle" - it is
+the one venue where the adapter can submit and still cannot run yet. And you
+cannot fund it from Uganda: the exchange funds by card or bank in the countries
+it serves, it decides who it serves, and its own eligibility check answers
+`requires_verification` for UG rather than a yes. So its row reads *"cannot hold
+real money from here: funds by card or bank transfer in the countries Betfair
+serves"*. An order path is still not a funding route.
 
 ## Extending to Other Sites
 

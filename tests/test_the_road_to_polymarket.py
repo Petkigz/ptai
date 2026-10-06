@@ -325,12 +325,13 @@ class TestThePageShowsTheRoad:
             agent.storage.close()
         body = console_client.get("/api/console/venue").json()
         reach = body["reach"]
-        # Two adapters now have a submission path: Polymarket and Kalshi. The
-        # list is a ranking, so it is compared as a set - and the money truth is
-        # asserted beside it, because "has an order path" is not "can hold your
-        # money": Kalshi's rail is a US bank account and its adapter marks Uganda
-        # restricted.
-        assert set(reach["real_orders"]) == {"polymarket", "kalshi"}, (
+        # Three adapters now have a submission path: Polymarket, Kalshi and
+        # Betfair. The list is a ranking, so it is compared as a set - and the
+        # money truth is asserted beside it, because "has an order path" is not
+        # "can hold your money": Kalshi's rail is a US bank account, Betfair's is
+        # card or bank in the countries it serves, and neither adapter reports
+        # Uganda as eligible.
+        assert set(reach["real_orders"]) == {"polymarket", "kalshi", "betfair"}, (
             "the venues whose adapters can submit a real order")
         rows = body["inventory"]["venues"]
         # The money truth, side by side: Kalshi's order path does NOT make it a

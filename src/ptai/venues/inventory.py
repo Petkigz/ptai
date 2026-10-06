@@ -326,16 +326,37 @@ def adapter_row(venue_id: str, adapter: Any,
         why = ("Read-only aggregator. It ranks arbitrage opportunities it has "
                "already found; it cannot hold a position.")
     elif use == USE_REAL_MONEY:
-        can_run_today = True
-        if armed:
+        # An order path does not imply a readable feed. Betfair has both an
+        # adapter that can submit AND a closed market feed: saying "reads live
+        # markets now and is paper-traded like every other venue" about it would
+        # describe a venue that returns nothing until its login is saved.
+        can_run_today = not needs_login
+        _login_name = login.get("label") or login.get("tool") or ""
+        if needs_login:
+            what_it_needs = (
+                f"an account and credentials for the {_login_name} login before "
+                f"it returns a single market, then venue credentials and an "
+                f"authorised budget to submit" if _login_name else
+                "an account and credentials before it returns a single market, "
+                "then an authorised budget to submit")
+            why = ("Its public feed is closed and its adapter has a real "
+                   "submission path: it returns no markets until the login is "
+                   "saved, and once it is, it can be scanned, paper-traded and - "
+                   "with a funded account that passes the health check - "
+                   "submitted for real.")
+        elif armed:
             what_it_needs = "nothing further - it is armed and funded"
+            why = ("Reads live markets now and is paper-traded like every other "
+                   "venue. Its adapter can also submit a real order once the login "
+                   "is saved, the account is funded, and the account health check "
+                   "has proven an order can be placed.")
         else:
             what_it_needs = ("venue credentials and an authorised budget; its "
                              "adapter has a real submission path")
-        why = ("Reads live markets now and is paper-traded like every other "
-               "venue. Its adapter can also submit a real order once the login "
-               "is saved, the account is funded, and the account health check "
-               "has proven an order can be placed.")
+            why = ("Reads live markets now and is paper-traded like every other "
+                   "venue. Its adapter can also submit a real order once the login "
+                   "is saved, the account is funded, and the account health check "
+                   "has proven an order can be placed.")
     elif use == USE_NEEDS_LOGIN:
         can_run_today = False
         _login_name = login.get("label") or login.get("tool") or ""

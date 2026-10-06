@@ -240,7 +240,10 @@ class AccountHealthEngine:
         "crypto_binance": (("api_key", "api_secret"), "api_key+secret"),
         "pionex": (("api_key", "api_secret"), "api_key+secret"),
         "grvt": (("api_key", "api_secret"), "api_key+secret"),
-        "betfair": (("username", "app_key"), "username+app_key(+certs)"),
+        # All three: the exchange's login is username+password+app key, and the
+        # order path signs with the session that login returns. A saved app key
+        # without the password arms nothing.
+        "betfair": (("username", "password", "app_key"), "username+password+app_key"),
         "betdaq": (("username", "app_key"), "username+app_key"),
         "manifold": (("api_key",), "api_key"),
         "chatgpt": (("api_key",), "api_key"),
