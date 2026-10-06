@@ -105,6 +105,14 @@ class Settings(BaseSettings):
     gamma_api: str = Field(default="https://gamma-api.polymarket.com", alias="GAMMA_API")
     dry_run: bool = Field(default=True, alias="DRY_RUN")
 
+    # The directional paper lane: spot positions on venues that quote PRICES
+    # (crypto exchanges), which the probability lane refuses on purpose. Its
+    # money is a separate paper purse and its trades never enter the resolved
+    # probability record that unlocks live capital, so this switch can only turn
+    # a paper bookkeeping lane on or off - never real capital.
+    directional_paper_enabled: bool = Field(default=True,
+                                            alias="DIRECTIONAL_PAPER_ENABLED")
+
     # LLM - Ollama
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     ollama_model: str = Field(default="llama3.1:8b", alias="OLLAMA_MODEL")

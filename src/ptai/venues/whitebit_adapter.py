@@ -5,6 +5,14 @@ Minimum order amounts low, API HMAC-SHA512, no testnet must test with min orders
 Real venue where $50 bankroll can execute
 API: https://whitebit.com/api
 Docs: https://docs.whitebit.com/
+
+An exchange quotes PRICES. This adapter used to write an invented probability of
+the price rising (`prob_up = 0.5 + change x 2`) into every market record, which
+is a forecast nobody made dressed as a quote - and the operator's log carried
+the consequence: `whitebit-BCH_TRY ... spread 6300.0%`. The record now carries
+the quote and nothing else, `probability_market: False` keeps the probability
+lane away from it, and the venue's real inputs (`directional_quote()`,
+`recent_candles()`) feed the directional lane instead.
 """
 from typing import List, Dict, Any
 from loguru import logger
@@ -14,6 +22,7 @@ import time
 
 from .adapter import MarketAdapter, VenueType, EligibilityStatus, VenueOpportunity, AdapterCapability
 from ..markets.base import Market, MarketSource, Token, DataMode
+from ..execution.directional import DirectionalQuote
 
 class WhiteBITAdapter(MarketAdapter):
     def __init__(self, api_key: str = None, api_secret: str = None):
@@ -33,7 +42,10 @@ class WhiteBITAdapter(MarketAdapter):
             supports_history=True,
             fee_taker_pct=0.001,  # 0.1% taker
             fee_maker_pct=0.0005,
-            min_order_usd=1.0
+            min_order_usd=1.0,
+            # Quotes a price, not a probability: paper-traded in the directional
+            # lane, refused by the probability lane.
+            quotes_prices_not_probabilities=True,
         )
         self.base_url = "https://whitebit.com/api/v4"
 
@@ -61,25 +73,26 @@ class WhiteBITAdapter(MarketAdapter):
                     try:
                         last = float(ticker.get("last_price", 0.5))
                         vol = float(ticker.get("quote_volume", 1000))
-                        # Convert to prediction-like prob for momentum strategy
-                        # For crypto derivatives, we treat as financial not prediction
-                        # price_change -> prob_up
                         change = float(ticker.get("change", 0))
-                        prob_up = max(0.1, min(0.9, 0.5 + change*2))
+                        # NO INVENTED PROBABILITY, for the same reason as the
+                        # Binance adapter: the venue quoted a price, and the
+                        # market record now says only that.
                         markets.append(Market(
                             id=f"whitebit-{symbol}",
                             source=MarketSource.POLYMARKET,
-                            question=f"Will {symbol} close higher?",
-                            outcomes=["YES", "NO"],
-                            outcome_prices=[prob_up, 1-prob_up],
-                            tokens=[Token(token_id=symbol, outcome="YES", price=prob_up)],
+                            question=f"{symbol} on WhiteBIT: price higher or lower in 24h?",
+                            description=f"{symbol} last {last:,.8g}, 24h change {change:+.2f}%, 24h quote volume {vol:,.0f}",
+                            outcomes=[symbol],
+                            outcome_prices=[last],
+                            tokens=[Token(token_id=symbol, outcome=symbol, price=last)],
                             volume=vol,
                             volume_24h=vol,
                             liquidity=vol*0.1,
                             active=True,
                             closed=False,
                             event_slug=symbol,
-                            raw={"venue": "whitebit", "symbol": symbol, "last_price": last, "type": "spot", "category": "crypto", "data_mode": "live", "data_source": "whitebit_api", "probability_market": False, "quote_scale": "currency", "is_mock": False},
+                            market_type="directional",
+                            raw={"venue": "whitebit", "symbol": symbol, "last_price": last, "change_pct": change, "type": "spot", "category": "crypto", "data_mode": "live", "data_source": "whitebit_api", "probability_market": False, "quote_scale": "currency", "market_kind": "directional", "is_mock": False},
                             venue_id="whitebit",
                             venue_type="financial",
                             data_mode=DataMode.LIVE,
@@ -201,6 +214,89 @@ class WhiteBITAdapter(MarketAdapter):
             "data_mode": "mock" if is_mock_market else "live",
             "warning": "MOCK_DATA - cannot execute" if is_mock_market else "Estimation - verify executable price"
         }
+
+    # ------------------------------------------------------------------
+    # the directional lane's measured inputs
+    # ------------------------------------------------------------------
+    def directional_quote(self, symbol, market: Market = None) -> DirectionalQuote:
+        """
+        WhiteBIT's own two-sided quote for this market, from its public book.
+
+        Read through the same endpoint the orderbook uses, so the lane trades on
+        exactly the prices the venue is showing. No quote, no trade. Accepts a
+        `Market` as the first argument too: the lane holds one during discovery
+        and only a symbol when it settles a position in a later cycle.
+        """
+        if not isinstance(symbol, str):
+            market, symbol = symbol, ""
+        if not symbol and market is not None:
+            symbol = str((market.raw or {}).get("symbol") or market.event_slug or "")
+        symbol = str(symbol or "").upper()
+        quote = DirectionalQuote(venue_id="whitebit", symbol=symbol, bid=0.0, ask=0.0)
+        if not symbol:
+            quote.reason = "the market record carries no symbol"
+            return quote
+        try:
+            import requests
+            resp = requests.get(f"{self.base_url}/public/orderbook/{symbol}",
+                                timeout=5)
+            if resp.status_code != 200:
+                quote.reason = f"HTTP {resp.status_code} from the public book"
+                return quote
+            data = resp.json() or {}
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            if not bids or not asks:
+                quote.reason = "the venue returned a one-sided book"
+                return quote
+            bid = float(bids[0][0])
+            ask = float(asks[0][0])
+        except Exception as e:  # noqa: BLE001
+            quote.reason = f"{type(e).__name__}: {e}"
+            return quote
+        if bid <= 0 or ask <= bid:
+            quote.reason = f"the venue quoted bid {bid} / ask {ask}"
+            return quote
+        quote.bid, quote.ask = bid, ask
+        raw = (market.raw or {}) if market is not None else {}
+        quote.last = float(raw.get("last_price") or 0) or None
+        quote.change_pct = raw.get("change_pct")
+        quote.volume_24h = getattr(market, "volume_24h", None)
+        quote.source = "whitebit_public_orderbook"
+        quote.is_real = True
+        return quote
+
+    def recent_candles(self, symbol: str, hours: int = 48,
+                       interval: str = "1h") -> List[Dict[str, Any]]:
+        """
+        The venue's own candles. WhiteBIT returns [time, open, close, high, low,
+        volume, ...] per row; the parse is defensive because a shape this lane
+        does not recognise must produce NO volatility (and therefore no trade),
+        never a plausible-looking one.
+        """
+        out: List[Dict[str, Any]] = []
+        try:
+            import requests
+            resp = requests.get(f"{self.base_url}/public/kline",
+                                params={"market": symbol, "interval": interval,
+                                        "limit": max(2, min(1000, int(hours)))},
+                                timeout=5)
+            if resp.status_code != 200:
+                self.last_error = f"HTTP {resp.status_code} from kline"
+                return out
+            payload = resp.json() or {}
+            rows = payload.get("result") if isinstance(payload, dict) else payload
+            for row in (rows or []):
+                if not isinstance(row, (list, tuple)) or len(row) < 5:
+                    continue
+                out.append({"open_time": int(row[0]), "open": float(row[1]),
+                            "close": float(row[2]), "high": float(row[3]),
+                            "low": float(row[4]),
+                            "volume": float(row[5]) if len(row) > 5 else 0.0})
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"{type(e).__name__}: {e}"
+            logger.debug(f"WhiteBIT candles failed for {symbol}: {e}")
+        return out
 
     async def get_portfolio(self) -> Dict[str, Any]:
         return {"balance": 0, "positions": [], "venue": "whitebit", "margin": "10x", "futures": "100x"}

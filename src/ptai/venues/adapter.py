@@ -60,6 +60,13 @@ class AdapterCapability:
     # instead of listing them as if they were quietly working.
     requires_credentials: bool = False
     supports_browser_fallback: bool = False
+    # Does this venue quote PRICES rather than probabilities? True for crypto
+    # exchanges: 'ADA_PERP at 0.748' is $0.748, there is no Yes share, and the
+    # probability lane refuses them on purpose. Those venues are not idle -
+    # they are paper-traded in the directional lane (execution/directional.py),
+    # and this flag is how the venue page says which lane a row runs in instead
+    # of listing a live feed as if nothing were happening.
+    quotes_prices_not_probabilities: bool = False
     fee_taker_pct: float = 0.0  # e.g. 0.02 = 2%
     # Gas the OPERATOR pays to place one order, per the venue's own mechanism.
     #

@@ -1663,6 +1663,40 @@ async def api_rounds(limit: int = 10) -> JSONResponse:
     })
 
 
+@app.get("/api/console/directional")
+async def api_directional(limit: int = 25) -> JSONResponse:
+    """
+    The directional paper record: the venue that quotes PRICES, traded as spot.
+
+    Crypto venues are refused by the probability scan on purpose - a price is not
+    a probability - so without this panel their markets were read every cycle and
+    never used, and the venue page read like they were switched off. These are
+    their paper positions: entry, stop, target, the model's direction, and the
+    closed record. Kept deliberately apart from the rest: a directional position
+    is not a probability forecast, so it is not in the resolved-trades count and
+    it cannot qualify a venue for live capital. The panel says so.
+    """
+    try:
+        wanted = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        wanted = 25
+    try:
+        from ..execution.directional import DirectionalPaperLane
+        lane = DirectionalPaperLane(get_storage())
+        record = lane.record(limit=wanted)
+    except Exception as e:  # noqa: BLE001 - a panel must still render
+        return JSONResponse({"available": False,
+                             "reason": f"{type(e).__name__}: {e}"})
+    # The switch lives on the ENGINE, which may be another process. This console
+    # reads it from the agent it hosts when it hosts one, and defaults to the
+    # setting's own default when it does not.
+    agent = _agent()
+    enabled = getattr(getattr(agent, "settings", None),
+                      "directional_paper_enabled", None)
+    record["enabled"] = True if enabled is None else bool(enabled)
+    return JSONResponse(record)
+
+
 @app.get("/api/console/agent-control")
 async def api_agent_control() -> JSONResponse:
     """
@@ -2068,6 +2102,26 @@ section[id]{scroll-margin-top:132px}
         than a flat one.
       </div>
       <div id="round"></div>
+    </div>
+
+    <!--
+      The venues that quote PRICES (crypto exchanges). The probability scan
+      refuses them on purpose - a price is not a probability - so their paper
+      trades run in the directional lane, with their own purse and their own
+      record. Kept visibly separate from the round card so nobody reads a spot
+      position as a probability bet.
+    -->
+    <div class="card" style="margin-top:16px">
+      <h2>Directional paper &mdash; the price venues</h2>
+      <div class="note" style="margin-bottom:9px">
+        A crypto exchange quotes a price, not a probability, so the forecast scan
+        will not touch it. These are its paper positions instead: entry at the
+        venue's own bid or ask, a stop and a target at the venue's own measured
+        volatility, and the model's direction. They use a <b>separate paper
+        purse</b> and they <b>do not count</b> toward the resolved probability
+        trades that unlock live capital.
+      </div>
+      <div id="directional"></div>
     </div>
 
     <!--
@@ -3176,6 +3230,70 @@ async function loadRounds(){
   showRound((body.rounds||[])[0] || null, body.summary||{}, body.rounds||[], false);
 }
 
+// ---- the directional paper lane: price venues, spot positions ----
+function showDirectional(d){
+  const el = $('directional');
+  if(!el) return;
+  if(!d || d.available === false){
+    el.innerHTML = `<div class="note">${esc((d && d.reason) || 'the directional record is unreadable')}</div>`;
+    return;
+  }
+  const open = d.open || [];
+  const closed = d.closed || [];
+  const head = `<div class="note" style="margin-bottom:9px">
+      ${d.enabled === false
+        ? '<span class="pill no">switched OFF</span> the directional paper switch is off: no price venue is being traded.'
+        : '<span class="pill ok">running</span> every cycle, on the venues that quote prices.'}
+      &middot; purse <b class="mono">$${Number(d.purse_usd||0).toFixed(2)}</b>
+      &middot; ${open.length} open
+      &middot; ${d.closed_count||0} closed
+      ${d.closed_count ? `&middot; ${d.wins||0} won (${(Number(d.win_rate||0)*100).toFixed(0)}%)
+        &middot; P&amp;L <b class="mono ${Number(d.pnl_usd)>=0?'pos':'neg'}">${Number(d.pnl_usd)>=0?'+':''}$${Math.abs(Number(d.pnl_usd)).toFixed(2)}</b>` : ''}
+    </div>`;
+  const openTable = open.length
+    ? `<div class="note" style="margin-top:9px"><b>Open</b></div>
+      <table><thead><tr><th>Venue</th><th>Symbol</th><th>Side</th><th>Entry</th>
+        <th>Stop</th><th>Target</th><th>Size</th><th>Model</th><th>EV/$</th>
+        <th>Opened</th></tr></thead><tbody>`
+      + open.map(p=>`<tr>
+          <td>${esc(p.venue_id||'')}</td>
+          <td class="mono">${esc(p.symbol||'')}</td>
+          <td><span class="pill ${p.side==='SHORT'?'no':'dim'}">${esc(p.side||'')}</span></td>
+          <td class="mono">${Number(p.entry_price||0).toFixed(4)}</td>
+          <td class="mono">${Number(p.stop_price||0).toFixed(4)}</td>
+          <td class="mono">${Number(p.target_price||0).toFixed(4)}</td>
+          <td class="mono">$${Number(p.position_size_usd||0).toFixed(2)}</td>
+          <td class="mono">${pct(p.model_prob)} up</td>
+          <td class="mono">${pct(p.ev_per_usd)}</td>
+          <td class="mono">${esc(String(p.opened_at||'').slice(0,16))}</td>
+        </tr>`).join('') + `</tbody></table>`
+    : `<div class="note" style="margin-top:9px">No directional position is open. This lane
+        opens one only when the venue quotes both sides, its own candles measure a
+        volatility, and the model answers with a direction that clears the fees.</div>`;
+  const closedTable = closed.length
+    ? `<div class="note" style="margin-top:11px"><b>Closed</b></div>
+      <table><thead><tr><th>Venue</th><th>Symbol</th><th>Side</th><th>Entry</th>
+        <th>Exit</th><th>How</th><th>P&amp;L</th><th>Closed</th></tr></thead><tbody>`
+      + closed.slice(0,20).map(p=>`<tr>
+          <td>${esc(p.venue_id||'')}</td>
+          <td class="mono">${esc(p.symbol||'')}</td>
+          <td>${esc(p.side||'')}</td>
+          <td class="mono">${Number(p.entry_price||0).toFixed(4)}</td>
+          <td class="mono">${p.exit_price==null?'&mdash;':Number(p.exit_price).toFixed(4)}</td>
+          <td>${esc(p.exit_reason||'')}</td>
+          <td class="mono ${Number(p.pnl_usd)>=0?'pos':'neg'}">${Number(p.pnl_usd)>=0?'+':''}$${Math.abs(Number(p.pnl_usd||0)).toFixed(2)}</td>
+          <td class="mono">${esc(String(p.closed_at||'').slice(0,16))}</td>
+        </tr>`).join('') + `</tbody></table>`
+    : '';
+  el.innerHTML = head + openTable + closedTable
+    + `<div class="note" style="margin-top:9px">${esc(d.note||'')}</div>`;
+}
+
+async function loadDirectional(){
+  const {body} = await api('/api/console/directional');
+  showDirectional(body);
+}
+
 // ---- the agent's lifecycle, from the page ----
 //
 // start / stop / run-now all act on THE agent. If the command window owns the
@@ -3923,7 +4041,7 @@ async function loadAll(){
       loadAgent(), loadStatus(), loadBrainSetup(), loadControl(),
       loadVenue(), loadCapital(), loadFunding(), loadOrders(), loadResults(),
       loadLogins(), loadVenueSwitches(), loadSports(), loadForecast(),
-      loadRounds(),
+      loadRounds(), loadDirectional(),
     ]);
     spyScroll();
   } finally {

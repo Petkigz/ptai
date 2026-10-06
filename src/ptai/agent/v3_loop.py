@@ -137,6 +137,13 @@ from ..execution.multi_venue_executor import MultiVenueExecutor
 from ..execution.account_health import AccountHealthEngine
 from ..execution.settlement import SettlementEngine
 from ..execution.position_ledger import PositionLedgerBuilder
+from ..execution.directional import (
+    DIRECTIONAL_MAX_CANDIDATES,
+    DirectionalForecaster,
+    DirectionalPaperLane,
+    measured_sigma,
+    plan_directional_trade,
+)
 from ..strategy.expected_ev import ExpectedNetEVEngine, executable_net_ev
 
 from ..learning.calibration_db import CalibrationDB
@@ -3566,6 +3573,15 @@ class TradingAgentV3:
             current_bankroll=current_bankroll, free_capital=free_capital,
             free_capital_paper=free_capital_paper)
 
+        # --- the directional lane -----------------------------------------
+        # The venues that quote PRICES, not probabilities, and are therefore
+        # refused by the scan above on purpose. Until this existed they read live
+        # markets every cycle and never did anything with them: the operator's
+        # "all of them except two say unavailable even in paper mode". They are
+        # paper-traded here - spot positions at the venue's own prices, with the
+        # purse and the record kept separate from the probability books.
+        directional = await self._run_directional_lane()
+
         # V10 FIX #8: Log exploration lane results (shadow only, no capital)
         if exploration_trades:
             logger.info(
@@ -3655,6 +3671,10 @@ class TradingAgentV3:
                            else {"available": False,
                                  "reason": "base rates were never loaded"}),
             "base_rate_refresh": self._base_rate_refresh,
+            # The venues that quote prices: read, paper-traded directionally,
+            # with their own purse and their own scoreboard - deliberately not
+            # part of the resolved-probability record.
+            "directional": directional,
             "arbitrage": {
                 "total_found": len(scan_result.arbitrage_opportunities),
                 "tradeable": len([a for a in scan_result.arbitrage_opportunities if a.should_trade]),
@@ -5552,6 +5572,182 @@ class TradingAgentV3:
             return str(Path(getattr(self.storage, "db_path", "./data/ptai.db")).parent)
         except Exception:  # noqa: BLE001
             return "./data"
+
+    # ------------------------------------------------------------------
+    # the directional lane: price venues, paper-traded as spot positions
+    # ------------------------------------------------------------------
+
+    def _directional_fee_pct(self, venue_id: str) -> float:
+        """The venue's own declared taker fee, or the crypto default if unreadable."""
+        try:
+            adapter = self.venue_registry.get_adapter_for_venue_id(venue_id)
+            rate = getattr(getattr(adapter, "capabilities", None), "fee_taker_pct", None)
+            if rate is not None:
+                return float(rate)
+        except Exception:  # noqa: BLE001
+            pass
+        return 0.001
+
+    def _directional_lane(self) -> DirectionalPaperLane:
+        lane = getattr(self, "_directional_lane_obj", None)
+        if lane is None:
+            lane = DirectionalPaperLane(self.storage,
+                                        fee_pct_for=self._directional_fee_pct)
+            self._directional_lane_obj = lane
+        return lane
+
+    def _directional_adapters(self):
+        """The registered adapters that declare they quote prices."""
+        out = []
+        for adapter in getattr(self.venue_registry, "adapters", {}).values():
+            caps = getattr(adapter, "capabilities", None)
+            if caps is None:
+                continue
+            if not getattr(caps, "quotes_prices_not_probabilities", False):
+                continue
+            if not (callable(getattr(adapter, "directional_quote", None))
+                    and callable(getattr(adapter, "recent_candles", None))):
+                continue
+            out.append(adapter)
+        return out
+
+    async def _run_directional_lane(self) -> Dict[str, Any]:
+        """
+        Open and settle directional paper positions on the price venues.
+
+        The rules this lane will not bend:
+
+          * no model answer, no trade - there is no heuristic fallback;
+          * no measured volatility, no trade;
+          * no two-sided quote, no trade;
+          * the money is its own paper purse, seeded from the paper bankroll, and
+            the positions are their own table. Nothing here can reach the
+            resolved-probability record that unlocks live capital.
+        """
+        summary: Dict[str, Any] = {
+            "enabled": False, "venues": [], "candidates": 0, "considered": 0,
+            "opened": 0, "refused": [], "settled": None, "model": "",
+            "purse_usd": None, "note": "",
+        }
+        if not bool(getattr(self.settings, "directional_paper_enabled", True)):
+            summary["note"] = ("the directional paper switch is OFF, so no price "
+                               "venue was traded this cycle")
+            logger.info(summary["note"])
+            return summary
+        adapters = self._directional_adapters()
+        if not adapters:
+            summary["note"] = ("no registered venue declares that it quotes prices, "
+                               "so the directional lane had nothing to run")
+            return summary
+        summary["enabled"] = True
+        lane = self._directional_lane()
+
+        # -- settle what the venue has already resolved ---------------------
+        def quote_lookup(venue_id: str, symbol: str):
+            try:
+                adapter = self.venue_registry.get_adapter_for_venue_id(venue_id)
+                return adapter.directional_quote(symbol)
+            except Exception:  # noqa: BLE001
+                return None
+
+        def candles_lookup(venue_id: str, symbol: str):
+            try:
+                adapter = self.venue_registry.get_adapter_for_venue_id(venue_id)
+                return adapter.recent_candles(symbol) or []
+            except Exception:  # noqa: BLE001
+                return []
+
+        try:
+            summary["settled"] = lane.settle_open(quote_lookup, candles_lookup)
+        except Exception as e:  # noqa: BLE001
+            summary["settled"] = {"error": f"{type(e).__name__}: {e}"}
+            logger.warning(f"Directional settlement failed: {type(e).__name__}: {e}")
+
+        # -- what the price venues are offering -----------------------------
+        candidates = []
+        for adapter in adapters:
+            row = {"venue_id": adapter.venue_id, "markets": 0, "error": ""}
+            try:
+                markets = await adapter.discover_markets(
+                    target_count=DIRECTIONAL_MAX_CANDIDATES * 4)
+            except Exception as e:  # noqa: BLE001
+                markets, row["error"] = [], f"{type(e).__name__}: {e}"
+            real = [m for m in (markets or [])
+                    if not getattr(m, "is_probability_market", True)]
+            row["markets"] = len(real)
+            if not real and not row["error"]:
+                row["error"] = getattr(adapter, "last_error", "") or "no markets"
+            summary["venues"].append(row)
+            candidates.extend(real)
+        candidates.sort(key=lambda m: float(getattr(m, "volume_24h", 0.0) or 0.0),
+                        reverse=True)
+        candidates = candidates[:DIRECTIONAL_MAX_CANDIDATES]
+        summary["candidates"] = len(candidates)
+        summary["purse_usd"] = lane.purse()
+        if not candidates:
+            summary["note"] = ("no price venue returned a market this cycle, so no "
+                               "directional position was considered")
+            return summary
+
+        forecaster = DirectionalForecaster(getattr(self, "llm_router", None))
+        if not forecaster.is_available():
+            summary["model"] = forecaster.last_problem or "no model answered"
+            summary["note"] = ("no model answered, so no directional position was "
+                               "opened - this lane never substitutes a heuristic")
+            logger.info(f"Directional lane: {summary['note']}")
+            return summary
+
+        for market in candidates:
+            symbol = str((market.raw or {}).get("symbol") or market.slug or "")
+            venue_id = str(getattr(market, "venue_id", "") or "")
+            try:
+                adapter = self.venue_registry.get_adapter_for_venue_id(venue_id)
+            except Exception:  # noqa: BLE001
+                adapter = None
+            if adapter is None:
+                summary["refused"].append(f"{symbol}: no adapter to quote from")
+                continue
+            summary["considered"] += 1
+            quote = adapter.directional_quote(market)
+            if not quote.valid:
+                summary["refused"].append(f"{symbol}: {quote.reason}")
+                continue
+            candles = adapter.recent_candles(symbol) or []
+            sigma = measured_sigma(candles)
+            if sigma is None:
+                summary["refused"].append(
+                    f"{symbol}: the venue's candles do not measure a volatility "
+                    f"({len(candles)} candles)")
+                continue
+            prob = forecaster.forecast(quote, sigma)
+            summary["model"] = forecaster.last_model or forecaster.last_problem
+            if prob is None:
+                summary["refused"].append(
+                    f"{symbol}: no directional probability ({forecaster.last_problem})")
+                continue
+            plan = plan_directional_trade(quote, sigma, prob, lane.purse(),
+                                          fee_pct=self._directional_fee_pct(venue_id))
+            if not plan.should_trade:
+                summary["refused"].append(f"{symbol}: " + "; ".join(plan.refusals))
+                continue
+            opened = lane.open(plan, market_question=str(market.question)[:200])
+            if opened.get("opened"):
+                summary["opened"] += 1
+            else:
+                summary["refused"].append(f"{symbol}: {opened.get('reason')}")
+
+        try:
+            summary["purse_usd"] = lane.purse()
+        except Exception:  # noqa: BLE001
+            pass
+        summary["note"] = (
+            f"{summary['opened']} directional position(s) opened from "
+            f"{summary['considered']} price market(s); {len(summary['refused'])} "
+            f"refused. Directions came from '{summary['model'] or 'no model'}'. "
+            f"Directional paper trades have their own purse and do not count "
+            f"toward the resolved probability trades.")
+        logger.info(f"Directional lane: {summary['note']}")
+        return summary
 
     async def _run_sports_lane(self, execution_mode: str) -> Dict[str, Any]:
         """

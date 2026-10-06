@@ -165,6 +165,38 @@ CREATE INDEX IF NOT EXISTS idx_calibration_unresolved
 -- strategy and category performance vanished on every restart: the tracker was
 -- rebuilt empty each run and the agent re-estimated allocation from nothing.
 -- Learning has to survive a restart to be learning.
+-- DIRECTIONAL PAPER POSITIONS: a spot position on a venue that quotes a price.
+--
+-- Kept OUT of `trades` on purpose. A row in `trades` is a probability bet whose
+-- `outcome` is 0 or 1 and whose forecast is scored by the calibration engine;
+-- a spot position has neither, and putting it in the same table would let it
+-- count toward the resolved-probability record that unlocks live trading. The
+-- two instruments keep separate books, and this table is the directional one.
+CREATE TABLE IF NOT EXISTS directional_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    venue_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    stop_price REAL,
+    target_price REAL,
+    position_size_usd REAL NOT NULL,
+    model_prob REAL,
+    sigma REAL,
+    ev_per_usd REAL,
+    fee_pct REAL,
+    horizon_hours REAL,
+    opened_at TEXT NOT NULL,
+    status TEXT DEFAULT 'open',
+    exit_price REAL,
+    exit_reason TEXT,
+    closed_at TEXT,
+    pnl_usd REAL,
+    fees_usd REAL,
+    market_question TEXT,
+    notes TEXT
+);
+
 CREATE TABLE IF NOT EXISTS trade_outcomes (
     trade_id TEXT PRIMARY KEY,
     market_id TEXT NOT NULL,
@@ -856,6 +888,65 @@ class Storage:
             VALUES (?, ?, ?, ?, ?)
         """, (now, market_id, tool, query, result[:5000]))
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # directional paper positions: their own table, their own record
+    # ------------------------------------------------------------------
+
+    def log_directional_position(self, position: Dict[str, Any]) -> int:
+        """Open a directional paper position. Never touches `trades`."""
+        cur = self.conn.execute("""
+            INSERT INTO directional_positions (
+                venue_id, symbol, side, entry_price, stop_price, target_price,
+                position_size_usd, model_prob, sigma, ev_per_usd, fee_pct,
+                horizon_hours, opened_at, status, market_question, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            position.get("venue_id"), position.get("symbol"), position.get("side"),
+            position.get("entry_price"), position.get("stop_price"),
+            position.get("target_price"), position.get("position_size_usd"),
+            position.get("model_prob"), position.get("sigma"),
+            position.get("ev_per_usd"), position.get("fee_pct"),
+            position.get("horizon_hours"),
+            position.get("opened_at") or datetime.now(timezone.utc).isoformat(),
+            position.get("status", "open"), position.get("market_question", ""),
+            position.get("notes", ""),
+        ))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_open_directional_positions(self) -> List[Dict[str, Any]]:
+        cur = self.conn.execute(
+            "SELECT * FROM directional_positions WHERE status = 'open' "
+            "ORDER BY opened_at ASC")
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_directional_positions(self, limit: int = 100) -> List[Dict[str, Any]]:
+        cur = self.conn.execute(
+            "SELECT * FROM directional_positions ORDER BY id DESC LIMIT ?",
+            (int(limit),))
+        return [dict(row) for row in cur.fetchall()]
+
+    def close_directional_position(self, position_id: int, exit_price: float,
+                                   exit_reason: str, pnl_usd: float,
+                                   fees_usd: float) -> bool:
+        """
+        Close a directional position. False when it does not exist or is already
+        closed, so a second settlement cannot pay out twice.
+        """
+        cur = self.conn.execute(
+            "SELECT status FROM directional_positions WHERE id = ?", (position_id,))
+        row = cur.fetchone()
+        if row is None or str(row["status"]) != "open":
+            logger.warning(f"close_directional_position: {position_id} is not open")
+            return False
+        self.conn.execute(
+            "UPDATE directional_positions SET status='closed', exit_price=?, "
+            "exit_reason=?, closed_at=?, pnl_usd=?, fees_usd=? WHERE id=?",
+            (exit_price, exit_reason, datetime.now(timezone.utc).isoformat(),
+             pnl_usd, fees_usd, position_id))
+        self.conn.commit()
+        return True
 
     def resolve_trade(self, trade_id: int, outcome: float, pnl: float,
                       notes: str = "") -> bool:

@@ -1778,6 +1778,62 @@ capital route this venue does not have. The honest use of Manifold is the one no
 implemented - a real venue with real prices and real resolutions feeding the paper
 record.
 
+## The Price Venues: A Directional Lane For Crypto
+
+Two venues read live markets every cycle and were never used for anything, and
+the reason was correct: a crypto exchange quotes a **price**. `ADA_PERP at 0.748`
+is $0.748, not a 74.8% chance, there is no Yes share to buy, and a forecast
+probability has nothing to be an edge against. So the scan refused them - and the
+venue page then read like they were switched off, which is the operator's
+*"all of them except two say unavailable even in paper mode"*.
+
+What was missing was not a client, a login or a network call. It was an
+**instrument that matches what an exchange sells**. That is now the directional
+paper lane, and it invents nothing:
+
+1. **The market record is the quote.** The old `discover_markets` wrote an
+   invented probability into every record (`prob_up = 0.5 + change% x 2`, then
+   `outcome_prices=[prob_up, 1-prob_up]`) - a forecast nobody made, dressed as a
+   venue price. The record now carries the symbol, the last price, the 24h change
+   and the volume, with `probability_market: False` and a `directional` market
+   type, so the probability lane refuses it for the right reason and this lane
+   reads it for the right one.
+2. **Entry and exit are the venue's own prices.** A LONG pays the ask, a SHORT
+   receives the bid - the sides that cost the trader, not the mid. No two-sided
+   quote, no trade.
+3. **The stop and target are the venue's own measured volatility.** One standard
+   deviation each way, from close-to-close returns on the venue's hourly candles,
+   scaled to the 24h horizon. Fewer than 12 candles, a missing close, or flat
+   candles measure nothing - and a trade sized on an unmeasured volatility is a
+   guess with a number attached to it.
+4. **The model answers one directional question.** A separate prompt asks for
+   *the probability the price is HIGHER at the horizon* - with the measured
+   volatility in front of it, and the instruction that 0.50 means no view. It is
+   never compared against a price that is not a probability. No model answer,
+   no trade: there is no heuristic fallback, and the run says so.
+5. **Fees are charged on both sides.** A position must clear the round-trip taker
+   fee by at least **1% of the stake** per dollar to open, after which it is
+   half-Kelly, capped at the same **6%** the probability lane uses.
+6. **Settlement walks the venue's candles.** Stop first, then target - so a
+   candle that contains both settles at the STOP, the conservative reading,
+   applied uniformly rather than guessed per trade. At the horizon it closes at
+   the venue's quoted price, or the last candle close when there is no quote.
+7. **The money is its own book.** Directional positions live in their own table,
+   `directional_positions`, and draw on their own paper purse, seeded once with
+   **20%** of the paper bankroll. They are not in `trades`, they are not scored by
+   the calibration engine, and therefore they **do not count** toward the resolved
+   probability trades that unlock live capital. A test asserts all three: after a
+   directional round trip, `trades`, `calibration` and `trade_outcomes` are empty
+   and the paper bankroll has not moved. The console panel says the same sentence.
+
+**What is still NOT true of these venues, in the row's own words:** they cannot
+hold your money (no order path in the adapter), and funding one from Uganda needs
+an exchange account and its KYC before any of this is real - which is why the
+crypto rows still read `fundable_from_here: False`. The directional lane is a
+paper instrument: it makes the venue's real prices and real volatility part of
+the record, and it keeps its scoreboard strictly separate from the one that
+unlocks live trading.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

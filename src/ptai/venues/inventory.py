@@ -377,6 +377,21 @@ def adapter_row(venue_id: str, adapter: Any,
         why = ("Its public feed is closed. Credentials let it be scanned and "
                "paper-traded; it still cannot place a real order, because no "
                "submission path exists in the adapter.")
+    elif use == USE_PAPER_ONLY and bool(
+            getattr(caps, "quotes_prices_not_probabilities", False)):
+        # A PRICE venue. Its markets are not probabilities, so the scan refuses
+        # them on purpose and the row must say what it does instead - otherwise a
+        # venue that IS being read and traded every cycle reads like one that is
+        # switched off.
+        can_run_today = True
+        what_it_needs = (
+            "nothing - it reads public prices with no account, and the directional "
+            "paper lane trades them without real capital")
+        why = ("A price venue: PTAI reads its quotes every cycle and paper-trades spot "
+               "positions in the directional lane, which keeps its own purse and its "
+               "own record. Those positions are not probability forecasts, so they do "
+               "NOT count toward the resolved trades that unlock live capital. The "
+               "venue cannot hold real money: the adapter has no order path.")
     else:  # USE_PAPER_ONLY
         can_run_today = True
         _login_name = login.get("label") or login.get("tool") or ""
