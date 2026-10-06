@@ -168,8 +168,18 @@ def _reach_layers(caps: Any, status: str, note: str, requires_creds: bool,
             next_step = ("write the account read (balance and open positions) - the "
                          "adapter has no portfolio call")
     elif not layers["places_real_orders"]:
-        next_step = (note or "write the order path: the adapter has no submission "
-                             "path, so it can be read and paper-traded only")
+        if bool(getattr(caps, "quotes_prices_not_probabilities", False)):
+            # A price venue: "write the order path" would be honest but
+            # incomplete - the operator also needs to know that what runs in the
+            # meantime is the directional lane, not the probability one.
+            next_step = (note or
+                         "there is no order path, so it is paper-traded only - and "
+                         "its paper trading is DIRECTIONAL (spot positions on its "
+                         "quotes), which is a separate purse and does not count "
+                         "toward the resolved probability trades")
+        else:
+            next_step = (note or "write the order path: the adapter has no submission "
+                                 "path, so it can be read and paper-traded only")
     else:
         next_step = "nothing - all three layers are written"
 
