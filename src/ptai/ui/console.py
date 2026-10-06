@@ -59,7 +59,8 @@ live_log.install()
 from ..strategy.venue_selection import MIN_SAMPLE_FOR_EVIDENCE, VenueSelector
 from ..validation.rule_bench import validation_block
 from ..venues.inventory import load_inventory
-from ..venues.qualification import VenueQualificationEngine, paper_record_progress
+from ..venues.qualification import (VenueQualificationEngine, paper_record_progress,
+                                    paper_slot_report)
 from ..strategy.venue_selection import (
     MAX_LIVE_VENUES_CEILING,
     max_live_venues_default,
@@ -458,6 +459,27 @@ async def api_funding(total: float = 50.0) -> JSONResponse:
 # ----------------------------------------------------------------------
 
 _agent_cache: Dict[str, Any] = {}
+
+
+def _paper_slot_max(agent=None) -> Optional[int]:
+    """
+    The paper account's concurrency budget, as the ENGINE has it.
+
+    The engine may be another process, so this falls back to the setting's own
+    default when no agent is hosted here - the number the next engine will use.
+    """
+    settings = getattr(agent, "settings", None)
+    value = getattr(settings, "paper_max_open_positions", None)
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    try:
+        from ..config import get_settings
+        return int(getattr(get_settings(), "paper_max_open_positions", 25) or 25)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _agent():
@@ -1312,6 +1334,7 @@ async def api_venue() -> JSONResponse:
                     "paper_tradable", "reads_live_markets_now",
                     "needs_credentials", "logged_in", "login",
                     "real_order_path", "can_place_real_orders",
+                    "can_report_settlement", "settlement_note",
                     "reason_unfundable", "minimum_deposit_usd", "currency"):
             if key in row:
                 out[key] = row[key]
@@ -1351,6 +1374,13 @@ async def api_venue() -> JSONResponse:
         "paper_record": paper_record_progress(
             storage, "polymarket",
             targets=_live_targets()),
+        # HOW MUCH ROOM THE PAPER ACCOUNT HAS TO BUILD THAT RECORD. A full book
+        # is the one reason the count can stand still while nothing is wrong,
+        # and a slot held by a venue that cannot report a resolution will never
+        # free itself - so both are stated rather than left to be inferred from
+        # a progress bar that is not moving.
+        "paper_slots": paper_slot_report(
+            storage, _paper_slot_max(agent)),
         # What out-of-sample validation says about the rules that are choosing
         # these trades. It can refuse a rule; it can never qualify a venue.
         # ...together with the bench: what the agent DOES about a refused
@@ -2666,7 +2696,9 @@ async function loadVenue(){
           : ''}.
         Every paper trade that settles counts, and the lane prefers markets that
         settle soon for exactly this reason.
-      </div>`;
+      </div>
+      ${(body.paper_slots||{}).note ? `<div class="note" style="margin-top:7px">
+        <b>Position slots.</b> ${esc(body.paper_slots.note)}</div>` : ''}`;
   }
 
   // ---- why ----
@@ -2715,17 +2747,25 @@ async function loadVenue(){
         : (a.can_run_today===false
            ? `<div class="note" style="margin-top:4px">not running: ${esc(a.what_it_needs||'')}</div>`
            : '');
+      // Whether a trade opened here could ever be CLOSED. It is the gate that
+      // decides which venues can contribute a resolved trade at all, so it is
+      // stated on the row rather than discovered when the count stops moving.
+      const settleNote = a.can_report_settlement===false
+        ? `<div class="note" style="margin-top:4px">${esc(a.settlement_note||'')}</div>`
+        : '';
       return `<tr>
         <td><b>${esc(a.label)}</b>${a.qualified?' <span class="pill ok">qualified</span>':''}${why}</td>
-        <td>${roleTxt}${canRun}</td>
+        <td>${roleTxt}${canRun}${settleNote}</td>
         <td class="mono">${a.resolved_trades}${noEv?` <span style="color:var(--dim)">/ ${body.min_sample_for_evidence} to score</span>`:''}</td>
         <td>${pnl}</td><td>${tot}</td>
       </tr>`;
     }).join('') + '</table>'
     + (mode==='paper' ? `<div class="note" style="margin-top:10px">
         "Cannot hold real money" is about real capital only: every venue here is
-        still scanned and paper-traded with the simulated account, and a venue
-        earns its place in the live list by doing exactly that.</div>` : '')
+        still scanned, and every venue whose adapter can report a resolution is
+        paper-traded with the simulated account. A venue earns its place in the
+        live list by doing exactly that - and one that cannot report a resolution
+        is read only, because a position there could never be closed or counted.</div>` : '')
     + ((rows.filter(a=>a.use==='no_client').length) ? `<div class="note" style="margin-top:6px">
         ${rows.filter(a=>a.use==='no_client').length} venue(s) have no client written
         yet. A login cannot help those - there is nothing to connect it to.</div>` : '');

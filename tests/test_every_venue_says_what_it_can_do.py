@@ -69,6 +69,25 @@ class _Venue(MarketAdapter):
     async def place_order(self, opportunity, max_spend_usd, max_price):
         return {"status": "dry_run", "reason": "test double"}
 
+    async def get_settlement(self, market_id: str):
+        # The ordinary stub stands in for a venue whose client is written: it
+        # reads markets AND can say how they ended. A stub without this is a
+        # different venue - see `_NoOutcomeVenue`.
+        return {"settled": False, "outcome": None, "is_real": True,
+                "source": "test_double", "reason": "test double"}
+
+
+class _NoOutcomeVenue(_Venue):
+    """
+    A venue with markets, orders and no settlement read.
+
+    This is not hypothetical: it is the state PredictIt's adapter is in, and the
+    executor refuses to open a position there because it could never be closed,
+    counted or learned from - it would only hold a position slot.
+    """
+
+    get_settlement = MarketAdapter.get_settlement
+
 
 class _Registry:
     def __init__(self, adapters):
@@ -346,3 +365,92 @@ class TestNoVenueIsCalledUnusableWhileItIsBeingWorked:
             "an optional key on a public venue is not a missing login")
         assert row["tool"] == "manifold"
         assert cov["counts"]["missing_form"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 4. a venue that cannot close a position is read, never traded
+# ---------------------------------------------------------------------------
+#
+# The road to 100 resolved trades is bounded by slots, and a slot handed to a
+# venue that cannot report a resolution is a slot that never comes back. The
+# executor refuses those positions, so the row must not describe the venue as
+# paper-traded - and a PRICE venue must not be swept up in that rule, because
+# its paper trading is the directional lane, which settles itself from prices.
+
+class TestAVenueThatCannotCloseSaysSo:
+    def test_a_probability_venue_with_no_settlement_read_is_read_only(
+            self, data_dir):
+        inv = build_inventory(_Registry({"predictit": _NoOutcomeVenue("predictit")}),
+                              data_dir)
+        row = inv["venues"]["predictit"]
+        assert row["can_report_settlement"] is False
+        assert row["paper_tradable"] is False, (
+            "the engine will not open a position there; the row must not say it "
+            "is paper-traded")
+        assert row["can_run_today"] is False
+        assert "settlement read" in row["what_it_needs"]
+        assert "could never be settled" in row["why"]
+        assert "cannot report how a market ended" in row["settlement_note"]
+
+    def test_a_venue_that_can_settle_is_paper_tradable_and_says_why(
+            self, data_dir):
+        inv = build_inventory(_Registry({"manifold": _open_venue("manifold")}),
+                              data_dir)
+        row = inv["venues"]["manifold"]
+        assert row["can_report_settlement"] is True
+        assert row["paper_tradable"] is True
+        assert "settle, count toward the record" in row["settlement_note"]
+
+    def test_a_price_venue_is_not_read_only(self, data_dir):
+        """
+        Its markets are prices, not probabilities, so the probability lane
+        refuses them - and that refusal is about the MARKET KIND, not about a
+        missing settlement read. The directional lane trades them and settles
+        them from prices, so the row keeps saying it runs.
+        """
+        inv = build_inventory(_Registry({
+            "whitebit": _NoOutcomeVenue("whitebit", implementation_status="live",
+                                        supports_market_discovery=True,
+                                        quotes_prices_not_probabilities=True)}),
+            data_dir)
+        row = inv["venues"]["whitebit"]
+        assert row["can_report_settlement"] is False
+        assert row["paper_tradable"] is True
+        assert row["can_run_today"] is True
+        assert "directional lane" in row["settlement_note"]
+        assert "do not count toward the" in row["settlement_note"]
+
+    def test_the_count_of_venues_that_can_close_a_trade_is_on_the_record(
+            self, data_dir):
+        inv = build_inventory(
+            _Registry({"predictit": _NoOutcomeVenue("predictit"),
+                       "manifold": _open_venue("manifold")}), data_dir)
+        assert inv["counts"]["can_report_settlement"] == 1
+
+
+class TestTheRealRegistryRowForPredictIt:
+    def test_predictit_is_scanned_but_never_given_a_position(self, console_app,
+                                                             console_client):
+        """
+        The live registry's own row, through the console's own payload. Until
+        PredictIt's adapter can report how a market ended, its markets are read
+        and no position is opened where it could never be closed.
+        """
+        inventory = _record(console_app)
+        row = inventory["venues"]["predictit"]
+        assert row["can_report_settlement"] is False
+        assert row["paper_tradable"] is False
+        assert row["can_run_today"] is False
+        assert "settlement read" in row["what_it_needs"]
+
+        capable = {vid for vid, r in inventory["venues"].items()
+                   if r["can_report_settlement"]}
+        assert {"polymarket", "kalshi", "manifold", "betfair"} <= capable, (
+            "the adapters that override get_settlement")
+        assert inventory["counts"]["can_report_settlement"] == len(capable)
+
+        body = console_client.get("/api/console/venue").json()
+        a = {r["venue_id"]: r for r in body["assessments"]}["predictit"]
+        assert a["can_report_settlement"] is False
+        assert "cannot report how a market ended" in a["settlement_note"]
+        assert a["can_run_today"] is False

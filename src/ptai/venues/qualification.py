@@ -902,6 +902,73 @@ LIVE_TARGETS = {
 RECORD_WINDOW_DAYS = 7
 
 
+def paper_slot_report(storage, max_open: Optional[int] = None) -> Dict[str, Any]:
+    """
+    The paper account's position slots: how many are held, by whom, and which
+    ones can never close.
+
+    The road to 100 is bounded by turnover, and turnover is bounded by slots: a
+    position that is waiting to settle holds one. Two numbers make that visible -
+    how many of the account's slots are in use, and how many are held by
+    positions on venues that CANNOT report a resolution (those will never close,
+    never count, and never free their slot).
+
+    Reads the trades table for the whole paper account, not one venue: a slot is
+    a slot whichever venue holds it.
+    """
+    out: Dict[str, Any] = {
+        "max": int(max_open) if max_open else None,
+        "open": 0, "free": None, "stuck_open": 0, "stuck_venues": [],
+        "by_venue": {}, "full": False, "note": "",
+    }
+    if storage is None:
+        out["note"] = "no storage"
+        return out
+    try:
+        rows = storage.conn.execute(
+            "SELECT venue_id, COUNT(*) AS n FROM trades "
+            "WHERE resolved = 0 AND COALESCE(execution_mode, 'live') = 'paper' "
+            "GROUP BY venue_id").fetchall()
+    except Exception as e:  # noqa: BLE001 - a panel must still render
+        out["note"] = f"{type(e).__name__}: {e}"
+        return out
+    by_venue = {str(r["venue_id"] or "?"): int(r["n"] or 0) for r in rows}
+    out["open"] = sum(by_venue.values())
+    out["by_venue"] = by_venue
+
+    try:
+        import json as _json
+        raw = storage.get_state("settlement_unsupported_venues") or "[]"
+        known = _json.loads(raw)
+        if not isinstance(known, list):
+            known = []
+    except Exception:  # noqa: BLE001
+        known = []
+    stuck = sorted(v for v in known if v in by_venue)
+    out["stuck_venues"] = [{"venue_id": v, "open": by_venue[v]} for v in stuck]
+    out["stuck_open"] = sum(by_venue[v] for v in stuck)
+
+    if out["max"]:
+        out["free"] = max(0, int(out["max"]) - out["open"])
+        out["full"] = out["free"] == 0
+    parts = []
+    if out["max"]:
+        parts.append(f"{out['open']} of {out['max']} paper position slot(s) in use")
+    else:
+        parts.append(f"{out['open']} paper position(s) open")
+    if out["full"]:
+        parts.append("every slot is held, so the record grows as these markets "
+                     "settle - not before")
+    if out["stuck_open"]:
+        names = ", ".join(f"{v['venue_id']} ({v['open']})" for v in out["stuck_venues"])
+        parts.append(
+            f"{out['stuck_open']} of them sit on a venue that cannot report a "
+            f"resolution ({names}) - they will never close, never count toward "
+            f"the 100, and hold their slot for good")
+    out["note"] = "; ".join(parts)
+    return out
+
+
 def paper_record_progress(storage, venue_id: str = "polymarket",
                           targets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """

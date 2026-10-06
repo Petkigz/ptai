@@ -102,6 +102,16 @@ class _StubVenue(MarketAdapter):
     def get_fee_rate(self, market):
         return 0.0
 
+    async def get_settlement(self, market_id):
+        """
+        This stub stands in for Polymarket, whose adapter CAN report a
+        resolution - so the paper lane may open positions here. The executor
+        refuses to open a position on an adapter that cannot, because it could
+        never be closed, counted or learned from.
+        """
+        return {"settled": False, "outcome": None, "is_real": True,
+                "source": "stub", "reason": "the test market never closes"}
+
     async def place_order(self, opportunity, max_spend_usd, max_price):
         """The real adapter's dry-run contract: walk the book, report the fill."""
         self.orders.append((opportunity.market.id, max_spend_usd, max_price))

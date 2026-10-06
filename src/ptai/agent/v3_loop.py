@@ -2142,19 +2142,26 @@ class TradingAgentV3:
         The difference from `run_cycle` is the number of positions. A round is
         meant to leave the account measurably different, and three positions on a
         $50 bankroll is a thin sample of a market the operator asked to be
-        involved in "more at once". The ceiling is the RISK rules, not this
-        method: it fills every position slot the limits leave open and no more,
-        reads them from the same ledger sizing reads, and never widens a cap.
+        involved in "more at once". The ceiling is the ACCOUNT's own budget, not
+        this method: it fills every position slot that account's budget leaves
+        open and no more, reads them from the same ledger sizing reads, and never
+        widens a cap.
 
-        Paper rounds are the same call with the same rules - the paper account
-        carries its own cash, so six positions of $3 is $18 of a $50 simulation,
-        under both the 6%-a-position and 50%-exposure ceilings.
+        Paper rounds are the same call with the same percentage rules, but their
+        position COUNT comes from the paper account's own budget
+        (`PTAI_PAPER_MAX_OPEN`, default 25 = the 50% ceiling in $1 slices of the
+        $50 paper account). It used to come from the live risk limit of six, so
+        six paper positions waiting to settle stopped every later round - and the
+        resolved-trade record those positions exist to build stood still.
         """
         if max_trades is None:
-            try:
-                limits_max = int(self.limits_engine.limits.max_open_positions)
-            except Exception:  # noqa: BLE001
-                limits_max = 6
+            # THE ACCOUNT'S OWN BUDGET. This read the live risk limit for both
+            # accounts, so a paper round was clamped to six minus what was
+            # already open - and once six paper positions were waiting to
+            # settle, every later round opened nothing while the record it
+            # exists to build stood still.
+            limits_max = int(self.paper_slot_budget()["max"])
+            _who = "the paper account" if self.dry_run else "the risk rules"
             ledger = self._round_ledger(
                 lambda mid: self._round_marks().get(str(mid)))
             if ledger is not None:
@@ -2170,11 +2177,11 @@ class TradingAgentV3:
             # Nothing is left to open - the round still researches and reports.
             max_trades = free_slots
             logger.info(
-                f"Round sizing: {held} position(s) already open, the risk rules "
-                f"allow {limits_max} - this round may open up to {max_trades}"
+                f"Round sizing: {held} position(s) already open, {_who} "
+                f"allow(s) {limits_max} - this round may open up to {max_trades}"
                 if max_trades else
-                f"Round sizing: the {held} open position(s) fill every slot the "
-                f"risk rules allow ({limits_max}) - this round will research and "
+                f"Round sizing: the {held} open position(s) fill every slot "
+                f"{_who} allow(s) ({limits_max}) - this round will research and "
                 f"score the book, and will not open anything")
         return await self.run_cycle(target_per_venue=target_per_venue,
                                     max_trades=max_trades)
@@ -3261,6 +3268,34 @@ class TradingAgentV3:
         if (not _exposure_seed.get("readable", True)
                 and self._round_report is not None):
             self._round_report.warnings.append(str(_exposure_seed.get("warning")))
+
+        # A POSITION THAT CAN NEVER BE CLOSED IS NOT A POSITION. Before anything
+        # is executed, the venue has to be able to report how the market ended.
+        # An adapter that cannot is asked forever, answers `unsupported` every
+        # time, and the position holds one of the account's slots permanently -
+        # so the road to 100 resolved trades fills with trades that can never
+        # resolve. The refusal is stated per opportunity, with the venue named.
+        _settleable: List[Any] = []
+        self._cycle_settlement_refusals = []
+        for opp in final_trades:
+            okay, why = self.settlement_capable(getattr(opp, "venue_id", ""))
+            if okay:
+                _settleable.append(opp)
+                continue
+            logger.info(f"Settlement gate blocks {opp.market.id} @ "
+                        f"{getattr(opp, 'venue_id', '?')}: {why}")
+            self._cycle_settlement_refusals.append({
+                "market_id": getattr(getattr(opp, "market", None), "id", ""),
+                "venue_id": getattr(opp, "venue_id", ""), "reason": why})
+        if self._cycle_settlement_refusals:
+            logger.warning(
+                f"Settlement gate: {len(self._cycle_settlement_refusals)} "
+                f"opportunit"
+                f"{'y' if len(self._cycle_settlement_refusals) == 1 else 'ies'} "
+                f"refused because the venue cannot report a resolution - nothing "
+                f"is opened where it could never be closed. Slots stay free for "
+                f"markets that settle and count.")
+        final_trades = _settleable
         
         self._set_phase(
             "executing",
@@ -3665,6 +3700,12 @@ class TradingAgentV3:
             # The paper account's own purse: its balance, and whether this cycle
             # had to re-seed it (and why not, when it did not).
             "paper_purse": dict(getattr(self, "_paper_purse", None) or {}),
+            # How many positions the account may hold, which budget set that
+            # number, and how many are free - so a round that opens nothing says
+            # whether the book was full or the markets were refused.
+            "position_slots": dict(_exposure_seed or {}),
+            "settlement_refusals": list(getattr(self, "_cycle_settlement_refusals",
+                                                None) or []),
             # Whether the base-rate component had real counted frequencies this
             # cycle, and from how many resolved markets.
             "base_rates": (self.base_rates.status() if self.base_rates is not None
@@ -4140,6 +4181,70 @@ class TradingAgentV3:
             return "paper"
         return "live"
 
+    def paper_slot_budget(self) -> Dict[str, Any]:
+        """
+        How many PAPER positions this account may hold at once, and why.
+
+        `ExposureManager.max_open_positions` is the risk limit for real capital
+        (6 positions). The paper account answers to its own budget: the position
+        COUNT must not be the thing that stops a simulation whose whole job is to
+        build the record that unlocks live trading. The percentage ceilings are
+        untouched and still bind - this only stops a constant written for real
+        positions from throttling the paper one.
+        """
+        risk_limit = 6
+        try:
+            risk_limit = int(self.limits_engine.limits.max_open_positions)
+        except Exception:  # noqa: BLE001
+            pass
+        paper_limit = risk_limit
+        try:
+            paper_limit = int(getattr(self.settings, "paper_max_open_positions",
+                                      risk_limit) or risk_limit)
+        except Exception:  # noqa: BLE001
+            pass
+        paper_limit = max(1, min(paper_limit, 500))
+        if self.dry_run:
+            return {"max": paper_limit, "source": "PTAI_PAPER_MAX_OPEN (the paper "
+                    "account's own concurrency budget)",
+                    "risk_limit": risk_limit, "note": (
+                        "the paper account may hold more positions than the live "
+                        "risk limit because it risks no capital; the percentage "
+                        "ceilings are unchanged and still bind")}
+        return {"max": risk_limit, "source": "the live risk limit "
+                "(max_open_positions)", "risk_limit": risk_limit,
+                "note": "real capital: the risk limit governs, unchanged"}
+
+    def settlement_capable(self, venue_id: str) -> tuple:
+        """
+        Can this venue tell PTAI how a market there ended?
+
+        Derived from the code, not from a claim: an adapter is settlement-capable
+        when it OVERRIDES `MarketAdapter.get_settlement`. Anything that inherits
+        the base method answers `unsupported` forever, so a position opened there
+        can never be closed, never learned from, and holds one of the account's
+        position slots for good. The operator's road to 100 resolved trades
+        cannot be built out of those, so the lane does not open them.
+
+        Returns (ok, reason).
+        """
+        from ..venues.adapter import can_report_settlement  # noqa: WPS433
+        vid = str(venue_id or "").split("+")[0].strip().lower()
+        if not vid:
+            return False, "the opportunity does not name a venue"
+        try:
+            adapter = self.venue_registry.get_adapter_for_venue_id(vid)
+        except Exception:  # noqa: BLE001
+            adapter = None
+        if adapter is None:
+            return False, f"no adapter is registered for {vid}"
+        # One definition, two readers: this same call decides what the venue
+        # panel may say about the venue.
+        if not can_report_settlement(adapter):
+            return False, (f"the {vid} adapter cannot report a settlement, so a "
+                           f"position there could never be closed or learned from")
+        return True, ""
+
     def _seed_exposure_manager(self, ledger: Any) -> Dict[str, Any]:
         """
         Load the open book into the exposure manager before the risk rules run.
@@ -4228,6 +4333,15 @@ class TradingAgentV3:
 
         self.exposure_manager.positions = seeded
         self.exposure_manager.update_bankroll(bankroll)
+        # WHICH CONCURRENCY BUDGET APPLIES TO THIS ACCOUNT. In paper it is the
+        # paper account's own budget; live keeps the risk limit exactly as it is.
+        budget = self.paper_slot_budget()
+        self.exposure_manager.max_open_positions = int(budget["max"])
+        report["max_open_positions"] = int(budget["max"])
+        report["slot_source"] = budget["source"]
+        report["slot_note"] = budget["note"]
+        report["risk_limit"] = budget["risk_limit"]
+        report["free_slots"] = max(0, int(budget["max"]) - len(seeded))
         self._exposure_account = mode
         logger.info(
             f"Exposure caps seeded with the {mode} book: {len(seeded)} position(s) "

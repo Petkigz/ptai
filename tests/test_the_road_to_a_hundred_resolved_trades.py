@@ -49,7 +49,12 @@ from src.ptai.venues.adapter import (
     MarketAdapter,
     VenueType,
 )
-from src.ptai.venues.qualification import LIVE_TARGETS, paper_record_progress
+from src.ptai.execution.position_ledger import PositionLedgerBuilder
+from src.ptai.venues.qualification import (
+    LIVE_TARGETS,
+    paper_record_progress,
+    paper_slot_report,
+)
 
 
 class _SettlingVenue(MarketAdapter):
@@ -95,13 +100,14 @@ class _Registry:
 
 
 def _log_paper_trade(storage, market_id="pm1", stake=1.0, price=0.42,
-                     side="YES", question="Will event happen?"):
+                     side="YES", question="Will event happen?",
+                     venue_id="polymarket"):
     """A paper position, written the way the executor writes one."""
     storage.log_trade({
         "market_id": market_id, "market_question": question, "side": side,
         "market_price": price, "fair_value": 0.5, "edge": 0.05,
         "kelly_fraction": 0.02, "position_size_usd": stake, "confidence": 0.7,
-        "status": "paper", "venue_id": "polymarket", "execution_mode": "paper",
+        "status": "paper", "venue_id": venue_id, "execution_mode": "paper",
         "token_price_at_entry": price, "fees_usd": 0.0,
     })
     row = storage.conn.execute(
@@ -346,3 +352,303 @@ class TestThePanelAnswersHowFarAlongItIs:
         body = console_client.get("/api/console/venue").json()
         assert body["paper_record"]["resolved"] == 1
         assert "1 of 100" in body["paper_record"]["note"]
+
+
+# ---------------------------------------------------------------------------
+# 4. the SLOTS - the thing that was stopping the count
+# ---------------------------------------------------------------------------
+#
+# The record stopped moving because of SLOTS, not signals. `ExposureManager`
+# carries the position-count cap for REAL capital (6), and the round read that
+# same constant for its free-slot arithmetic - so once six paper positions were
+# waiting to settle, every later round opened nothing while the record those
+# positions exist to build stood still. A paper account has its own budget, and
+# the two things that must never happen are covered below: the budget must not
+# leak into live capital, and a slot must never be handed to a venue that cannot
+# report a resolution (that position would hold it for good).
+
+
+class _VenueWithNoOutcome(MarketAdapter):
+    """Reads markets, fills in paper - and cannot say how any of them ended."""
+
+    def __init__(self, venue_id="predictit"):
+        super().__init__(venue_id=venue_id, venue_type=VenueType.PREDICTION)
+        self.capabilities = AdapterCapability(
+            implementation_status="live", supports_market_discovery=True)
+        self.label = venue_id.title()
+
+    def check_eligibility(self, country_code="UG"):
+        return EligibilityStatus.ELIGIBLE
+
+    async def discover_markets(self, target_count=100, **kwargs):
+        return []
+
+    async def get_orderbook(self, market):
+        return {}
+
+    async def get_portfolio(self):
+        return {"venue_id": self.venue_id, "available": True}
+
+    async def place_order(self, opportunity, max_spend_usd, max_price):
+        return {"status": "dry_run"}
+
+
+def _agent(monkeypatch, tmp_path):
+    monkeypatch.setenv("PTAI_DB", str(tmp_path / "agent.db"))
+    monkeypatch.setenv("LM_STUDIO_HOST", "http://127.0.0.1:9")
+    from src.ptai.agent.v3_loop import TradingAgentV3
+
+    return TradingAgentV3(country_code="UG", dry_run=True)
+
+
+def _ledger(storage):
+    return PositionLedgerBuilder(storage=storage).build()
+
+
+class TestThePaperAccountHasItsOwnSlots:
+    def test_the_paper_budget_is_not_the_live_risk_limit(self, monkeypatch,
+                                                         tmp_path):
+        """
+        Six is the risk limit for real capital. A paper account risking nothing
+        is not bound by it - and the percentage ceilings (6% a position, 15% a
+        category, 20% correlated, 50% total) are unchanged and still bind.
+        """
+        agent = _agent(monkeypatch, tmp_path)
+        try:
+            budget = agent.paper_slot_budget()
+            assert budget["max"] == 25, (
+                "the 50% ceiling expressed in $1 slices of the $50 paper account")
+            assert budget["risk_limit"] == int(
+                agent.limits_engine.limits.max_open_positions)
+            assert budget["max"] > budget["risk_limit"]
+            assert "paper" in budget["source"]
+            assert "percentage ceilings are unchanged" in budget["note"]
+
+            # The budget is a setting, not a magic number.
+            monkeypatch.setattr(agent.settings, "paper_max_open_positions", 3,
+                                raising=False)
+            assert agent.paper_slot_budget()["max"] == 3
+
+            # ...and it can never loosen REAL capital: in live mode the risk
+            # limit governs, whatever the paper setting says.
+            agent.dry_run = False
+            live = agent.paper_slot_budget()
+            assert live["max"] == live["risk_limit"] == int(
+                agent.limits_engine.limits.max_open_positions)
+            assert "live" in live["source"]
+        finally:
+            agent.storage.close()
+
+    def test_seven_open_positions_no_longer_fill_the_book(self, monkeypatch,
+                                                          tmp_path):
+        """
+        The regression itself. Seven paper positions is 14% of a $50 paper
+        account - three of the ceilings would still allow it - but under the old
+        cap of six, `can_open` refused the seventh because the book was "full".
+        """
+        agent = _agent(monkeypatch, tmp_path)
+        try:
+            for i in range(7):
+                _log_paper_trade(agent.storage, market_id=f"SLOT-{i}", stake=1.0,
+                                 price=0.5)
+            seed = agent._seed_exposure_manager(_ledger(agent.storage))
+
+            assert seed["positions"] == 7
+            assert seed["max_open_positions"] == 25
+            assert seed["risk_limit"] == 6, "the live limit is still reported"
+            assert seed["free_slots"] == 18
+            assert "paper" in seed["slot_source"]
+            assert seed["slot_note"]
+            assert agent.exposure_manager.max_open_positions == 25
+
+            allowed, reason = agent.exposure_manager.can_open(
+                market_id="SLOT-NEW", amount_usd=1.0, category="politics",
+                correlation_group="politics", venue="polymarket")
+            assert allowed is True, (
+                f"the seventh position was refused as a full book: {reason}")
+        finally:
+            agent.storage.close()
+
+    def test_a_full_budget_is_still_a_full_book(self, monkeypatch, tmp_path):
+        """Widening the count for paper is not the same as removing it."""
+        agent = _agent(monkeypatch, tmp_path)
+        try:
+            for i in range(25):
+                _log_paper_trade(agent.storage, market_id=f"FULL-{i}", stake=1.0,
+                                 price=0.5)
+            seed = agent._seed_exposure_manager(_ledger(agent.storage))
+            assert seed["free_slots"] == 0
+            allowed, reason = agent.exposure_manager.can_open(
+                market_id="ONE-MORE", amount_usd=1.0, category="politics",
+                correlation_group="politics", venue="polymarket")
+            assert allowed is False and "Max open positions" in reason
+        finally:
+            agent.storage.close()
+
+
+# ---------------------------------------------------------------------------
+# 5. a slot is never handed to a venue that cannot close the position
+# ---------------------------------------------------------------------------
+
+class TestAVenueThatCannotCloseIsRefusedBeforeAnythingOpens:
+    def test_settlement_capability_is_a_fact_about_the_adapter(self, monkeypatch,
+                                                               tmp_path):
+        agent = _agent(monkeypatch, tmp_path)
+        try:
+            agent.venue_registry = _Registry(_VenueWithNoOutcome("predictit"))
+            ok, why = agent.settlement_capable("predictit")
+            assert ok is False
+            assert "cannot report a settlement" in why
+            assert "never be closed or learned from" in why
+
+            agent.venue_registry = _Registry(_SettlingVenue("polymarket"))
+            assert agent.settlement_capable("polymarket")[0] is True
+
+            # An empty or unknown venue is refused, never assumed settleable.
+            assert agent.settlement_capable("")[0] is False
+            ok, why = agent.settlement_capable("nowhere")
+            assert ok is False and "no adapter is registered" in why
+        finally:
+            agent.storage.close()
+
+    def test_a_round_refuses_the_position_and_still_runs(self, tmp_path,
+                                                         monkeypatch):
+        """
+        The whole round on a venue whose adapter cannot report a resolution: the
+        opportunity reaches the decision, the gate refuses it, nothing is
+        written, and the round still researches and reports.
+        """
+        from tests.test_full_cycle_from_discovery_to_allocation import (
+            VENUE,
+            _force_qualified,
+            _inject_opportunity,
+            build_agent,
+        )
+
+        agent, adapter = build_agent(tmp_path, dry_run=True)
+        try:
+            _force_qualified(agent, monkeypatch)
+            _inject_opportunity(agent, adapter._market(), monkeypatch)
+            # The stub CAN settle - which is what makes the refusal below about
+            # the gate rather than about the fixture. Removing the override is
+            # exactly the state PredictIt's adapter is in.
+            assert agent.settlement_capable(VENUE)[0] is True
+            monkeypatch.setattr(type(adapter), "get_settlement",
+                                MarketAdapter.get_settlement)
+
+            result = asyncio.run(agent.run_round(target_per_venue=5))
+
+            refusals = result["settlement_refusals"]
+            assert refusals, "the opportunity never reached the gate"
+            assert refusals[0]["venue_id"] == VENUE
+            assert "cannot report a settlement" in refusals[0]["reason"]
+            assert result["execution"] == [], (
+                "a refused opportunity must not be executed")
+            assert result["round"]["positions_opened"] == 0
+            assert agent.storage.get_performance_summary()["total_trades"] == 0
+            assert result["position_slots"]["max_open_positions"] > 0
+        finally:
+            agent.storage.close()
+
+
+class TestAPositionThatCanNeverCloseIsNamedNotCounted:
+    def test_the_settlement_report_carries_the_stuck_count(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "stuck.db"))
+        try:
+            _log_paper_trade(storage, market_id="pi1", venue_id="predictit")
+            engine = SettlementEngine(
+                storage=storage,
+                venue_registry=_Registry(_VenueWithNoOutcome("predictit")))
+            report = asyncio.run(engine.settle_pending())
+
+            assert report.stuck == 1
+            assert report.to_dict()["stuck"] == 1
+            assert report.items and report.items[0].source == "unsupported"
+            # Recorded in storage, so the panel can read it in another process.
+            assert json.loads(
+                storage.get_state("settlement_unsupported_venues")) == ["predictit"]
+            # No invented outcome, and no resolved trade: the position stays open.
+            paper = storage.get_paper_performance()
+            assert paper["settled_trades"] == 0, (
+                "an unsupported venue must never be resolved")
+            assert storage.get_open_positions(), "the position must still be open"
+        finally:
+            storage.close()
+
+    def test_a_settleable_venue_is_never_recorded_as_stuck(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "fine.db"))
+        try:
+            _log_paper_trade(storage, market_id="pm1", venue_id="polymarket")
+            engine = SettlementEngine(
+                storage=storage, venue_registry=_Registry(_SettlingVenue()))
+            report = asyncio.run(engine.settle_pending())
+            assert report.stuck == 0
+            assert report.to_dict()["stuck"] == 0
+            assert storage.get_state("settlement_unsupported_venues") in (None, "")
+        finally:
+            storage.close()
+
+    def test_the_slot_report_names_which_slots_are_stuck(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "slots.db"))
+        try:
+            _log_paper_trade(storage, market_id="pi1", venue_id="predictit")
+            _log_paper_trade(storage, market_id="pi2", venue_id="predictit")
+            _log_paper_trade(storage, market_id="pm1", venue_id="polymarket")
+            storage.set_state("settlement_unsupported_venues", '["predictit"]')
+
+            slots = paper_slot_report(storage, 25)
+            assert slots["open"] == 3
+            assert slots["free"] == 22
+            assert slots["full"] is False
+            assert slots["by_venue"] == {"predictit": 2, "polymarket": 1}
+            assert slots["stuck_open"] == 2
+            assert slots["stuck_venues"] == [{"venue_id": "predictit", "open": 2}]
+            assert "cannot report a resolution" in slots["note"]
+            assert "predictit (2)" in slots["note"]
+        finally:
+            storage.close()
+
+    def test_a_full_book_says_the_record_grows_when_they_settle(self, tmp_path):
+        storage = Storage(db_path=str(tmp_path / "full.db"))
+        try:
+            for i in range(25):
+                _log_paper_trade(storage, market_id=f"pm{i}", venue_id="polymarket")
+            slots = paper_slot_report(storage, 25)
+            assert slots["full"] is True and slots["free"] == 0
+            assert "every slot is held" in slots["note"]
+        finally:
+            storage.close()
+
+
+class TestThePanelSaysWhyTheCountWouldNotMove:
+    def test_the_venue_payload_carries_the_position_slots(self, console_app,
+                                                          console_client):
+        body = console_client.get("/api/console/venue").json()
+        slots = body["paper_slots"]
+        assert slots["max"] == 25
+        assert slots["open"] == 0 and slots["free"] == 25
+        assert slots["full"] is False
+        assert "0 of 25 paper position slot(s) in use" in slots["note"]
+
+    def test_a_stuck_slot_is_named_on_the_panel(self, console_app,
+                                                console_client, tmp_path):
+        """
+        A count that is not moving has two very different explanations - a full
+        book, and a slot that can never free itself. Both are on the page.
+        """
+        storage = Storage(db_path=str(tmp_path / "console.db"))
+        try:
+            _log_paper_trade(storage, market_id="pi1", venue_id="predictit")
+            storage.set_state("settlement_unsupported_venues", '["predictit"]')
+        finally:
+            storage.close()
+
+        body = console_client.get("/api/console/venue").json()
+        slots = body["paper_slots"]
+        assert slots["stuck_open"] == 1
+        assert slots["free"] == 24
+        assert "never close" in slots["note"] and "predictit (1)" in slots["note"]
+        # and the panel renders it rather than leaving it in the payload.
+        html = console_client.get("/").text
+        assert "Position slots." in html
+        assert "paper_slots" in html

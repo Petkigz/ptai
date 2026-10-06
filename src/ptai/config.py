@@ -113,6 +113,24 @@ class Settings(BaseSettings):
     directional_paper_enabled: bool = Field(default=True,
                                             alias="DIRECTIONAL_PAPER_ENABLED")
 
+    # HOW MANY PAPER POSITIONS THE PAPER ACCOUNT MAY HOLD AT ONCE.
+    #
+    # The road to 100 resolved trades is bounded by two things: how many
+    # positions can be open while they wait to settle, and how fast those
+    # markets settle. The position COUNT cap was 6 - the same constant the risk
+    # rules use for real capital - so the paper record could never hold more
+    # than six positions even though six $1 positions are $6 of a $50 paper
+    # account. Once it held six, every later cycle opened nothing at all, and
+    # the record advanced only as fast as those six markets resolved.
+    #
+    # This is the PAPER account's own concurrency budget. It changes nothing
+    # about real capital: live still uses the risk limit, and the percentage
+    # ceilings (6% a position, 15% a category, 20% correlated, 50% total) are
+    # enforced unchanged and remain the honest bound. The default of 25 is that
+    # 50% ceiling expressed in $1 slices of the $50 starting paper bankroll -
+    # not a number chosen to make the record move.
+    paper_max_open_positions: int = Field(default=25, alias="PTAI_PAPER_MAX_OPEN")
+
     # LLM - Ollama
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     ollama_model: str = Field(default="llama3.1:8b", alias="OLLAMA_MODEL")

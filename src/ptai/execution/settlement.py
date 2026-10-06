@@ -51,6 +51,11 @@ class SettlementReport:
     unresolved: int = 0
     unreadable: int = 0
     ambiguous: int = 0
+    # Positions whose VENUE cannot report a resolution at all. Distinct from
+    # "unreadable" (a transient failure) and from "unresolved" (not settled yet):
+    # these will never close, so they hold a position slot forever and can never
+    # contribute a resolved trade.
+    stuck: int = 0
     errors: int = 0
     realised_pnl_usd: float = 0.0
     # Fees charged on the positions this settlement closed, and the gross P&L
@@ -76,6 +81,7 @@ class SettlementReport:
             "unresolved": self.unresolved,
             "unreadable": self.unreadable,
             "ambiguous": self.ambiguous,
+            "stuck": self.stuck,
             "errors": self.errors,
             "realised_pnl_usd": round(self.realised_pnl_usd, 2),
             "fees_paid_usd": round(self.fees_paid_usd, 2),
@@ -162,6 +168,23 @@ class SettlementEngine:
         # Without this, an adapter that does not implement settlement would be
         # queried on every cycle forever.
         self._unsupported_venues: set = set()
+
+    def _note_unsupported_venue(self, venue_id: str) -> None:
+        """Remember, in storage, that this venue cannot report a resolution."""
+        if not self.storage or not venue_id:
+            return
+        import json as _json
+        try:
+            raw = self.storage.get_state("settlement_unsupported_venues") or "[]"
+            known = _json.loads(raw)
+            if not isinstance(known, list):
+                known = []
+            if venue_id not in known:
+                known.append(venue_id)
+                self.storage.set_state("settlement_unsupported_venues",
+                                       _json.dumps(sorted(known)))
+        except Exception as e:  # noqa: BLE001 - a note must never break settling
+            logger.debug(f"Could not record unsupported venue {venue_id}: {e}")
 
     def _adapter_for(self, venue_id: str):
         if not self.venue_registry:
@@ -261,6 +284,9 @@ class SettlementEngine:
                 continue
 
             if venue_id in self._unsupported_venues:
+                # Already known (from this run or an earlier one) as a venue that
+                # cannot report a resolution: whatever is open here is stuck.
+                report.stuck += 1
                 report.unreadable += 1
                 continue
 
@@ -292,6 +318,14 @@ class SettlementEngine:
                 source = (verdict or {}).get("source", "unknown")
                 if source == "unsupported":
                     self._unsupported_venues.add(venue_id)
+                    # RECORDED, not just remembered in this process. A position
+                    # on a venue that cannot answer will never close and will
+                    # never count, and it holds one of the account's position
+                    # slots while it waits. The panel reads this so the operator
+                    # can see WHICH positions are stuck rather than watching a
+                    # count that does not move.
+                    self._note_unsupported_venue(venue_id)
+                    report.stuck += 1
                     logger.info(
                         f"Settlement: {venue_id} cannot report settlement - "
                         f"skipping it for the rest of this run rather than "

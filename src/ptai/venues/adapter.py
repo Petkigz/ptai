@@ -397,6 +397,26 @@ class MarketAdapter(ABC):
         }
 
 
+def can_report_settlement(adapter: Any) -> bool:
+    """
+    Whether this adapter can tell PTAI how a market there ended.
+
+    The base `get_settlement` is a deliberate refusal ("unsupported"), so the
+    only adapters that can answer are the ones that OVERRIDE it. That is a fact
+    about the code, and both readers of it have to agree: the executor refuses to
+    open a position that could never be closed, and the venue panel says so on
+    the row. Asking the same question in one place is what stops the panel from
+    describing a venue as paper-tradable when the engine would refuse it.
+
+    An adapter that cannot report a resolution contributes nothing to the
+    resolved-trade record: it would hold a position slot forever.
+    """
+    if adapter is None:
+        return False
+    impl = getattr(type(adapter), "get_settlement", None)
+    return impl is not None and impl is not MarketAdapter.get_settlement
+
+
 class UnimplementedVenueAdapter(MarketAdapter):
     """
     Base for a venue with no working client.

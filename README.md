@@ -1834,6 +1834,55 @@ paper instrument: it makes the venue's real prices and real volatility part of
 the record, and it keeps its scoreboard strictly separate from the one that
 unlocks live trading.
 
+## The Record That Was Not Moving: Slots, Not Signals
+
+Your words: *"i need to get Polymarket paper record to 100 resolved trades so
+live unlocks."* Last iteration gave that lane volume, a preference for markets
+that settle soon, and a panel with all five gates on it. Then the count stopped
+anyway - and the reason was not the markets, the model or the network. It was a
+**number six**.
+
+**The defect.** `ExposureManager.max_open_positions` is the position-count cap for
+**real capital** (6), and the round asked that same constant for its free-slot
+arithmetic. So once six paper positions were waiting to settle,
+`free_slots = 6 - 6 = 0` and every later round opened **nothing at all** while the
+record those positions exist to build stood still. Six $1 positions is $6 of a $50
+paper account - the account was not full, the *constant* was wrong for it.
+
+**1. The paper account has its own slot budget.** `PTAI_PAPER_MAX_OPEN`, default
+**25** - the same 50% ceiling the rules already impose, expressed in $1 slices of
+the $50 paper account, not a number picked to make the record move. Live capital
+is untouched: a live round still uses the risk limit, the setting cannot loosen
+it, and the percentage ceilings (6% a position, 15% a category, 20% correlated,
+50% total) are unchanged and still bind. A full book is still a full book: at 25
+positions the round reports zero free slots and opens nothing, exactly as the
+ceiling intends.
+
+**2. A slot is never handed to a venue that cannot close the position.** The other
+half of the same problem: an adapter with no settlement read (the base method
+answers `unsupported` forever) would take a slot, never close, never count, and
+hold it for good. Before anything is executed the venue now has to be able to
+report how its market ended, derived from the code - the adapter must OVERRIDE
+`get_settlement` - with the refusal stated per opportunity and the venue named.
+PredictIt is the live example: its adapter has no settlement read, so its markets
+are scanned and no position is opened there.
+
+**3. Both facts are on the page.** The venue panel's paper-record block now
+carries a **Position slots** line: *"7 of 25 paper position slot(s) in use"*, and,
+when it applies, *"2 of them sit on a venue that cannot report a resolution
+(predictit (2)) - they will never close, never count toward the 100, and hold
+their slot for good."* Every venue row says `can_report_settlement` in its own
+words, so "readable" and "can be completed" are two facts rather than one word the
+operator has to interpret. The round report carries the same numbers
+(`position_slots`, `settlement_refusals`), so a round that opens nothing says
+whether the book was full or the markets were refused.
+
+**What this means for you:** restart PTAI and leave it in paper. The lane is no
+longer clamped to six waiting positions; a round fills every slot the paper budget
+leaves free, on markets chosen to settle soon - and nothing is opened where it
+could never be closed. One throttle remains and it is deliberate: a single CYCLE
+opens at most 3 trades (`PTAI_PAPER_TRADES_PER_CYCLE`), so the book fills over
+several cycles rather than in one. Say the word if you want that raised too.
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

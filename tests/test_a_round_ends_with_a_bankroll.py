@@ -426,7 +426,17 @@ class TestARoundFillsTheSlotsTheRulesLeaveOpen:
         return TradingAgentV3(country_code="UG", dry_run=True)
 
     def test_it_asks_for_every_free_slot(self, monkeypatch, tmp_path):
+        """
+        The round asks for the PAPER account's free slots, not the live risk
+        limit's. It read `limits_engine.limits.max_open_positions` (6, a real
+        capital constant), so six waiting paper positions stopped every later
+        round from opening anything - and the paper record those positions exist
+        to build froze.
+        """
         agent = self._agent(monkeypatch, tmp_path)
+        budget = int(agent.paper_slot_budget()["max"])
+        assert budget > int(agent.limits_engine.limits.max_open_positions), (
+            "the paper account has its own concurrency budget")
         for i in range(2):
             _paper_position(agent.storage, market_id=f"M-{i}", size=3.0)
         called = {}
@@ -441,13 +451,13 @@ class TestARoundFillsTheSlotsTheRulesLeaveOpen:
 
         result = asyncio.run(agent.run_round())
         assert result == {"status": "stub"}
-        assert called["max_trades"] == agent.limits_engine.limits.max_open_positions - 2
+        assert called["max_trades"] == budget - 2
         assert called["max_trades"] >= 1
 
     def test_a_full_book_is_not_widened_to_keep_the_round_busy(self, monkeypatch,
                                                                tmp_path):
         agent = self._agent(monkeypatch, tmp_path)
-        limit = int(agent.limits_engine.limits.max_open_positions)
+        limit = int(agent.paper_slot_budget()["max"])
         for i in range(limit):
             _paper_position(agent.storage, market_id=f"M-full-{i}", size=1.0)
         called = {}
@@ -461,8 +471,8 @@ class TestARoundFillsTheSlotsTheRulesLeaveOpen:
 
         asyncio.run(agent.run_round())
         assert called["max_trades"] == 0, (
-            "every slot the rules allow is already held - opening another "
-            "position is exactly what the ceiling exists to prevent"
+            "every slot the account's budget allows is already held - opening "
+            "another position is exactly what the ceiling exists to prevent"
         )
 
     def test_the_exposure_caps_are_seeded_with_the_paper_book(self, monkeypatch,

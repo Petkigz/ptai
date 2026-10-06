@@ -39,7 +39,8 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from .adapter import STATUS_LIVE, STATUS_SCANNER, STATUS_UNIMPLEMENTED
+from .adapter import (STATUS_LIVE, STATUS_SCANNER, STATUS_UNIMPLEMENTED,
+                     can_report_settlement)
 
 # The state key the agent writes and the console reads. One key, one record.
 VENUE_INVENTORY_KEY = "operator.venue_inventory"
@@ -306,6 +307,15 @@ def adapter_row(venue_id: str, adapter: Any,
                  and not needs_login)
     real_path = bool(getattr(caps, "real_order_path", False))
     armed = bool(getattr(adapter, "can_place_real_orders", False))
+    # CAN IT SAY HOW A MARKET ENDED. The executor refuses to open a position on a
+    # venue whose adapter cannot report a resolution - such a position could never
+    # be closed, never counted, and would hold its slot forever - so a row that
+    # called that venue paper-tradable would describe a trade the engine will not
+    # take. A PRICE venue is the exception and not a loophole: its paper trading
+    # is the directional lane, which closes its own positions from prices rather
+    # than by asking the venue for an outcome.
+    price_venue = bool(getattr(caps, "quotes_prices_not_probabilities", False))
+    settles = can_report_settlement(adapter)
 
     if status == STATUS_UNIMPLEMENTED:
         use = USE_NO_CLIENT
@@ -402,6 +412,19 @@ def adapter_row(venue_id: str, adapter: Any,
                "own record. Those positions are not probability forecasts, so they do "
                "NOT count toward the resolved trades that unlock live capital. The "
                "venue cannot hold real money: the adapter has no order path.")
+    elif use == USE_PAPER_ONLY and not settles and not price_venue:
+        # A probability venue PTAI can read but never settle. Scanning it is
+        # fine; opening a position is not - so the row says which of the two it
+        # is, rather than borrowing the "scanned and paper-traded" sentence.
+        can_run_today = False
+        what_it_needs = ("the settlement read: its adapter cannot report how a "
+                         "market ended, and nothing is opened where a position "
+                         "could never be closed")
+        why = ("PTAI reads its markets, but will not open a position there: the "
+               "adapter cannot report a resolution, so the trade could never be "
+               "settled, counted or learned from - it would only hold a position "
+               "slot. Its markets are scanned; its paper record stays empty until "
+               "the settlement read is written.")
     else:  # USE_PAPER_ONLY
         can_run_today = True
         _login_name = login.get("label") or login.get("tool") or ""
@@ -417,6 +440,15 @@ def adapter_row(venue_id: str, adapter: Any,
             what_it_needs = "nothing - it reads public data with no account"
         why = ("Scanned and paper-traded every cycle at no cost. It cannot hold "
                "real money: the adapter has no way to submit an order.")
+
+    # Belt and braces for a venue that could have an order path WITHOUT a
+    # settlement read: the executor would refuse to open there, and the row must
+    # not describe it as running when it would not.
+    if (use in (USE_REAL_MONEY, USE_PAPER_ONLY) and not settles and not price_venue
+            and "cannot report how a market ended" not in why):
+        why += (" Its adapter cannot report how a market ended, so no position is "
+                "opened there in the meantime: it could never be settled or "
+                "counted, and it would only hold a slot.")
 
     return {
         "venue_id": venue_id,
@@ -454,9 +486,29 @@ def adapter_row(venue_id: str, adapter: Any,
         # market feed, reachable without a login. A venue that needs credentials
         # before it returns a single market is not tradable yet - it is
         # available once you log in, which is what `what_it_needs` says.
+        # Whether a paper fill can happen AND be completed. For a probability
+        # venue that means the adapter must also be able to report the resolution
+        # (the executor refuses anything else); for a price venue it means the
+        # directional lane, which settles itself from prices.
         "paper_tradable": (status == STATUS_LIVE
                            and bool(getattr(caps, "supports_market_discovery", False))
-                           and not needs_login),
+                           and not needs_login
+                           and (settles or price_venue)),
+        # Stated separately so "can it be read" and "can what it opens be closed"
+        # are two facts on the row, not one flag the operator has to interpret.
+        "can_report_settlement": settles,
+        "settlement_note": (
+            "the adapter reports how a market ended, so a paper trade here can "
+            "settle, count toward the record, and free its position slot"
+            if settles else
+            ("the adapter cannot report how a market ended; its paper trading is "
+             "the directional lane, which closes its own positions from prices "
+             "and keeps its own record - those positions do not count toward the "
+             "resolved probability trades")
+            if price_venue else
+            ("the adapter cannot report how a market ended: its markets are "
+             "scanned, but no position is opened where it could never be closed, "
+             "counted or learned from")),
         "can_place_real_orders": armed,
         "real_order_path": real_path,
         "can_run_today": can_run_today,
@@ -493,6 +545,10 @@ def build_inventory(registry: Any,
         "registered": len(rows),
         "readable_now": count(lambda r: r["reads_live_markets_now"]),
         "paper_tradable": count(lambda r: r["paper_tradable"]),
+        # How many venues can report a resolution at all. Every paper trade that
+        # counts toward the live gate needs this, so a drop here is a drop in the
+        # record's ceiling.
+        "can_report_settlement": count(lambda r: r["can_report_settlement"]),
         "can_place_real_orders": count(lambda r: r["can_place_real_orders"]),
         "real_order_path": count(lambda r: r["real_order_path"]),
         # Venues STILL blocked by a login (not: venues whose adapter could read
