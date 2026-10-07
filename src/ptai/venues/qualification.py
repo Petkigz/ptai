@@ -974,6 +974,13 @@ def paper_record_progress(storage, venue_id: str = "polymarket",
     """
     How close this venue is to the live gate, in resolved PAPER trades.
 
+    The count is PAPER trades, in both halves of it: the open-trade count used to
+    be venue-wide (`resolved = 0`, any mode), so a live position waiting to
+    settle was reported as a paper trade still being waited on. It also made this
+    panel disagree with the one beside it - `paper_slot_report` has always
+    filtered by mode - so the same account could show two different numbers for
+    the trades that are open, on the same page.
+
     The operator's ask was exact - "i need to get Polymarket paper record to 100
     resolved trades so live unlocks" - and the product could not answer it. The
     count existed per venue but was never shown against the target, the RATE was
@@ -1022,6 +1029,7 @@ def paper_record_progress(storage, venue_id: str = "polymarket",
             SELECT COUNT(*) AS open_trades
             FROM trades
             WHERE venue_id = ? AND resolved = 0
+              AND COALESCE(execution_mode, 'live') = 'paper'
             """, (venue_id,)).fetchone()
     except Exception as e:  # noqa: BLE001 - a panel must still render
         out["note"] = f"{type(e).__name__}: {e}"

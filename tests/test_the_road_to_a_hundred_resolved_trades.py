@@ -490,6 +490,35 @@ class TestThePaperAccountHasItsOwnSlots:
 # 5. a slot is never handed to a venue that cannot close the position
 # ---------------------------------------------------------------------------
 
+class TestTheTwoPanelsCountTheSameThing:
+    def test_an_open_live_position_is_not_an_open_paper_trade(self, tmp_path):
+        """
+        `paper_record_progress` counted every unresolved row for the venue -
+        live mode included - while `paper_slot_report`, printed beside it on the
+        same page, has always filtered by mode. The same account could therefore
+        report a paper trade still waiting to settle next to a slot line that
+        said nothing was in use.
+        """
+        storage = Storage(db_path=str(tmp_path / "modes.db"))
+        try:
+            _log_paper_trade(storage, market_id="paper-1")
+            now = datetime.now(timezone.utc).isoformat()
+            storage.conn.execute(
+                "INSERT INTO trades (timestamp, market_id, side, market_price,"
+                " position_size_usd, resolved, status, venue_id, execution_mode)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (now, "live-1", "YES", 0.5, 3.0, 0, "open", "polymarket", "live"))
+            storage.conn.commit()
+
+            progress = paper_record_progress(storage, "polymarket")
+            slots = paper_slot_report(storage, 25)
+            assert progress["open_trades"] == 1, (
+                "the live row is not a paper trade waiting to settle")
+            assert progress["open_trades"] == slots["open"]
+        finally:
+            storage.close()
+
+
 class TestAVenueThatCannotCloseIsRefusedBeforeAnythingOpens:
     def test_settlement_capability_is_a_fact_about_the_adapter(self, monkeypatch,
                                                                tmp_path):
