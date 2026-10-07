@@ -23,8 +23,10 @@ WHAT THIS ADAPTER WILL NOT DO:
   * It will not submit a REAL-money order. Simmer can route orders to Polymarket
     and Kalshi with a signed wallet; handing a third party the operator's signing
     key is not something this product does, and it is not needed - PTAI talks to
-    Polymarket directly. `venue="sim"` is pinned at construction, `real_order_path`
-    is False, and live mode gets a refusal that says so.
+    Polymarket directly. `venue="sim"` is pinned at construction,
+    `real_order_path` is False, live mode gets a refusal that says so, and the
+    client is built with `_ignore_env_wallets=True` so not even a stray
+    WALLET_PRIVATE_KEY in the environment can be picked up by it.
   * It will not invent a book. When the venue publishes a top of book
     (`best_bid`/`best_ask` and their sizes) those are the prices. When it does
     not - the synthetic venue publishes one number, its current probability -
@@ -148,8 +150,15 @@ class SimmerAdapter(MarketAdapter):
             # resolves the $SIM order server-side, which is the whole point of
             # this adapter. The venue is pinned to `sim`: nothing here can reach
             # a real-money market.
+            #
+            # `_ignore_env_wallets=True` is deliberate and is about the one thing
+            # this adapter must never do: the SDK otherwise auto-detects a wallet
+            # from WALLET_PRIVATE_KEY / OWS_WALLET in the environment, and PTAI
+            # signs for nobody. With wallets ignored, a stray key in the
+            # operator's environment cannot reach this client at all.
             self._client_obj = simmer_sdk.SimmerClient(
-                api_key=self.api_key, venue=SIMMER_PAPER_VENUE, live=True)
+                api_key=self.api_key, venue=SIMMER_PAPER_VENUE, live=True,
+                _ignore_env_wallets=True)
             self._sdk_module = simmer_sdk
         except Exception as e:  # noqa: BLE001
             return None, (f"the Simmer client could not be built "

@@ -243,7 +243,10 @@ class TestTheVenueHasAClientNow:
         adapter = SimmerAdapter(api_key="k")
         _discover(adapter)
         assert constructed == [{"api_key": "k", "venue": SIMMER_PAPER_VENUE,
-                                "live": True}]
+                                "live": True, "_ignore_env_wallets": True}]
+        # No wallet can be handed to this client, even if the operator's
+        # environment carries one: PTAI signs for nobody.
+        assert constructed[0]["_ignore_env_wallets"] is True
         assert SIMMER_PAPER_VENUE == "sim"
         # And the client is reused, not rebuilt per call.
         _discover(adapter)

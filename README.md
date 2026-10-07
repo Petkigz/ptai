@@ -2019,7 +2019,10 @@ by way of a **signed wallet**. PTAI signs for nobody, talks to Polymarket
 directly for real orders, and pins this adapter to the synthetic venue:
 `venue="sim"` at construction, `supports_trading: false`, `real_order_path:
 false`, and live mode gets a refusal that names the wallet as the reason rather
-than suggesting a switch that would change nothing.
+than suggesting a switch that would change nothing. The SDK's habit of
+auto-detecting a wallet from `WALLET_PRIVATE_KEY` / `OWS_WALLET` is switched off
+explicitly (`_ignore_env_wallets=True`), so a stray key in the environment cannot
+reach this client either.
 
 **The book.** When the venue publishes a top of book (bid, ask and their sizes)
 that is the book, and depth is the smaller published size. When it does not - the
