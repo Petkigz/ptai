@@ -24,13 +24,18 @@ from src.ptai.venues.adapter import (MarketAdapter, STATUS_LIVE, STATUS_SCANNER,
 # Modules that must declare themselves unimplemented, and the class name.
 # (betfair_adapter.BetfairAdapter is the legacy stub, superseded by the real
 # exchange adapter in betfair_exchange.py.)
+#
+# simmer_adapter.SimmerAdapter was on this list until its client was written
+# (Simmer's SDK, the synthetic $SIM venue, its resolutions): it now reads real
+# markets and can be paper-traded through the venue itself, so it is excluded by
+# the same rule that put it here - a venue is only listed as unimplemented while
+# there is nothing to use. Its own suite is tests/test_simmer_can_trade_and_settle.py.
 UNIMPLEMENTED = [
     ("apify_adapter", "ApifyAdapter"),
     ("afx_adapter", "AFXAdapter"),
     ("cymetica_adapter", "CymeticaAdapter"),
     ("grvt_adapter", "GRVTAdapter"),
     ("pionex_adapter", "PionexAdapter"),
-    ("simmer_adapter", "SimmerAdapter"),
     ("veynor_adapter", "VeynorAdapter"),
     ("openpx_adapter", "OpenPXAdapter"),
     ("ccxt_adapter", "CCXTUnifiedAdapter"),

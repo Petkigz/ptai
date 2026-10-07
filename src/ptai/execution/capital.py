@@ -327,6 +327,27 @@ def local_money_entry(country_code: Optional[str] = None) -> Optional[Dict[str, 
     return dict(entry) if entry else None
 
 
+# A venue balance in one of these is NOT money. Simmer's synthetic venue trades
+# in $SIM and Manifold's in Mana: both are real balances at the venue, both are
+# deliberately non-withdrawable, and neither can be deposited or spent on a real
+# order. They must never be counted as capital or shown as dollars - the whole
+# point of these two venues is that they cost nothing and can hold nothing.
+VIRTUAL_BALANCE_CURRENCIES = {"SIM", "MANA"}
+
+
+def _balance_currency(balance: Optional[Dict[str, Any]]) -> str:
+    """The currency token a venue reported, upper-cased: "SIM (virtual)" -> SIM."""
+    raw = str((balance or {}).get("currency") or "").strip().upper()
+    return raw.split()[0] if raw else ""
+
+
+def is_virtual_balance(balance: Optional[Dict[str, Any]]) -> bool:
+    """Is this reported balance play money rather than capital?"""
+    balance = balance or {}
+    if balance.get("virtual") or balance.get("paper"):
+        return True
+    return _balance_currency(balance) in VIRTUAL_BALANCE_CURRENCIES
+
 
 @dataclass
 class VenueAccount:
@@ -348,6 +369,12 @@ class VenueAccount:
     deposited_usd: float = 0.0
     realised_pnl_usd: float = 0.0
     currency: str = ""
+    # A balance the venue reported in a currency that is not money ($SIM on
+    # Simmer's synthetic venue, Mana on Manifold). It is real, it is at the
+    # venue, and it is NOT capital: it cannot be deposited, withdrawn or spent,
+    # so it is reported here under its own name and never as a dollar figure.
+    virtual_balance: float = 0.0
+    virtual_currency: str = ""
     notes: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -399,6 +426,8 @@ class VenueAccount:
             "can_deploy_live": self.can_deploy_live,
             "over_committed": self.over_committed,
             "currency": self.currency,
+            "virtual_balance": round(self.virtual_balance, 2),
+            "virtual_currency": self.virtual_currency,
             "notes": self.notes,
             "warnings": self.warnings,
         }
@@ -523,14 +552,16 @@ class CapitalLedger:
                 continue
             if not (balance or {}).get("available"):
                 continue
+            virtual = is_virtual_balance(balance)
             real = float((balance or {}).get("balance") or 0.0)
-            if real <= 0:
+            if real <= 0 and not virtual:
                 continue
             account = self._account(venue_id, 0.0,
                                     venue_labels.get(venue_id, venue_id), balance)
-            account.warnings.append(
-                f"the venue reports ${real:.2f}; no budget has been authorised "
-                f"for it, so the agent will not deploy capital here")
+            if not virtual:
+                account.warnings.append(
+                    f"the venue reports ${real:.2f}; no budget has been authorised "
+                    f"for it, so the agent will not deploy capital here")
             plan.accounts.append(account)
 
         if mode == "live" and not plan.live_venues:
@@ -556,6 +587,26 @@ class CapitalLedger:
         account.balance_is_real = bool(balance.get("available"))
         account.reported_balance_usd = float(balance.get("balance") or 0.0) \
             if account.balance_is_real else 0.0
+
+        # A balance that is not money. Simmer's $SIM and Manifold's Mana are read
+        # from the venue and are real numbers - they are just not capital, and a
+        # plan that showed them as dollars would be telling the operator he has
+        # money at a venue that cannot hold any. The figure is kept, under the
+        # currency that issued it, and the account is not funded by it.
+        if is_virtual_balance(balance):
+            reported_virtual = (float(balance.get("balance") or 0.0)
+                                if account.balance_is_real else 0.0)
+            currency = (_balance_currency(balance)
+                        or str(balance.get("virtual_currency") or ""))
+            if reported_virtual > 0 and currency:
+                account.virtual_balance = reported_virtual
+                account.virtual_currency = currency
+                account.warnings.append(
+                    f"the venue reports {reported_virtual:,.2f} {currency}, which "
+                    f"is play money: it cannot be deposited, withdrawn or spent "
+                    f"on a real order, so it is not counted as capital here")
+            account.balance_is_real = False
+            account.reported_balance_usd = 0.0
 
         # Deposited capital is the authorised budget, not the venue's balance.
         # The balance may hold money from other activity, or money the operator

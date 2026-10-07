@@ -116,9 +116,14 @@ async def test_venue_discovery_returns_no_fabricated_markets():
 
 @pytest.mark.asyncio
 async def test_unimplemented_venues_declare_themselves():
-    """A venue with no client must say so rather than returning markets."""
+    """A venue with no client must say so rather than returning markets.
+
+    SimmerAdapter used to be in this list. Its client was written - the SDK, the
+    synthetic $SIM venue, its resolutions - so it is now on the other side of the
+    same rule, which the test below pins.
+    """
     from src.ptai.venues.adapter import STATUS_UNIMPLEMENTED
-    for adapter in [SimmerAdapter(), CymeticaAdapter(), AFXAdapter(), GRVTAdapter(),
+    for adapter in [CymeticaAdapter(), AFXAdapter(), GRVTAdapter(),
                     PionexAdapter(), CCXTUnifiedAdapter(), VeynorAdapter(),
                     OpenPXAdapter(), BetdaqAdapter(), BetConnectAdapter()]:
         assert adapter.capabilities.implementation_status == STATUS_UNIMPLEMENTED, \
@@ -127,6 +132,30 @@ async def test_unimplemented_venues_declare_themselves():
         assert await adapter.discover_markets() == [], adapter.venue_id
         # UNKNOWN, not ELIGIBLE: an adapter with no client cannot be traded on.
         assert adapter.check_eligibility("UG").value == "unknown", adapter.venue_id
+
+
+def test_simmer_no_longer_belongs_to_the_no_client_list():
+    """
+    Simmer has a client, and the two things that must stay true about it.
+
+    Its markets are read through the venue's own SDK, so it declares discovery
+    (with the credential requirement that goes with it: the SDK carries the key
+    on every call). It has no REAL-money order path, because that would need a
+    signed wallet - and this product signs for nobody.
+    """
+    import asyncio
+
+    adapter = SimmerAdapter()
+    assert adapter.capabilities.implementation_status == "live"
+    assert adapter.capabilities.supports_market_discovery is True
+    assert adapter.capabilities.requires_credentials is True
+    assert adapter.capabilities.real_order_path is False
+    assert adapter.capabilities.supports_trading is False
+    assert adapter.can_place_real_orders is False
+    # No key saved in this process: it returns nothing and says what is missing
+    # rather than inventing a feed.
+    assert asyncio.run(adapter.discover_markets()) == []
+    assert "Simmer API key" in adapter.last_error
 
 
 def test_eligibility_ug():
@@ -307,18 +336,24 @@ def test_openpx_is_declared_unimplemented():
 
 def test_registry_capability_report_separates_live_from_declared():
     """The UI needs to distinguish reachable venues from merely-registered ones."""
+    from src.ptai.venues.cymetica_adapter import CymeticaAdapter
+
     registry = VenueRegistry(country_code="UG")
     registry.register(PolymarketAdapter())
     registry.register(SimmerAdapter())
+    registry.register(CymeticaAdapter())
     from src.ptai.venues.betfair_exchange import BetfairExchangeAdapter
     registry.register(BetfairExchangeAdapter())
 
     report = registry.capability_report()
-    assert report["total_registered"] == 3
+    assert report["total_registered"] == 4
     assert "polymarket" in report["live"]
     assert "betfair" in report["live"]
-    assert "simmer" in report["unimplemented"]
-    assert "simmer" not in report["live"]
+    # Simmer's client was written (its SDK, the $SIM venue): it now has markets,
+    # an orderbook and a settlement read, so it is no longer "merely registered".
+    assert "simmer" in report["live"]
+    # Cymetica is still the honest member of that list: no client at all.
+    assert "cymetica" in report["unimplemented"]
     assert report["tradeable"] == [], "nothing here places orders"
     # every venue reports what is missing
     for v in report["venues"]:

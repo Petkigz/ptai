@@ -214,6 +214,22 @@ TOOLS: Dict[str, Tool] = {
             Field("api_key", "API key", env="MANIFOLD_API_KEY", required=False),
         ),
     ),
+    "simmer": Tool(
+        name="simmer",
+        label="Simmer (free virtual-currency venue)",
+        kind="venue",
+        venue_id="simmer",
+        unlocks=("the whole venue: its synthetic $SIM venue, the only place PTAI "
+                 "can submit an order today. No card, no wallet, no deposit - the "
+                 "key is all it needs"),
+        then=("nothing further for the $SIM venue. Simmer's REAL-money venues "
+              "(Polymarket, Kalshi through Simmer) are not used here: they need a "
+              "signed wallet, and PTAI talks to Polymarket directly instead."),
+        docs="https://simmer.markets/dashboard (free API key)",
+        fields=(
+            Field("api_key", "API key", env="SIMMER_API_KEY", required=False),
+        ),
+    ),
     "apify": Tool(
         name="apify",
         label="Apify (paid arb scanner)",
@@ -660,6 +676,7 @@ def refresh_adapters(registry, settings=None, data_dir: str = "./data") -> Dict[
         "kalshi": lambda adapter: _apply_kalshi(adapter, data_dir),
         "betfair": lambda adapter: _apply_betfair(adapter, data_dir),
         "manifold": lambda adapter: _apply_manifold(adapter, data_dir),
+        "simmer": lambda adapter: _apply_simmer(adapter, data_dir),
     }
     changed: Dict[str, Any] = {}
     for venue_id, apply_fn in appliers.items():
@@ -709,6 +726,39 @@ def _apply_manifold(adapter, data_dir: str) -> List[str]:
     if hasattr(adapter, "last_error"):
         adapter.last_error = ""
     applied.append("api_key")
+    return applied
+
+
+def _apply_simmer(adapter, data_dir: str) -> List[str]:
+    """
+    A Simmer key saved while the agent is running, applied to the adapter.
+
+    The Simmer client is built lazily (`adapter._client()`), so the key landing
+    on the adapter is what matters - and the capability flags that were computed
+    from what was known at construction have to be raised, or the venue keeps
+    reporting "needs a login" and no account read until the next restart.
+    """
+    values = resolve("simmer", data_dir)
+    key = values.get("api_key")
+    if not key or getattr(adapter, "api_key", None) == key:
+        return []
+    applied = ["api_key"]
+    adapter.api_key = key
+    # The cached client, if one was built without the key, is dropped rather
+    # than patched: the SDK client carries the key inside its own session.
+    if getattr(adapter, "_client_obj", None) is not None:
+        adapter._client_obj = None
+        applied.append("client_rebuilt")
+    caps = getattr(adapter, "capabilities", None)
+    if caps is not None:
+        if not getattr(caps, "requires_credentials", False):
+            caps.requires_credentials = True
+            applied.append("requires_credentials")
+        if not getattr(caps, "supports_portfolio", False):
+            caps.supports_portfolio = True
+            applied.append("supports_portfolio")
+    if hasattr(adapter, "last_error"):
+        adapter.last_error = ""
     return applied
 
 

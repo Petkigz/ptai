@@ -563,8 +563,13 @@ class TradingAgentV3:
         predictit_adapter = PredictItAdapter()
         self.venue_registry.register(predictit_adapter)
 
-        # Simmer - AI agents trade against each other, Python SDK virtual + live
-        simmer_adapter = SimmerAdapter(use_virtual=True)
+        # Simmer - the free virtual-currency venue, and the only venue PTAI can
+        # SUBMIT an order to today. The key comes from the same vault/env store
+        # as every other login; without it the SDK returns nothing, so the row
+        # says a login is needed rather than looking broken.
+        _simmer = credential_store.resolve("simmer", self.data_dir)
+        simmer_adapter = SimmerAdapter(api_key=_simmer.get("api_key"),
+                                       use_virtual=True)
         self.venue_registry.register(simmer_adapter)
 
         # Cymetica - perpetual prediction markets official Python SDK

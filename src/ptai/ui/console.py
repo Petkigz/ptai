@@ -276,6 +276,12 @@ async def _venue_balances(agent=None, force: bool = False) -> Dict[str, Dict[str
                 "available": bool(result.get("available")),
                 "balance": float(result.get("balance") or 0.0),
                 "source": result.get("source", ""),
+                # WHAT CURRENCY, AND WHETHER IT IS MONEY. A balance in $SIM or
+                # Mana is real at the venue and is not capital; without these two
+                # fields downstream can only see a number, and the capital ledger
+                # would print it as dollars.
+                "currency": result.get("currency", ""),
+                "virtual": bool(result.get("virtual", False)),
             }
     _BALANCE_CACHE["at"] = _time.monotonic()
     _BALANCE_CACHE["values"] = dict(balances)
@@ -394,6 +400,17 @@ async def api_set_budget(request: Request) -> JSONResponse:
 
     balances = await _venue_balances(_agent())
     reported = balances.get(venue) or {}
+    if reported.get("virtual"):
+        # Simmer's $SIM and Manifold's Mana are not capital. The venue is already
+        # refused above for having no funding route; this is the belt to that
+        # braces, on the one endpoint that authorises money.
+        return JSONResponse(status_code=409, content={
+            "error": (f"cannot authorise capital at {venue}: its balance is "
+                      f"{reported.get('currency') or 'play money'}, which cannot "
+                      f"be deposited, withdrawn or spent"),
+            "note": ("A budget is permission to use money that already exists at "
+                     "the venue. This venue holds no money."),
+        })
     if amount > 0 and not reported.get("available"):
         return JSONResponse(status_code=409, content={
             "error": (f"cannot authorise capital at {venue}: the venue's balance "

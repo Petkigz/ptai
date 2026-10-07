@@ -456,19 +456,19 @@ class ManifoldAdapter(MarketAdapter):
         """
         if not self.api_key:
             return {"available": False, "balance": None, "positions": [],
-                    "orders": [], "venue": "manifold", "paper": True,
+                    "orders": [], "venue": "manifold", "paper": True, "virtual": True,
                     "reason": ("no Manifold API key saved; the venue's account read "
                                "needs one, and its market feed does not")}
         try:
             resp = self.session.get(f"{self.base_url}/me", timeout=10)
             if resp.status_code != 200:
                 return {"available": False, "balance": None, "positions": [],
-                        "orders": [], "venue": "manifold", "paper": True,
+                        "orders": [], "venue": "manifold", "paper": True, "virtual": True,
                         "reason": f"HTTP {resp.status_code} from Manifold /me"}
             me = resp.json() or {}
         except Exception as e:  # noqa: BLE001
             return {"available": False, "balance": None, "positions": [],
-                    "orders": [], "venue": "manifold", "paper": True,
+                    "orders": [], "venue": "manifold", "paper": True, "virtual": True,
                     "reason": f"{type(e).__name__}: {e}"}
         balance = me.get("balance")
         return {
@@ -480,7 +480,7 @@ class ManifoldAdapter(MarketAdapter):
                                "does not list them because Mana cannot be withdrawn"),
             "orders": [],
             "username": me.get("username"),
-            "paper": True,
+            "paper": True, "virtual": True,
             "source": "manifold_api_real",
         }
 

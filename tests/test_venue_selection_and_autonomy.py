@@ -221,15 +221,15 @@ def test_unavailable_is_reserved_for_a_venue_that_cannot_be_used_at_all(selector
     for the agent to read or a login to unlock.
     """
     sel = selector.select(selector.assess(
-        ["manifold", "simmer"], labels=_labels(),
-        unusable={"simmer": "no Simmer SDK client; neither the virtual-currency "
-                            "test path nor live trading is implemented"},
+        ["manifold", "cymetica"], labels=_labels(),
+        unusable={"cymetica": "no Cymetica SDK client; orderbook streaming and "
+                              "order placement are unimplemented"},
         unfundable={"manifold": "play-money only: no real capital can be deployed"}))
     roles = {a.venue_id: a.role for a in sel.assessments}
-    assert roles["simmer"] == ROLE_UNAVAILABLE
+    assert roles["cymetica"] == ROLE_UNAVAILABLE
     assert roles["manifold"] == ROLE_PAPER
-    simmer = next(a for a in sel.assessments if a.venue_id == "simmer")
-    assert "no Simmer SDK client" in simmer.blockers[0]
+    cymetica = next(a for a in sel.assessments if a.venue_id == "cymetica")
+    assert "no Cymetica SDK client" in cymetica.blockers[0]
 
 
 # ----------------------------------------------------------------------

@@ -1369,6 +1369,11 @@ coverage counts add up to 19. Saving a Betfair login moves the venue from
 `needs_login / can_run_today False` to `paper_only / can_run_today True` and the
 counts from 6 readable venues to 7.
 
+*(Those counts are from the release that fixed this. Simmer's client was written
+afterwards - see the last section - so the no-client line reads 10 today, and the
+venue that stopped being one of them is now read, priced and settled like the
+rest.)*
+
 ## Reaching Polymarket, Venue By Venue
 
 Your words: *"lets start giving the venues enough code to reach poly market. i
@@ -1396,10 +1401,15 @@ betfair        1 layer missing: place a real order; then save the login
 crypto_binance 1 layer missing: place a real order
 manifold       1 layer missing: place a real order
 whitebit       1 layer missing: place a real order
+simmer         2 layers missing: read the account; place a real order
 predictit      2 layers missing: read the account; place a real order
 apify          3 layers missing - no Apify API client ...
-simmer         3 layers missing - no Simmer SDK client ...
 ```
+
+One of those rows moves without a line of code: **save Simmer's free key** and its
+account read exists (the venue lists positions and the $SIM balance), leaving only
+`place a real order` - which stays missing on purpose: Simmer's real venues need a
+signed wallet, and PTAI signs for nobody. See the last section.
 
 **But code is only half of it, and the other half decides where the effort goes.**
 A venue you cannot put money into is a paper exercise no matter how much is
@@ -1418,8 +1428,9 @@ you are*:
 * **Crypto (Binance, WhiteBIT)** - fundable by you, real APIs, but they are not
   probability books: the mispricing-versus-forecast stack does not apply without
   a separate strategy lane.
-* The other eleven have no client written at all, and most are UK/EU exchanges
-  that will not accept a Uganda account either.
+* The other **ten** have no client written at all (eleven before Simmer's was
+  written), and most are UK/EU exchanges that will not accept a Uganda account
+  either.
 
 So the honest queue for a real trade is: **Polymarket (done)**, then the first
 venue that is both buildable *and* fundable from Uganda - and that is a decision
@@ -1986,6 +1997,85 @@ the reference still read `missing` on its row (the account read and the order
 path), so its distance to Polymarket is **2**, and the `next_step` on the row
 says which: write the account read. Money cannot reach it and the row says so:
 `fundable: false`, `fundable_from_here: false`.
+
+## Simmer: The First Venue That Will Take The Order
+
+Every venue in this build can be *read*. One can be *written to*, and it is not
+the one with the biggest API - it is the one whose whole point is agents trading
+against it: **Simmer** (simmer.markets), whose published Python SDK
+(`simmer-sdk`) fronts a synthetic venue called `sim` where every market trades in
+**$SIM**, a virtual currency. Add a free API key from its dashboard and PTAI can
+submit an order, get a real fill back from the venue's own engine, hold the
+position there, and read the outcome when the venue resolves it.
+
+**Why it matters more than it looks.** The road to live capital is a hundred
+resolved paper trades, and a resolved trade needs two things this build has
+struggled to get in one place: a real price to fill at, and a resolution the
+venue itself publishes. Simmer has both, needs no money to get either, and works
+from Uganda.
+
+**What it will not do.** Simmer can also route orders to Polymarket and Kalshi -
+by way of a **signed wallet**. PTAI signs for nobody, talks to Polymarket
+directly for real orders, and pins this adapter to the synthetic venue:
+`venue="sim"` at construction, `supports_trading: false`, `real_order_path:
+false`, and live mode gets a refusal that names the wallet as the reason rather
+than suggesting a switch that would change nothing.
+
+**The book.** When the venue publishes a top of book (bid, ask and their sizes)
+that is the book, and depth is the smaller published size. When it does not - the
+synthetic venue quotes one number, the current probability, and Simmer's own
+documentation says a $SIM order fills at the AMM price with no spread - the book
+is that number on both sides, `spread: 0.0`, `spread_basis:
+"synthetic_venue_amm_price"`, one share a side because one share is what the
+venue publishes, and `size_basis` says exactly that. A crossed quote is a refusal
+with no numbers, as everywhere else.
+
+**The fill is the venue's, not ours.** `place_order` submits
+`client.trade(market_id, side, amount, venue="sim")` and reports what comes back:
+the filled shares, the new price, the $SIM cost, the venue's trade id and the
+remaining $SIM balance. Every recorded number names its currency
+(`"currency": "SIM (virtual)"`), and a venue refusal is a refusal here - no
+position is opened.
+
+**The outcome is the venue's own field.** `Market.outcome` is True/False once
+Simmer has resolved a market: Yes is 1.00, No is 0.00, source
+`simmer_market_outcome`. A market that is merely still open reports
+`settled: false` **with a real answer** - which is deliberately not the word
+`unsupported`: that string is what gets written to storage as "this venue can
+never close a position". A resolved market with no outcome published is refused,
+like every other inference this system declines to make.
+
+**$SIM is not dollars, and nothing may print it as dollars.** A venue that
+reports a balance and has no authorised budget used to produce a capital line
+saying *"the venue reports $990.00"* - and for Simmer (or Manifold, whose Mana is
+the same kind of play money) that sentence would have been a claim about money
+the operator cannot ever hold, withdraw or spend. Balances now carry the currency
+that issued them: a non-money balance (`currency: "SIM"` or `"MANA"`, or a
+portfolio that declares itself `virtual`) is reported under its own name
+(`virtual_balance` / `virtual_currency`), **never** in `reported_balance_usd`,
+never counted in `total_available_usd`, and never funded by it. The budget
+endpoint refuses the same thing a second time: play money cannot be authorised as
+capital. A venue that reports a real balance in USD is untouched - the guard fires
+only on a currency that is not money.
+
+**In the panel:** the Simmer row stops being one of the no-client venues. Its
+`use` becomes `needs_login` until the free key is saved (the venue's SDK carries
+the key on every call, markets included), then `paper_only / can_run_today: true
+/ can_report_settlement: true`, with `next_step` naming the account layer that
+only a saved key completes. Money still cannot reach it and the row says so:
+`fundable: false`, `fundable_from_here: false`.
+
+**It has already changed the totals.** In the recorded inventory: the no-client
+column fell from 11 to 10, venues that can report a settlement rose from 5 to 6,
+and the venues still blocked by a login rose to 2 - Manifold and Simmer, the two
+play-money venues whose account reads need a key and move no money either way.
+
+**Watch it work end to end:** the test suite drives a fake SDK through the real
+adapter, writes the returned fill into the real storage, and settles it with the
+real settlement engine - asserting the record moves from one open trade to one
+resolved trade with the $SIM profit, and that a market the venue has not resolved
+yet leaves the position open while **not** being filed as a venue that cannot
+answer. Those positions settle, count toward the 100, and free their slot.
 
 ## Extending to Other Sites
 

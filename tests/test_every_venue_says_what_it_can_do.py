@@ -111,9 +111,11 @@ def _closed_venue(venue_id: str = "betfair") -> _Venue:
                   supports_market_discovery=True, requires_credentials=True)
 
 
-def _unbuilt_venue(venue_id: str = "simmer") -> _Venue:
+def _unbuilt_venue(venue_id: str = "cymetica") -> _Venue:
+    """Still the honest no-client venue - Simmer grew a client, Cymetica has
+    not (tests/test_simmer_can_trade_and_settle.py covers its own row)."""
     return _Venue(venue_id, implementation_status="unimplemented",
-                  implementation_note="no Simmer SDK client")
+                  implementation_note="no Cymetica SDK client")
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +173,7 @@ class TestTheLoginCoverageBlock:
         return build_inventory(_Registry({
             "manifold": _open_venue(),          # public data, no login
             "betfair": _closed_venue(),         # closed without a login
-            "simmer": _unbuilt_venue(),         # no client at all
+            "cymetica": _unbuilt_venue(),       # no client at all
             "polymarket": _Venue(               # reads now, login for real orders
                 "polymarket", implementation_status="live",
                 supports_market_discovery=True, real_order_path=True),
@@ -189,12 +191,12 @@ class TestTheLoginCoverageBlock:
         state = {r["venue_id"]: r["state"] for r in cov["venues"]}
         assert state["manifold"] == "no_login_needed"
         assert state["betfair"] == "login_required"
-        assert state["simmer"] == "no_client"
+        assert state["cymetica"] == "no_client"
         assert state["polymarket"] == "login_available"
         # The venue with no client says a login would not be used, rather than
         # leaving the operator to wonder whether they typed it in wrong.
-        simmer = next(r for r in cov["venues"] if r["venue_id"] == "simmer")
-        assert "no client" in simmer["why"]
+        cymetica = next(r for r in cov["venues"] if r["venue_id"] == "cymetica")
+        assert "no client" in cymetica["why"]
         betfair = next(r for r in cov["venues"] if r["venue_id"] == "betfair")
         assert "save the" in betfair["why"]
 
@@ -426,6 +428,41 @@ class TestAVenueThatCannotCloseSaysSo:
             _Registry({"predictit": _NoOutcomeVenue("predictit"),
                        "manifold": _open_venue("manifold")}), data_dir)
         assert inv["counts"]["can_report_settlement"] == 1
+
+
+class TestTheRealRegistryRowForSimmer:
+    def test_simmer_is_no_longer_a_venue_with_no_client(self, console_app,
+                                                       console_client):
+        """
+        The live registry's own row, through the console's own payload.
+
+        Simmer was one of the eleven rows reading "no client at all": its SDK
+        existed and its synthetic $SIM venue was the one place an order could
+        actually be submitted, and none of it had been written. Now the row must
+        say the two things that are true - it can be read and closed, and what it
+        needs is the free key - rather than reading as unused.
+        """
+        inventory = _record(console_app)
+        row = inventory["venues"]["simmer"]
+        assert row["use"] != "no_client"
+        assert row["can_report_settlement"] is True
+        # The capability says a login is required, and no key is saved in this
+        # test's vault, so the row says so and names the form.
+        assert row["needs_credentials"] is True
+        assert row["login"]["tool"] == "simmer", (
+            "the operator must have a form to save the one thing this venue needs")
+        assert row["fundable"] is False
+        assert row["fundable_from_here"] is False
+        # It cannot hold real money: no submission path for real venues here.
+        assert row["can_place_real_orders"] is False
+        assert row["real_order_path"] is False
+        assert inventory["counts"]["no_client"] < 11, (
+            "the no-client count only ever falls as clients are written")
+
+        body = console_client.get("/api/console/venue").json()
+        a = {r["venue_id"]: r for r in body["assessments"]}["simmer"]
+        assert a["can_report_settlement"] is True
+        assert a["can_place_real_orders"] is False
 
 
 class TestTheRealRegistryRowForPredictIt:
