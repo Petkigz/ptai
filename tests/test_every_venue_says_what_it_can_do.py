@@ -429,28 +429,42 @@ class TestAVenueThatCannotCloseSaysSo:
 
 
 class TestTheRealRegistryRowForPredictIt:
-    def test_predictit_is_scanned_but_never_given_a_position(self, console_app,
-                                                             console_client):
+    def test_predictit_can_now_close_what_it_opens(self, console_app,
+                                                  console_client):
         """
-        The live registry's own row, through the console's own payload. Until
-        PredictIt's adapter can report how a market ended, its markets are read
-        and no position is opened where it could never be closed.
+        The live registry's own row, through the console's own payload.
+
+        This row read `can_report_settlement: False / paper_tradable: False /
+        can_run_today: False` until the adapter learned to read a closed
+        contract's own final prices: without that, V68's gate refused every
+        PredictIt opportunity at execution time (a position that can never be
+        closed holds a slot and never counts), so the venue was registered,
+        priced, and never traded. The adapter's `get_settlement` is now real, so
+        the row says so - and still says the venue cannot hold money.
         """
         inventory = _record(console_app)
         row = inventory["venues"]["predictit"]
-        assert row["can_report_settlement"] is False
-        assert row["paper_tradable"] is False
-        assert row["can_run_today"] is False
-        assert "settlement read" in row["what_it_needs"]
+        assert row["can_report_settlement"] is True
+        assert row["paper_tradable"] is True
+        assert row["can_run_today"] is True
+        assert "settle, count toward the record" in row["settlement_note"], (
+            "the row says what the settlement read buys: a closed position and "
+            "a slot back")
 
         capable = {vid for vid, r in inventory["venues"].items()
                    if r["can_report_settlement"]}
-        assert {"polymarket", "kalshi", "manifold", "betfair"} <= capable, (
-            "the adapters that override get_settlement")
+        assert {"polymarket", "kalshi", "manifold", "betfair",
+                "predictit"} <= capable, ("every adapter that overrides "
+                                          "get_settlement")
         assert inventory["counts"]["can_report_settlement"] == len(capable)
 
         body = console_client.get("/api/console/venue").json()
         a = {r["venue_id"]: r for r in body["assessments"]}["predictit"]
-        assert a["can_report_settlement"] is False
-        assert "cannot report how a market ended" in a["settlement_note"]
-        assert a["can_run_today"] is False
+        assert a["can_report_settlement"] is True
+        # The venue publishes prices and resolutions and has no order API, so
+        # it can be paper-traded and can never spend real money from here.
+        assert a["can_place_real_orders"] is False
+        assert a["can_run_today"] is True
+        # And the money answer is unchanged: no order path, nothing fundable.
+        assert row["fundable"] is False
+        assert row["fundable_from_here"] is False

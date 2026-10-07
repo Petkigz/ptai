@@ -186,6 +186,37 @@ class SettlementEngine:
         except Exception as e:  # noqa: BLE001 - a note must never break settling
             logger.debug(f"Could not record unsupported venue {venue_id}: {e}")
 
+    def _forget_unsupported_venue(self, venue_id: str) -> None:
+        """
+        A venue that has just ANSWERED is no longer one that cannot.
+
+        `settlement_unsupported_venues` was written once and never revised, and
+        the panel reads it to name the open positions that can never close. When
+        an adapter gains a settlement read, the stored note kept describing it by
+        a fact that had stopped being true - so it is revised the moment the
+        venue answers. The in-memory set is per run, but this one is on disk and
+        outlives the process.
+        """
+        if not venue_id:
+            return
+        self._unsupported_venues.discard(venue_id)
+        if not self.storage:
+            return
+        import json as _json
+        try:
+            raw = self.storage.get_state("settlement_unsupported_venues") or "[]"
+            known = _json.loads(raw)
+            if not isinstance(known, list) or venue_id not in known:
+                return
+            known = [v for v in known if v != venue_id]
+            self.storage.set_state("settlement_unsupported_venues",
+                                   _json.dumps(sorted(known)))
+            logger.info(
+                f"Settlement: {venue_id} answered this cycle, so it is no longer "
+                f"recorded as a venue that cannot report a resolution")
+        except Exception as e:  # noqa: BLE001 - a note must never break settling
+            logger.debug(f"Could not revise unsupported venue {venue_id}: {e}")
+
     def _adapter_for(self, venue_id: str):
         if not self.venue_registry:
             return None
@@ -340,6 +371,10 @@ class SettlementEngine:
                 continue
 
             if not verdict.get("settled"):
+                # A real answer is not a resolution, and it still means this
+                # venue CAN answer: "not settled yet" must never leave it filed
+                # as a venue that never will.
+                self._forget_unsupported_venue(venue_id)
                 report.unresolved += 1
                 continue
 
@@ -354,6 +389,7 @@ class SettlementEngine:
                 ))
                 continue
 
+            self._forget_unsupported_venue(venue_id)
             item = SettledItem(
                 market_id=market_id, venue_id=venue_id,
                 kind="forecast" if has_forecast else "trade",

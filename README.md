@@ -1864,14 +1864,20 @@ answers `unsupported` forever) would take a slot, never close, never count, and
 hold it for good. Before anything is executed the venue now has to be able to
 report how its market ended, derived from the code - the adapter must OVERRIDE
 `get_settlement` - with the refusal stated per opportunity and the venue named.
-PredictIt is the live example: its adapter has no settlement read, so its markets
-are scanned and no position is opened there.
+PredictIt was the live example at the time: its adapter had no settlement read,
+so its markets were scanned and no position was opened there. (Its settlement
+read was written in the next iteration - see *PredictIt: The Venue That Was
+Reading And Never Trading* below. The gate itself is unchanged, and it still
+refuses any venue whose adapter cannot answer.)
 
 **3. Both facts are on the page.** The venue panel's paper-record block now
 carries a **Position slots** line: *"7 of 25 paper position slot(s) in use"*, and,
 when it applies, *"2 of them sit on a venue that cannot report a resolution
-(predictit (2)) - they will never close, never count toward the 100, and hold
-their slot for good."* Every venue row says `can_report_settlement` in its own
+(betdaq (2)) - they will never close, never count toward the 100, and hold their
+slot for good."* The list is revised the moment a venue answers: the note that
+names a venue is written to storage, and V69 began deleting it when the venue
+proves it can report a settlement, so the panel cannot keep showing a fact that
+has stopped being true. Every venue row says `can_report_settlement` in its own
 words, so "readable" and "can be completed" are two facts rather than one word the
 operator has to interpret. The round report carries the same numbers
 (`position_slots`, `settlement_refusals`), so a round that opens nothing says
@@ -1883,6 +1889,104 @@ leaves free, on markets chosen to settle soon - and nothing is opened where it
 could never be closed. One throttle remains and it is deliberate: a single CYCLE
 opens at most 3 trades (`PTAI_PAPER_TRADES_PER_CYCLE`), so the book fills over
 several cycles rather than in one. Say the word if you want that raised too.
+## PredictIt: The Venue That Was Reading And Never Trading
+
+The V68 gate fixed the record by refusing to open a position at a venue that
+cannot report how the market ended - and PredictIt was the venue that fact was
+written about: its adapter read live markets every cycle, priced them with a
+**mock orderbook**, and had no settlement read at all. So its markets were
+scanned, never traded, and the panel said so on its own row: *"the settlement
+read is what it needs"*.
+
+That adapter is rewritten. What changed, and what each change was for:
+
+**1. The book is the venue's own quote, not a spread we made up.** The old
+`get_orderbook` returned `bid = price - 0.02, ask = price + 0.02`, an invented
+depth, and `source: "predictit_mock"` in the payload - a number no venue ever
+published, and one the scan could not even shortlist (it requires
+`book["validated"]`). The venue's public API publishes, per contract,
+`bestBuyYesCost` (the cost to buy one Yes share) and `bestSellYesCost` (the
+price to sell one). Those two prices are now the book, with the venue's own no
+side where it publishes one and the binary equivalence (`1 - yes_bid`) where it
+does not - named as such in `executable_price_no_source`. A crossed quote, a
+one-sided quote, a spread wider than 0.10, or no quote at all is a **refusal**:
+`source: "predictit_no_quote"`, `validated: false`, and no numbers.
+
+**2. The record stopped inventing what the venue does not publish.** Three
+fabrications were deciding things downstream: `liquidity=1000` on every market
+(it gated the scan's floors), no `end_date` at all (so the lane's preference for
+markets that settle soon could never apply here), and one market per market with
+`contracts[0]` priced as the whole question (so a three-way "which party
+controls the Senate" was priced as a bet on its first name). Now: **one Market
+per contract** (`predictit-8155-33624`), the contract's name in the question
+when the market has more than one, the end date parsed (`"N/A"` is no date), and
+volume/liquidity at 0.0 with `volume_basis: "not_published"` in raw. A contract
+with no published price is **skipped** - it used to become a 0.50 coin flip.
+
+**3. The scan learned the difference between "no trading" and "not published".**
+The volume and liquidity floors exist to keep model time off markets nobody
+trades, and they only mean that when the venue publishes the figures. Those
+floors are now applied to venues that publish them and skipped for venues that
+declare they do not (`Market.volume_is_published`); the book and spread checks
+still apply in full, and every other venue is unchanged. The score line says it
+out loud: *"(this venue publishes no volume or depth, so those terms are not
+scored)"*.
+
+**4. Every venue gets one turn before any venue takes a second.** The deep
+budget is small (8 markets by default) and the score compares things venues
+report unevenly, so a venue with no volume and no depth ranks last however good
+its book - and was never asked. The shortlist now reserves **one slot per venue
+with a priceable market first**, then fills the rest strictly by score. A
+reserved row is still a market with a validated two-sided book that passed every
+rule; a venue with the best markets still takes most of the budget. This is the
+same defect as *"nineteen venues and seventeen say unavailable"*, one level
+down: registered, readable, and never asked.
+
+**5. The settlement read is the venue's own record - and it refuses to guess.**
+PredictIt has no results endpoint, but a **closed contract's own final prices**
+are its outcome. The rule: every final price the venue published for that
+contract (`lastClosePrice`, `lastTradePrice`) must sit at **>= 0.99 or <= 0.01**,
+and they must agree with each other. Then Yes is 1.00 or 0.00, source
+`predictit_closed_contract`. Anything else - a contract that stopped at 0.62, two
+published prices that disagree, a market still open, a contract no longer
+listed - is a **refusal** with the numbers that were read, and never the word
+`unsupported`: `unsupported` is what V68 files in storage as "this venue can
+never close a position", and a read that can answer next cycle must not be
+recorded as one that never will. The resolution of a market whose last print was
+0.62 is not knowable from the venue's API, and inventing it would be a fake
+outcome in the calibration record forever.
+
+**6. What it costs, and what it cannot do.** `fee_taker_pct` is **0.0** because
+the venue charges nothing to open; its fees are 10% of profit when a position is
+closed early and 5% on withdrawn profit, neither of which is an entry cost, and
+both are stated in `get_mechanics` (`source: "predictit_documented_rules"`,
+`is_real: False` - a documented rule is not a per-market read). The order path
+is **closed** and says so: `supports_trading: False`, `real_order_path: False`,
+`can_place_real_orders: False`, and live mode gets the refusal that names the
+real reason instead of inviting a switch that would change nothing. Only US
+residents may trade there (`check_eligibility`), and no account read exists -
+the public API exposes no balances and no positions.
+
+**7. The note that said it could never settle is deleted, not left standing.**
+`settlement_unsupported_venues` is written to the database and read by the panel,
+which uses it to name the open positions that can never close. Nothing ever
+removed an entry - so on this operator's own database, which carries the word
+`predictit` from runs before this change, the panel would have kept saying that
+PredictIt's positions can never close, on a build where it can. The settlement
+engine now revises the note the moment a venue answers, including for a market
+that is merely still open: *"not settled yet"* is not *"cannot report a
+settlement"*, and only the second one belongs in that list.
+
+**What it means in the panel:** the PredictIt row now reads
+`can_report_settlement: true / paper_tradable: true / can_run_today: true`, its
+market records are real two-sided quotes, and its paper trades **settle, count
+toward the record and free their slot** - the test suite walks the real adapter,
+the real storage and the real settlement engine for exactly that. Two layers of
+the reference still read `missing` on its row (the account read and the order
+path), so its distance to Polymarket is **2**, and the `next_step` on the row
+says which: write the account read. Money cannot reach it and the row says so:
+`fundable: false`, `fundable_from_here: false`.
+
 ## Extending to Other Sites
 
 Edit `config/config.yaml`:

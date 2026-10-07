@@ -281,12 +281,25 @@ class StrategyEngineV3:
         return self.liquidity_filter(self.cheap_filters(markets))[:self.evaluate_limit]
 
     def cheap_filters(self, markets: List[Market]) -> List[Market]:
+        """
+        The cheap stage: what is worth reading a book for.
+
+        The volume and liquidity floors exist to keep model time off markets
+        nobody trades - and they only mean that when the VENUE PUBLISHES the
+        figures. PredictIt's API publishes a best price per contract and no
+        volume and no depth at all, so comparing its 0.0 against a floor says
+        "nobody trades here" about a market whose trading the venue simply does
+        not report. Those markets skip the two floors (their books and spreads
+        are still checked, and one venue cannot take more than its turn of the
+        deep budget), and every other venue is unchanged.
+        """
         filtered = []
         for m in markets:
-            if m.volume_24h < self.min_volume_24h:
-                continue
-            if m.liquidity < self.min_liquidity:
-                continue
+            if bool(getattr(m, "volume_is_published", True)):
+                if m.volume_24h < self.min_volume_24h:
+                    continue
+                if m.liquidity < self.min_liquidity:
+                    continue
             if not m.active or m.closed:
                 continue
             # Allow extreme prices for mean reversion strategy, but filter for others

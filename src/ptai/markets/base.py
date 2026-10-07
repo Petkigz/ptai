@@ -152,6 +152,24 @@ class Market:
         return raw.get("probability_market", True) is not False
 
     @property
+    def volume_is_published(self) -> bool:
+        """
+        Does this market's venue publish trading volume and depth?
+
+        It matters because those figures gate the scan: markets below the
+        volume/liquidity floors are never given model time. A venue whose API
+        publishes a price and nothing else (PredictIt) is not a venue whose
+        markets "had no trading" - the difference is invisible in the number,
+        which is why the adapter states it on the record and the scan reads the
+        statement instead of comparing 0 against a floor. Adapters that publish
+        neither set `volume_basis: "not_published"` in raw.
+        """
+        raw = getattr(self, "raw", None)
+        if not isinstance(raw, dict):
+            return True
+        return raw.get("volume_basis") != "not_published"
+
+    @property
     def best_price(self) -> float:
         """Get YES price if binary"""
         if self.outcome_prices:

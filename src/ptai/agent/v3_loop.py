@@ -990,18 +990,32 @@ class TradingAgentV3:
         # markets "sent to the model" in a cycle where the model was never
         # asked at all. These are the same two floors `cheap_filters` applies.
         engine = self.strategy_engine_v3
-        if float(market.volume_24h or 0.0) < float(engine.min_volume_24h):
-            return -1.0, (f"volume_24h {float(market.volume_24h or 0.0):,.0f} is below "
-                          f"the {engine.min_volume_24h:,} the scan will trade")
-        if float(market.liquidity or 0.0) < float(engine.min_liquidity):
-            return -1.0, (f"liquidity {float(market.liquidity or 0.0):,.0f} is below "
-                          f"the {engine.min_liquidity:,} the scan will trade")
+        # THE FLOORS ONLY MEAN SOMETHING IF THE VENUE PUBLISHES THE FIGURES.
+        # PredictIt's API publishes a best price per contract and no volume and
+        # no depth: its markets are not untraded, they are unreported, and a
+        # market refused here never reaches the book read that could price it.
+        # The book and spread checks below still apply in full.
+        publishes_volume = bool(getattr(market, "volume_is_published", True))
+        if publishes_volume:
+            if float(market.volume_24h or 0.0) < float(engine.min_volume_24h):
+                return -1.0, (f"volume_24h {float(market.volume_24h or 0.0):,.0f} is below "
+                              f"the {engine.min_volume_24h:,} the scan will trade")
+            if float(market.liquidity or 0.0) < float(engine.min_liquidity):
+                return -1.0, (f"liquidity {float(market.liquidity or 0.0):,.0f} is below "
+                              f"the {engine.min_liquidity:,} the scan will trade")
         if not bool(getattr(market, "active", True)) or bool(getattr(market, "closed", False)):
             return -1.0, "the market is not active"
         depth = float(book.get("depth") or 0.0)
         liquidity_score = min(1.0, (float(market.liquidity) + depth) / 20000.0)
         book_quality = max(0.0, 1.0 - float(spread) / 0.10)
         volume_score = min(1.0, float(market.volume_24h) / 20000.0)
+        if not publishes_volume:
+            # Scored as zero, and SAID: a venue that publishes no volume cannot
+            # be ranked as though it had none. The score is lower for it, which
+            # is why the deep budget gives every venue one turn before any venue
+            # takes a second (see `_prescan_and_rank`).
+            liquidity_score = 0.0
+            volume_score = 0.0
         score = 0.45 * liquidity_score + 0.40 * book_quality + 0.15 * volume_score
         # CAPITAL x TIME IS PART OF THE RETURN, so a market that settles soon is
         # worth more of the deep budget than an identical one that settles in
@@ -1023,10 +1037,12 @@ class TradingAgentV3:
         else:
             horizon_bonus, horizon_why = 0.0, f"resolves in {days:.0f}d"
         score = min(1.0, score + horizon_bonus)
+        _unpublished = (" (this venue publishes no volume or depth, so those "
+                        "terms are not scored)" if not publishes_volume else "")
         return round(score, 6), (
             f"liquidity {liquidity_score:.2f}, book quality {book_quality:.2f} "
             f"(spread {float(spread):.1%}), volume {volume_score:.2f}, "
-            f"{horizon_why}")
+            f"{horizon_why}{_unpublished}")
 
     async def _prescan_and_rank(self, markets: List[Market]) -> Dict[str, Any]:
         """
@@ -1148,9 +1164,43 @@ class TradingAgentV3:
         dropped_by_scan = [market for score, market, _why in ranked
                            if score >= 0 and market.id not in will_evaluate]
 
-        shortlist = [row for row in ranked
-                     if row[0] >= 0 and row[1].id in will_evaluate][
-                         :self.deep_analysis_limit]
+        eligible_rows = [row for row in ranked
+                         if row[0] >= 0 and row[1].id in will_evaluate]
+        # EVERY VENUE GETS ONE TURN BEFORE ANY VENUE TAKES A SECOND.
+        #
+        # The deep budget is small (8 by default) and the score is a comparison
+        # of things venues report unevenly: liquidity, depth, volume. A venue
+        # that publishes no volume and no depth therefore ranks below every
+        # venue that does, however good its own book is - and never gets model
+        # time, so its paper record stays at zero however long the agent runs.
+        # That is the same defect as "nineteen venues and seventeen say
+        # unavailable", one level down: registered, readable, and never asked.
+        #
+        # One reserved slot per venue with a priceable market fixes it without
+        # inventing a figure: the reserved row is still a market with a
+        # validated two-sided book, and it still has to pass every rule the scan
+        # applies. The remaining slots are then filled strictly by score, so a
+        # venue with the best markets still takes most of the budget.
+        shortlist = []
+        _taken_venues = set()
+        _shortlisted = set()
+        for row in eligible_rows:
+            if len(shortlist) >= self.deep_analysis_limit:
+                break
+            venue_key = _venue_key(row[1])
+            if venue_key in _taken_venues:
+                continue
+            _taken_venues.add(venue_key)
+            shortlist.append(row)
+            _shortlisted.add(row[1].id)
+        for row in eligible_rows:
+            if len(shortlist) >= self.deep_analysis_limit:
+                break
+            if row[1].id in _shortlisted:
+                continue
+            shortlist.append(row)
+            _shortlisted.add(row[1].id)
+        shortlist.sort(key=lambda row: row[0], reverse=True)
         self._deep_market_ids = {row[1].id for row in shortlist}
         self._deep_shortlist_active = True
         self._screen = {
@@ -1163,6 +1213,10 @@ class TradingAgentV3:
                            "score": score, "why": why}
                           for score, m, why in shortlist],
             "screened_out": len(ranked) - len(shortlist),
+            # WHICH VENUES GOT A RESERVED TURN. One slot each, before any venue
+            # is given a second.
+            "venues_shortlisted": sorted(_taken_venues),
+            "one_turn_per_venue": True,
             # EVERY MARKET READ IS ACCOUNTED FOR, because the operator reads
             # these numbers to answer "how long do I have to run this".
             #   read = chosen + dropped by the scan's cap + refused at the
