@@ -26,7 +26,8 @@ from src.ptai.venues.whitebit_adapter import WhiteBITAdapter
 from src.ptai.venues.afx_adapter import AFXAdapter
 from src.ptai.venues.grvt_adapter import GRVTAdapter
 from src.ptai.venues.pionex_adapter import PionexAdapter
-from src.ptai.venues.betfair_adapter import BetfairAdapter, BetdaqAdapter, BetConnectAdapter
+from src.ptai.venues.betdaq_adapter import BetdaqAdapter
+from src.ptai.venues.betfair_adapter import BetfairAdapter, BetConnectAdapter
 from src.ptai.venues.ccxt_adapter import CCXTUnifiedAdapter
 from src.ptai.venues.veynor_adapter import VeynorAdapter
 from src.ptai.venues.openpx_adapter import OpenPXAdapter
@@ -120,12 +121,14 @@ async def test_unimplemented_venues_declare_themselves():
 
     SimmerAdapter used to be in this list. Its client was written - the SDK, the
     synthetic $SIM venue, its resolutions - so it is now on the other side of the
-    same rule, which the test below pins.
+    same rule, which the test below pins. BetdaqAdapter used to be here too: its
+    client is now written (the venue's own SDK, pinned to its play-money markets),
+    and its own suite is tests/test_betdaq_can_trade_and_settle.py.
     """
     from src.ptai.venues.adapter import STATUS_UNIMPLEMENTED
     for adapter in [CymeticaAdapter(), AFXAdapter(), GRVTAdapter(),
                     PionexAdapter(), CCXTUnifiedAdapter(), VeynorAdapter(),
-                    OpenPXAdapter(), BetdaqAdapter(), BetConnectAdapter()]:
+                    OpenPXAdapter(), BetConnectAdapter()]:
         assert adapter.capabilities.implementation_status == STATUS_UNIMPLEMENTED, \
             adapter.venue_id
         assert adapter.capabilities.supports_market_discovery is False, adapter.venue_id

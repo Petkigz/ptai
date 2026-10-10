@@ -75,12 +75,13 @@ from ..venues.crypto_adapter import CryptoAdapter
 from ..venues.stock_adapter import StockAdapter
 from ..venues.predictit_adapter import PredictItAdapter
 from ..venues.simmer_adapter import SimmerAdapter
+from ..venues.betdaq_adapter import BetdaqAdapter
 from ..venues.cymetica_adapter import CymeticaAdapter
 from ..venues.whitebit_adapter import WhiteBITAdapter
 from ..venues.afx_adapter import AFXAdapter
 from ..venues.grvt_adapter import GRVTAdapter
 from ..venues.pionex_adapter import PionexAdapter
-from ..venues.betfair_adapter import BetdaqAdapter, BetConnectAdapter
+from ..venues.betfair_adapter import BetConnectAdapter
 from ..venues.betfair_exchange import BetfairExchangeAdapter
 from ..betting.engine import BettingEngine
 from ..betting.market_types import catalogue_report as betting_catalogue_report
@@ -618,7 +619,16 @@ class TradingAgentV3:
             include_player_markets=False,
         )
         self.venue_registry.register(betfair_adapter)
-        betdaq_adapter = BetdaqAdapter()
+        # Betdaq - the betting exchange, pinned to its play-money markets: real
+        # questions, matched by the venue's own engine, settled by the venue.
+        # The login comes from the same vault/env store as every other login;
+        # without it the venue's feed carries no answer, so the row says a
+        # login is needed rather than looking broken. No real-money market is
+        # ever read, so no real order can leave.
+        _betdaq = credential_store.resolve("betdaq", self.data_dir)
+        betdaq_adapter = BetdaqAdapter(
+            username=_betdaq.get("username", ""),
+            password=_betdaq.get("password", ""))
         self.venue_registry.register(betdaq_adapter)
         betconnect_adapter = BetConnectAdapter()
         self.venue_registry.register(betconnect_adapter)

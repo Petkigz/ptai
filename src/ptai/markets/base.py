@@ -163,11 +163,16 @@ class Market:
         which is why the adapter states it on the record and the scan reads the
         statement instead of comparing 0 against a floor. Adapters that publish
         neither set `volume_basis: "not_published"` in raw.
+
+        A venue whose matched amounts are published in its own PLAY currency
+        (Betdaq's play markets) sets `volume_basis: "play_money"`: the figure is
+        published, but it is not the unit the floors are written in, so the
+        floors are skipped for it exactly as for an unpublished one.
         """
         raw = getattr(self, "raw", None)
         if not isinstance(raw, dict):
             return True
-        return raw.get("volume_basis") != "not_published"
+        return raw.get("volume_basis") not in ("not_published", "play_money")
 
     @property
     def best_price(self) -> float:

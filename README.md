@@ -1369,10 +1369,10 @@ coverage counts add up to 19. Saving a Betfair login moves the venue from
 `needs_login / can_run_today False` to `paper_only / can_run_today True` and the
 counts from 6 readable venues to 7.
 
-*(Those counts are from the release that fixed this. Simmer's client was written
-afterwards - see the last section - so the no-client line reads 10 today, and the
-venue that stopped being one of them is now read, priced and settled like the
-rest.)*
+*(Those counts are from the release that fixed this. Simmer's and Betdaq's
+clients were written afterwards - see the last sections - so the no-client line
+reads 9 today, and the venues that stopped being among them are now read, priced
+and settled like the rest.)*
 
 ## Reaching Polymarket, Venue By Venue
 
@@ -1402,6 +1402,7 @@ crypto_binance 1 layer missing: place a real order
 manifold       1 layer missing: place a real order
 whitebit       1 layer missing: place a real order
 simmer         2 layers missing: read the account; place a real order
+betdaq         2 layers missing: read the account; place a real order
 predictit      2 layers missing: read the account; place a real order
 apify          3 layers missing - no Apify API client ...
 ```
@@ -1428,9 +1429,9 @@ you are*:
 * **Crypto (Binance, WhiteBIT)** - fundable by you, real APIs, but they are not
   probability books: the mispricing-versus-forecast stack does not apply without
   a separate strategy lane.
-* The other **ten** have no client written at all (eleven before Simmer's was
-  written), and most are UK/EU exchanges that will not accept a Uganda account
-  either.
+* The other **nine** have no client written at all (eleven before Simmer's was
+  written, ten before Betdaq's), and most are UK/EU exchanges that will not
+  accept a Uganda account either.
 
 So the honest queue for a real trade is: **Polymarket (done)**, then the first
 venue that is both buildable *and* fundable from Uganda - and that is a decision
@@ -2079,6 +2080,84 @@ real settlement engine - asserting the record moves from one open trade to one
 resolved trade with the $SIM profit, and that a market the venue has not resolved
 yet leaves the position open while **not** being filed as a venue that cannot
 answer. Those positions settle, count toward the 100, and free their slot.
+
+## Betdaq: The Second Venue That Will Take The Order
+
+Simmer was the first venue PTAI could submit an order to with no money behind
+it. **Betdaq** is the second, and it is a different kind of venue: a sports
+betting *exchange* (api.betdaq.com, API v2.0) whose API ships as a Python
+wrapper on PyPI (`betdaq`), running **play markets** alongside its real-money
+ones - `WantPlayMarkets` is a first-class flag in its own market-data calls,
+and every market row carries `is_play_market`. Play markets are the venue's own
+simulation, settled in play money: real questions, real orders matched by the
+venue's engine, and a result the venue publishes per runner. The adapter is
+pinned to them - discovery asks for play markets and publishes only rows the
+venue marks `is_play_market` - so every stake it ever places is play money and
+no real-money market is even read.
+
+**The shape of it.** One Market per venue market with one outcome per runner,
+priced from the venue's own decimal-odds ladders: odds become the probability
+`1/odds`, and a backer's stake becomes `stake x odds` contracts. Only
+single-winner play markets with a two-sided price on every published runner are
+published, and a market whose *first* runner is unpriced is not published at all
+- the same settlement-order rule the Betfair adapter enforces, because
+settlement maps the winning runner onto outcome index 0 through exactly that
+order. The venue publishes matched amounts, but in its play currency, so the
+row records `volume_basis: "play_money"` and the scan's dollar floors are
+skipped for it rather than fed numbers from a different unit (the
+one-turn-per-venue reservation is what still gives it model time).
+
+**The fill is the venue's, not ours.** `place_order` builds the order with the
+wrapper's own `create_order` filter and submits it to the play market; what is
+recorded is what the venue's receipt says: the matched stake (the cost), the
+matched odds (the price), and the contracts (stake x odds). A venue refusal, a
+return code, a venue error, or a match of nothing is a refusal with its reason -
+no position is opened. Only a BACK is built: a lay risks `stake x (odds - 1)`,
+which is not the quantity this executor sizes, and a NO on a market with more
+than two outcomes is not one runner.
+
+**The outcome is the venue's own words.** Betdaq publishes results per *runner*
+through its selection-changes feed (`SettlementResultString`), not as a field on
+the market - the market row only says `SETTLED`. The adapter polls that feed
+with a cursor (full history on the first read only, incremental after), matches
+the venue's own result string against the winner wording, and maps the winning
+runner onto the published outcome order. A settled market whose feed names no
+winner is refused, not interpreted; an unrecognised result string is not the
+winner; a voided market resolves nothing. "Still open" is a real answer and is
+deliberately not the word `unsupported`.
+
+**Play money is not dollars, again.** The venue publishes one account balance
+and it is *real* money - so the adapter does not report it as this venue's.
+The portfolio carries the play-market positions, declares itself
+`virtual`, and no balance figure: a balance shown next to play-money positions
+would invite the reading "this venue holds my money", which is false here. The
+capital ledger and the budget endpoint refuse play money exactly as they do
+$SIM and Mana.
+
+**What it will not do.** No real-money order, ever: `supports_trading: false`,
+`real_order_path: false`, live mode gets a refusal that says so. The venue's
+real-money markets are never read. Betdaq's commission is charged on net
+winnings *at settlement*, not on the order - `get_mechanics` says so rather
+than quoting a rate the code cannot verify, and the paper record's P&L is
+gross of that commission.
+
+**In the panel:** the Betdaq row leaves the no-client list. Its `use` becomes
+`needs_login` until a Betdaq login is saved (the venue's feed carries the
+login on every call, markets included - it is a SOAP header), then `paper_only /
+can_run_today: true / can_report_settlement: true`. Money still cannot reach it
+and the row says so: `fundable: false`, `fundable_from_here: false`.
+
+**It has already changed the totals.** In the recorded inventory: the no-client
+column fell from 10 to 9, and venues that can report a settlement rose from 6
+to 7.
+
+**Watch it work end to end:** `tests/test_betdaq_can_trade_and_settle.py` drives
+a fake `betdaq` package of the wrapper's documented shapes through the real
+adapter, writes the returned match into the real storage, and settles it with
+the real settlement engine - asserting the record moves from one open trade to
+one resolved trade with the play-money profit, and that a market the venue has
+not settled yet leaves the position open while **not** being filed as a venue
+that cannot answer.
 
 ## Extending to Other Sites
 

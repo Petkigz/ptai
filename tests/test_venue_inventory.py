@@ -180,15 +180,19 @@ class TestTheAnswersAnOperatorNeeds:
 
     def test_no_client_venues_are_named_as_such(self, inventory):
         """
-        Eleven adapters have no client. They must not be presented as available
+        Nine adapters have no client. They must not be presented as available
         ("run it and see") and must not be dropped from the list either - an
         operator is entitled to know a venue exists and is unbuilt.
+
+        The count tracks the venue build-out: it was eleven before Simmer's
+        client, ten after it, and nine now that Betdaq's client has shipped too
+        (its own suite is tests/test_betdaq_can_trade_and_settle.py).
         """
         rows = inventory["venues"]
         unbuilt = {vid: row for vid, row in rows.items()
                    if row["use"] == USE_NO_CLIENT}
         assert len(unbuilt) == inventory["counts"]["no_client"]
-        assert len(unbuilt) >= 10
+        assert len(unbuilt) >= 9
         for vid, row in unbuilt.items():
             assert not row["can_run_today"], f"{vid} cannot run and says it can"
             assert not row["reads_live_markets_now"]

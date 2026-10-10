@@ -2408,12 +2408,13 @@ async def api_v5_venues():
         from .venues.stock_adapter import StockAdapter
         from .venues.predictit_adapter import PredictItAdapter
         from .venues.simmer_adapter import SimmerAdapter
+        from .venues.betdaq_adapter import BetdaqAdapter
         from .venues.cymetica_adapter import CymeticaAdapter
         from .venues.whitebit_adapter import WhiteBITAdapter
         from .venues.afx_adapter import AFXAdapter
         from .venues.grvt_adapter import GRVTAdapter
         from .venues.pionex_adapter import PionexAdapter
-        from .venues.betfair_adapter import BetfairAdapter, BetdaqAdapter, BetConnectAdapter
+        from .venues.betfair_adapter import BetfairAdapter, BetConnectAdapter
         from .venues.ccxt_adapter import CCXTUnifiedAdapter
         from .venues.veynor_adapter import VeynorAdapter
         from .venues.openpx_adapter import OpenPXAdapter

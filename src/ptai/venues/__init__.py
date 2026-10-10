@@ -8,12 +8,13 @@ from .crypto_adapter import CryptoAdapter
 from .stock_adapter import StockAdapter
 from .predictit_adapter import PredictItAdapter
 from .simmer_adapter import SimmerAdapter
+from .betdaq_adapter import BetdaqAdapter
 from .cymetica_adapter import CymeticaAdapter
 from .whitebit_adapter import WhiteBITAdapter
 from .afx_adapter import AFXAdapter
 from .grvt_adapter import GRVTAdapter
 from .pionex_adapter import PionexAdapter
-from .betfair_adapter import BetfairAdapter, BetdaqAdapter, BetConnectAdapter
+from .betfair_adapter import BetfairAdapter, BetConnectAdapter
 from .ccxt_adapter import CCXTUnifiedAdapter
 from .veynor_adapter import VeynorAdapter
 from .openpx_adapter import OpenPXAdapter

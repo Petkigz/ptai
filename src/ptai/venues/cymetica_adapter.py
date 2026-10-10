@@ -1,8 +1,11 @@
 """
-Cymetica Event Trader Adapter - perpetual prediction markets with an official Python SDK.
+Cymetica Event Trader Adapter - perpetual prediction markets.
 
-No SDK client exists. The SDK is not installed and neither the orderbook path
-nor order placement was ever written.
+No client exists. The original docstring claimed an official Python SDK; none
+could be found for it - not on PyPI under `cymetica` or any of the usual
+`cymetica-*` names, and on GitHub only a website repository - so there is no
+SDK to build on and neither the orderbook path nor order placement was ever
+written. The row says exactly that rather than citing an SDK nobody can install.
 """
 from typing import Any, Dict, List
 
@@ -23,7 +26,9 @@ class CymeticaAdapter(UnimplementedVenueAdapter):
         super().__init__(
             venue_id="cymetica",
             venue_type=VenueType.PREDICTION,
-            note=("no Cymetica SDK client; orderbook streaming and order placement are unimplemented"),
+            note=("no Cymetica client: no SDK found on PyPI or GitHub to "
+                  "build on; orderbook streaming and order placement are "
+                  "unimplemented"),
         )
         self.api_key = api_key
         self.capabilities.implementation_status = STATUS_UNIMPLEMENTED

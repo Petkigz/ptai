@@ -30,6 +30,12 @@ from src.ptai.venues.adapter import (MarketAdapter, STATUS_LIVE, STATUS_SCANNER,
 # markets and can be paper-traded through the venue itself, so it is excluded by
 # the same rule that put it here - a venue is only listed as unimplemented while
 # there is nothing to use. Its own suite is tests/test_simmer_can_trade_and_settle.py.
+#
+# betdaq_adapter.BetdaqAdapter was on this list (as betfair_adapter.BetdaqAdapter)
+# until its client was written (the venue's own `betdaq` SDK, pinned to its
+# play-money markets, its selection-results feed for settlement). It now reads
+# real markets and can be paper-traded through the venue itself. Its own suite is
+# tests/test_betdaq_can_trade_and_settle.py.
 UNIMPLEMENTED = [
     ("apify_adapter", "ApifyAdapter"),
     ("afx_adapter", "AFXAdapter"),
@@ -41,7 +47,6 @@ UNIMPLEMENTED = [
     ("ccxt_adapter", "CCXTUnifiedAdapter"),
     ("stock_adapter", "StockAdapter"),
     ("betfair_adapter", "BetfairAdapter"),
-    ("betfair_adapter", "BetdaqAdapter"),
     ("betfair_adapter", "BetConnectAdapter"),
 ]
 

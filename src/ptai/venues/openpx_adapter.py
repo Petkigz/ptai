@@ -2,8 +2,16 @@
 OpenPX Adapter - Rust client with sub-millisecond WebSocket support across
 Polymarket and Kalshi.
 
-No client exists. The Rust library is not installed and no Python interop was
-written.
+No venue client exists, and the reason is not a missing binding: the `openpx`
+package on PyPI (0.3.1) IS a Python binding - a compiled Rust core with a
+Python wrapper - but it is a UNIFIED Kalshi+Polymarket SDK, not a venue. There
+is no OpenPX exchange behind it to read markets from or place orders on.
+Polymarket and Kalshi already have first-party adapters in this build
+(polymarket_adapter.py, kalshi_adapter.py), so a second client for the same two
+exchanges would be an unmaintained translation step in front of venues that
+already work - the same reasoning as the ccxt_unified row. This adapter stays
+unimplemented by design, and the note says so rather than citing a binding that
+exists for a different purpose.
 """
 from typing import Any, Dict, List
 
@@ -24,7 +32,9 @@ class OpenPXAdapter(UnimplementedVenueAdapter):
         super().__init__(
             venue_id="openpx",
             venue_type=VenueType.PREDICTION,
-            note=("no OpenPX client; the Rust library is not installed and no Python binding was written"),
+            note=("no OpenPX venue: the `openpx` PyPI package is a unified "
+                  "Kalshi+Polymarket SDK, not a venue, and both exchanges "
+                  "already have first-party adapters - redundant by design"),
         )
         self.polymarket_key = polymarket_key
         self.kalshi_key = kalshi_key

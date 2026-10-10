@@ -230,6 +230,25 @@ TOOLS: Dict[str, Tool] = {
             Field("api_key", "API key", env="SIMMER_API_KEY", required=False),
         ),
     ),
+    "betdaq": Tool(
+        name="betdaq",
+        label="Betdaq (play-money betting exchange)",
+        kind="venue",
+        venue_id="betdaq",
+        unlocks=("the whole venue: its play-money markets, where real questions "
+                 "are matched by the venue's own engine and settled by the venue. "
+                 "The login is all it needs - play money needs no card, no wallet "
+                 "and no deposit"),
+        then=("nothing further for the play markets. Betdaq's REAL-money markets "
+              "are not used here: this adapter is pinned to the venue's play "
+              "markets, so no real order can be placed and the venue can never "
+              "hold your money through it."),
+        docs="https://api.betdaq.com/v2.0/Docs (Betdaq API; login from your Betdaq account)",
+        fields=(
+            Field("username", "Username", env="BETDAQ_USERNAME", secret=False),
+            Field("password", "Password", env="BETDAQ_PASSWORD"),
+        ),
+    ),
     "apify": Tool(
         name="apify",
         label="Apify (paid arb scanner)",
@@ -677,6 +696,7 @@ def refresh_adapters(registry, settings=None, data_dir: str = "./data") -> Dict[
         "betfair": lambda adapter: _apply_betfair(adapter, data_dir),
         "manifold": lambda adapter: _apply_manifold(adapter, data_dir),
         "simmer": lambda adapter: _apply_simmer(adapter, data_dir),
+        "betdaq": lambda adapter: _apply_betdaq(adapter, data_dir),
     }
     changed: Dict[str, Any] = {}
     for venue_id, apply_fn in appliers.items():
@@ -754,6 +774,41 @@ def _apply_simmer(adapter, data_dir: str) -> List[str]:
         if not getattr(caps, "requires_credentials", False):
             caps.requires_credentials = True
             applied.append("requires_credentials")
+        if not getattr(caps, "supports_portfolio", False):
+            caps.supports_portfolio = True
+            applied.append("supports_portfolio")
+    if hasattr(adapter, "last_error"):
+        adapter.last_error = ""
+    return applied
+
+
+def _apply_betdaq(adapter, data_dir: str) -> List[str]:
+    """
+    A Betdaq login saved while the agent is running, applied to the adapter.
+
+    The client is built lazily (`adapter._client()`), so the login landing on
+    the adapter is what matters - and the capability flags that were computed
+    from what was known at construction have to be raised, or the venue keeps
+    reporting "needs a login" and no account read until the next restart.
+    """
+    values = resolve("betdaq", data_dir)
+    username = values.get("username")
+    password = values.get("password")
+    if not username or not password:
+        return []
+    if getattr(adapter, "username", "") == username \
+            and getattr(adapter, "password", "") == password:
+        return []
+    applied = ["username", "password"]
+    adapter.username = username
+    adapter.password = password
+    # The cached client, if one was built without the login, is dropped rather
+    # than patched: the SDK client carries the login inside its own session.
+    if getattr(adapter, "_client_obj", None) is not None:
+        adapter._client_obj = None
+        applied.append("client_rebuilt")
+    caps = getattr(adapter, "capabilities", None)
+    if caps is not None:
         if not getattr(caps, "supports_portfolio", False):
             caps.supports_portfolio = True
             applied.append("supports_portfolio")

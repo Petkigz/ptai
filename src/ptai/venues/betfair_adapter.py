@@ -12,8 +12,9 @@ carries goals, corners, cards and player props was never connected to the
 trading path. Real Betfair markets now come from
 `betfair_exchange.BetfairExchangeAdapter`.
 
-Betdaq and BetConnect are separate exchanges listed in the original docstring as
-flumine integrations. Neither has a client here.
+BetConnect is a separate exchange listed in the original docstring as a flumine
+integration; it has no client here. Betdaq's client lives in betdaq_adapter.py
+(the venue's own SDK, pinned to its play-money markets).
 """
 from typing import Any, Dict, List
 
@@ -43,20 +44,6 @@ class BetfairAdapter(UnimplementedVenueAdapter):
         )
         self.use_flumine = use_flumine
         logger.warning("BetfairAdapter is a deprecated stub - use BetfairExchangeAdapter")
-
-
-class BetdaqAdapter(UnimplementedVenueAdapter):
-    """Betdaq exchange: no client exists."""
-
-    def __init__(self, username: str = None, password: str = None, **kwargs):
-        super().__init__(
-            venue_id="betdaq",
-            venue_type=VenueType.OTHER,
-            note=("no Betdaq client; the flumine integration referenced in the original "
-                  "docstring was never written"),
-        )
-        self.username = username
-        self.password = password
 
 
 class BetConnectAdapter(UnimplementedVenueAdapter):
